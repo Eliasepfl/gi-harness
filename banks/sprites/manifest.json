@@ -1,0 +1,374 @@
+{
+  "schema": "banks/sprites/manifest v1",
+  "generated": "2026-07-13",
+  "purpose": "Provenance + integrity record for the CC0 Kenney sprite packs vendored under banks/sprites/raw/. Sprites are a purely cosmetic overlay on the parts bank (see notes/parts_bank/design.md); no physics or collider data comes from these files. Atlas region coordinates are consumed via slicemap.v1.json.",
+  "download_method": {
+    "note": "kenney.nl asset pages are JS-gated and did not respond to automated curl (connection hung/timeout on /assets/* pages, though kenney.nl root answered 200). Packs were fetched from the ETdoFresh/kenney.nl GitHub mirror, which stores each pack's EXTRACTED files (not a zip). A deterministic zip per pack was assembled locally from the vendored files so an integrity sha256 exists; reproducibility is anchored by the source commit below.",
+    "mirror": "https://github.com/ETdoFresh/kenney.nl",
+    "source_commit": "45df48c4d45f8716216b1a9e22df0b69cd9f5932",
+    "fetch_command": "git clone --filter=blob:none --no-checkout --depth 1 https://github.com/ETdoFresh/kenney.nl.git ; git sparse-checkout set <mirror_path> ; git checkout",
+    "manual_fallback_from_kenney_direct": [
+      "Open the pack asset_page in a browser (JS required).",
+      "Click the green 'Download' button; kenney.nl serves the official zip (CC0, no login).",
+      "Unzip into banks/sprites/raw/<pack>/ replacing the mirror copy if a byte-exact official artifact is desired."
+    ]
+  },
+  "atlas_format_note": "All packs ship Sparrow/Starling TextureAtlas XML (flat list of <SubTexture name x y width height>) alongside the spritesheet PNG, PLUS individual PNGs and vector (SVG/SWF) files. IMPORTANT: the XML 'imagePath' attribute in this mirror is a generic placeholder ('sprites.png' / 'sheet.png') and does NOT match the real PNG filename. slicemap.v1.json references the REAL filenames. The XML carries geometry only (name + rect) \u2014 zero physics/collider data.",
+  "license_summary": "All three packs are Creative Commons Zero (CC0-1.0) per their bundled License.txt. Free for personal and commercial use, no attribution required.",
+  "packs": [
+    {
+      "id": "kenney_physics-assets",
+      "display_name": "Kenney Physics Assets",
+      "kenney_asset_page": "https://kenney.nl/assets/physics-assets",
+      "source_url": "https://github.com/ETdoFresh/kenney.nl/tree/45df48c4d45f8716216b1a9e22df0b69cd9f5932/physicspack",
+      "source_mirror_path": "physicspack",
+      "source_commit": "45df48c4d45f8716216b1a9e22df0b69cd9f5932",
+      "vendored_at": "banks/sprites/raw/kenney_physics-assets/",
+      "license": "CC0-1.0",
+      "license_verified": true,
+      "license_file": "raw/kenney_physics-assets/license.txt",
+      "license_file_sha256": "7c07e6a0f885258c4b1f0ececca6f5f34764e01cf1571b810866d703508148ae",
+      "declared_asset_count_kenney": 215,
+      "local_zip": {
+        "file": "raw/kenney_physics-assets.zip",
+        "sha256": "130b8236d308bf7db02a8dd1afbc78927249144049c8b5edd8512d77cdbda8c5",
+        "bytes": 2592727,
+        "note": "locally assembled deterministic zip (mirror hosts extracted files, not a zip)"
+      },
+      "inventory": {
+        "file_count": 369,
+        "total_bytes": 3762555,
+        "by_extension": {
+          ".png": 345,
+          ".xml": 9,
+          ".svg": 7,
+          ".swf": 7,
+          ".txt": 1
+        },
+        "by_top_dir": {
+          "PNG": 333,
+          "Spritesheet": 18,
+          "Vector": 14,
+          "(root)": 4
+        }
+      },
+      "atlas": {
+        "format": "Sparrow/Starling TextureAtlas XML + spritesheet PNG",
+        "physics_data": false,
+        "spritesheets": [
+          {
+            "file": "Spritesheet/spritesheet_aliens.png",
+            "bytes": 21434,
+            "sha256": "78b2be3bd4f9cc95ef5dfda0ecdcded37fd1c6e0413031de4c96f0f3b3831ccb"
+          },
+          {
+            "file": "Spritesheet/spritesheet_aliens.xml",
+            "bytes": 1271,
+            "sha256": "d75607a89fd6b2ec828721cfb060e966636eb8df9454bc63abef4d1aa62413d1"
+          },
+          {
+            "file": "Spritesheet/spritesheet_debris.png",
+            "bytes": 8572,
+            "sha256": "f5586ac853d611afe32038a59d98c76822819fbafbc214d0b4b3b799ae70ddae"
+          },
+          {
+            "file": "Spritesheet/spritesheet_debris.xml",
+            "bytes": 749,
+            "sha256": "df016c2d5c58da996bbd4ccf5e17923d79befc6e42cbae838473458bd20efbac"
+          },
+          {
+            "file": "Spritesheet/spritesheet_elements.png",
+            "bytes": 537598,
+            "sha256": "28206b6a7ef2882f4c09cdb72bc127bd6785bedf0658bf57be8af11e98a37bc5"
+          },
+          {
+            "file": "Spritesheet/spritesheet_elements.xml",
+            "bytes": 23796,
+            "sha256": "c3f9dedf86e1f84d9e29afd5d015306a278dc20c27b320c8a6f00ef6c4091e54"
+          },
+          {
+            "file": "Spritesheet/spritesheet_explosive.png",
+            "bytes": 92454,
+            "sha256": "29df7e61c70760d5598f762db46f3f23c0f7681ce523ddeb6ffb8e84c2bd89db"
+          },
+          {
+            "file": "Spritesheet/spritesheet_explosive.xml",
+            "bytes": 5060,
+            "sha256": "25a2703a27d952d636260b3441c079707800ff7c2d74182f68d6d20733600f7b"
+          },
+          {
+            "file": "Spritesheet/spritesheet_glass.png",
+            "bytes": 105960,
+            "sha256": "51b2c90d7825b0b3a83675eee0abe411b91f1ad9f547a1f084b567fd084fb692"
+          },
+          {
+            "file": "Spritesheet/spritesheet_glass.xml",
+            "bytes": 4585,
+            "sha256": "ca961e404bbc3c2c6f40be91816ba31035ca8c03e7a0c8ceed14be4407860f73"
+          },
+          {
+            "file": "Spritesheet/spritesheet_metal.png",
+            "bytes": 104668,
+            "sha256": "fea90b9f917fcf5a47940be942c110e53165f8da72784565bdd0229c0073b8c2"
+          },
+          {
+            "file": "Spritesheet/spritesheet_metal.xml",
+            "bytes": 4829,
+            "sha256": "f439e2006f8fcbd21d7c5c541529543f47259c938c2387d3b9865fd81840ea1d"
+          },
+          {
+            "file": "Spritesheet/spritesheet_stone.png",
+            "bytes": 77870,
+            "sha256": "cd9d1848529639ce5e06d0bf296c25b50b007cec4fd47c11dbe48216ec6c1ee4"
+          },
+          {
+            "file": "Spritesheet/spritesheet_stone.xml",
+            "bytes": 4583,
+            "sha256": "153bf00308ee74f24f40af8e3f4584dcdeab1c7d19a08e64a0a280572c5cd519"
+          },
+          {
+            "file": "Spritesheet/spritesheet_tiles.png",
+            "bytes": 23232,
+            "sha256": "9e7e1627249a90171459e1cb6a216e76c5f915512c798cb86b2053ef5316df7a"
+          },
+          {
+            "file": "Spritesheet/spritesheet_tiles.xml",
+            "bytes": 1516,
+            "sha256": "890e45ae95ebc97b35cdd4403c367af0ebf37e63a2aeef7619e3d0c0348e480d"
+          },
+          {
+            "file": "Spritesheet/spritesheet_wood.png",
+            "bytes": 77401,
+            "sha256": "346acc5bfdcc266d64ee7326d03080f5c1d02b74eea0895ea91fe1a7f854e2ec"
+          },
+          {
+            "file": "Spritesheet/spritesheet_wood.xml",
+            "bytes": 4528,
+            "sha256": "fb1ad94d80051b1c34a57485666ff9ad2c368cbb0a5df05cd916adad7e0dd721"
+          }
+        ]
+      }
+    },
+    {
+      "id": "kenney_platformer-pack-redux",
+      "display_name": "Kenney Platformer Pack Redux",
+      "kenney_asset_page": "https://kenney.nl/assets/platformer-pack-redux",
+      "source_url": "https://github.com/ETdoFresh/kenney.nl/tree/45df48c4d45f8716216b1a9e22df0b69cd9f5932/platformer-pack-redux-360-assets",
+      "source_mirror_path": "platformer-pack-redux-360-assets",
+      "source_commit": "45df48c4d45f8716216b1a9e22df0b69cd9f5932",
+      "vendored_at": "banks/sprites/raw/kenney_platformer-pack-redux/",
+      "license": "CC0-1.0",
+      "license_verified": true,
+      "license_file": "raw/kenney_platformer-pack-redux/License.txt",
+      "license_file_sha256": "11984808943c0dc8919f62f90de3b3d06edfa70c8b538da66c23373ade983968",
+      "declared_asset_count_kenney": 360,
+      "local_zip": {
+        "file": "raw/kenney_platformer-pack-redux.zip",
+        "sha256": "ddf0c3191835ed56369b14ba6a1722bfcd20e36d912e36c6f53d9575163ea479",
+        "bytes": 4292608,
+        "note": "locally assembled deterministic zip (mirror hosts extracted files, not a zip)"
+      },
+      "inventory": {
+        "file_count": 453,
+        "total_bytes": 5395631,
+        "by_extension": {
+          ".png": 430,
+          ".xml": 7,
+          ".svg": 5,
+          ".swf": 5,
+          ".url": 3,
+          ".ken": 2,
+          ".txt": 1
+        },
+        "by_top_dir": {
+          "(root)": 8,
+          "KEN": 3,
+          "PNG": 418,
+          "Spritesheets": 14,
+          "Vector": 10
+        }
+      },
+      "atlas": {
+        "format": "Sparrow/Starling TextureAtlas XML + spritesheet PNG",
+        "physics_data": false,
+        "spritesheets": [
+          {
+            "file": "Spritesheets/spritesheet_complete.png",
+            "bytes": 966488,
+            "sha256": "cae45d63645e010eccac318605e94b1c608bd0dbd67179d61b5a225662288d62"
+          },
+          {
+            "file": "Spritesheets/spritesheet_complete.xml",
+            "bytes": 29223,
+            "sha256": "dd62be78eef5954e21580fac9540970b51777d8342fb422455b99a9d6c589a5c"
+          },
+          {
+            "file": "Spritesheets/spritesheet_enemies.png",
+            "bytes": 132167,
+            "sha256": "f0384fad8d013f66428c7a392e551371cc333d2b422ffd28fe4c3504d4f0db42"
+          },
+          {
+            "file": "Spritesheets/spritesheet_enemies.xml",
+            "bytes": 4580,
+            "sha256": "12c36a50c0e31adaad68f7f64fd571ab9f533602c02b3906ccd380b6fb104541"
+          },
+          {
+            "file": "Spritesheets/spritesheet_ground.png",
+            "bytes": 207369,
+            "sha256": "0c4ad7540c77a299f2cb8df0a747ef406a037a4e82b4fe2267825f1822c838af"
+          },
+          {
+            "file": "Spritesheets/spritesheet_ground.xml",
+            "bytes": 8932,
+            "sha256": "229b3b61994fc864a704e1444132af65c61d7bb07fc8a7b55734fa099dd16af8"
+          },
+          {
+            "file": "Spritesheets/spritesheet_hud.png",
+            "bytes": 66434,
+            "sha256": "00768c06bcd799a1a36c5c8133b9fa163db2e8d27218a4a27c9cbebc7fe8ff10"
+          },
+          {
+            "file": "Spritesheets/spritesheet_hud.xml",
+            "bytes": 2924,
+            "sha256": "110c0746be786096e919ce5fb8cc034e870ca9c58ef0008bfe5d0cf4dcb6a689"
+          },
+          {
+            "file": "Spritesheets/spritesheet_items.png",
+            "bytes": 32491,
+            "sha256": "b1b976806b861f23a0e14f6828ae853473cd22a2de999e559f2db750e5d20e7a"
+          },
+          {
+            "file": "Spritesheets/spritesheet_items.xml",
+            "bytes": 1911,
+            "sha256": "b89c5e59a02afdb7a1a184f8ade3898d1d69b7bc06f08bad7cde69f7d26d57fc"
+          },
+          {
+            "file": "Spritesheets/spritesheet_players.png",
+            "bytes": 242837,
+            "sha256": "89e907b2e39afc854c45643c3705e1760985d9b505fd5dd80f6137b8862279f6"
+          },
+          {
+            "file": "Spritesheets/spritesheet_players.xml",
+            "bytes": 4704,
+            "sha256": "f920b59fe31531dd2729cf106edf2b790b18f64c82557bd5182fc98ab175b08a"
+          },
+          {
+            "file": "Spritesheets/spritesheet_tiles.png",
+            "bytes": 131120,
+            "sha256": "62e43ffdc6cc0737d325b6d229e99c5731e913e91f2cc907a4afe0860136d0b8"
+          },
+          {
+            "file": "Spritesheets/spritesheet_tiles.xml",
+            "bytes": 5753,
+            "sha256": "d0fa20251416fc9f0c3a3bee7729c666ee62e7a39557758caba8ef0f1d12c13b"
+          }
+        ]
+      }
+    },
+    {
+      "id": "kenney_abstract-platformer",
+      "display_name": "Kenney Abstract Platformer",
+      "kenney_asset_page": "https://kenney.nl/assets/abstract-platformer",
+      "source_url": "https://github.com/ETdoFresh/kenney.nl/tree/45df48c4d45f8716216b1a9e22df0b69cd9f5932/abstract-platformer-370-assets",
+      "source_mirror_path": "abstract-platformer-370-assets",
+      "source_commit": "45df48c4d45f8716216b1a9e22df0b69cd9f5932",
+      "vendored_at": "banks/sprites/raw/kenney_abstract-platformer/",
+      "license": "CC0-1.0",
+      "license_verified": true,
+      "license_file": "raw/kenney_abstract-platformer/License.txt",
+      "license_file_sha256": "d2181485c137800eb0fed53e3eb1abbc7d09215d12573c2febd9bd96ec2772ed",
+      "declared_asset_count_kenney": 370,
+      "local_zip": {
+        "file": "raw/kenney_abstract-platformer.zip",
+        "sha256": "96a2163d2d043b34293eb58d675628322fe82fd18f3f97db6cddfda234a0ae6a",
+        "bytes": 2544196,
+        "note": "locally assembled deterministic zip (mirror hosts extracted files, not a zip)"
+      },
+      "inventory": {
+        "file_count": 401,
+        "total_bytes": 3051229,
+        "by_extension": {
+          ".png": 382,
+          ".db": 8,
+          ".xml": 6,
+          ".svg": 2,
+          ".swf": 2,
+          ".txt": 1
+        },
+        "by_top_dir": {
+          "(root)": 4,
+          "PNG": 378,
+          "Spritesheet": 12,
+          "Tilesheet": 3,
+          "Vector": 4
+        }
+      },
+      "atlas": {
+        "format": "Sparrow/Starling TextureAtlas XML + spritesheet PNG",
+        "physics_data": false,
+        "spritesheets": [
+          {
+            "file": "Spritesheet/spritesheet_complete.png",
+            "bytes": 196557,
+            "sha256": "007925f9005b4cb54dc064d389e443aacd973a2d38a6de898431dbb0987efa1e"
+          },
+          {
+            "file": "Spritesheet/spritesheet_complete.xml",
+            "bytes": 49188,
+            "sha256": "fc3aa287aa67c213803013659e8c05e9e3765d0d41e4aaca8f83fa1736a847c7"
+          },
+          {
+            "file": "Spritesheet/spritesheet_enemies.png",
+            "bytes": 10337,
+            "sha256": "4786a9fd2bed40a91546954ea523313c5d6f059c672df33b8f0c878f32433348"
+          },
+          {
+            "file": "Spritesheet/spritesheet_enemies.xml",
+            "bytes": 3448,
+            "sha256": "7a0e4b82045c1228965da3470ce20ccb67ff973c32d75fbb8695a120054a48f5"
+          },
+          {
+            "file": "Spritesheet/spritesheet_items.png",
+            "bytes": 7174,
+            "sha256": "15ac5db91788e81f44366fc2c9b10d4c56936268a8f2d464f1cd767be7aaf73a"
+          },
+          {
+            "file": "Spritesheet/spritesheet_items.xml",
+            "bytes": 3465,
+            "sha256": "9ebc26c24f58682cd5260f9c444af37727bf0e83a8958c71affabb371affea6a"
+          },
+          {
+            "file": "Spritesheet/spritesheet_other.png",
+            "bytes": 54759,
+            "sha256": "d555cb7b2d9ff25028a4397162ed4cc58652070cb8d321b222279d69869ca3dc"
+          },
+          {
+            "file": "Spritesheet/spritesheet_other.xml",
+            "bytes": 17816,
+            "sha256": "52cec73be49523f1bd862e5cc49af302eb168c495658236a766a29b781d9b112"
+          },
+          {
+            "file": "Spritesheet/spritesheet_players.png",
+            "bytes": 35607,
+            "sha256": "8e273f2f92e68107e4af582b77a0f995e9ed10fb4d1cba0f7d20b18430619d3f"
+          },
+          {
+            "file": "Spritesheet/spritesheet_players.xml",
+            "bytes": 10152,
+            "sha256": "a527477fbeeac966f32ed2d2b3dc8af6e6fda55df9817950667957ec6f106734"
+          },
+          {
+            "file": "Spritesheet/spritesheet_tiles.png",
+            "bytes": 72705,
+            "sha256": "2b7325fed7d04669b66d2f861fe7d4b7274eccd0183a33842cbdfae27ff71ec4"
+          },
+          {
+            "file": "Spritesheet/spritesheet_tiles.xml",
+            "bytes": 14782,
+            "sha256": "0718610180ed8cc412b6c47498c8a4f10d7efec488229b78b779706e3872b5a3"
+          }
+        ]
+      }
+    }
+  ]
+}

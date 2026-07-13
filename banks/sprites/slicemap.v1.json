@@ -1,0 +1,462 @@
+{
+  "schema": "banks/sprites/slicemap v1",
+  "generated": "2026-07-13",
+  "purpose": "First mapping from LIKELY parts-bank part names to concrete CC0 sprite regions. This is the CONTRACT the renderer/site consumes: each mapped part gives a pack, atlas PNG+XML, region name, and rect. Sprites are cosmetic only (never read by physics/verification). Parts with no good CC0 match are explicit nulls (candidates for a later pass / PixelLab).",
+  "conventions": {
+    "paths": "pack + atlas_png/atlas_xml are relative to banks/sprites/raw/<pack>/",
+    "rect": "[x, y, width, height] in pixels, top-left origin, into the atlas PNG",
+    "pivot": "[px, py] fractional anchor (0.5,0.5 = center) for placement/rotation",
+    "region": "the SubTexture 'name' in the atlas XML (kept for tools that address by name)",
+    "null": "part has no suitable CC0 sprite in the fetched packs; see note",
+    "imagePath_warning": "do NOT use the atlas XML's imagePath attribute \u2014 it is a generic placeholder in this mirror; use atlas_png here."
+  },
+  "coverage": {
+    "total_parts": 28,
+    "mapped": 25,
+    "null": 3,
+    "null_parts": [
+      "ice_floor",
+      "target_zone",
+      "pit_zone"
+    ]
+  },
+  "parts": {
+    "ground": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "grassMid.png",
+      "rect": [
+        1560,
+        390,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "grass-topped surface tile (128px); tile horizontally"
+    },
+    "ground_dirt": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "dirtMid.png",
+      "rect": [
+        1690,
+        780,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "dirt-topped surface tile"
+    },
+    "ground_stone": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "stoneMid.png",
+      "rect": [
+        130,
+        1806,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "stone-topped surface tile"
+    },
+    "wall": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "stoneCenter.png",
+      "rect": [
+        1040,
+        780,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "solid stone interior block; tile for walls/fills"
+    },
+    "platform": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "grassHalf_mid.png",
+      "rect": [
+        1560,
+        1040,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "half-height grass ledge; use as a floating platform middle segment"
+    },
+    "ledge": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "grassHalf.png",
+      "rect": [
+        1560,
+        1300,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "standalone half-height grass shelf"
+    },
+    "ramp": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "grassHill_right.png",
+      "rect": [
+        1560,
+        650,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "45-degree grass slope (right-rising); mirror for left"
+    },
+    "ice_floor": {
+      "sprite": null,
+      "note": "no clean CC0 ice/slippery surface tile in the 3 fetched packs (physics 'snow'/'frozenBush' are decor tiles, not a floor). Candidate for Kenney ice-world pack or PixelLab."
+    },
+    "crate": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "boxCrate.png",
+      "rect": [
+        2340,
+        1690,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "wooden crate, 128px; the canonical stackable/pushable box"
+    },
+    "crate_double": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "boxCrate_double.png",
+      "rect": [
+        2340,
+        1560,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "wooden crate variant (double-plank look)"
+    },
+    "ball": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_metal.png",
+      "atlas_xml": "Spritesheet/spritesheet_metal.xml",
+      "region": "elementMetal001.png",
+      "rect": [
+        500,
+        640,
+        70,
+        70
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "metal ball (70px, verified circular: alpha coverage 0.80, circle-IoU 0.98). Generic dynamic ball."
+    },
+    "rock": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "rock.png",
+      "rect": [
+        2080,
+        390,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "rounded rock prop/obstacle"
+    },
+    "boulder": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_stone.png",
+      "atlas_xml": "Spritesheet/spritesheet_stone.xml",
+      "region": "elementStone001.png",
+      "rect": [
+        570,
+        640,
+        70,
+        70
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "stone ball (70px, verified circular IoU 0.98); heavy round boulder / wrecking-ball head"
+    },
+    "tnt": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "boxExplosive.png",
+      "rect": [
+        2340,
+        1170,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "explosive crate (destructible/hazard prop)"
+    },
+    "spike": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "spikes.png",
+      "rect": [
+        1950,
+        1560,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "upward metal spikes hazard, 128px"
+    },
+    "lava": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "lava.png",
+      "rect": [
+        2210,
+        130,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "lava body tile; pair with surface variant 'lavaTop_high.png' [2210,0,128,128] for the top row"
+    },
+    "saw": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "saw.png",
+      "rect": [
+        3250,
+        910,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "circular buzz-saw hazard (also present in spritesheet_enemies.xml)"
+    },
+    "water": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "water.png",
+      "rect": [
+        1820,
+        1690,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "water body tile; surface variants waterTop_high/low available"
+    },
+    "wrecking_ball": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_stone.png",
+      "atlas_xml": "Spritesheet/spritesheet_stone.xml",
+      "region": "elementStone001.png",
+      "rect": [
+        570,
+        640,
+        70,
+        70
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "stone ball for the pendulum head only; the chain + static anchor are authored in code, not sprited"
+    },
+    "moving_platform": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "grassHalf_mid.png",
+      "rect": [
+        1560,
+        1040,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "cosmetic reuse of the platform tile; the horizontal/vertical motion is code-driven"
+    },
+    "seesaw": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_wood.png",
+      "atlas_xml": "Spritesheet/spritesheet_wood.xml",
+      "region": "elementWood012.png",
+      "rect": [
+        0,
+        70,
+        220,
+        70
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "220x70 wooden plank/beam for a seesaw or lever; the pivot joint is code"
+    },
+    "goal_zone": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "flagGreen1.png",
+      "rect": [
+        2600,
+        1300,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "green goal flag; the win-sensor rectangle itself is invisible"
+    },
+    "checkpoint": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "flagBlue1.png",
+      "rect": [
+        2600,
+        1690,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "blue checkpoint flag"
+    },
+    "coin": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "coinGold.png",
+      "rect": [
+        2730,
+        0,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "collectible gold coin (pickup target)"
+    },
+    "gem": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "gemBlue.png",
+      "rect": [
+        2600,
+        130,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "collectible blue gem (alt pickup target)"
+    },
+    "target_zone": {
+      "sprite": null,
+      "note": "a target/hit zone is a bare sensor rectangle with no natural sprite; renderer should draw an outline. Optionally decorate with flagRed1.png [2600,910,128,128]."
+    },
+    "pit_zone": {
+      "sprite": null,
+      "note": "an invisible fail/kill sensor region; no sprite by design. Renderer draws a translucent zone outline."
+    },
+    "sign": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "sign.png",
+      "rect": [
+        2080,
+        260,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "blank wooden sign (decor / prompt-theming)"
+    }
+  }
+}
