@@ -40,8 +40,11 @@ def test_query_fields():
     w = World()
     w.add("box", "box", pos=(120, 340), size=(40, 40), velocity=(5, -3))
     q = w.query("box")
-    assert set(q) == {"pos", "vel", "angle", "angular_vel", "bbox",
-                      "shape", "static", "sensor", "controlled"}
+    # Core contract keys always present; shape-dependent extras (verts for
+    # polys/segments, radius for circles/segments) are additive.
+    assert {"pos", "vel", "angle", "angular_vel", "bbox",
+            "shape", "static", "sensor", "controlled"} <= set(q)
+    assert len(q["verts"]) == 4          # a box exposes its 4 world-space corners
     assert q["pos"] == pytest.approx([120, 340])
     assert q["vel"] == pytest.approx([5, -3])
     # bbox centered around the position

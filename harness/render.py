@@ -27,11 +27,26 @@ FRAME_MS = 60      # per-frame duration in the GIF
 BG = (18, 19, 26)          # #12131a  dark background
 GRID = (30, 32, 42)        # subtle 40px grid
 C_CONTROLLED = (94, 205, 130)   # #5ecd82  the controlled body
-C_SENSOR = (240, 190, 70)       # #f0be46  sensor zones (translucent)
+C_SENSOR = (240, 190, 70)       # #f0be46  neutral sensor zones (translucent)
+C_GOAL = (110, 220, 140)        # goal-ish sensors: green (distinct from hazards!)
+C_HAZARD = (235, 100, 90)       # hazard-ish sensors: red
 C_STATIC = (95, 100, 120)       # #5f6478  static geometry
 C_TEXT = (150, 155, 170)
 # other dynamic bodies cycle through 3 stable blues/violets (per-name hash)
 C_DYNAMIC = [(94, 164, 255), (122, 132, 220), (168, 124, 240)]
+
+# Sensor semantics by name — a stopgap until bank categories carry semantics.
+_GOAL_WORDS = ("goal", "exit", "star", "flag", "finish", "target", "dock", "pad_zone")
+_HAZARD_WORDS = ("spike", "lava", "hazard", "saw", "danger", "pit", "acid", "fire")
+
+
+def _sensor_colour(name: str):
+    n = name.lower()
+    if any(w in n for w in _HAZARD_WORDS):
+        return C_HAZARD
+    if any(w in n for w in _GOAL_WORDS):
+        return C_GOAL
+    return C_SENSOR
 
 GRID_PX = 40
 
@@ -65,15 +80,28 @@ def _inset(box, px: int = 1):
     return [x0, y0, x1, y1]
 
 
-def _draw_shape(draw, shape: str, box, *, fill=None, outline=None, width: int = 2):
-    """Draw one entity shape into `draw` from its screen bbox."""
+def _screen_pts(verts, scale: float, world_h: float):
+    """World-space vertex list -> flat screen point list (y flipped)."""
+    return [(x * scale, (world_h - y) * scale) for x, y in verts]
+
+
+def _draw_shape(draw, shape: str, box, *, fill=None, outline=None, width: int = 2,
+                verts=None, scale: float = 1.0, world_h: float = 600.0):
+    """Draw one entity. Prefers true world-space `verts` (rotation-correct);
+    falls back to the axis-aligned bbox when verts are unavailable."""
     if shape == "circle":
         draw.ellipse(box, fill=fill, outline=outline, width=width)
     elif shape == "segment":
-        # thick line across the bbox diagonal (orientation unknown from bbox)
         col = outline or fill
-        draw.line([box[0], box[3], box[2], box[1]], fill=col, width=max(3, width + 1))
-    else:  # box / poly / unknown -> rectangle from bbox
+        if verts and len(verts) == 2:
+            (x0, y0), (x1, y1) = _screen_pts(verts, scale, world_h)
+            draw.line([x0, y0, x1, y1], fill=col, width=max(3, width + 1))
+        else:
+            draw.line([box[0], box[3], box[2], box[1]], fill=col, width=max(3, width + 1))
+    elif verts and len(verts) >= 3:  # box / poly with a real outline -> true polygon
+        draw.polygon(_screen_pts(verts, scale, world_h), fill=fill,
+                     outline=outline, width=width)
+    else:  # unknown / no verts -> rectangle from bbox
         draw.rectangle(box, fill=fill, outline=outline, width=width)
 
 
@@ -119,9 +147,17 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size,
         if q.get("bbox"):
             ents.append((name, q))
 
-    # static solid screen rects: used to erase dynamic-body penetration
-    solids = [_screen_box(q["bbox"], scale, world_h)
-              for _, q in ents if q.get("static") and not q.get("sensor")]
+    # True-shape mask of static solids: used to erase dynamic-body penetration.
+    # (Rect-based masking mangled rotated statics like ramps.)
+    static_mask = Image.new("L", (W, H), 0)
+    md = ImageDraw.Draw(static_mask)
+    for _, q in ents:
+        if q.get("static") and not q.get("sensor"):
+            _draw_shape(md, q.get("shape", "box"),
+                        _screen_box(q["bbox"], scale, world_h),
+                        fill=255, outline=255, width=1,
+                        verts=q.get("verts"), scale=scale, world_h=world_h)
+    transparent = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 
     ents.sort(key=lambda e: _Z.get(_kind(e[1]), 2))
 
@@ -129,25 +165,26 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size,
         kind = _kind(q)
         shape = q.get("shape", "box")
         box = _inset(_screen_box(q["bbox"], scale, world_h))
+        verts = q.get("verts")
 
         if kind == "sensor":
-            _draw_shape(d, shape, box, fill=(*C_SENSOR, 40),
-                        outline=(*C_SENSOR, 230), width=2)
+            col = _sensor_colour(name)
+            _draw_shape(d, shape, box, fill=(*col, 40),
+                        outline=(*col, 230), width=2,
+                        verts=verts, scale=scale, world_h=world_h)
         elif kind == "static":
             _draw_shape(d, shape, box, fill=C_STATIC,
-                        outline=_shade(C_STATIC, 1.35), width=1)
+                        outline=_shade(C_STATIC, 1.35), width=1,
+                        verts=verts, scale=scale, world_h=world_h)
         else:
             colour = C_CONTROLLED if kind == "controlled" else _dyn_colour(name)
-            # dedicated layer, then erase overlap with every static solid
+            # dedicated layer, then erase the true-shape overlap with statics
             layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
             ld = ImageDraw.Draw(layer)
             _draw_shape(ld, shape, box, fill=(*colour, 255),
-                        outline=(*_shade(colour, 0.65), 255), width=2)
-            for sl, st, sr, sb in solids:
-                ox0, oy0 = max(box[0], sl), max(box[1], st)
-                ox1, oy1 = min(box[2], sr), min(box[3], sb)
-                if ox1 > ox0 and oy1 > oy0:
-                    layer.paste((0, 0, 0, 0), (int(ox0), int(oy0), int(ox1), int(oy1)))
+                        outline=(*_shade(colour, 0.65), 255), width=2,
+                        verts=verts, scale=scale, world_h=world_h)
+            layer = Image.composite(transparent, layer, static_mask)
             img.paste(layer, (0, 0), layer)
 
     if label:

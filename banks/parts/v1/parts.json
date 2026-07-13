@@ -1,0 +1,2289 @@
+{
+  "schema_version": "1.0",
+  "bank_version": "1.0.0",
+  "description": "v1 parts bank: calibrated, pre-certified NOUNS for world.part().",
+  "generated": "2026-07-13",
+  "parts": [
+    {
+      "name": "ground",
+      "category": "terrain",
+      "summary": "full-width static floor; the default ground plane games rest everything on",
+      "tags": [
+        "floor",
+        "ground",
+        "static",
+        "support"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            800,
+            20
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            1.5
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        },
+        "elasticity": {
+          "range": [
+            0.0,
+            0.9
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_wrecking ground (800x20, friction 0.9)"
+      },
+      "cert": {
+        "pos": [
+          400,
+          10
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "platform_thin",
+      "category": "terrain",
+      "summary": "thin static ledge for footholds and gaps; jump-clearance sized",
+      "tags": [
+        "platform",
+        "ledge",
+        "static",
+        "foothold"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            140,
+            16
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        },
+        "elasticity": {
+          "range": [
+            0.0,
+            0.9
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_volcano slabs"
+      },
+      "cert": {
+        "pos": [
+          400,
+          150
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "platform_wide",
+      "category": "terrain",
+      "summary": "wide static platform/slab to stand a build on",
+      "tags": [
+        "platform",
+        "slab",
+        "static",
+        "support"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            320,
+            20
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        },
+        "elasticity": {
+          "range": [
+            0.0,
+            0.9
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_volcano slabs (300x20, friction 0.9)"
+      },
+      "cert": {
+        "pos": [
+          400,
+          150
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "wall",
+      "category": "terrain",
+      "summary": "tall static vertical barrier that contains the play area",
+      "tags": [
+        "wall",
+        "barrier",
+        "static",
+        "bound"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.5,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            24,
+            320
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        },
+        "elasticity": {
+          "range": [
+            0.0,
+            0.95
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_volcano shaft walls"
+      },
+      "cert": {
+        "pos": [
+          400,
+          170
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "ledge",
+      "category": "terrain",
+      "summary": "chunky static shelf/block to demolish onto or climb; sits proud of the floor",
+      "tags": [
+        "ledge",
+        "shelf",
+        "block",
+        "static"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            160,
+            90
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_wrecking ledge (140x80)"
+      },
+      "cert": {
+        "pos": [
+          400,
+          120
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "ramp15",
+      "category": "terrain",
+      "summary": "shallow ~15 deg static wedge; bodies roll/slide down it gently",
+      "tags": [
+        "ramp",
+        "slope",
+        "wedge",
+        "static"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "poly",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "vertices": [
+            [
+              -110,
+              -30
+            ],
+            [
+              110,
+              -30
+            ],
+            [
+              110,
+              30
+            ]
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored wedge (rise/run ~ tan 15 deg)"
+      },
+      "cert": {
+        "pos": [
+          400,
+          120
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "ramp30",
+      "category": "terrain",
+      "summary": "steeper ~30 deg static wedge; faster roll/slide",
+      "tags": [
+        "ramp",
+        "slope",
+        "wedge",
+        "static",
+        "steep"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "poly",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "vertices": [
+            [
+              -90,
+              -52
+            ],
+            [
+              90,
+              -52
+            ],
+            [
+              90,
+              52
+            ]
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored wedge (rise/run ~ tan 30 deg)"
+      },
+      "cert": {
+        "pos": [
+          400,
+          120
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "step_block",
+      "category": "terrain",
+      "summary": "small static block to hop onto; height under the ~65px jump clearance",
+      "tags": [
+        "step",
+        "block",
+        "static",
+        "stair"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            70,
+            56
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            1.8
+          ]
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "all_static",
+        "stays_put"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "sdk JUMP_IMPULSE clearance ~65px"
+      },
+      "cert": {
+        "pos": [
+          400,
+          60
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "crate_light",
+      "category": "prop",
+      "summary": "light wooden crate; stacks and topples, easy to push",
+      "tags": [
+        "crate",
+        "box",
+        "stackable",
+        "pushable",
+        "light"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.1,
+          "locked_rotation": false,
+          "size": [
+            40,
+            40
+          ],
+          "mass": 0.5
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            0.2,
+            2.0
+          ],
+          "path": "body.mass"
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        },
+        "elasticity": {
+          "range": [
+            0.0,
+            0.9
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_wrecking crates (mass 0.4, friction 0.9)"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "crate_heavy",
+      "category": "prop",
+      "summary": "heavy steel crate; resists pushing, good ballast for stacking",
+      "tags": [
+        "crate",
+        "box",
+        "stackable",
+        "heavy",
+        "ballast"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.05,
+          "locked_rotation": false,
+          "size": [
+            50,
+            50
+          ],
+          "mass": 3.0
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            1.0,
+            8.0
+          ],
+          "path": "body.mass"
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_wrecking crates scaled up"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "ball_light",
+      "category": "prop",
+      "summary": "light rolling ball; nudged easily and carries momentum",
+      "tags": [
+        "ball",
+        "sphere",
+        "rolling",
+        "light"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.5,
+          "elasticity": 0.4,
+          "locked_rotation": false,
+          "radius": 16,
+          "mass": 0.6
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            0.2,
+            2.0
+          ],
+          "path": "body.mass"
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        },
+        "elasticity": {
+          "range": [
+            0.0,
+            0.9
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "sdk add_ball defaults (r15, friction 0.7)"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "ball_dense",
+      "category": "prop",
+      "summary": "dense heavy ball; hits hard and is slow to deflect",
+      "tags": [
+        "ball",
+        "sphere",
+        "rolling",
+        "heavy",
+        "dense"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.6,
+          "elasticity": 0.1,
+          "locked_rotation": false,
+          "radius": 18,
+          "mass": 5.0
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            2.0,
+            12.0
+          ],
+          "path": "body.mass"
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_wrecking ball (mass 10) scaled down"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "ball_bouncy",
+      "category": "prop",
+      "summary": "springy rubber ball; high restitution, bounces off surfaces",
+      "tags": [
+        "ball",
+        "sphere",
+        "bouncy",
+        "elastic"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.4,
+          "elasticity": 0.75,
+          "locked_rotation": false,
+          "radius": 14,
+          "mass": 0.4
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            0.2,
+            1.5
+          ],
+          "path": "body.mass"
+        },
+        "elasticity": {
+          "range": [
+            0.3,
+            0.9
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "drift template puck elasticity"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "barrel",
+      "category": "prop",
+      "summary": "upright drum/barrel; tips and rolls when struck",
+      "tags": [
+        "barrel",
+        "drum",
+        "box",
+        "pushable"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.7,
+          "elasticity": 0.1,
+          "locked_rotation": false,
+          "size": [
+            36,
+            52
+          ],
+          "mass": 1.4
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            0.5,
+            4.0
+          ],
+          "path": "body.mass"
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored (between crate_light and crate_heavy)"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "plank",
+      "category": "prop",
+      "summary": "long thin board; leans, bridges gaps, or levers",
+      "tags": [
+        "plank",
+        "board",
+        "beam",
+        "bridge"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.8,
+          "elasticity": 0.1,
+          "locked_rotation": false,
+          "size": [
+            170,
+            18
+          ],
+          "mass": 1.0
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            0.4,
+            4.0
+          ],
+          "path": "body.mass"
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored beam (mass 1.0)"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "boulder",
+      "category": "prop",
+      "summary": "large heavy rock; crushes and rolls with big momentum",
+      "tags": [
+        "boulder",
+        "rock",
+        "sphere",
+        "heavy"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.85,
+          "elasticity": 0.1,
+          "locked_rotation": false,
+          "radius": 28,
+          "mass": 8.0
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            1.8
+          ]
+        },
+        "mass": {
+          "range": [
+            3.0,
+            18.0
+          ],
+          "path": "body.mass"
+        },
+        "friction": {
+          "range": [
+            0.0,
+            1.2
+          ],
+          "path": "body.friction"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_wrecking ball scaled up"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "puck",
+      "category": "prop",
+      "summary": "low-friction disc for ice/air-hockey games; glides and keeps momentum",
+      "tags": [
+        "puck",
+        "disc",
+        "slippery",
+        "glide"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.2,
+          "elasticity": 0.6,
+          "locked_rotation": false,
+          "radius": 16,
+          "mass": 1.0
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": null,
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.0
+          ]
+        },
+        "mass": {
+          "range": [
+            0.3,
+            3.0
+          ],
+          "path": "body.mass"
+        },
+        "elasticity": {
+          "range": [
+            0.0,
+            0.9
+          ],
+          "path": "body.elasticity"
+        }
+      },
+      "invariants": [
+        "is_dynamic",
+        "settles_at_rest",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "drift template puck (r16, friction 0.2, elasticity 0.6)"
+      },
+      "cert": {
+        "ground": true
+      }
+    },
+    {
+      "name": "spike_strip",
+      "category": "hazard",
+      "summary": "floor spike strip; a wide sensor the game reads as lethal on contact",
+      "tags": [
+        "spikes",
+        "hazard",
+        "lethal",
+        "sensor",
+        "floor"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.0,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            120,
+            20
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "hazard",
+        "lethal": true
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            3.0
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal_physically"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_lander lethal-contact wiring"
+      },
+      "cert": {
+        "pos": [
+          400,
+          40
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "lava_pool",
+      "category": "hazard",
+      "summary": "pool of lava; a wide sensor hazard, non-physical so bodies pass into it",
+      "tags": [
+        "lava",
+        "hazard",
+        "lethal",
+        "sensor",
+        "liquid"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.0,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            200,
+            40
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "hazard",
+        "lethal": true
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            3.0
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal_physically"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_volcano lava sensor"
+      },
+      "cert": {
+        "pos": [
+          400,
+          40
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "saw_disc",
+      "category": "hazard",
+      "summary": "spinning saw blade; a circular sensor hazard read as lethal on contact",
+      "tags": [
+        "saw",
+        "blade",
+        "hazard",
+        "lethal",
+        "sensor"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.0,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "radius": 26
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "hazard",
+        "lethal": true
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.5
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal_physically"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored hazard disc"
+      },
+      "cert": {
+        "pos": [
+          400,
+          150
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "spike_pit",
+      "category": "hazard",
+      "summary": "wide floor-level spike pit; a broad sensor kill-zone to clear or avoid",
+      "tags": [
+        "pit",
+        "spikes",
+        "hazard",
+        "lethal",
+        "sensor",
+        "gap"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.0,
+          "elasticity": 0.0,
+          "locked_rotation": false,
+          "size": [
+            160,
+            30
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "hazard",
+        "lethal": true
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            3.5
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal_physically"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored kill-zone"
+      },
+      "cert": {
+        "pos": [
+          400,
+          30
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "wrecking_ball",
+      "category": "mobile",
+      "summary": "heavy ball on a rigid chain hung from a fixed anchor; swings as a pendulum",
+      "tags": [
+        "wrecking_ball",
+        "pendulum",
+        "swing",
+        "chain",
+        "mobile",
+        "demolition"
+      ],
+      "assembly": [
+        {
+          "role": "anchor",
+          "shape": "circle",
+          "offset": [
+            0,
+            270
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "radius": 6
+        },
+        {
+          "role": "ball",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.6,
+          "elasticity": 0.2,
+          "locked_rotation": false,
+          "radius": 25,
+          "mass": 10.0
+        }
+      ],
+      "joints": [
+        {
+          "type": "pin",
+          "a": "anchor",
+          "b": "ball",
+          "anchor_a": [
+            0,
+            0
+          ],
+          "anchor_b": [
+            0,
+            0
+          ]
+        }
+      ],
+      "primary": "ball",
+      "control_candidate": "ball",
+      "behavior": {
+        "kind": "pendulum",
+        "impulse_axis": "x"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.6,
+            1.4
+          ]
+        },
+        "mass": {
+          "range": [
+            2.0,
+            40.0
+          ],
+          "path": "ball.mass"
+        },
+        "chain": {
+          "range": [
+            120,
+            320
+          ],
+          "path": "anchor.offset[1]"
+        }
+      },
+      "invariants": [
+        "joint_present",
+        "settles_without_nan",
+        "bounded_motion",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "day2_wrecking crane+ball (r25, mass 10, pin at CoM, chain 270)"
+      },
+      "cert": {
+        "pos": [
+          400,
+          220
+        ],
+        "ground": true
+      }
+    },
+    {
+      "name": "pendulum",
+      "category": "mobile",
+      "summary": "lighter bob on a short rigid chain; a compact swinging pendulum",
+      "tags": [
+        "pendulum",
+        "bob",
+        "swing",
+        "mobile"
+      ],
+      "assembly": [
+        {
+          "role": "anchor",
+          "shape": "circle",
+          "offset": [
+            0,
+            150
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "radius": 5
+        },
+        {
+          "role": "bob",
+          "shape": "circle",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.6,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "radius": 16,
+          "mass": 3.0
+        }
+      ],
+      "joints": [
+        {
+          "type": "pin",
+          "a": "anchor",
+          "b": "bob",
+          "anchor_a": [
+            0,
+            0
+          ],
+          "anchor_b": [
+            0,
+            0
+          ]
+        }
+      ],
+      "primary": "bob",
+      "control_candidate": "bob",
+      "behavior": {
+        "kind": "pendulum",
+        "impulse_axis": "x"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.6,
+            1.4
+          ]
+        },
+        "mass": {
+          "range": [
+            1.0,
+            20.0
+          ],
+          "path": "bob.mass"
+        },
+        "arm": {
+          "range": [
+            80,
+            240
+          ],
+          "path": "anchor.offset[1]"
+        }
+      },
+      "invariants": [
+        "joint_present",
+        "settles_without_nan",
+        "bounded_motion",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "wrecking_ball, lightened and shortened"
+      },
+      "cert": {
+        "pos": [
+          400,
+          240
+        ],
+        "ground": true
+      }
+    },
+    {
+      "name": "seesaw",
+      "category": "mobile",
+      "summary": "plank balanced on a fixed fulcrum; tips when weight lands off-centre",
+      "tags": [
+        "seesaw",
+        "lever",
+        "teeter",
+        "balance",
+        "mobile"
+      ],
+      "assembly": [
+        {
+          "role": "fulcrum",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "size": [
+            44,
+            40
+          ]
+        },
+        {
+          "role": "plank",
+          "shape": "box",
+          "offset": [
+            0,
+            30
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.1,
+          "locked_rotation": false,
+          "size": [
+            220,
+            16
+          ],
+          "mass": 2.0
+        }
+      ],
+      "joints": [
+        {
+          "type": "pivot",
+          "a": "fulcrum",
+          "b": "plank",
+          "point": [
+            0,
+            30
+          ]
+        }
+      ],
+      "primary": "plank",
+      "control_candidate": "plank",
+      "behavior": {
+        "kind": "seesaw",
+        "pivot": "center"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.6,
+            1.4
+          ]
+        },
+        "mass": {
+          "range": [
+            1.0,
+            6.0
+          ],
+          "path": "plank.mass"
+        }
+      },
+      "invariants": [
+        "joint_present",
+        "settles_without_nan",
+        "bounded_motion",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored lever, pivot at plank centre of mass"
+      },
+      "cert": {
+        "pos": [
+          400,
+          120
+        ],
+        "ground": true
+      }
+    },
+    {
+      "name": "moving_platform_h",
+      "category": "mobile",
+      "summary": "platform hung from an anchor and free to sway HORIZONTALLY (a flat trapeze); carries bodies as it swings. Continuous kinematic travel is deferred to the prompt/engine wave.",
+      "tags": [
+        "platform",
+        "moving",
+        "swing",
+        "horizontal",
+        "mobile"
+      ],
+      "assembly": [
+        {
+          "role": "anchor",
+          "shape": "box",
+          "offset": [
+            0,
+            120
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "size": [
+            14,
+            14
+          ]
+        },
+        {
+          "role": "platform",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": true,
+          "size": [
+            130,
+            18
+          ],
+          "mass": 4.0
+        }
+      ],
+      "joints": [
+        {
+          "type": "pin",
+          "a": "anchor",
+          "b": "platform",
+          "anchor_a": [
+            0,
+            0
+          ],
+          "anchor_b": [
+            0,
+            0
+          ]
+        }
+      ],
+      "primary": "platform",
+      "control_candidate": "platform",
+      "behavior": {
+        "kind": "moving_platform",
+        "axis": "h",
+        "mode": "swing"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.6,
+            1.4
+          ]
+        },
+        "mass": {
+          "range": [
+            1.0,
+            10.0
+          ],
+          "path": "platform.mass"
+        },
+        "drop": {
+          "range": [
+            60,
+            220
+          ],
+          "path": "anchor.offset[1]"
+        }
+      },
+      "invariants": [
+        "joint_present",
+        "settles_without_nan",
+        "bounded_motion",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "pendulum with a flat locked-rotation deck"
+      },
+      "cert": {
+        "pos": [
+          400,
+          300
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "moving_platform_v",
+      "category": "mobile",
+      "summary": "platform on a stiff damped spring above a fixed base; bobs VERTICALLY and settles, supporting light loads. Continuous kinematic travel is deferred to the prompt/engine wave.",
+      "tags": [
+        "platform",
+        "moving",
+        "spring",
+        "vertical",
+        "elevator",
+        "mobile"
+      ],
+      "assembly": [
+        {
+          "role": "base",
+          "shape": "box",
+          "offset": [
+            0,
+            -120
+          ],
+          "static": true,
+          "sensor": false,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "size": [
+            14,
+            14
+          ]
+        },
+        {
+          "role": "platform",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": false,
+          "sensor": false,
+          "friction": 0.9,
+          "elasticity": 0.0,
+          "locked_rotation": true,
+          "size": [
+            130,
+            18
+          ],
+          "mass": 4.0
+        }
+      ],
+      "joints": [
+        {
+          "type": "spring",
+          "a": "base",
+          "b": "platform",
+          "rest_length": 123.0,
+          "stiffness": 1200.0,
+          "damping": 80.0,
+          "anchor_a": [
+            0,
+            0
+          ],
+          "anchor_b": [
+            0,
+            0
+          ]
+        }
+      ],
+      "primary": "platform",
+      "control_candidate": "platform",
+      "behavior": {
+        "kind": "moving_platform",
+        "axis": "v",
+        "mode": "spring"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.6,
+            1.4
+          ]
+        },
+        "mass": {
+          "range": [
+            1.0,
+            8.0
+          ],
+          "path": "platform.mass"
+        }
+      },
+      "invariants": [
+        "joint_present",
+        "settles_without_nan",
+        "bounded_motion",
+        "no_self_penetration"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "damped spring tuned so default mass rests at spawn height"
+      },
+      "cert": {
+        "pos": [
+          400,
+          300
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "goal_zone",
+      "category": "trigger",
+      "summary": "goal region; a sensor that fires a contact when the target body enters",
+      "tags": [
+        "goal",
+        "zone",
+        "sensor",
+        "trigger",
+        "win"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "size": [
+            120,
+            120
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "trigger",
+        "role": "goal"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            3.0
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "drift template pad sensor"
+      },
+      "cert": {
+        "pos": [
+          400,
+          150
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "pressure_zone",
+      "category": "trigger",
+      "summary": "floor pressure pad; a low sensor that fires while a body stands on it",
+      "tags": [
+        "pad",
+        "pressure",
+        "switch",
+        "sensor",
+        "trigger"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "size": [
+            90,
+            24
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "trigger",
+        "role": "switch"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            3.0
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored switch pad"
+      },
+      "cert": {
+        "pos": [
+          400,
+          40
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "checkpoint_zone",
+      "category": "trigger",
+      "summary": "tall checkpoint gate; a sensor that marks a milestone as a body passes through",
+      "tags": [
+        "checkpoint",
+        "gate",
+        "sensor",
+        "trigger",
+        "milestone"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "size": [
+            70,
+            130
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "trigger",
+        "role": "checkpoint"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.5
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored gate"
+      },
+      "cert": {
+        "pos": [
+          400,
+          150
+        ],
+        "ground": false
+      }
+    },
+    {
+      "name": "target_zone",
+      "category": "trigger",
+      "summary": "small target region; a compact sensor for aim/bounce goals",
+      "tags": [
+        "target",
+        "zone",
+        "sensor",
+        "trigger",
+        "aim"
+      ],
+      "assembly": [
+        {
+          "role": "body",
+          "shape": "box",
+          "offset": [
+            0,
+            0
+          ],
+          "static": true,
+          "sensor": true,
+          "friction": 0.7,
+          "elasticity": 0.3,
+          "locked_rotation": false,
+          "size": [
+            80,
+            80
+          ]
+        }
+      ],
+      "joints": [],
+      "primary": "body",
+      "control_candidate": "body",
+      "behavior": {
+        "kind": "trigger",
+        "role": "target"
+      },
+      "overridable": {
+        "scale": {
+          "range": [
+            0.5,
+            2.5
+          ]
+        }
+      },
+      "invariants": [
+        "is_sensor",
+        "non_lethal"
+      ],
+      "sprite": null,
+      "provenance": {
+        "author": "harness-curated",
+        "license": "CC0-1.0",
+        "source": "hand-authored",
+        "calibrated_from": "hand-authored aim target"
+      },
+      "cert": {
+        "pos": [
+          400,
+          150
+        ],
+        "ground": false
+      }
+    }
+  ]
+}

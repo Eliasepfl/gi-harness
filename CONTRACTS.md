@@ -251,3 +251,102 @@ python -m harness game replay scenes/games/<file>.py [--gif out.gif]
 Each agent runs its own tests (`python -m pytest tests/test_<x>.py -q`) plus the legacy suite
 for files it translated, before finishing. If another agent's module doesn't exist yet:
 mock it in your tests (FakeWorld etc.), never implement it.
+
+## 9. Parts bank (v2.2 step 1)
+
+A curated, versioned, pre-certified vocabulary of NOUNS (calibrated bodies and
+pre-jointed subassemblies) exposed through ONE new verb, `world.part(...)`. The
+bank supplies OBJECTS the code-writing model kept mis-calibrating (masses, joint
+anchors, static/sensor wiring); the game keeps writing every VERB itself. This
+converts a class of "the model guessed wrong physics" into "the model picked a
+name that was already proven correct". Rationale + prior art: `notes/parts_bank/`.
+`world.add()` stays the escape hatch — anything the bank lacks is still free code.
+
+### 9.1 Layout & versioning
+
+- Bank is DATA, not code: `banks/parts/<version>/parts.json` (+ `bank.lock`),
+  versioned independently. v1 ships at `banks/parts/v1/` (30 entries: terrain 8,
+  prop 9, hazard 4, mobile 5, trigger 4). `decor` is a valid category with no v1
+  entries.
+- `bank.lock = {schema_version, bank_version, content_hash, n_parts}`. The hash is
+  SHA-256 over the CANONICAL catalog serialization (sorted keys, no whitespace),
+  so it is stable across reformatting. `harness/bank.py` (`load_bank`, `content_hash`,
+  `write_lock`) owns loading/validation/hashing/resolution.
+- Pinning: the integrity-manifest extension (hashing the pinned catalog into
+  `integrity.snapshot`) and the `ledger.bank_version` field land with the
+  prompt-integration wave — NOT this one. `load_bank(verify_hash=True)` already
+  enforces lock↔catalog agreement on demand.
+
+### 9.2 Entry schema (per part)
+
+`name` · `category` (terrain|prop|hazard|mobile|trigger|decor) · `summary` (one
+line, for retrieval) · `tags` (list) · `assembly` (≥1 body: `role`, engine-neutral
+`shape`+geometry, `offset`, and defaults `mass`/`friction`/`elasticity`/`static`/
+`sensor`/`locked_rotation`) · `joints` (subassemblies: `pin`/`pivot`/`spring` over
+roles) · `primary` (the role the handle returns) · `control_candidate` · `behavior`
+(declarative hint) · `overridable` (the bounded whitelist, below) · `invariants`
+(the per-category guarantees bank-CI enforces) · `sprite` (`null` in v1 — cosmetic,
+attached lazily, never read by physics or the verifier) · `provenance`
+(`author`/`license`/`source` mandatory) · `cert` (bank-CI spawn hint).
+
+Category invariants (enforced at DATA level by `validate_bank` AND on live bodies
+by bank-CI): terrain → all sub-bodies static; prop → primary dynamic; hazard →
+sensor (read as lethal by the game); mobile → ≥1 joint, settles without NaN,
+bounded motion; trigger → primary is a sensor.
+
+### 9.3 `world.part()` — signature & semantics
+
+```python
+def part(self, name: str, kind: str, *, pos, **overrides) -> str
+```
+- Instantiates bank entry `kind` at world `pos` under namespace `name`. Returns the
+  PRIMARY handle.
+- Sub-body namespacing: the PRIMARY sub-body registers under the bare `name`; every
+  other sub-body under `name.<role>` (a `wrecking_ball` called `"wrecker"` →
+  `"wrecker"` is the ball, `"wrecker.anchor"` the anchor). A subassembly counts each
+  sub-body toward the ≤14-body cap (`wrecking_ball` = 2 bodies).
+- `part()` NEVER calls `control` — designating the controlled body stays the game's
+  choice (`world.control(name)`). Lazy bank load, cached per World (default `v1`).
+- `add()` is untouched and remains the escape hatch.
+
+### 9.4 Override rules (bounded, REJECT out-of-range)
+
+- Only keys in the entry's `overridable` map are accepted; each is range-clamped.
+  `pos` is free (the required kwarg). `scale` is uniform and range-bounded so
+  geometry stays sane (scales all geometry, offsets, joint anchors, spring rest
+  length). Path overrides (`mass`, `chain`, `arm`, `friction`, …) target one
+  sub-body field via a `role.field`/`role.field[i]` path.
+- Unknown keys (e.g. `density` — deliberately never overridable) and out-of-range
+  values RAISE `ValueError` (`BankOverrideError`), surfaced by G0 as ENV_ERROR with
+  a precise message. No override can flip a category invariant (those keys simply
+  are not in `overridable`).
+
+### 9.5 Certification (bank-CI) — `python -m harness.bank_ci`
+
+One-time, offline, when a part is admitted (NOT per game). For every entry, across
+a small grid of its override extremes, bank-CI spawns it in a minimal world (on a
+test ground where applicable), runs a settle, and asserts: no NaN/explosion; dynamic
+sub-bodies in bounds; no initial self-penetration; no resting penetration; and the
+per-category invariant. It reuses `gameverify` constants + the World NaN sentinel.
+The CLI prints a table + per-category summary and exits non-zero if any entry fails
+(naming the entry and offending checks). v1: 30/30 certified.
+
+### 9.6 Non-goals of THIS wave (explicit)
+
+- NO prompt changes: `_SYSTEM_PROMPT` Tier-1 block, the first-user-message themed
+  menu, and the DESIGN `Parts used:` line are v2.2 step 2, not here.
+- NO retrieval: the two-stage selection / BM25+dense retriever is out of scope
+  (studies in `notes/parts_bank/retrieval.md`, `pipeline.md`).
+- NO integrity/ledger wiring, NO sprites (all `sprite: null`), NO changes to
+  `gameverify`/`gamegen`/`integrity`. Free-code games verify byte-identically.
+
+### 9.7 Deviations (v1)
+
+`moving_platform_h` / `moving_platform_v` are realized as bounded JOINTED platforms
+(a flat locked-rotation deck that sways on a pin, resp. bobs on a stiff damped
+spring and settles) rather than continuously translating kinematic platforms:
+continuous kinematic travel needs a per-step driver, which belongs to the game's
+`on_step` or the prompt/engine wave. The bounded-jointed realization satisfies the
+mobile invariant (joint present, settles without NaN, bounded) and is certifiable
+now; the `behavior` field records the intended `moving_platform` semantics for the
+later wave.

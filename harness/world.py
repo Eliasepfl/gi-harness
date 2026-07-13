@@ -49,6 +49,9 @@ class World:
         self._step_count = 0
         self._controlled: str | None = None
         self._frozen = False                            # set once NaN/explosion seen
+        # Parts bank (v2.2): lazily loaded + cached per World; see part().
+        self._bank_version = "v1"
+        self._bank_obj = None
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -211,6 +214,39 @@ class World:
             raise ValueError(f"controlled body must be dynamic: {name!r}")
         self._controlled = name
 
+    def _bank(self):
+        """Lazily load + cache the parts bank for this World (v2.2)."""
+        if self._bank_obj is None:
+            from harness.bank import load_bank
+            self._bank_obj = load_bank(self._bank_version)
+        return self._bank_obj
+
+    def part(self, name: str, kind: str, *, pos, **overrides) -> str:
+        """Instantiate a pre-certified bank part ``kind`` at ``pos`` under ``name``.
+
+        The bank supplies a calibrated NOUN — a single body or a pre-jointed
+        subassembly (e.g. a ``wrecking_ball``: anchor + ball + a correctly
+        anchored pin). This one verb is the whole bank surface; every VERB
+        (act/on_step/success/checkpoints) stays the game's own code, and
+        ``world.add`` remains the escape hatch for anything the bank lacks.
+
+        Sub-bodies register instance-prefixed: the PRIMARY sub-body under the
+        bare ``name`` and every other under ``name.<role>`` (a ``wrecking_ball``
+        called "wrecker" -> "wrecker" is the ball, "wrecker.anchor" the anchor).
+        Returns the primary handle (``name``).
+
+        ``overrides`` accepts ONLY keys in the entry's whitelist, each clamped to
+        its declared range; an unknown key (e.g. ``density``) or an out-of-range
+        value raises ValueError (surfaced by the verifier's G0 as ENV_ERROR).
+        This method never calls ``control`` — the game keeps that choice.
+        """
+        resolved = self._bank().resolve(kind, name, pos, overrides)
+        for body in resolved.bodies:
+            self.add(body["name"], body["shape"], **body["kwargs"])
+        for joint in resolved.joints:
+            getattr(self, joint["verb"])(*joint["args"], **joint["kwargs"])
+        return resolved.primary
+
     # ------------------------------------------------------------------ #
     # Game dynamics (used by act / on_step)
     # ------------------------------------------------------------------ #
@@ -290,7 +326,7 @@ class World:
         shape = self._shapes[name]
         bb = shape.bb
         static = body.body_type == pymunk.Body.STATIC
-        return {
+        out = {
             "pos": [body.position.x, body.position.y],
             "vel": [body.velocity.x, body.velocity.y],
             "angle": body.angle,
@@ -301,6 +337,19 @@ class World:
             "sensor": bool(shape.sensor),
             "controlled": name == self._controlled,
         }
+        # World-space outline so renderers can draw ROTATED shapes truthfully
+        # (an axis-aligned bbox turns a tilted plank into a bloated slab).
+        if isinstance(shape, pymunk.Poly):
+            out["verts"] = [[v.x, v.y] for v in
+                            (body.local_to_world(lv) for lv in shape.get_vertices())]
+        elif isinstance(shape, pymunk.Segment):
+            a = body.local_to_world(shape.a)
+            b = body.local_to_world(shape.b)
+            out["verts"] = [[a.x, a.y], [b.x, b.y]]
+            out["radius"] = float(shape.radius)
+        elif isinstance(shape, pymunk.Circle):
+            out["radius"] = float(shape.radius)
+        return out
 
     def contacts(self, a: str, b: str) -> bool:
         """True if the two entities touch (distance ~<= 0)."""
