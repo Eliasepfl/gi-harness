@@ -69,6 +69,18 @@ certificate.
 
 ## Explorations open
 
+- **Real game engines (rung 4) — research DONE (13 juil.), synthesis in
+  `notes/GAME_ENGINE_INTEGRATIONS.md`** (details per engine in `notes/engines/`).
+  Structural finding: ALL existing Claude↔engine integrations are authoring
+  layers; nobody ships the per-tick state↔action loop — we'd build it ourselves.
+  Recommendation ladder: (1) stay pymunk for the campaign; (2) rung-4 step 1 =
+  **Planck.js/Matter.js in pure Node** (loop parity, real engine family, JS as
+  2nd generation language, Phaser+CDP on-ramp for visual demos); (3) step 2 =
+  Godot WITH Rapier after a ½-day determinism/boot spike (sandboxing GDScript =
+  open problem); (4) Roblox = downstream showcase export of certified games only
+  (no headless physics — staff-confirmed); (5) skip Unity/Unreal for the loop.
+  Cross-lesson: small verb-shaped World API beats big API — resist growth.
+
 - **OpenEnv / Agent World Model infra** (github.com/Snowflake-Labs/agent-world-model,
   merged into github.com/huggingface/OpenEnv): analysis in progress — could wrap our
   games as standard envs (reset/step/reward from checkpoints) for the training step
