@@ -94,8 +94,12 @@ _Z = {"sensor": 0, "static": 1, "dynamic": 2, "controlled": 3}
 # ==========================================================================
 #  Frame drawing
 # ==========================================================================
-def _render_frame(world, tick: int, label: str, scale: float, world_size) -> Image.Image:
-    """Redraw the whole scene from world.query() into one RGB frame."""
+def _render_frame(world, tick: int, label: str, scale: float, world_size,
+                  flash: str | None = None) -> Image.Image:
+    """Redraw the whole scene from world.query() into one RGB frame.
+
+    `flash` is an optional short string (a freshly latched milestone name)
+    drawn in sensor-amber under the label."""
     world_w, world_h = world_size
     W, H = max(1, int(world_w * scale)), max(1, int(world_h * scale))
     img = Image.new("RGB", (W, H), BG)
@@ -148,6 +152,8 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size) -> Ima
 
     if label:
         d.text((8, 6), label, fill=C_TEXT)
+    if flash:
+        d.text((8, 20), f"* {flash}", fill=C_SENSOR)
     tick_str = f"tick {tick}"
     try:
         tw = d.textlength(tick_str)
@@ -168,6 +174,7 @@ def _symbols(obj) -> SimpleNamespace:
         if not callable(fn):
             raise RuntimeError(f"invalid game module: '{req}' missing or not callable")
     on_step, failure = get("on_step"), get("failure")
+    checkpoints = get("checkpoints")
     return SimpleNamespace(
         TITLE=get("TITLE", "") or "",
         PROMPT=get("PROMPT", "") or "",
@@ -177,6 +184,7 @@ def _symbols(obj) -> SimpleNamespace:
         on_step=on_step if callable(on_step) else None,
         success=success,
         failure=failure if callable(failure) else None,
+        checkpoints=checkpoints if callable(checkpoints) else None,
     )
 
 
@@ -290,11 +298,33 @@ def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
 
     frames: list = []
     last_snap = -1
+    latched: set = set()          # milestones already latched (runner-side, like gameverify)
+    flash_text: str | None = None
+    flash_until = -1              # tick until which the flash stays visible
+    FLASH_TICKS = 8               # (eng.) how long a latched milestone stays on screen
 
     def snap(t: int) -> None:
         nonlocal last_snap
-        frames.append(_render_frame(world, t, label, scale, world_size))
+        cur_flash = flash_text if t <= flash_until else None
+        frames.append(_render_frame(world, t, label, scale, world_size, flash=cur_flash))
         last_snap = t
+
+    def latch_new(t: int) -> bool:
+        """Evaluate checkpoints (guarded); latch and arm the flash for new ones."""
+        nonlocal flash_text, flash_until
+        if game.checkpoints is None:
+            return False
+        try:
+            state = game.checkpoints(world)
+        except Exception:  # noqa: BLE001 — display-only feature, never break replay
+            return False
+        fresh = [k for k, v in (state or {}).items() if v and k not in latched]
+        if not fresh:
+            return False
+        latched.update(fresh)
+        flash_text = ", ".join(fresh)
+        flash_until = t + FLASH_TICKS
+        return True
 
     snap(0)
     result = "timeout"
@@ -307,6 +337,7 @@ def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
                 if game.on_step is not None:
                     game.on_step(world)
             tick = i + 1
+            newly_latched = latch_new(tick)
             ended = None
             if game.failure is not None and game.failure(world):
                 ended = "failure"
@@ -316,7 +347,7 @@ def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
                 result = ended
                 snap(tick)
                 break
-            if tick % every == 0:
+            if newly_latched or tick % every == 0:
                 snap(tick)
     except Exception as exc:  # noqa: BLE001  — NaN/explosion surfaced by World.step
         if last_snap != tick and frames:

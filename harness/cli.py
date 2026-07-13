@@ -276,6 +276,131 @@ def cmd_game_replay(args) -> int:
     return 0 if result.get("result") in ("success", "failure", "timeout") else 1
 
 
+# ---- game demo -----------------------------------------------------------
+# Plain-English seeds, varied mechanics, NO design hints: the prompt is all the
+# model gets. Demos are generated ON THE FLY at demo start (nothing pre-baked).
+DEFAULT_DEMO_PROMPTS = [
+    "a catapult that must fling a stone over a wall into a bucket",
+    "keep a balloon from touching the ground for as long as it takes to drift "
+    "across the screen",
+    "a magnet crane that must pick up scrap and drop it in a bin",
+]
+
+
+def _demo_row(prompt: str, backend: str, generate_game, replay_gif) -> dict:
+    """Run ONE live demo: generate -> replay -> structured summary.
+
+    Everything here comes from the machine-readable result dict (no LLM
+    narration): verdict, backend, attempt count, per-failed-attempt
+    failure_class + hint, witness ticks, checkpoint latch ticks, integrity, gif.
+    """
+    row = {"prompt": prompt, "verdict": None, "backend": None, "attempts": 0,
+           "failed_attempts": [], "witness_ticks": None, "checkpoints": {},
+           "integrity": None, "note": None, "game_path": None, "gif": None,
+           "gif_result": None, "error": None}
+    try:
+        result = generate_game(prompt, backend=backend)
+    except Exception as exc:  # noqa: BLE001 — one bad prompt must not sink the demo
+        row["verdict"] = "ERROR"
+        row["error"] = f"generate failed: {exc}"
+        return row
+
+    row["verdict"] = result.get("verdict")
+    row["backend"] = result.get("backend")
+    row["note"] = result.get("note")
+    row["integrity"] = result.get("integrity")
+    row["game_path"] = result.get("game_path")
+    attempts = result.get("attempts") or []
+    row["attempts"] = len(attempts)
+
+    # One line per FAILED attempt: its failure class + repair hint.
+    for i, att in enumerate(attempts, start=1):
+        rep = att.get("report") if isinstance(att, dict) else None
+        if isinstance(rep, dict) and not rep.get("passed"):
+            row["failed_attempts"].append({
+                "n": i,
+                "failure_class": rep.get("failure_class"),
+                "hint": (rep.get("hint") or "").strip(),
+            })
+
+    # Witness ticks + checkpoint latch ticks come from the FINAL report's witness.
+    final = attempts[-1].get("report") if attempts else None
+    witness = final.get("witness") if isinstance(final, dict) else None
+    if isinstance(witness, dict):
+        row["witness_ticks"] = witness.get("ticks")
+        row["checkpoints"] = dict(witness.get("checkpoints") or {})
+
+    # Render the winning witness to a GIF next to the final game file.
+    game_path = row["game_path"]
+    if game_path and row["verdict"] == "COMPLETED":
+        gif = str(Path(game_path).with_suffix(".gif"))
+        try:
+            rr = (replay_gif(game_path, gif, actions=witness)
+                  if isinstance(witness, dict) else replay_gif(game_path, gif))
+            row["gif"] = rr.get("out_path", gif)
+            row["gif_result"] = rr.get("result")
+        except Exception as exc:  # noqa: BLE001
+            row["gif_result"] = f"render error: {exc}"
+    return row
+
+
+def _print_demo(demos: list[dict], backend: str, all_completed: bool) -> None:
+    print(f"=== LIVE GAME DEMO (backend={backend}) ===")
+    for i, d in enumerate(demos, start=1):
+        print(f"\n[{i}] {d['prompt']}")
+        print(f"    verdict    : {d['verdict']}   backend: {d['backend']}   "
+              f"tries: {d['attempts']}")
+        if d.get("error"):
+            print(f"    error      : {d['error']}")
+        if d["witness_ticks"] is not None:
+            print(f"    witness    : solved in {d['witness_ticks']} decision ticks")
+        if d["checkpoints"]:
+            cps = ", ".join(f"{k}@{v if v is not None else '-'}"
+                            for k, v in d["checkpoints"].items())
+            print(f"    milestones : {cps}")
+        for fa in d["failed_attempts"]:
+            print(f"    attempt {fa['n']} : {fa['failure_class']} - {fa['hint']}")
+        integ = d["integrity"]
+        integ_str = "ok" if integ == "ok" else json.dumps(integ, default=str)
+        print(f"    integrity  : {integ_str}")
+        if d.get("note"):
+            print(f"    note       : {d['note']}")
+        if d["gif"]:
+            print(f"    gif        : {d['gif']} ({d['gif_result']})")
+    total = len(demos)
+    ok = sum(1 for d in demos if d["verdict"] == "COMPLETED")
+    print("\n" + "-" * 60)
+    print(f"RESULT: {'OK' if all_completed else 'gaps detected'} "
+          f"({ok}/{total} COMPLETED)")
+
+
+def cmd_game_demo(args) -> int:
+    """Live product demo: generate + verify + replay N prompts on the fly.
+
+    Exit 0 iff every prompt reached COMPLETED. No LLM narration anywhere.
+    """
+    try:
+        from harness.gamegen import generate_game
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("gamegen", exc, args.json)
+    try:
+        from harness.render import replay_gif
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("render", exc, args.json)
+
+    prompts = args.prompts or DEFAULT_DEMO_PROMPTS
+    demos = [_demo_row(p, args.backend, generate_game, replay_gif) for p in prompts]
+    all_completed = bool(demos) and all(d["verdict"] == "COMPLETED" for d in demos)
+
+    if args.json:
+        _emit_json({"all_completed": all_completed, "backend": args.backend,
+                    "demos": demos})
+        return 0 if all_completed else 1
+
+    _print_demo(demos, args.backend, all_completed)
+    return 0 if all_completed else 1
+
+
 # ---- parser --------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -316,7 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     gn = gmsub.add_parser("new", help="generate a whole game from an open-ended prompt")
     gn.add_argument("prompt", help="open-ended natural-language prompt")
-    gn.add_argument("--backend", default="auto", choices=["auto", "anthropic", "template"])
+    gn.add_argument("--backend", default="auto",
+                    choices=["auto", "anthropic", "openrouter", "template"])
     gn.add_argument("--out-dir", default="scenes/games")
     gn.add_argument("--json", action="store_true")
     gn.set_defaults(func=cmd_game_new)
@@ -333,6 +459,15 @@ def build_parser() -> argparse.ArgumentParser:
     gr.add_argument("--seed", type=int, default=0)
     gr.add_argument("--json", action="store_true")
     gr.set_defaults(func=cmd_game_replay)
+
+    gd = gmsub.add_parser(
+        "demo", help="live product demo: generate + verify + replay N prompts")
+    gd.add_argument("--prompts", nargs="+", default=None,
+                    help="one or more prompts (default: 3 built-in demo prompts)")
+    gd.add_argument("--backend", default="auto",
+                    choices=["auto", "anthropic", "openrouter", "template"])
+    gd.add_argument("--json", action="store_true")
+    gd.set_defaults(func=cmd_game_demo)
 
     return p
 

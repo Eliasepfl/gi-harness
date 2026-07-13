@@ -6,6 +6,8 @@ pass/fail reports; the anthropic backend is short-circuited by monkeypatch.
 from __future__ import annotations
 
 import ast
+import json
+import os
 import re
 import sys
 import types
@@ -459,6 +461,9 @@ def test_unsolved_hint_injected_into_llm_conversation(tmp_path, monkeypatch):
 def test_auto_falls_back_to_template_when_anthropic_missing(tmp_path, monkeypatch):
     # Simulate the ImportError path: the package is not present.
     monkeypatch.setattr(GG, "anthropic", None)
+    # Also make the openrouter link in the auto chain unavailable, so no real
+    # network call is made and auto ends on templates.
+    monkeypatch.setattr(GG, "requests", None)
     _install_gameverify(monkeypatch, lambda p: {"passed": True,
                                                 "failure_class": None, "hint": "",
                                                 "witness": {}})
@@ -469,6 +474,8 @@ def test_auto_falls_back_to_template_when_anthropic_missing(tmp_path, monkeypatc
     assert res["backend"] == "template"
     assert res["verdict"] == "COMPLETED"
     assert "note" in res and "anthropic unavailable" in res["note"]
+    # The auto chain also records the openrouter fallback.
+    assert "openrouter unavailable" in res["note"]
 
 
 def test_auto_falls_back_on_connection_error(tmp_path, monkeypatch):
@@ -477,6 +484,7 @@ def test_auto_falls_back_on_connection_error(tmp_path, monkeypatch):
             request=httpx.Request("GET", "http://localhost"))
 
     monkeypatch.setattr(GG, "_make_client", boom)
+    monkeypatch.setattr(GG, "requests", None)  # openrouter unavailable too
     _install_gameverify(monkeypatch, lambda p: {"passed": True,
                                                 "failure_class": None, "hint": "",
                                                 "witness": {}})
@@ -508,3 +516,393 @@ def test_anthropic_backend_uses_llm(tmp_path, monkeypatch):
     with open(res["game_path"], encoding="utf-8") as f:
         written = f.read()
     assert "TITLE" in written and "DESIGN" not in written
+
+
+# =============================================================================
+#  OpenRouter backend (all mocked — NEVER a real key or a real request)
+# =============================================================================
+# The real key is never used here; tests inject an obvious fake value.
+_FAKE_KEY = "sk-or-v1-FAKEKEYFORTESTS"
+_FAKE_MODEL = "vendor/fake-model:free"
+
+
+class _FakeResp:
+    """Minimal stand-in for a requests.Response."""
+
+    def __init__(self, status_code, json_data=None, headers=None, text=""):
+        self.status_code = status_code
+        self._json = json_data
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no json body")
+        return self._json
+
+
+class _FakeRequests:
+    """Stand-in for the `requests` module: records .post calls, returns canned
+    responses in order (a single response is reused for every call)."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "headers": headers, "json": json,
+                           "timeout": timeout})
+        if len(self._responses) == 1:
+            return self._responses[0]
+        return self._responses.pop(0)
+
+
+def _fake_secrets(monkeypatch, key=_FAKE_KEY, model=_FAKE_MODEL):
+    monkeypatch.setattr(GG, "_resolve_secret",
+                        lambda name: {"OPENROUTER_API_KEY": key,
+                                      "OPENROUTER_MODEL": model}.get(name))
+
+
+def _chat(content):
+    return {"choices": [{"message": {"content": content}}]}
+
+
+# --- Secret resolution: os.environ vs env.py ---------------------------------
+
+def test_secret_environ_wins_over_env_py(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-ENVIRON-WINS")
+    # env.py would offer a different value, but os.environ must take precedence.
+    fake_env = types.SimpleNamespace(OPENROUTER_API_KEY="sk-or-FROM-ENVPY",
+                                     OPENROUTER_MODEL="envpy/model")
+    monkeypatch.setattr(GG, "_load_env_module", lambda: fake_env)
+    assert GG._resolve_secret("OPENROUTER_API_KEY") == "sk-or-ENVIRON-WINS"
+
+
+def test_secret_falls_back_to_env_py(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
+    fake_env = types.SimpleNamespace(OPENROUTER_API_KEY="sk-or-FROM-ENVPY",
+                                     OPENROUTER_MODEL="envpy/model")
+    monkeypatch.setattr(GG, "_load_env_module", lambda: fake_env)
+    assert GG._resolve_secret("OPENROUTER_API_KEY") == "sk-or-FROM-ENVPY"
+    assert GG._resolve_secret("OPENROUTER_MODEL") == "envpy/model"
+
+
+def test_secret_none_when_env_py_missing(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(GG, "_load_env_module", lambda: None)  # env.py absent
+    assert GG._resolve_secret("OPENROUTER_API_KEY") is None
+
+
+def test_secret_none_when_name_absent_in_env_py(monkeypatch):
+    monkeypatch.delenv("NOPE_KEY", raising=False)
+    monkeypatch.setattr(GG, "_load_env_module",
+                        lambda: types.SimpleNamespace(OTHER="x"))
+    assert GG._resolve_secret("NOPE_KEY") is None
+
+
+# --- _openrouter_complete: request shape, retries, errors --------------------
+
+def test_openrouter_complete_success_request_shape(monkeypatch):
+    _fake_secrets(monkeypatch)
+    fake = _FakeRequests([_FakeResp(200, _chat("hi there"))])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    out = GG._openrouter_complete("SYS", [{"role": "user", "content": "seed"}])
+
+    assert out == "hi there"
+    call = fake.calls[0]
+    assert call["url"] == GG._OPENROUTER_URL
+    assert call["headers"]["Authorization"] == f"Bearer {_FAKE_KEY}"
+    assert call["timeout"] == GG._OPENROUTER_TIMEOUT
+    body = call["json"]
+    assert body["model"] == _FAKE_MODEL
+    assert body["max_tokens"] == GG._OPENROUTER_MAX_TOKENS
+    # System prompt is prepended before the caller's messages.
+    assert body["messages"][0] == {"role": "system", "content": "SYS"}
+    assert body["messages"][1] == {"role": "user", "content": "seed"}
+
+
+def test_openrouter_retries_on_429_then_succeeds(monkeypatch):
+    _fake_secrets(monkeypatch)
+    fake = _FakeRequests([
+        _FakeResp(429, headers={"Retry-After": "0"}),
+        _FakeResp(503),
+        _FakeResp(200, _chat("recovered")),
+    ])
+    monkeypatch.setattr(GG, "requests", fake)
+    monkeypatch.setattr(GG.time, "sleep", lambda s: None)  # no real backoff wait
+
+    out = GG._openrouter_complete("SYS", [])
+    assert out == "recovered"
+    assert len(fake.calls) == 3  # 429 -> 503 -> 200
+
+
+def test_openrouter_gives_up_after_retry_budget(monkeypatch):
+    _fake_secrets(monkeypatch)
+    fake = _FakeRequests([_FakeResp(429, headers={"Retry-After": "0"})])  # always 429
+    monkeypatch.setattr(GG, "requests", fake)
+    monkeypatch.setattr(GG.time, "sleep", lambda s: None)
+
+    with pytest.raises(GG._BackendUnavailable) as ei:
+        GG._openrouter_complete("SYS", [])
+    # 1 initial attempt + _OPENROUTER_MAX_RETRIES retries.
+    assert len(fake.calls) == GG._OPENROUTER_MAX_RETRIES + 1
+    assert "429" in str(ei.value)
+
+
+def test_openrouter_4xx_raises_unavailable_and_hides_key(monkeypatch):
+    secret = "sk-or-v1-MUST-NOT-LEAK"
+    _fake_secrets(monkeypatch, key=secret)
+    fake = _FakeRequests([_FakeResp(
+        401, {"error": {"message": "No auth credentials found"}})])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    with pytest.raises(GG._BackendUnavailable) as ei:
+        GG._openrouter_complete("SYS", [])
+    msg = str(ei.value)
+    assert "401" in msg
+    assert "No auth credentials" in msg     # the API's own message is surfaced
+    assert secret not in msg                # ... but the key never leaks
+    assert len(fake.calls) == 1             # 4xx is not retried
+
+
+def test_openrouter_model_error_reports_api_message(monkeypatch):
+    _fake_secrets(monkeypatch)
+    fake = _FakeRequests([_FakeResp(
+        400, {"error": {"message": "vendor/fake-model:free is not a valid model ID"}})])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    with pytest.raises(GG._BackendUnavailable) as ei:
+        GG._openrouter_complete("SYS", [])
+    assert "not a valid model ID" in str(ei.value)
+
+
+def test_openrouter_unavailable_without_requests(monkeypatch):
+    _fake_secrets(monkeypatch)
+    monkeypatch.setattr(GG, "requests", None)
+    with pytest.raises(GG._BackendUnavailable):
+        GG._openrouter_complete("SYS", [])
+
+
+def test_openrouter_unavailable_without_config(monkeypatch):
+    monkeypatch.setattr(GG, "requests", _FakeRequests([_FakeResp(200, _chat("x"))]))
+    monkeypatch.setattr(GG, "_resolve_secret", lambda name: None)  # no key/model
+    with pytest.raises(GG._BackendUnavailable):
+        GG._openrouter_complete("SYS", [])
+
+
+def test_retry_after_parsing():
+    assert GG._retry_after(_FakeResp(429, headers={"Retry-After": "2.5"}), 1.0) == 2.5
+    assert GG._retry_after(_FakeResp(429, headers={}), 1.0) == 1.0
+    assert GG._retry_after(_FakeResp(429, headers={"Retry-After": "nope"}), 1.0) == 1.0
+
+
+# --- Backend selection: auto -> openrouter, and the openrouter repair loop ----
+
+def test_auto_uses_openrouter_when_anthropic_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(GG, "anthropic", None)  # anthropic down
+    _fake_secrets(monkeypatch)
+    content = "DESIGN\nTheme: t\n```python\n" + GG._DRIFT + "\n```"
+    fake = _FakeRequests([_FakeResp(200, _chat(content))])
+    monkeypatch.setattr(GG, "requests", fake)
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+
+    res = GG.generate_game("drift on ice", out_dir=str(tmp_path),
+                           backend="auto", max_repairs=2)
+
+    assert res["backend"] == "openrouter"
+    assert res["verdict"] == "COMPLETED"
+    # The request actually carried the configured model + bearer key.
+    assert fake.calls[0]["json"]["model"] == _FAKE_MODEL
+    assert fake.calls[0]["headers"]["Authorization"] == f"Bearer {_FAKE_KEY}"
+
+
+def test_openrouter_backend_shares_repair_loop(tmp_path, monkeypatch):
+    _fake_secrets(monkeypatch)
+    content = "DESIGN\nTheme: t\n```python\n" + GG._DRIFT + "\n```"
+    fake = _FakeRequests([_FakeResp(200, _chat(content))])  # same content each call
+    monkeypatch.setattr(GG, "requests", fake)
+
+    calls = {"n": 0}
+
+    def fake_verify(path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"passed": False, "failure_class": "UNSOLVED",
+                    "hint": "0/40 episodes", "witness": None,
+                    "progress": {"reach_counts": {"moved_off_start": 5},
+                                 "stuck_after": "moved_off_start"}}
+        return {"passed": True, "failure_class": None, "hint": "",
+                "witness": {"ticks": 9, "actions": ["left"], "seed": 1,
+                            "checkpoints": {"moved_off_start": 2}}}
+
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("drift", out_dir=str(tmp_path),
+                           backend="openrouter", max_repairs=3)
+
+    assert res["backend"] == "openrouter"
+    assert res["verdict"] == "COMPLETED"
+    assert len(res["attempts"]) == 2
+    assert len(fake.calls) == 2
+    # The repair turn carried the verifier feedback back to the model.
+    repair_msgs = fake.calls[1]["json"]["messages"]
+    user_texts = [m["content"] for m in repair_msgs if m["role"] == "user"]
+    assert any("no random rollout reached success" in t for t in user_texts)
+
+
+# =============================================================================
+#  Per-run sandbox dir layout
+# =============================================================================
+
+def test_per_run_sandbox_dir_layout(tmp_path, monkeypatch):
+    calls = {"n": 0}
+
+    def fake_verify(path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"passed": False, "failure_class": "UNSOLVED",
+                    "hint": "stuck", "witness": None}
+        return {"passed": True, "failure_class": None, "hint": "",
+                "witness": {"ticks": 9, "actions": [], "seed": 0, "checkpoints": {}}}
+
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
+                           backend="template", max_repairs=3)
+
+    slug = GG._slug("a puck on ice")
+    run_dir = tmp_path / slug
+    assert run_dir.is_dir()
+    # One file per attempt: a1.py, a2.py.
+    assert (run_dir / "a1.py").is_file()
+    assert (run_dir / "a2.py").is_file()
+    # Final game promoted to <slug>.py inside the run dir.
+    final = run_dir / f"{slug}.py"
+    assert final.is_file()
+    assert os.path.abspath(res["game_path"]) == os.path.abspath(str(final))
+    assert final.read_text(encoding="utf-8") == (run_dir / "a2.py").read_text(encoding="utf-8")
+    # The run wrote ONLY into its own sandbox dir (nothing else in out_dir).
+    assert {p.name for p in tmp_path.iterdir()} == {slug}
+
+
+# =============================================================================
+#  Run integrity: base-code freeze / INVALIDATED verdict
+# =============================================================================
+
+def test_integrity_ok_when_base_untouched(tmp_path, monkeypatch):
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+    res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
+                           backend="template", max_repairs=2)
+    assert res["integrity"] == "ok"
+    assert res["verdict"] == "COMPLETED"
+
+
+def test_base_mutation_forces_invalidated(tmp_path, monkeypatch):
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+    # Simulate a base-code change mid-run via a monkeypatched violations().
+    monkeypatch.setattr(GG.integrity, "violations",
+                        lambda before, root: ["harness/world.py"])
+
+    res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
+                           backend="template", max_repairs=2)
+
+    assert res["verdict"] == "INVALIDATED"
+    assert res["integrity"] == {"violated": ["harness/world.py"]}
+    # The game was still produced; it simply does not count.
+    assert res["game_path"] is not None
+
+
+# =============================================================================
+#  game demo command (mocked generate_game + replay_gif; no network, no physics)
+# =============================================================================
+
+def _canned_result(tmp_path, verdict="COMPLETED", backend="template"):
+    game_path = str(tmp_path / "g.py")
+    with open(game_path, "w", encoding="utf-8") as fh:
+        fh.write("TITLE = 'x'\n")
+    return {
+        "game_path": game_path,
+        "verdict": verdict,
+        "backend": backend,
+        "attempts": [
+            {"report": {"passed": False, "failure_class": "UNSOLVED",
+                        "hint": "stuck between a and b", "witness": None}},
+            {"report": {"passed": True, "failure_class": None, "hint": "solved",
+                        "witness": {"ticks": 12, "actions": ["left"], "seed": 0,
+                                    "checkpoints": {"m1": 3, "m2": 9}}}},
+        ],
+        "design": "DESIGN\nTheme: t\n",
+        "integrity": "ok",
+    }
+
+
+def test_game_demo_json_from_mocked_generate(tmp_path, monkeypatch, capsys):
+    from harness import cli
+
+    def fake_generate(prompt, out_dir="scenes/games", backend="auto", max_repairs=4):
+        return _canned_result(tmp_path, backend=backend)
+
+    def fake_replay(game_path, out_path, **kw):
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write("gif")
+        return {"ticks": 12, "result": "success", "out_path": out_path}
+
+    monkeypatch.setattr("harness.gamegen.generate_game", fake_generate)
+    monkeypatch.setattr("harness.render.replay_gif", fake_replay)
+
+    rc = cli.main(["game", "demo", "--prompts", "p one", "p two",
+                   "--backend", "template", "--json"])
+    out = capsys.readouterr().out
+    data = json.loads(out)
+
+    assert rc == 0
+    assert data["all_completed"] is True
+    assert len(data["demos"]) == 2
+    d = data["demos"][0]
+    assert d["verdict"] == "COMPLETED"
+    assert d["backend"] == "template"
+    assert d["attempts"] == 2
+    assert d["witness_ticks"] == 12
+    assert d["checkpoints"] == {"m1": 3, "m2": 9}
+    assert d["integrity"] == "ok"
+    # Per-failed-attempt failure_class + hint captured (one entry: the 1st try).
+    assert d["failed_attempts"] == [
+        {"n": 1, "failure_class": "UNSOLVED", "hint": "stuck between a and b"}]
+    assert d["gif"] is not None
+
+
+def test_game_demo_exit_code_reflects_completion(tmp_path, monkeypatch, capsys):
+    from harness import cli
+
+    def fake_generate(prompt, out_dir="scenes/games", backend="auto", max_repairs=4):
+        verdict = "COMPLETED" if "good" in prompt else "UNSOLVED"
+        res = _canned_result(tmp_path, verdict=verdict)
+        if verdict != "COMPLETED":
+            # A failed run: last attempt did not pass, no witness.
+            res["attempts"] = [{"report": {"passed": False,
+                                           "failure_class": "UNSOLVED",
+                                           "hint": "never solved", "witness": None}}]
+        return res
+
+    monkeypatch.setattr("harness.gamegen.generate_game", fake_generate)
+    monkeypatch.setattr("harness.render.replay_gif",
+                        lambda gp, op, **kw: {"result": "success", "out_path": op})
+
+    # One good + one bad -> exit 1 (not all COMPLETED).
+    rc = cli.main(["game", "demo", "--prompts", "good one", "bad one",
+                   "--backend", "template", "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert data["all_completed"] is False
+
+    # All good -> exit 0.
+    rc2 = cli.main(["game", "demo", "--prompts", "good one", "good two",
+                    "--backend", "template", "--json"])
+    data2 = json.loads(capsys.readouterr().out)
+    assert rc2 == 0
+    assert data2["all_completed"] is True

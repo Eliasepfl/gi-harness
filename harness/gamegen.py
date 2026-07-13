@@ -6,35 +6,107 @@ prompt: it designs a WHOLE game - its own actions, rules and win/lose - and the
 harness only checks universal sanity + solvability.
 
 Backends:
-- "anthropic": Anthropic SDK (claude-opus-4-8, adaptive thinking).
-- "template":  two tiny built-in v2 games, for offline tests/demos (no network).
-- "auto":      anthropic if the client is reachable, else fall back to templates.
+- "anthropic":  Anthropic SDK (claude-opus-4-8, adaptive thinking).
+- "openrouter": OpenRouter chat-completions (free model, key in env.py) - the
+                volume backend; same system prompt + repair loop as anthropic.
+- "template":   two tiny built-in v2 games, for offline tests/demos (no network).
+- "auto":       anthropic -> openrouter -> template, in that order; result["backend"]
+                reflects what ran and result["note"] explains any fallback.
 
 The loop writes the module, calls harness.gameverify.verify_game (lazy import),
 and on failure re-generates with the full JSON report as feedback, within budget
 (OMNI-EPIC pattern: on repeated compile errors we discard rather than grind).
+
+Every run is written into its OWN sandbox dir (<out_dir>/<slug>/) and wrapped in
+an integrity manifest check (harness.integrity): if any tracked base file mutates
+mid-run the verdict is forced to INVALIDATED (OBJECTIVES hard rule).
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
+import shutil
+import time
+
+from harness import integrity
 
 try:  # lazily needed: the template backend must run without the package
     import anthropic
 except ImportError:  # pragma: no cover - environment dependent
     anthropic = None
 
+try:  # only the openrouter backend needs HTTP; template/anthropic run without it
+    import requests
+except ImportError:  # pragma: no cover - environment dependent
+    requests = None
+
 _MODEL = "claude-opus-4-8"
 _MAX_TOKENS = 16000
 _COMPILE_CAP = 5  # max attempts for env/compile errors (G0 load/build) -> discard
+
+# OpenRouter backend ([eng.] = engineering choices)
+_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OPENROUTER_MAX_TOKENS = 16000
+_OPENROUTER_TIMEOUT = 300          # seconds, per request [eng.]
+_OPENROUTER_MAX_RETRIES = 3        # extra attempts on 429/5xx before giving up [eng.]
+_OPENROUTER_BACKOFF = 1.0          # initial backoff seconds, doubled each retry [eng.]
 
 _UNSOLVED_HINT = ("no random rollout reached success - make the goal easier to "
                   "reach or actions more effective")
 
 
 class _BackendUnavailable(Exception):
-    """The anthropic backend is not usable -> fall back to templates."""
+    """An LLM backend is not usable -> fall back to the next backend/templates.
+
+    Its message MUST NEVER contain secret material (the API key).
+    """
+
+
+# --- Secrets: os.environ first, then a gitignored env.py at the repo root ----
+# The key is NEVER printed, logged, written, or embedded in any exception message.
+
+def _repo_root() -> str:
+    """Repo root = parent of the harness package directory."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_env_module():
+    """Lazily import <repo_root>/env.py; None if the file is absent/unloadable.
+
+    Guarded on every failure mode so a missing env.py simply means "backend
+    unavailable" rather than an error.
+    """
+    path = os.path.join(_repo_root(), "env.py")
+    if not os.path.isfile(path):
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_gi_env", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:  # noqa: BLE001 - any failure -> treat as no config
+        return None
+
+
+def _resolve_secret(name: str):
+    """Resolve a secret by name: os.environ wins, then env.py; None if neither."""
+    if name in os.environ:
+        return os.environ[name]
+    module = _load_env_module()
+    if module is not None:
+        return getattr(module, name, None)
+    return None
+
+
+def _redact(text: str, secret) -> str:
+    """Defence in depth: never let the key appear in a surfaced string."""
+    if secret and isinstance(text, str) and secret in text:
+        return text.replace(secret, "***")
+    return text
 
 
 # --- THE OPEN PROMPT ---------------------------------------------------------
@@ -227,6 +299,114 @@ def _llm_complete(client, system, messages):
     return "\n".join(parts)
 
 
+# --- OpenRouter backend ------------------------------------------------------
+
+def _retry_after(resp, default: float) -> float:
+    """Honour a Retry-After header (seconds) when present, else `default`."""
+    try:
+        raw = resp.headers.get("Retry-After")
+    except Exception:  # noqa: BLE001 - header bag may be anything in a mock
+        raw = None
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    return default
+
+
+def _openrouter_error(resp, key) -> str:
+    """A concise, key-free error string from a 4xx OpenRouter response."""
+    msg = None
+    try:
+        data = resp.json()
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            msg = err.get("message")
+        elif isinstance(err, str):
+            msg = err
+    except Exception:  # noqa: BLE001 - non-JSON body
+        msg = None
+    if not msg:
+        try:
+            msg = resp.text
+        except Exception:  # noqa: BLE001
+            msg = None
+    msg = (msg or "request rejected").strip()
+    if len(msg) > 200:  # a reasoning-model body can be huge; keep notes readable
+        msg = msg[:200] + "..."
+    status = getattr(resp, "status_code", "?")
+    return _redact(f"OpenRouter HTTP {status}: {msg}", key)
+
+
+def _openrouter_content(resp, key):
+    """Extract choices[0].message.content from a 200 body, or None if malformed."""
+    try:
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _openrouter_complete(system, messages):
+    """One OpenRouter chat completion -> choices[0].message.content.
+
+    Free models are rate-limited: retry up to _OPENROUTER_MAX_RETRIES times on
+    429/5xx (and transient network errors) with exponential backoff, honouring
+    Retry-After. 4xx auth/model errors are not retryable -> _BackendUnavailable
+    carrying the API's (key-free) error message. Missing config/`requests` ->
+    _BackendUnavailable so `auto` falls through cleanly.
+    """
+    if requests is None:
+        raise _BackendUnavailable("requests package not installed")
+    key = _resolve_secret("OPENROUTER_API_KEY")
+    model = _resolve_secret("OPENROUTER_MODEL")
+    if not key or not model:
+        raise _BackendUnavailable("OpenRouter API key or model not configured")
+
+    headers = {"Authorization": f"Bearer {key}"}
+    payload = {
+        "model": model,
+        "max_tokens": _OPENROUTER_MAX_TOKENS,
+        "messages": [{"role": "system", "content": system}] + list(messages),
+    }
+
+    backoff = _OPENROUTER_BACKOFF
+    for attempt in range(_OPENROUTER_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(_OPENROUTER_URL, headers=headers, json=payload,
+                                 timeout=_OPENROUTER_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - requests.RequestException etc.
+            # Transient network trouble: retry, then give up as unavailable.
+            if attempt < _OPENROUTER_MAX_RETRIES:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            raise _BackendUnavailable(
+                _redact(f"OpenRouter unreachable: {type(exc).__name__}", key))
+
+        status = getattr(resp, "status_code", 0)
+        if status == 200:
+            content = _openrouter_content(resp, key)
+            if content is not None:
+                return content
+            # Malformed 200 (no choices/content): treat as unavailable, key-free.
+            raise _BackendUnavailable(_openrouter_error(resp, key))
+
+        if status == 429 or status >= 500:
+            # Rate-limited / server-side: back off and retry within budget.
+            if attempt < _OPENROUTER_MAX_RETRIES:
+                time.sleep(_retry_after(resp, backoff))
+                backoff *= 2
+                continue
+            raise _BackendUnavailable(
+                f"OpenRouter rate-limited/unavailable (HTTP {status}) after "
+                f"{_OPENROUTER_MAX_RETRIES} retries")
+
+        # 4xx auth/model error: not retryable.
+        raise _BackendUnavailable(_openrouter_error(resp, key))
+
+
 def _extract_code(text):
     """First ```python block (fallback: first fenced block, else raw text)."""
     m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
@@ -253,8 +433,9 @@ def _slug(prompt):
     return s[:40] or "game"
 
 
-def _write_game(out_dir, prompt, attempt, code):
-    path = os.path.join(out_dir, f"{_slug(prompt)}_a{attempt}.py")
+def _write_attempt(run_dir, attempt, code):
+    """Write one attempt into the per-run sandbox dir as a{n}.py."""
+    path = os.path.join(run_dir, f"a{attempt}.py")
     with open(path, "w", encoding="utf-8") as f:
         f.write(code)
     return path
@@ -269,8 +450,13 @@ def _verify(game_path):
     return verify_game(game_path)
 
 
-def _repair_loop(prompt, out_dir, produce, backend_used, max_repairs, note):
-    """Shared write -> verify -> repair loop for both backends."""
+def _repair_loop(run_dir, produce, backend_used, max_repairs, note):
+    """Shared write -> verify -> repair loop for every backend.
+
+    Attempts are written ONLY into `run_dir` (the per-run sandbox), one file
+    per attempt (a1.py, a2.py, ...). The winning/final attempt is later promoted
+    to <slug>.py by generate_game.
+    """
     attempts = []
     feedback = None
     env_failures = 0
@@ -283,7 +469,7 @@ def _repair_loop(prompt, out_dir, produce, backend_used, max_repairs, note):
     while True:
         n += 1
         code, design = produce(feedback)
-        game_path = _write_game(out_dir, prompt, n, code)
+        game_path = _write_attempt(run_dir, n, code)
         report = _verify(game_path)
 
         if report is None:
@@ -323,15 +509,15 @@ def _repair_loop(prompt, out_dir, produce, backend_used, max_repairs, note):
     return result
 
 
-def _run_template(prompt, out_dir, max_repairs, note):
+def _run_template(prompt, run_dir, max_repairs, note):
     name = _select_template(prompt)
     code = _TEMPLATE_GAMES[name]
     design = _DESIGNS[name]
-    return _repair_loop(prompt, out_dir, lambda feedback: (code, design),
+    return _repair_loop(run_dir, lambda feedback: (code, design),
                         "template", max_repairs, note)
 
 
-def _run_llm(prompt, out_dir, max_repairs):
+def _run_anthropic(prompt, run_dir, max_repairs):
     if anthropic is None:
         raise _BackendUnavailable("anthropic package not installed")
     try:
@@ -356,29 +542,107 @@ def _run_llm(prompt, out_dir, max_repairs):
         messages.append({"role": "assistant", "content": text})
         return _extract_code(text), _extract_design(text)
 
-    return _repair_loop(prompt, out_dir, produce, "anthropic", max_repairs, None)
+    return _repair_loop(run_dir, produce, "anthropic", max_repairs, None)
+
+
+def _run_openrouter(prompt, run_dir, max_repairs):
+    """OpenRouter backend: SAME system prompt + repair loop as anthropic.
+
+    Availability (requests + configured key/model) is probed up front so that
+    `auto` can fall through to the next backend without a wasted attempt. A
+    _BackendUnavailable raised mid-loop (auth/rate-limit) propagates to
+    generate_game, which then falls back to templates.
+    """
+    if requests is None:
+        raise _BackendUnavailable("requests package not installed")
+    if not _resolve_secret("OPENROUTER_API_KEY") or not _resolve_secret("OPENROUTER_MODEL"):
+        raise _BackendUnavailable("OpenRouter API key or model not configured")
+
+    messages = [{"role": "user", "content": _first_user_msg(prompt)}]
+
+    def produce(feedback):
+        if feedback is not None:
+            messages.append({"role": "user", "content": _repair_user_msg(feedback)})
+        text = _openrouter_complete(_SYSTEM_PROMPT, messages)
+        messages.append({"role": "assistant", "content": text})
+        return _extract_code(text), _extract_design(text)
+
+    return _repair_loop(run_dir, produce, "openrouter", max_repairs, None)
 
 
 # --- Public API --------------------------------------------------------------
 
+# Ordered LLM backends tried under `auto`.
+_LLM_RUNNERS = {"anthropic": _run_anthropic, "openrouter": _run_openrouter}
+
+
+def _dispatch(prompt, run_dir, backend, max_repairs):
+    """Pick and run a backend, honouring the auto fallback chain."""
+    if backend == "template":
+        return _run_template(prompt, run_dir, max_repairs, None)
+
+    if backend == "auto":
+        order = ["anthropic", "openrouter"]
+    else:  # explicit "anthropic" or "openrouter": that one, then templates
+        order = [backend]
+
+    notes = []
+    for name in order:
+        try:
+            return _LLM_RUNNERS[name](prompt, run_dir, max_repairs)
+        except _BackendUnavailable as e:
+            notes.append(f"{name} unavailable ({e})")
+    note = "; ".join(notes) + "; falling back to templates" if notes else None
+    return _run_template(prompt, run_dir, max_repairs, note)
+
+
+def _finalize_game(run_dir, slug, result):
+    """Promote the final attempt to <slug>.py inside the run dir; repoint path."""
+    src = result.get("game_path")
+    if src and os.path.isfile(src):
+        final = os.path.join(run_dir, f"{slug}.py")
+        if os.path.abspath(src) != os.path.abspath(final):
+            shutil.copyfile(src, final)
+        result["game_path"] = final
+    return result
+
+
 def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4):
     """Generate an original game for `prompt` and return the loop report.
 
+    Each run gets its OWN sandbox dir `<out_dir>/<slug>/` (attempts a1.py, a2.py,
+    ...; the final game promoted to <slug>.py). The run may write ONLY there. The
+    whole run is bracketed by an integrity manifest check over the tracked base
+    files: any base-code mutation mid-run forces verdict INVALIDATED.
+
     -> {"game_path": str|None, "attempts": [...], "verdict", "backend", "design",
-        "note"?}
-       verdict in COMPLETED | PARTIAL | ENV_ERROR | GOAL_ERROR | UNSOLVED
+        "integrity": "ok" | {"violated": [...]}, "note"?}
+       verdict in COMPLETED | PARTIAL | ENV_ERROR | GOAL_ERROR | UNSOLVED |
+       INVALIDATED
     """
-    if backend not in ("auto", "anthropic", "template"):
+    if backend not in ("auto", "anthropic", "openrouter", "template"):
         backend = "auto"
     os.makedirs(out_dir, exist_ok=True)
 
-    note = None
-    if backend in ("auto", "anthropic"):
-        try:
-            return _run_llm(prompt, out_dir, max_repairs)
-        except _BackendUnavailable as e:
-            note = f"anthropic unavailable ({e}); falling back to templates"
-    return _run_template(prompt, out_dir, max_repairs, note)
+    slug = _slug(prompt)
+    run_dir = os.path.join(out_dir, slug)
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Freeze the base code for the duration of the run.
+    root = _repo_root()
+    before = integrity.snapshot(root)
+
+    result = _dispatch(prompt, run_dir, backend, max_repairs)
+    _finalize_game(run_dir, slug, result)
+
+    # Base code must be untouched: a mutation invalidates the whole run.
+    violated = integrity.violations(before, root)
+    if violated:
+        result["integrity"] = {"violated": violated}
+        result["verdict"] = "INVALIDATED"
+    else:
+        result["integrity"] = "ok"
+    return result
 
 
 # --- Built-in v2 games (offline test fixture - NOT a template library) --------
