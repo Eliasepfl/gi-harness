@@ -1081,14 +1081,8 @@ class _PaddedResp:
 
 def test_openrouter_content_tolerates_keepalive_padding():
     from harness.gamegen import _openrouter_content, _openrouter_json
-    payload = {"choices": [{"message": {"content": "DESIGN
-ok
-```python
-X=1
-```"}}]}
-    padding = (": OPENROUTER PROCESSING
-" * 40) + ("
-" * 900)
+    payload = {"choices": [{"message": {"content": "DESIGN\nok\n```python\nX=1\n```"}}]}
+    padding = (": OPENROUTER PROCESSING\n" * 40) + ("\n" * 900)
     assert _openrouter_content(_PaddedResp(payload, "")) is not None
     assert _openrouter_content(_PaddedResp(payload, padding)) is not None
     assert _openrouter_json(_PaddedResp({}, "")) == {}
