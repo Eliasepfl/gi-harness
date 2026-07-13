@@ -52,6 +52,14 @@ _OPENROUTER_MAX_TOKENS = 16000
 _OPENROUTER_TIMEOUT = 300          # seconds, per request [eng.]
 _OPENROUTER_MAX_RETRIES = 3        # extra attempts on 429/5xx before giving up [eng.]
 _OPENROUTER_BACKOFF = 1.0          # initial backoff seconds, doubled each retry [eng.]
+# Reasoning-token cap: without one, free reasoning models (e.g. hy3) burn the
+# whole max_tokens budget thinking and return content=null. Override via the
+# OPENROUTER_REASONING_MAX_TOKENS secret; "0" removes the field entirely
+# (for non-reasoning models). [eng.]
+_OPENROUTER_REASONING_DEFAULT = 4000
+
+# Telemetry ledger (harness.telemetry) — one JSON line appended per run.
+_LEDGER_PATH = "runs/ledger.jsonl"
 
 _UNSOLVED_HINT = ("no random rollout reached success - make the goal easier to "
                   "reach or actions more effective")
@@ -339,37 +347,54 @@ def _openrouter_error(resp, key) -> str:
     return _redact(f"OpenRouter HTTP {status}: {msg}", key)
 
 
-def _openrouter_content(resp, key):
-    """Extract choices[0].message.content from a 200 body, or None if malformed."""
+def _openrouter_content(resp):
+    """choices[0].message.content from a 200 body; None if malformed/empty.
+
+    A null/blank content (reasoning models spending the whole budget thinking)
+    counts as missing so the caller can attempt the cap-halving salvage.
+    """
     try:
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError, ValueError):
         return None
+    if isinstance(content, str) and content.strip():
+        return content
+    return None
 
 
-def _openrouter_complete(system, messages):
-    """One OpenRouter chat completion -> choices[0].message.content.
+def _reasoning_cap() -> int:
+    """Resolve the reasoning-token cap (secret > default; 0 disables the field)."""
+    raw = _resolve_secret("OPENROUTER_REASONING_MAX_TOKENS")
+    if raw is None:
+        return _OPENROUTER_REASONING_DEFAULT
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return _OPENROUTER_REASONING_DEFAULT
 
-    Free models are rate-limited: retry up to _OPENROUTER_MAX_RETRIES times on
-    429/5xx (and transient network errors) with exponential backoff, honouring
-    Retry-After. 4xx auth/model errors are not retryable -> _BackendUnavailable
-    carrying the API's (key-free) error message. Missing config/`requests` ->
-    _BackendUnavailable so `auto` falls through cleanly.
-    """
-    if requests is None:
-        raise _BackendUnavailable("requests package not installed")
-    key = _resolve_secret("OPENROUTER_API_KEY")
-    model = _resolve_secret("OPENROUTER_MODEL")
-    if not key or not model:
-        raise _BackendUnavailable("OpenRouter API key or model not configured")
 
-    headers = {"Authorization": f"Bearer {key}"}
+def _openrouter_payload(model, system, messages, cap: int) -> dict:
     payload = {
         "model": model,
         "max_tokens": _OPENROUTER_MAX_TOKENS,
         "messages": [{"role": "system", "content": system}] + list(messages),
     }
+    if cap > 0:
+        payload["reasoning"] = {"max_tokens": cap}
+    return payload
+
+
+def _openrouter_request(key, model, system, messages, cap: int):
+    """Send one completion request; return the 200 response.
+
+    Retries up to _OPENROUTER_MAX_RETRIES times on 429/5xx (and transient
+    network errors) with exponential backoff, honouring Retry-After. 4xx
+    auth/model errors are not retryable -> _BackendUnavailable carrying the
+    API's (key-free) error message.
+    """
+    headers = {"Authorization": f"Bearer {key}"}
+    payload = _openrouter_payload(model, system, messages, cap)
 
     backoff = _OPENROUTER_BACKOFF
     for attempt in range(_OPENROUTER_MAX_RETRIES + 1):
@@ -387,11 +412,7 @@ def _openrouter_complete(system, messages):
 
         status = getattr(resp, "status_code", 0)
         if status == 200:
-            content = _openrouter_content(resp, key)
-            if content is not None:
-                return content
-            # Malformed 200 (no choices/content): treat as unavailable, key-free.
-            raise _BackendUnavailable(_openrouter_error(resp, key))
+            return resp
 
         if status == 429 or status >= 500:
             # Rate-limited / server-side: back off and retry within budget.
@@ -404,6 +425,39 @@ def _openrouter_complete(system, messages):
                 f"{_OPENROUTER_MAX_RETRIES} retries")
 
         # 4xx auth/model error: not retryable.
+        raise _BackendUnavailable(_openrouter_error(resp, key))
+
+
+def _openrouter_complete(system, messages):
+    """One OpenRouter chat completion -> choices[0].message.content.
+
+    The request carries a reasoning-token cap (see _reasoning_cap): without it
+    free reasoning models can spend the entire max_tokens budget thinking and
+    return content=null. If a 200 still comes back with null/blank content, we
+    salvage ONCE by halving the cap (cheaper thinking leaves room for output)
+    before declaring _BackendUnavailable. Missing config/`requests` ->
+    _BackendUnavailable so `auto` falls through cleanly.
+    """
+    if requests is None:
+        raise _BackendUnavailable("requests package not installed")
+    key = _resolve_secret("OPENROUTER_API_KEY")
+    model = _resolve_secret("OPENROUTER_MODEL")
+    if not key or not model:
+        raise _BackendUnavailable("OpenRouter API key or model not configured")
+
+    cap = _reasoning_cap()
+    salvage_left = 1
+    while True:
+        resp = _openrouter_request(key, model, system, messages, cap)
+        content = _openrouter_content(resp)
+        if content is not None:
+            return content
+        # 200 with null/blank content. With no cap to halve (cap disabled)
+        # there is nothing to salvage; otherwise retry once at half the cap.
+        if salvage_left > 0 and cap > 0:
+            salvage_left -= 1
+            cap = max(1, cap // 2)
+            continue
         raise _BackendUnavailable(_openrouter_error(resp, key))
 
 
@@ -442,12 +496,25 @@ def _write_attempt(run_dir, attempt, code):
 
 
 def _verify(game_path):
-    """Lazy import of verify_game; None if module F does not exist yet."""
+    """Lazy import of verify_game; None if module F does not exist yet.
+
+    An error-shaped result ({"error": ...}: sandbox timeout, worker crash) is
+    an INFRASTRUCTURE failure, not a game failure — retry once; if it persists,
+    surface it so the loop can stop instead of repairing blind on an empty hint."""
     try:
         from harness.gameverify import verify_game
     except ImportError:
         return None
-    return verify_game(game_path)
+    report = verify_game(game_path)
+    if isinstance(report, dict) and "error" in report and "layers" not in report:
+        time.sleep(2.0)
+        report = verify_game(game_path)
+    return report
+
+
+def _is_verify_error(report) -> bool:
+    """True for error-shaped reports (no funnel layers, just an error record)."""
+    return isinstance(report, dict) and "error" in report and "layers" not in report
 
 
 def _repair_loop(run_dir, produce, backend_used, max_repairs, note):
@@ -480,6 +547,14 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note):
             break
 
         attempts.append({"report": report})
+
+        if _is_verify_error(report):
+            # Verification infrastructure failed twice on this code: stop the
+            # run honestly (the game code may be fine) — never repair blind.
+            verdict = "VERIFY_ERROR"
+            note = (note + "; " if note else "") + \
+                f"verification infrastructure failed: {report['error'].get('type', 'unknown')}"
+            break
 
         if report.get("passed"):
             verdict = "COMPLETED"
@@ -607,13 +682,24 @@ def _finalize_game(run_dir, slug, result):
     return result
 
 
+def _model_used(backend):
+    """The actual model id behind a backend label (for the telemetry ledger)."""
+    if backend == "anthropic":
+        return _MODEL
+    if backend == "openrouter":
+        return _resolve_secret("OPENROUTER_MODEL")
+    return backend  # "template" (or unknown)
+
+
 def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4):
     """Generate an original game for `prompt` and return the loop report.
 
     Each run gets its OWN sandbox dir `<out_dir>/<slug>/` (attempts a1.py, a2.py,
     ...; the final game promoted to <slug>.py). The run may write ONLY there. The
     whole run is bracketed by an integrity manifest check over the tracked base
-    files: any base-code mutation mid-run forces verdict INVALIDATED.
+    files: any base-code mutation mid-run forces verdict INVALIDATED. Every run
+    is appended to the telemetry ledger (harness.telemetry, runs/ledger.jsonl);
+    telemetry is best-effort and can never break a run.
 
     -> {"game_path": str|None, "attempts": [...], "verdict", "backend", "design",
         "integrity": "ok" | {"violated": [...]}, "note"?}
@@ -632,7 +718,9 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4)
     root = _repo_root()
     before = integrity.snapshot(root)
 
+    t0 = time.time()
     result = _dispatch(prompt, run_dir, backend, max_repairs)
+    wall_s = time.time() - t0
     _finalize_game(run_dir, slug, result)
 
     # Base code must be untouched: a mutation invalidates the whole run.
@@ -642,6 +730,14 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4)
         result["verdict"] = "INVALIDATED"
     else:
         result["integrity"] = "ok"
+
+    # Telemetry: counting failures/repairs is a first-class statistic.
+    try:
+        from harness import telemetry
+        telemetry.record_run(result, prompt, _model_used(result.get("backend")),
+                             wall_s, path=_LEDGER_PATH)
+    except Exception:  # noqa: BLE001 - telemetry must never break a run
+        pass
     return result
 
 

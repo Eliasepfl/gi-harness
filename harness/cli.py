@@ -401,6 +401,46 @@ def cmd_game_demo(args) -> int:
     return 0 if all_completed else 1
 
 
+# ---- game stats ------------------------------------------------------------
+def cmd_game_stats(args) -> int:
+    """Aggregate the runs ledger (telemetry) per backend/model."""
+    try:
+        from harness.telemetry import stats
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("telemetry", exc, args.json)
+
+    data = stats(args.path)
+    if args.json:
+        _emit_json(data)
+        return 0 if data.get("total_runs") else 1
+
+    if not data.get("total_runs"):
+        print(f"no runs recorded in {args.path}")
+        return 1
+
+    print(f"=== RUN LEDGER ({args.path}: {data['total_runs']} runs) ===")
+    header = (f"{'backend':<12} {'model':<32} {'runs':>4} {'done':>4} {'rate':>5} "
+              f"{'inval':>5} {'avg_tries':>9} {'avg_s':>7}")
+    print(header)
+    print("-" * len(header))
+    for g in data["groups"]:
+        rate = f"{int(round(g['completion_rate'] * 100))}%"
+        tries = g["mean_attempts_to_completed"]
+        wall = g["mean_wall_s"]
+        tries_s = "" if tries is None else f"{tries}"
+        wall_s = "" if wall is None else f"{wall}"
+        print(f"{str(g['backend']):<12} {str(g['model']):<32} {g['runs']:>4} "
+              f"{g['completed']:>4} {rate:>5} {g['invalidated']:>5} "
+              f"{tries_s:>9} {wall_s:>7}")
+        if g["failure_classes"]:
+            hist = ", ".join(f"{k}={v}" for k, v in sorted(g["failure_classes"].items()))
+            print(f"{'':<12}   failure_classes : {hist}")
+        if g["flagrant"]:
+            hist = ", ".join(f"{k}={v}" for k, v in sorted(g["flagrant"].items()))
+            print(f"{'':<12}   flagrant        : {hist}")
+    return 0
+
+
 # ---- parser --------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -468,6 +508,11 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["auto", "anthropic", "openrouter", "template"])
     gd.add_argument("--json", action="store_true")
     gd.set_defaults(func=cmd_game_demo)
+
+    gs = gmsub.add_parser("stats", help="aggregate the runs ledger (telemetry)")
+    gs.add_argument("--path", default="runs/ledger.jsonl")
+    gs.add_argument("--json", action="store_true")
+    gs.set_defaults(func=cmd_game_stats)
 
     return p
 

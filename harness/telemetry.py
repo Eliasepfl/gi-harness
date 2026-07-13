@@ -1,0 +1,202 @@
+"""Run-telemetry ledger — failures and repairs counted as first-class statistics.
+
+Every `gamegen.generate_game` run appends ONE JSON line to `runs/ledger.jsonl`
+(the `runs/` dir is created on demand). The ledger is the raw data of the
+base-of-games campaign: which prompts, which model, how many repair attempts,
+which failure classes, and — crucially — which failures are FLAGRANT.
+
+Flagrant = model-discipline errors, where the model ignored the instructions it
+was given: no valid python emitted (syntax error at the sandbox scan), forbidden
+imports, missing required symbols, module load or build(world) crashes. These
+are distinct from HEALTHY design failures (UNSOLVED goals, dead actions, goal
+errors), which are the productive part of the repair loop. The flagrant/healthy
+ratio per model is the core signal for choosing a volume backend.
+
+`record_run` extracts everything from the machine-readable result dict — no
+narration. `stats` aggregates the ledger per (backend, model).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timezone
+
+DEFAULT_LEDGER = "runs/ledger.jsonl"
+
+
+# --------------------------------------------------------------------------
+# Extraction from one verifier report
+# --------------------------------------------------------------------------
+def _failed_checks(report: dict) -> list[str]:
+    """Names ('layer.check') of every failed check in a verification report."""
+    failed = []
+    for layer, body in (report.get("layers") or {}).items():
+        if isinstance(body, dict) and not body.get("passed", True):
+            for name, res in (body.get("checks") or {}).items():
+                ok = res.get("pass", True) if isinstance(res, dict) else bool(res)
+                if not ok:
+                    failed.append(f"{layer}.{name}")
+    return failed
+
+
+def _flagrant_labels(report: dict) -> list[str]:
+    """Model-discipline error labels detected in one failed attempt's report.
+
+    These map to "the model ignored the instructions", as opposed to healthy
+    design failures (UNSOLVED / GOAL_ERROR / dead actions):
+      - no_python_block : sandbox scan hit a syntax error (raw prose/truncated
+                          text was written instead of a valid python module)
+      - forbidden_import: the game imported something (only `world` is allowed)
+      - dunder_access   : sandbox rejected dunder introspection
+      - load_error      : module executed but crashed at load time
+      - missing_symbols : required section-2 symbols absent/not callable
+      - build_failure   : build(world) raised
+    """
+    labels: list[str] = []
+    checks = ((report.get("layers") or {}).get("G0_static") or {}).get("checks") or {}
+
+    scan = checks.get("sandbox_scan")
+    if isinstance(scan, dict) and not scan.get("pass", True):
+        violations = [str(v) for v in (scan.get("violations") or [])]
+        if any("syntax error" in v for v in violations):
+            labels.append("no_python_block")
+        if any("forbidden import" in v for v in violations):
+            labels.append("forbidden_import")
+        if any("dunder" in v for v in violations):
+            labels.append("dunder_access")
+
+    for check_name, label in (("loads", "load_error"),
+                              ("symbols", "missing_symbols"),
+                              ("builds", "build_failure")):
+        res = checks.get(check_name)
+        if isinstance(res, dict) and not res.get("pass", True):
+            labels.append(label)
+    return labels
+
+
+# --------------------------------------------------------------------------
+# Ledger writing
+# --------------------------------------------------------------------------
+def record_run(result: dict, prompt: str, model, wall_s: float,
+               path: str = DEFAULT_LEDGER) -> dict:
+    """Append one machine-readable ledger line for a generate_game run.
+
+    Returns the entry dict that was written. Creates the ledger dir on demand.
+    """
+    attempts = result.get("attempts") or []
+
+    failures = []
+    flagrant: list[str] = []
+    for att in attempts:
+        rep = att.get("report") if isinstance(att, dict) else None
+        if not isinstance(rep, dict) or rep.get("passed"):
+            continue
+        if "error" in rep and "layers" not in rep:
+            # Error-shaped report (sandbox timeout, worker crash): an
+            # INFRASTRUCTURE failure — count it visibly, never as a model failure.
+            failures.append({
+                "failure_class": "VERIFY_ERROR",
+                "failed_checks": [],
+                "hint": f"verification infrastructure: {rep['error'].get('type', 'unknown')}",
+            })
+            continue
+        failures.append({
+            "failure_class": rep.get("failure_class"),
+            "failed_checks": _failed_checks(rep),
+            "hint": (rep.get("hint") or "").strip(),
+        })
+        flagrant.extend(_flagrant_labels(rep))
+
+    final = attempts[-1].get("report") if attempts and isinstance(attempts[-1], dict) else None
+    witness = final.get("witness") if isinstance(final, dict) else None
+    witness = witness if isinstance(witness, dict) else None
+
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "prompt": prompt,
+        "backend": result.get("backend"),
+        "model": model,
+        "verdict": result.get("verdict"),
+        "attempts": len(attempts),
+        "failures": failures,
+        "witness_ticks": witness.get("ticks") if witness else None,
+        "checkpoints": dict(witness.get("checkpoints") or {}) if witness else {},
+        "integrity": result.get("integrity"),
+        "wall_s": round(float(wall_s), 2),
+        "flagrant": flagrant,
+    }
+
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    return entry
+
+
+# --------------------------------------------------------------------------
+# Aggregation
+# --------------------------------------------------------------------------
+def _read_ledger(path: str) -> list[dict]:
+    entries: list[dict] = []
+    if not os.path.isfile(path):
+        return entries
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a corrupt line must not sink the aggregation
+            if isinstance(obj, dict):
+                entries.append(obj)
+    return entries
+
+
+def stats(path: str = DEFAULT_LEDGER) -> dict:
+    """Aggregate the ledger per (backend, model).
+
+    -> {"total_runs": N, "groups": [{backend, model, runs, completed,
+        completion_rate, invalidated, mean_attempts_to_completed,
+        failure_classes: {cls: n}, flagrant: {label: n}, mean_wall_s}]}
+    """
+    entries = _read_ledger(path)
+    groups: dict = {}
+    for e in entries:
+        key = (str(e.get("backend")), str(e.get("model")))
+        g = groups.setdefault(key, {
+            "backend": e.get("backend"), "model": e.get("model"),
+            "runs": 0, "completed": 0, "invalidated": 0,
+            "_attempts_to_completed": [], "_walls": [],
+            "failure_classes": {}, "flagrant": {},
+        })
+        g["runs"] += 1
+        verdict = e.get("verdict")
+        if verdict == "COMPLETED":
+            g["completed"] += 1
+            g["_attempts_to_completed"].append(int(e.get("attempts") or 0))
+        elif verdict == "INVALIDATED":
+            g["invalidated"] += 1
+        for f in e.get("failures") or []:
+            cls = (f.get("failure_class") if isinstance(f, dict) else None) or "unknown"
+            g["failure_classes"][cls] = g["failure_classes"].get(cls, 0) + 1
+        for label in e.get("flagrant") or []:
+            g["flagrant"][str(label)] = g["flagrant"].get(str(label), 0) + 1
+        wall = e.get("wall_s")
+        if isinstance(wall, (int, float)):
+            g["_walls"].append(float(wall))
+
+    out = []
+    for g in groups.values():
+        atc = g.pop("_attempts_to_completed")
+        walls = g.pop("_walls")
+        g["completion_rate"] = round(g["completed"] / g["runs"], 3) if g["runs"] else 0.0
+        g["mean_attempts_to_completed"] = (round(sum(atc) / len(atc), 2)
+                                           if atc else None)
+        g["mean_wall_s"] = round(sum(walls) / len(walls), 1) if walls else None
+        out.append(g)
+    out.sort(key=lambda g: (str(g["backend"]), str(g["model"])))
+    return {"total_runs": len(entries), "groups": out}

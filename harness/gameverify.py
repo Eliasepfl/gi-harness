@@ -35,6 +35,7 @@ from harness.sandbox import (
 
 # --- Constants ([eng.] = engineering choice to calibrate) ---------------- #
 K_STEPS = 6                 # physics steps per decision tick (CONTRACTS §2)
+GAMEVERIFY_TIMEOUT_S = 180  # sandbox subprocess budget for a full G0-G3 run [eng.]
 
 # G0
 MIN_ACTIONS, MAX_ACTIONS = 2, 8         # declared action-set size
@@ -782,7 +783,11 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
     """
     if sandboxed:
         from harness.sandbox import run_sandboxed
-        return run_sandboxed(game_path, "gameverify")
+        # Game verification legitimately includes the G3 probe (tens of thousands
+        # of physics steps) plus a Windows spawn re-import; the legacy 20 s default
+        # times out under machine load and yields an error-shaped report with no
+        # hint — which would make repair loops run blind. [eng.]
+        return run_sandboxed(game_path, "gameverify", timeout_s=GAMEVERIFY_TIMEOUT_S)
 
     report = make_report()
     factory = world_factory or _default_world_factory

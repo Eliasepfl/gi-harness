@@ -42,6 +42,16 @@ def _remove_gameverify(monkeypatch):
     monkeypatch.delitem(sys.modules, "harness.gameverify", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _ledger_to_tmp(tmp_path_factory, monkeypatch):
+    """Redirect the telemetry ledger away from the real repo for every test.
+
+    Uses its own temp dir (not the test's tmp_path) so tests that treat
+    tmp_path as out_dir see no foreign files."""
+    ledger_dir = tmp_path_factory.mktemp("ledger")
+    monkeypatch.setattr(GG, "_LEDGER_PATH", str(ledger_dir / "test_ledger.jsonl"))
+
+
 _REQUIRED = ("TITLE", "PROMPT", "ACTIONS", "build", "act", "success", "checkpoints")
 
 
@@ -906,3 +916,149 @@ def test_game_demo_exit_code_reflects_completion(tmp_path, monkeypatch, capsys):
     data2 = json.loads(capsys.readouterr().out)
     assert rc2 == 0
     assert data2["all_completed"] is True
+
+
+# =============================================================================
+#  Reasoning cap + null-content salvage (all mocked, no network)
+# =============================================================================
+
+def _fake_secrets_with_cap(monkeypatch, cap_value):
+    monkeypatch.setattr(
+        GG, "_resolve_secret",
+        lambda name: {"OPENROUTER_API_KEY": _FAKE_KEY,
+                      "OPENROUTER_MODEL": _FAKE_MODEL,
+                      "OPENROUTER_REASONING_MAX_TOKENS": cap_value}.get(name))
+
+
+def test_reasoning_cap_default_in_request_body(monkeypatch):
+    _fake_secrets(monkeypatch)  # no reasoning secret -> default cap
+    fake = _FakeRequests([_FakeResp(200, _chat("ok"))])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    GG._openrouter_complete("SYS", [])
+
+    body = fake.calls[0]["json"]
+    assert body["reasoning"] == {"max_tokens": GG._OPENROUTER_REASONING_DEFAULT}
+
+
+def test_reasoning_cap_custom_value(monkeypatch):
+    _fake_secrets_with_cap(monkeypatch, "1234")
+    fake = _FakeRequests([_FakeResp(200, _chat("ok"))])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    GG._openrouter_complete("SYS", [])
+
+    assert fake.calls[0]["json"]["reasoning"] == {"max_tokens": 1234}
+
+
+def test_reasoning_cap_zero_disables_field(monkeypatch):
+    _fake_secrets_with_cap(monkeypatch, "0")
+    fake = _FakeRequests([_FakeResp(200, _chat("ok"))])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    GG._openrouter_complete("SYS", [])
+
+    assert "reasoning" not in fake.calls[0]["json"]
+
+
+def test_reasoning_cap_garbage_falls_back_to_default(monkeypatch):
+    _fake_secrets_with_cap(monkeypatch, "not-a-number")
+    assert GG._reasoning_cap() == GG._OPENROUTER_REASONING_DEFAULT
+
+
+_NULL_CONTENT_BODY = {"choices": [{"message": {"content": None},
+                                   "finish_reason": "length"}]}
+
+
+def test_null_content_salvage_halves_cap_once(monkeypatch):
+    # 200-with-null-content (reasoning ate the budget) -> retry ONCE at cap/2.
+    _fake_secrets(monkeypatch)
+    fake = _FakeRequests([_FakeResp(200, _NULL_CONTENT_BODY),
+                          _FakeResp(200, _chat("recovered"))])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    out = GG._openrouter_complete("SYS", [])
+
+    assert out == "recovered"
+    assert len(fake.calls) == 2
+    cap = GG._OPENROUTER_REASONING_DEFAULT
+    assert fake.calls[0]["json"]["reasoning"] == {"max_tokens": cap}
+    assert fake.calls[1]["json"]["reasoning"] == {"max_tokens": cap // 2}
+
+
+def test_null_content_twice_gives_up_key_free(monkeypatch):
+    secret = "sk-or-v1-NEVER-IN-ERRORS"
+    _fake_secrets(monkeypatch, key=secret)
+    fake = _FakeRequests([_FakeResp(200, _NULL_CONTENT_BODY)])  # reused each call
+    monkeypatch.setattr(GG, "requests", fake)
+
+    with pytest.raises(GG._BackendUnavailable) as ei:
+        GG._openrouter_complete("SYS", [])
+
+    assert len(fake.calls) == 2          # initial + exactly one salvage
+    assert secret not in str(ei.value)
+
+
+def test_null_content_no_salvage_when_cap_disabled(monkeypatch):
+    # With the reasoning field disabled there is no cap to halve -> fail fast.
+    _fake_secrets_with_cap(monkeypatch, "0")
+    fake = _FakeRequests([_FakeResp(200, _NULL_CONTENT_BODY)])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    with pytest.raises(GG._BackendUnavailable):
+        GG._openrouter_complete("SYS", [])
+    assert len(fake.calls) == 1
+
+
+def test_blank_content_treated_as_null(monkeypatch):
+    # Whitespace-only content is as useless as null: same salvage path.
+    _fake_secrets(monkeypatch)
+    fake = _FakeRequests([_FakeResp(200, _chat("   \n  ")),
+                          _FakeResp(200, _chat("real text"))])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    assert GG._openrouter_complete("SYS", []) == "real text"
+    assert len(fake.calls) == 2
+
+
+# =============================================================================
+#  Telemetry hook in generate_game (ledger redirected to tmp by the fixture)
+# =============================================================================
+
+def test_generate_game_records_one_ledger_line(tmp_path, monkeypatch):
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(GG, "_LEDGER_PATH", str(ledger))
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {"ticks": 8,
+                                                "actions": [], "seed": 0,
+                                                "checkpoints": {"m": 2}}})
+
+    GG.generate_game("a puck on ice", out_dir=str(tmp_path / "out"),
+                     backend="template", max_repairs=2)
+
+    lines = ledger.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["prompt"] == "a puck on ice"
+    assert entry["backend"] == "template"
+    assert entry["model"] == "template"
+    assert entry["verdict"] == "COMPLETED"
+    assert entry["attempts"] == 1
+    assert entry["witness_ticks"] == 8
+    assert entry["checkpoints"] == {"m": 2}
+    assert entry["integrity"] == "ok"
+    assert entry["wall_s"] >= 0
+
+
+def test_telemetry_failure_never_breaks_a_run(tmp_path, monkeypatch):
+    def boom(*a, **kw):
+        raise OSError("disk full")
+
+    import harness.telemetry as Tel
+    monkeypatch.setattr(Tel, "record_run", boom)
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+
+    res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
+                           backend="template", max_repairs=2)
+    assert res["verdict"] == "COMPLETED"  # the run survived the telemetry crash
