@@ -1,0 +1,334 @@
+"""Generic GIF replay renderer for arbitrary v2 generated games (PIL only).
+
+No pixels are read from the engine: every frame is redrawn from `world.query()`
+bbox/shape data. The renderer runs the shared section-2 runner semantics (a
+decision tick = act, then K physics steps, then win/lose checks) and captures
+frames along the way.
+
+Shape-aware, palette-consistent, and lightly anti-clipped: dynamic bodies are
+masked by static solids so the solver's penetration into walls is not shown.
+Physics is never touched — masking is purely visual.
+"""
+
+from __future__ import annotations
+
+import zlib
+from pathlib import Path
+from types import SimpleNamespace
+
+from PIL import Image, ImageDraw
+
+# ---- runner / capture constants (eng.) -----------------------------------
+K = 6              # physics steps per decision tick (section-2 runner)
+HOLD_FRAMES = 15   # duplicate the final frame this many times (readable end)
+FRAME_MS = 60      # per-frame duration in the GIF
+
+# ---- palette (see CONTRACTS section 5) -----------------------------------
+BG = (18, 19, 26)          # #12131a  dark background
+GRID = (30, 32, 42)        # subtle 40px grid
+C_CONTROLLED = (94, 205, 130)   # #5ecd82  the controlled body
+C_SENSOR = (240, 190, 70)       # #f0be46  sensor zones (translucent)
+C_STATIC = (95, 100, 120)       # #5f6478  static geometry
+C_TEXT = (150, 155, 170)
+# other dynamic bodies cycle through 3 stable blues/violets (per-name hash)
+C_DYNAMIC = [(94, 164, 255), (122, 132, 220), (168, 124, 240)]
+
+GRID_PX = 40
+
+
+# ==========================================================================
+#  Small helpers
+# ==========================================================================
+def _shade(c, f):
+    """Multiply an RGB colour by `f`, clamped to [0, 255]."""
+    return tuple(max(0, min(255, int(v * f))) for v in c)
+
+
+def _dyn_colour(name: str):
+    """Stable blue/violet for a non-controlled dynamic body (deterministic)."""
+    return C_DYNAMIC[zlib.crc32(name.encode("utf-8")) % len(C_DYNAMIC)]
+
+
+def _screen_box(bbox, scale: float, world_h: float):
+    """World bbox [l, b, r, t] (y up) -> screen box [x0, y0, x1, y1] (y down)."""
+    l, b, r, t = bbox
+    return [l * scale, (world_h - t) * scale, r * scale, (world_h - b) * scale]
+
+
+def _inset(box, px: int = 1):
+    """Shrink a screen box inward by `px` on every side, guarding against flip."""
+    x0, y0, x1, y1 = box
+    if x1 - x0 > 2 * px:
+        x0, x1 = x0 + px, x1 - px
+    if y1 - y0 > 2 * px:
+        y0, y1 = y0 + px, y1 - px
+    return [x0, y0, x1, y1]
+
+
+def _draw_shape(draw, shape: str, box, *, fill=None, outline=None, width: int = 2):
+    """Draw one entity shape into `draw` from its screen bbox."""
+    if shape == "circle":
+        draw.ellipse(box, fill=fill, outline=outline, width=width)
+    elif shape == "segment":
+        # thick line across the bbox diagonal (orientation unknown from bbox)
+        col = outline or fill
+        draw.line([box[0], box[3], box[2], box[1]], fill=col, width=max(3, width + 1))
+    else:  # box / poly / unknown -> rectangle from bbox
+        draw.rectangle(box, fill=fill, outline=outline, width=width)
+
+
+def _kind(q: dict) -> str:
+    """Classify an entity for colouring and z-order."""
+    if q.get("sensor"):
+        return "sensor"
+    if q.get("controlled"):
+        return "controlled"
+    if q.get("static"):
+        return "static"
+    return "dynamic"
+
+
+_Z = {"sensor": 0, "static": 1, "dynamic": 2, "controlled": 3}
+
+
+# ==========================================================================
+#  Frame drawing
+# ==========================================================================
+def _render_frame(world, tick: int, label: str, scale: float, world_size) -> Image.Image:
+    """Redraw the whole scene from world.query() into one RGB frame."""
+    world_w, world_h = world_size
+    W, H = max(1, int(world_w * scale)), max(1, int(world_h * scale))
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img, "RGBA")
+
+    for gx in range(0, W, GRID_PX):
+        d.line([(gx, 0), (gx, H)], fill=GRID, width=1)
+    for gy in range(0, H, GRID_PX):
+        d.line([(0, gy), (W, gy)], fill=GRID, width=1)
+
+    ents = []
+    for name in world.entities():
+        try:
+            q = dict(world.query(name))
+        except Exception:  # noqa: BLE001  — a missing/removed body must not break a frame
+            continue
+        if q.get("bbox"):
+            ents.append((name, q))
+
+    # static solid screen rects: used to erase dynamic-body penetration
+    solids = [_screen_box(q["bbox"], scale, world_h)
+              for _, q in ents if q.get("static") and not q.get("sensor")]
+
+    ents.sort(key=lambda e: _Z.get(_kind(e[1]), 2))
+
+    for name, q in ents:
+        kind = _kind(q)
+        shape = q.get("shape", "box")
+        box = _inset(_screen_box(q["bbox"], scale, world_h))
+
+        if kind == "sensor":
+            _draw_shape(d, shape, box, fill=(*C_SENSOR, 40),
+                        outline=(*C_SENSOR, 230), width=2)
+        elif kind == "static":
+            _draw_shape(d, shape, box, fill=C_STATIC,
+                        outline=_shade(C_STATIC, 1.35), width=1)
+        else:
+            colour = C_CONTROLLED if kind == "controlled" else _dyn_colour(name)
+            # dedicated layer, then erase overlap with every static solid
+            layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ld = ImageDraw.Draw(layer)
+            _draw_shape(ld, shape, box, fill=(*colour, 255),
+                        outline=(*_shade(colour, 0.65), 255), width=2)
+            for sl, st, sr, sb in solids:
+                ox0, oy0 = max(box[0], sl), max(box[1], st)
+                ox1, oy1 = min(box[2], sr), min(box[3], sb)
+                if ox1 > ox0 and oy1 > oy0:
+                    layer.paste((0, 0, 0, 0), (int(ox0), int(oy0), int(ox1), int(oy1)))
+            img.paste(layer, (0, 0), layer)
+
+    if label:
+        d.text((8, 6), label, fill=C_TEXT)
+    tick_str = f"tick {tick}"
+    try:
+        tw = d.textlength(tick_str)
+    except Exception:  # noqa: BLE001
+        tw = 7 * len(tick_str)
+    d.text((max(8.0, W - tw - 8), 6), tick_str, fill=C_TEXT)
+    return img
+
+
+# ==========================================================================
+#  Game loading (gameverify loader if present, else local restricted exec)
+# ==========================================================================
+def _symbols(obj) -> SimpleNamespace:
+    """Extract the section-2 game symbols from a module / namespace / dict."""
+    get = obj.get if isinstance(obj, dict) else (lambda k, dflt=None: getattr(obj, k, dflt))
+    build, act, success = get("build"), get("act"), get("success")
+    for req, fn in (("build", build), ("act", act), ("success", success)):
+        if not callable(fn):
+            raise RuntimeError(f"invalid game module: '{req}' missing or not callable")
+    on_step, failure = get("on_step"), get("failure")
+    return SimpleNamespace(
+        TITLE=get("TITLE", "") or "",
+        PROMPT=get("PROMPT", "") or "",
+        ACTIONS=list(get("ACTIONS", []) or []),
+        build=build,
+        act=act,
+        on_step=on_step if callable(on_step) else None,
+        success=success,
+        failure=failure if callable(failure) else None,
+    )
+
+
+def _local_load(game_path: str) -> dict:
+    """Execute a game module in a restricted namespace (sandbox scan if available)."""
+    src = Path(game_path).read_text(encoding="utf-8")
+    try:
+        from harness.sandbox import scan_source  # lazy import
+    except Exception:
+        scan_source = None
+    if scan_source is not None:
+        violations = scan_source(src)
+        if violations:
+            raise RuntimeError(f"game rejected by the sandbox: {violations}")
+    ns: dict = {"__name__": "game", "__builtins__": __builtins__}
+    exec(compile(src, str(game_path), "exec"), ns)
+    return ns
+
+
+def _load_game(game_path: str) -> SimpleNamespace:
+    """Load a game via harness.gameverify's loader if present, else local exec."""
+    try:
+        from harness import gameverify  # lazy import (module F may not exist yet)
+        for fname in ("load_game", "_load_game", "load_game_module"):
+            loader = getattr(gameverify, fname, None)
+            if callable(loader):
+                return _symbols(loader(game_path))
+    except Exception:  # noqa: BLE001  — fall back to local exec
+        pass
+    return _symbols(_local_load(game_path))
+
+
+def _import_world():
+    """Lazy import of the real World (module E may not exist yet)."""
+    from harness.world import World
+    return World
+
+
+def _world_size(world) -> tuple[int, int]:
+    """Best-effort read of the world dimensions (default 800x600)."""
+    size = getattr(world, "size", None)
+    if callable(size):
+        try:
+            size = size()
+        except Exception:  # noqa: BLE001
+            size = None
+    if isinstance(size, (tuple, list)) and len(size) == 2:
+        return int(size[0]), int(size[1])
+    return 800, 600
+
+
+def _resolve_actions(game_path: str, actions, seed: int):
+    """Return (action_list, seed): explicit list, witness dict, or verify witness."""
+    if isinstance(actions, dict):  # a G3 witness
+        return list(actions.get("actions", [])), int(actions.get("seed", seed))
+    if actions is not None:
+        return list(actions), seed
+    from harness import gameverify  # lazy import
+    report = gameverify.verify_game(game_path)
+    witness = report.get("witness") or {}
+    return list(witness.get("actions", [])), int(witness.get("seed", seed))
+
+
+def _save_gif(frames, out_path: str) -> None:
+    out = Path(out_path)
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(str(out), save_all=True, append_images=frames[1:],
+                   duration=FRAME_MS, loop=0, optimize=True, disposal=2)
+
+
+# ==========================================================================
+#  Public entry point
+# ==========================================================================
+def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
+               label=None, max_ticks: int = 400, scale: float = 0.6,
+               every: int = 2, world_factory=None) -> dict:
+    """Render a game replay to an animated GIF.
+
+    `actions` is an explicit list of action strings, a G3 witness dict, or None
+    (re-verify the game to fetch the witness). `world_factory(seed=...)` overrides
+    the real World (used by tests); it defaults to harness.world.World.
+
+    Returns {"ticks": int, "result": "success|failure|timeout|error", ...}.
+    """
+    every = max(1, int(every))
+
+    try:
+        game = _load_game(game_path)
+    except Exception as exc:  # noqa: BLE001
+        return {"ticks": 0, "result": "error", "error": f"load failed: {exc}"}
+
+    try:
+        action_list, seed = _resolve_actions(game_path, actions, seed)
+    except Exception as exc:  # noqa: BLE001
+        return {"ticks": 0, "result": "error", "error": f"witness unavailable: {exc}"}
+
+    try:
+        make_world = world_factory or _import_world()
+        world = make_world(seed=seed)
+    except Exception as exc:  # noqa: BLE001
+        return {"ticks": 0, "result": "error", "error": f"world unavailable: {exc}"}
+
+    try:
+        game.build(world)
+    except Exception as exc:  # noqa: BLE001
+        return {"ticks": 0, "result": "error", "error": f"build failed: {exc}"}
+
+    world_size = _world_size(world)
+    label = game.TITLE if label is None else label
+
+    frames: list = []
+    last_snap = -1
+
+    def snap(t: int) -> None:
+        nonlocal last_snap
+        frames.append(_render_frame(world, t, label, scale, world_size))
+        last_snap = t
+
+    snap(0)
+    result = "timeout"
+    tick = 0
+    try:
+        for i, action in enumerate(action_list[:max_ticks]):
+            game.act(world, action)
+            for _ in range(K):
+                world.step(1)
+                if game.on_step is not None:
+                    game.on_step(world)
+            tick = i + 1
+            ended = None
+            if game.failure is not None and game.failure(world):
+                ended = "failure"
+            elif game.success(world):
+                ended = "success"
+            if ended is not None:
+                result = ended
+                snap(tick)
+                break
+            if tick % every == 0:
+                snap(tick)
+    except Exception as exc:  # noqa: BLE001  — NaN/explosion surfaced by World.step
+        if last_snap != tick and frames:
+            snap(tick)
+        if frames:
+            _save_gif(frames, out_path)
+        return {"ticks": tick, "result": "error", "error": f"runtime: {exc}"}
+
+    if last_snap != tick:
+        snap(tick)
+    frames.extend([frames[-1]] * HOLD_FRAMES)
+
+    _save_gif(frames, out_path)
+    return {"ticks": tick, "result": result, "frames": len(frames),
+            "out_path": str(out_path)}
