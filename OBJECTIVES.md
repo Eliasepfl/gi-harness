@@ -69,6 +69,17 @@ certificate.
 
 ## Explorations open
 
+- **PARTS BANK (direction d'Elias, 13 juil. soir)** — curated bank of items/
+  obstacles/elements with PREDICTABLE physical properties (+optional sprites)
+  that the generation model pulls by name from prompt context, instead of
+  hand-calibrating physics in code. Goal: cut the load on the code-writing
+  model (necessary for scaling) and strengthen per-part verifier invariants.
+  Design principle: bank = NOUNS (parts), freedom = VERBS (mechanics/rules
+  stay free code) — do not regress to v1's genre lock-in. Research in
+  `notes/parts_bank/` (assets.md / mcp_tools.md / design.md → synthesis to
+  become CONTRACTS §9). Ledger failure classes are the evidence base for what
+  a bank eliminates (physics mis-calibration) vs not (goal design).
+
 - **Real game engines (rung 4) — research DONE (13 juil.), synthesis in
   `notes/GAME_ENGINE_INTEGRATIONS.md`** (details per engine in `notes/engines/`).
   Structural finding: ALL existing Claude↔engine integrations are authoring

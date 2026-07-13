@@ -1,0 +1,54 @@
+{
+  "startup": {
+    "times_ms": [
+      72.8,
+      72.4,
+      73.0,
+      73.9,
+      66.3
+    ],
+    "median_ms": 72.8,
+    "pass": true
+  },
+  "throughput_node": {
+    "episodes": 40,
+    "successes": 34,
+    "wall_s": 0.16248679999262094,
+    "eps_per_sec": 246.1738430556607
+  },
+  "throughput_pymunk": {
+    "episodes": 40,
+    "successes": 35,
+    "wall_s": 0.10812690015882254,
+    "eps_per_sec": 369.93569538427414
+  },
+  "throughput_ratio": 0.6654503637448269,
+  "determinism": {
+    "cross_process_identical": true,
+    "within_process_identical": true,
+    "bytes_a": 19624,
+    "bytes_b": 19624,
+    "pass": true
+  },
+  "solvability": {
+    "solved": true,
+    "solved_within": 0,
+    "total_success": 34,
+    "witness_ticks": 61,
+    "witness_checkpoints": {
+      "moved_off_start": 3,
+      "crossed_midline": 29,
+      "entered_upper_half": 20
+    },
+    "dead_milestones": [],
+    "empirical_order": [
+      "moved_off_start",
+      "entered_upper_half",
+      "crossed_midline"
+    ],
+    "order_matches_declared": false,
+    "non_trivial": true,
+    "pass": true
+  },
+  "overall_pass": true
+}
