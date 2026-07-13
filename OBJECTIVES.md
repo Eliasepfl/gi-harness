@@ -69,16 +69,17 @@ certificate.
 
 ## Explorations open
 
-- **PARTS BANK (direction d'Elias, 13 juil. soir)** — curated bank of items/
-  obstacles/elements with PREDICTABLE physical properties (+optional sprites)
-  that the generation model pulls by name from prompt context, instead of
-  hand-calibrating physics in code. Goal: cut the load on the code-writing
-  model (necessary for scaling) and strengthen per-part verifier invariants.
-  Design principle: bank = NOUNS (parts), freedom = VERBS (mechanics/rules
-  stay free code) — do not regress to v1's genre lock-in. Research in
-  `notes/parts_bank/` (assets.md / mcp_tools.md / design.md → synthesis to
-  become CONTRACTS §9). Ledger failure classes are the evidence base for what
-  a bank eliminates (physics mis-calibration) vs not (goal design).
+- **PARTS BANK — research DONE (13 juil. soir), synthesis in `notes/PARTS_BANK.md`**
+  (details: notes/parts_bank/{assets,mcp_tools,design}.md — design.md = future
+  CONTRACTS §9). Verdict GO: no off-the-shelf bank exists (sprite libs carry zero
+  physics metadata) — bank = named PRE-CERTIFIED World.add presets + lazy Kenney
+  CC0 sprites; one verb `world.part()`, add() stays escape hatch; two-tier prompt
+  (+~380 tokens); versioned data pinned per run (integrity + ledger bank_version);
+  engine-neutral schema (pymunk → Planck → Phaser). Ledger evidence: 50% of repair
+  iterations = physics mis-calibration the bank kills by construction; other 50%
+  = verb mistakes → prompt rules. No MCP needed (local-first); PixelLab API
+  optional build-time later. Sequencing: v2.2 after current campaign, then A/B
+  re-run WITH bank to quantify the repair-rate delta.
 
 - **Real game engines (rung 4) — research DONE (13 juil.), synthesis in
   `notes/GAME_ENGINE_INTEGRATIONS.md`** (details per engine in `notes/engines/`).
