@@ -327,7 +327,7 @@ def _openrouter_error(resp, key) -> str:
     """A concise, key-free error string from a 4xx OpenRouter response."""
     msg = None
     try:
-        data = resp.json()
+        data = _openrouter_json(resp)
         err = data.get("error") if isinstance(data, dict) else None
         if isinstance(err, dict):
             msg = err.get("message")
@@ -347,16 +347,38 @@ def _openrouter_error(resp, key) -> str:
     return _redact(f"OpenRouter HTTP {status}: {msg}", key)
 
 
+def _openrouter_json(resp):
+    """Parse an OpenRouter body, tolerating keep-alive padding.
+
+    On long non-streaming generations OpenRouter prepends anti-timeout padding
+    (blank/comment lines) before the JSON document; a strict resp.json() then
+    fails and a perfectly good completion looks unusable. Parse from the first
+    '{' instead. (Diagnosed live: ~5 KB of padding on 800 s GLM generations.)
+    """
+    try:
+        return resp.json()
+    except ValueError:
+        pass
+    try:
+        text = resp.text
+        start = text.find("{")
+        if start < 0:
+            return None
+        return json.loads(text[start:])
+    except (ValueError, AttributeError):
+        return None
+
+
 def _openrouter_content(resp):
     """choices[0].message.content from a 200 body; None if malformed/empty.
 
     A null/blank content (reasoning models spending the whole budget thinking)
     counts as missing so the caller can attempt the cap-halving salvage.
     """
+    data = _openrouter_json(resp)
     try:
-        data = resp.json()
         content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError, ValueError):
+    except (KeyError, IndexError, TypeError):
         return None
     if isinstance(content, str) and content.strip():
         return content

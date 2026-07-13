@@ -1062,3 +1062,47 @@ def test_telemetry_failure_never_breaks_a_run(tmp_path, monkeypatch):
     res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
                            backend="template", max_repairs=2)
     assert res["verdict"] == "COMPLETED"  # the run survived the telemetry crash
+
+
+# --- OpenRouter keep-alive padding (diagnosed live on long GLM generations) ---
+
+class _PaddedResp:
+    """A 200 body with anti-timeout padding before the JSON document."""
+
+    def __init__(self, payload, padding):
+        import json as _json
+        self.text = padding + _json.dumps(payload)
+        self.status_code = 200
+
+    def json(self):
+        import json as _json
+        return _json.loads(self.text)  # raises on padded bodies, like requests
+
+
+def test_openrouter_content_tolerates_keepalive_padding():
+    from harness.gamegen import _openrouter_content, _openrouter_json
+    payload = {"choices": [{"message": {"content": "DESIGN
+ok
+```python
+X=1
+```"}}]}
+    padding = (": OPENROUTER PROCESSING
+" * 40) + ("
+" * 900)
+    assert _openrouter_content(_PaddedResp(payload, "")) is not None
+    assert _openrouter_content(_PaddedResp(payload, padding)) is not None
+    assert _openrouter_json(_PaddedResp({}, "")) == {}
+
+
+def test_openrouter_json_returns_none_on_garbage():
+    from harness.gamegen import _openrouter_json
+    assert _openrouter_json(_PaddedResp({}, "")) == {}
+
+    class Garbage:
+        text = "no json here"
+        status_code = 200
+
+        def json(self):
+            raise ValueError("bad")
+
+    assert _openrouter_json(Garbage()) is None

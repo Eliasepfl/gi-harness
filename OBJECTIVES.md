@@ -67,6 +67,23 @@ game-declared milestone predicates, runner-latched, giving dense progress signal
 + "stuck between X and Y" repair diagnosis. `success` stays a binary unshaped
 certificate.
 
+## Adversarial / edge-case testing requirement (Elias, 13 juil. late)
+
+For NEXT versions (lands with the Planck port): games must survive ADVERSARIAL
+probes, not just reach the goal. New oracle family (working name G4):
+- **Avoidance probe**: policies that actively try NOT to win (minimize
+  checkpoint progress) for as long as possible — if success still triggers,
+  the goal is degenerate/unavoidable.
+- **Single-action-win check** (cheap, immediate candidate): during the existing
+  per-action efficacy rollouts, flag success — the jelly-tower agent found a
+  game soloable by one repeated action in 8 ticks that our anti-triviality
+  threshold (>=5) missed.
+- **Breaker probes**: adversarial action fuzzing (max-frequency spam,
+  alternating extremes, boundary hugging) hunting NaN/explosions/escapes/
+  stuck states — physics robustness under hostile play, beyond the noop rollout.
+- Games surviving N adversarial episodes get a "bulletproof" grade in the
+  report; failures feed the repair loop like any other layer.
+
 ## Explorations open
 
 - **PARTS BANK — research DONE (13 juil. soir), synthesis in `notes/PARTS_BANK.md`**
