@@ -68,6 +68,39 @@ domain; Physics Assets ×215 + platformer packs ×~950). Rejected: itch.io
 (license heterogeneity), LPC (copyleft), OpenGameArt (mixed; CC0-filter only).
 v1 target: ~40-60 archetypes / ~80 curated sprites.
 
+## Two-stage selection & retrieval (addendum, same evening — Elias's proposal)
+
+Detailed studies: `notes/parts_bank/retrieval.md` (tech) and `pipeline.md` (design).
+
+- **Physics is never chosen by the model** — it ships pre-certified with each
+  part; stage-1 only selects WHICH parts (bounded overrides allowed). Prompt
+  exoticism is carried INTO the bank by retrieval, and out of it by the escape
+  hatch when the bank can't follow (logged as bank-growth demand).
+- **Retrieval stack** (tiny-corpus framing, 60→500 parts): hybrid brute-force —
+  BM25 (`bm25s`) ⊕ static Model2Vec embeddings (`potion-retrieval-32M`, MIT,
+  sub-ms, byte-reproducible) fused by RRF; NO vector DB, NO reranker, NO
+  keyword-extraction step (a 30-token prompt is already keywords). LLM-as-
+  selector fails the determinism axis → escape hatch only. Ship BM25-only with
+  the campaign; add the dense channel at the exotic-prompt phase.
+- **Pipeline = Option A for v2.2**: harness-side retrieval, no extra LLM call —
+  stage-1 is a pure function of (prompt, bank_version): deterministic, ~0
+  amortized tokens, drop-in to the existing repair loop. Option B ("kit-picker"
+  stage-1 LLM emitting a pinned manifest) only if campaign data shows menu
+  mis-selection is the residual bottleneck. Option C (in-call tool) deferred.
+- **Three design rules**: (1) retrieval external & deterministic, vocabulary out
+  of context (legend + ≤15-part themed menu, never the full catalog); (2) pin
+  the retrieved set for the whole run — on repair APPEND (one bounded
+  missing-kind re-retrieval), never rebuild; (3) the menu is advisory, never a
+  cage — strong prompt anchor + "menu is optional" line keeps models in the
+  advisory regime (RAG-for-codegen literature), world.add stays open, every
+  out-of-menu use feeds `game bank-demand` (ranked authoring queue).
+- **Source correction**: GenSim's retrieval is random-sample / embedding-
+  similarity over prior tasks, NOT keyword menus — our design is closer to
+  ToolLLM's dense-retriever shape; reframed accordingly.
+- New telemetry: ledger `pipeline` block (retrieved_set, parts_used, misses,
+  re_retrieval, menu_mode); G0 gains manifest compliance (used ⊆ bank ∪
+  escape-hatch — hard; menu compliance soft in A).
+
 ## Verdict & sequencing
 
 GO — build after the current campaign cycle: (1) bank schema + bank-CI +
