@@ -142,6 +142,16 @@ Condensed path:
 | Paper: LLM-as-a-Verifier | `notes/papers/LLM_AS_A_VERIFIER.md` |
 | Parts bank | `notes/PARTS_BANK.md` + `banks/` |
 
+## Model config (current)
+
+- `OPENROUTER_MODEL = deepseek/deepseek-v4-flash` (Elias, 14 juil. — autonomous
+  runs; id verified against the OpenRouter models endpoint; smoke generation
+  COMPLETED in 2 attempts using bank parts). Previous volume model:
+  tencent/hy3:free. Routing policy per DIFFICULTY_MAP_R1.md stands.
+- The three Godot example specs were enriched from plumbing fixtures to real
+  demo levels (80d4e0b) and published as day-2's "third engine" row
+  (demos 15-17, rendered from real Godot engine state).
+
 ## Open decisions (Elias's calls)
 
 1. Switch the day-2 gallery from GIFs to the canvas replayer (pilot live at
