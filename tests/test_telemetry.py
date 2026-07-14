@@ -297,3 +297,13 @@ def test_cli_ledger_merge(tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert out["appended"] == 2 and out["shards"] == 2
+
+
+def test_record_run_honors_harness_ledger_env(tmp_path, monkeypatch):
+    shard = tmp_path / "shards" / "ledger.7.3.jsonl"
+    monkeypatch.setenv("HARNESS_LEDGER", str(shard))
+    entry = TEL.record_run(_result(), "p", "m", 1.0)          # no explicit path
+    assert shard.is_file() and entry["verdict"] is not None
+    explicit = tmp_path / "explicit.jsonl"                    # arg still wins
+    TEL.record_run(_result(), "p", "m", 1.0, path=str(explicit))
+    assert explicit.is_file()

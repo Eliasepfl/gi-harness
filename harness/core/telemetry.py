@@ -79,11 +79,15 @@ def _flagrant_labels(report: dict) -> list[str]:
 # Ledger writing
 # --------------------------------------------------------------------------
 def record_run(result: dict, prompt: str, model, wall_s: float,
-               path: str = DEFAULT_LEDGER) -> dict:
+               path: str | None = None) -> dict:
     """Append one machine-readable ledger line for a generate_game run.
 
     Returns the entry dict that was written. Creates the ledger dir on demand.
+    Path resolution: explicit arg > HARNESS_LEDGER env var > DEFAULT_LEDGER —
+    the env var is the per-task shard hook for parallel generation farms
+    (cross-node NFS appends to one file corrupt; shards + `ledger merge`).
     """
+    path = path or os.environ.get("HARNESS_LEDGER") or DEFAULT_LEDGER
     attempts = result.get("attempts") or []
 
     failures = []
