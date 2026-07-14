@@ -47,14 +47,17 @@ order: raycast sensors → move/spin_body → ordered_flag → path_follow → j
   0.656 · meteor *hard* 0.06 · vault *hard* 0.0 (stalls at `cleared_gap1`) ·
   flood_tower *not_learnable*. Key insight: **G4 robustness and RL difficulty
   are different axes** — the certified set spreads across five grades.
-- **Live curriculum round 1**: mechanics work end-to-end; hy3:free failed
-  5/5 regenerating the vault from scratch under the v2.3+ bar (best attempt
-  stuck between `cleared_gap2`/`in_vault`); bookkeeping bug found+fixed
-  (`26b3fc4`). **Revise mode** (certified source + directive as minimal-edit
-  task) was being built by an agent at snapshot time — check
-  `notes/rl_agent/CURRICULUM_LOOP.md` and `git branch --list "worktree-*"`
-  for its outcome. Model routing policy: easy→hy3, target→ship,
-  hard→revise (Opus if hy3 fails), not_learnable→ease directive.
+- **Live curriculum rounds 1-2**: round 1 (from-scratch regen) — hy3:free
+  failed 5/5 under the v2.3+ bar; bookkeeping bug found+fixed (`26b3fc4`).
+  Round 2 (**revise mode**, merged, 443 tests): hy3 produced a COMPLETED
+  minimal edit **first attempt, zero repairs** — 3 edits all on `cleared_gap1`
+  (shelf widened, spike narrowed), PROMPT byte-identical, later stages
+  untouched, re-certifies independently. Grade stayed *hard* but moved right:
+  sr 0→0.125, gap1 mastery 0.155→0.485. Lesson: **hy3 can edit, not
+  blank-page**; remaining gap to target = budget-limited (2M and/or a second
+  ease round). Caveat noted: successive revise rounds overwrite the same slug
+  dir (versioned per-round subdirs = follow-up). Model routing: easy→hy3
+  variants, target→ship, hard→hy3 revise first then Opus, not_learnable→ease.
 
 ## Restarting a work session (local)
 
