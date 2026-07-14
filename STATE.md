@@ -81,11 +81,27 @@ order: raycast sensors → move/spin_body → ordered_flag → path_follow → j
 Condensed path:
 
 1. Open an Engaging session (login node). Run the **day-1 checklist** (§plan):
-   module load miniforge → clone with `core.autocrlf=input` → mamba env
-   (py3.12, pymunk, torch-cpu, nodejs) → `npm install` in nodeworld/ →
-   **egress probe** (`srun ... curl openrouter` — compute-node internet is NOT
-   promised; if absent: generate locally, verify/train remotely) → smoke
-   `pytest` on `mit_quicktest`.
+   module load miniforge → clone → mamba env (py3.12, pymunk, torch-cpu,
+   nodejs) → `npm install` in nodeworld/ → **egress probe** (`srun ... curl
+   openrouter` — compute-node internet is NOT promised; if absent: generate
+   locally, verify/train remotely) → smoke `pytest` on `mit_quicktest`.
+
+   **Cloning (the repo is PRIVATE — you need auth on the cluster):**
+   ```bash
+   git config --global core.autocrlf input        # BEFORE cloning (CRLF kills node/bash)
+   git clone https://github.com/Eliasepfl/gi-harness.git   # HTTPS + a GitHub PAT,
+   # or add an SSH key on the cluster and use git@github.com:Eliasepfl/gi-harness.git
+   ```
+
+   **What does NOT travel with the clone (gitignored) — restore each:**
+   | Missing | Why | Restore on the cluster |
+   |---|---|---|
+   | `env.py` (OpenRouter key) | secret | recreate by hand, or `export OPENROUTER_API_KEY=...` (env vars override) — only needed if compute/login nodes generate |
+   | `nodeworld/node_modules/` | deps | `npm install` in `nodeworld/` (or baked into the `.sif`) |
+   | `godotworld/tools/` (Godot exe + rapier) | binaries, Windows-only anyway | download the LINUX artifacts per the runbook (`Godot_v4.7-stable_linux.x86_64` + the same rapier zip, which ships the linux `.so`), then the one-time `--headless --import` |
+   | `scenes/games/` (the 6 showcase games, curriculum artifacts) | generated artifacts | `rsync -av "scenes/games/" orcd-login.mit.edu:~/gi-harness/scenes/games/` from this machine — git does NOT carry them |
+   | `runs/` (ledger) | telemetry | start fresh on the cluster (per-task shards + merge, per the runbook); rsync the local ledger only if continuity matters |
+   | `banks/sprites/raw/` (Kenney atlases) | cosmetic only | skip — cluster demos return `frames.json`, not GIFs |
 2. Build the **canonical certifier image** from the verbatim `.sif` definition
    in the plan (ubuntu22.04 + miniforge + node + **Linux Godot 4.7 single
    binary** + rapier `.so` from the same zip we already use + the mandatory
