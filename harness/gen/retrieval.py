@@ -314,6 +314,8 @@ def build_menu(names, engine="py", *, bank=None) -> str:
          canonical ``world.add`` preset (physics params from the bank JSON) and
          states THE NAMING RULE — name the primary entity with the exact part
          name so the renderer can bind a sprite by name.
+    godot : same as js — the declarative spec has no ``world.part()``; its body
+         NAMES drive sprite skinning exactly like js, so it reuses the js menu.
 
     Returns ``""`` when ``names`` is empty (caller uses the legend-only prompt).
     """
@@ -321,7 +323,7 @@ def build_menu(names, engine="py", *, bank=None) -> str:
     if not names:
         return ""
     b = bank if bank is not None else _bank.load_bank("v1")
-    key = "js" if str(engine).lower() == "js" else "py"
+    key = "js" if str(engine).lower() in ("js", "godot") else "py"
 
     if key == "js":
         usage = ("world.js has no world.part() yet: build each part with world.add "

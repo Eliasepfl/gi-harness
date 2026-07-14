@@ -8,6 +8,7 @@ exactly like base code (a mid-run prompt edit invalidates the run).
 from __future__ import annotations
 
 from harness.gen import prompts as P
+from harness.gen import retrieval as R
 from harness.core import integrity as INT
 
 
@@ -141,3 +142,71 @@ def test_integrity_real_repo_covers_a_prompt_md():
     snap = INT.snapshot(root)
     assert "harness/gen/prompts/contract.md" in snap
     assert "harness/gen/prompts/rules.md" in snap
+    # The godot engine section is frozen base content just like the others.
+    assert "harness/gen/prompts/api_godot.md" in snap
+
+
+# --- Godot lane (declarative JSON spec) ---------------------------------------
+
+def test_all_sections_present_in_composed_godot():
+    sp = P.compose("godot")
+    # api_godot.md — the self-contained spec contract + format + worked example.
+    assert "ONE JSON object" in sp                 # emit DATA, not code
+    assert "a single FROZEN, audited runner interprets your spec" in sp
+    assert "predicates" in sp and "on_step" in sp   # spec section tables
+    assert "grounded(" in sp                        # the predicate DSL
+    assert '"verb": "impulse"' in sp                # the act verb vocabulary
+    assert "```json" in sp                          # the worked mini-example fence
+    # rules.md — reused untouched (engine-neutral hard constraints).
+    assert "Hard constraints" in sp
+    # orientation.md — reused untouched.
+    assert "do NOT default to a platformer" in sp
+    assert "Composition idioms" in sp
+    # design_block.md — DESIGN output format, fence resolved to json.
+    assert "DESIGN" in sp and "Milestones:" in sp and "Parts used:" in sp
+    assert "```json" in sp
+
+
+def test_composed_godot_has_no_code_contract_or_raw_placeholders():
+    sp = P.compose("godot")
+    # The code-module contract.md and the py/js API sections are NOT composed
+    # for godot (it carries its own spec contract in api_godot.md).
+    assert "pymunk underneath" not in sp
+    assert "Planck.js / Box2D underneath" not in sp
+    assert "world.add(name, shape=" not in sp        # api_py signature
+    # Every {..} placeholder the shared sections carry is resolved for godot.
+    for token in ("{lang}", "{fence}", "{artifact}", "{substrate}", "{false}",
+                  "{import_rule}", "{rng_forbid}", "{dict_word}"):
+        assert token not in sp, token
+
+
+def test_compose_godot_deterministic_and_distinct():
+    assert P.compose("godot") == P.compose("godot")
+    assert P.compose("godot") != P.compose("py")
+    assert P.compose("godot") != P.compose("js")
+
+
+def test_menu_splices_into_godot_before_design_block():
+    menu = "# Parts available for this prompt (optional menu)\nGODOT_MENU_MARKER\n"
+    sp = P.compose("godot", menu)
+    assert "GODOT_MENU_MARKER" in sp
+    # The menu comes AFTER orientation and BEFORE the DESIGN output format.
+    assert sp.index("Composition idioms") < sp.index("GODOT_MENU_MARKER")
+    assert sp.index("GODOT_MENU_MARKER") < sp.index("# Output format")
+    assert "GODOT_MENU_MARKER" not in P.compose("godot")
+
+
+def test_engine_key_maps_godot():
+    assert P._engine_key("godot") == "godot"
+    assert P._engine_key("GODOT") == "godot"
+    # Rendered godot rules resolve the boolean to JSON `false`, not Python `False`.
+    rules = P.section_text(P.RULES, "godot")
+    assert "false" in rules and "{false}" not in rules
+
+
+def test_godot_bank_menu_reuses_the_js_renderer():
+    # "spec body NAMES drive sprite skinning exactly like js" — so the godot menu
+    # is byte-identical to the js menu (same naming-rule usage line + preset lines).
+    names = ["wrecking_ball"]
+    assert R.build_menu(names, "godot") == R.build_menu(names, "js")
+    assert R.build_menu(names, "godot") != R.build_menu(names, "py")

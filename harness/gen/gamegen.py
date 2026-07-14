@@ -137,11 +137,21 @@ _SYSTEM_PROMPT = prompts.compose("py")
 
 def _engine_lang(engine):
     """(language name, code-fence) for a given engine."""
-    return ("JavaScript", "javascript") if engine == "js" else ("Python", "python")
+    if engine == "js":
+        return ("JavaScript", "javascript")
+    if engine == "godot":
+        # The godot artifact is a declarative JSON spec, not code.
+        return ("JSON", "json")
+    return ("Python", "python")
+
+
+# The godot lane's per-run system prompt (menu-free shim, byte-identical to
+# compose("godot")); parallels _SYSTEM_PROMPT / SYSTEM_PROMPT_JS.
+_SYSTEM_PROMPT_GODOT = prompts.compose("godot")
 
 
 def _system_prompt(engine, menu_text=None):
-    """The open system prompt for the target language (py default).
+    """The open system prompt for the target engine (py default).
 
     With ``menu_text`` (a retrieved Tier-1b parts menu) the prompt is composed
     fresh so the menu is spliced in; without it the pre-composed, menu-free shim
@@ -149,18 +159,29 @@ def _system_prompt(engine, menu_text=None):
     """
     if menu_text:
         return prompts.compose(engine, menu_text)
-    return SYSTEM_PROMPT_JS if engine == "js" else _SYSTEM_PROMPT
+    if engine == "js":
+        return SYSTEM_PROMPT_JS
+    if engine == "godot":
+        return _SYSTEM_PROMPT_GODOT
+    return _SYSTEM_PROMPT
 
 
 def _game_ext(engine):
-    return ".js" if engine == "js" else ".py"
+    if engine == "js":
+        return ".js"
+    if engine == "godot":
+        # The .spec.json extension is what detect_engine routes to the godot lane.
+        return ".spec.json"
+    return ".py"
 
 
 def _first_user_msg(prompt, engine="py"):
     _, fence = _engine_lang(engine)
+    # The godot artifact is one JSON object (the spec), not a code module.
+    artifact = "spec (one JSON object)" if engine == "godot" else "module"
     return (f'User prompt: "{prompt}"\n'
             "Design an original 2D physics game for this prompt. Return the "
-            f"DESIGN block, then exactly one ```{fence} module that follows the "
+            f"DESIGN block, then exactly one ```{fence} {artifact} that follows the "
             "required format and every hard constraint.")
 
 
@@ -423,8 +444,28 @@ def _openrouter_complete(system, messages):
         raise _BackendUnavailable(_openrouter_error(resp, key))
 
 
+def _extract_spec(text):
+    """The godot spec JSON object from a model reply: first ``{`` .. last ``}``.
+
+    The godot artifact is DATA, so we do not look for a code fence — we take the
+    outermost brace slice, tolerating a DESIGN block before it, a ```json fence
+    around it, keep-alive padding, or trailing prose after it (the same padding
+    tolerance _openrouter_json applies to a raw body). Verification does the JSON
+    parsing; this only isolates the object. Falls back to the whole text when no
+    brace pair is present."""
+    if not isinstance(text, str):
+        return text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < 0 or end < start:
+        return text
+    return text[start:end + 1]
+
+
 def _extract_code(text, engine="py"):
     """First fenced code block for the engine (fallback: any fenced block, raw text)."""
+    if engine == "godot":
+        return _extract_spec(text)
     if engine == "js":
         for lang in ("javascript", "js"):
             m = re.search(rf"```{lang}\s*\n(.*?)```", text, re.DOTALL)
@@ -554,7 +595,12 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
 
 def _run_template(prompt, run_dir, max_repairs, note, engine="py"):
     name = _select_template(prompt)
-    if engine == "js":
+    if engine == "godot":
+        # One certified spec fixture (mirrors the js single-template shape); the
+        # per-prompt keyword selection has no godot variants yet.
+        code = _TEMPLATE_GAMES_GODOT.get(name, _TRAVERSE_GODOT)
+        design = _DESIGNS_GODOT.get(name, _DESIGNS_GODOT["traverse"])
+    elif engine == "js":
         code = _TEMPLATE_GAMES_JS.get(name, _DRIFT_JS)
         design = _DESIGNS_JS.get(name, _DESIGNS_JS["drift"])
     else:
@@ -664,10 +710,17 @@ def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None,
 
 
 def _resolve_engine(engine):
-    """Target language: explicit arg > HARNESS_ENGINE env > 'py' default."""
+    """Target engine: explicit arg > HARNESS_ENGINE env > 'py' default.
+
+    'js' (Planck), 'godot' (declarative spec) or 'py' (pymunk, the default)."""
     if engine is None:
         engine = os.environ.get("HARNESS_ENGINE", "py")
-    return "js" if str(engine).lower() == "js" else "py"
+    e = str(engine).lower()
+    if e == "js":
+        return "js"
+    if e == "godot":
+        return "godot"
+    return "py"
 
 
 def _finalize_game(run_dir, slug, result, ext=".py"):
@@ -699,6 +752,9 @@ def _model_used(backend):
 _PART_PY_RE = re.compile(
     r"""world\.part\(\s*["'][^"']*["']\s*,\s*["']([A-Za-z0-9_]+)["']""")
 _ADD_JS_RE = re.compile(r"""world\.add\(\s*["']([A-Za-z0-9_.]+)["']""")
+# godot: the spec's body NAMES carry the part identity (skinned by name, like js);
+# only bodies use a "name" key, so this reliably enumerates the declared entities.
+_NAME_GODOT_RE = re.compile(r'"name"\s*:\s*"([A-Za-z0-9_.]+)"')
 
 
 def _bank_names():
@@ -717,8 +773,13 @@ def _parse_parts_used(source, engine, bank_names):
     """
     if not source:
         return []
-    if str(engine).lower() == "js":
+    eng = str(engine).lower()
+    if eng == "js":
         candidates = _ADD_JS_RE.findall(source)
+        want = bank_names
+    elif eng == "godot":
+        # Spec body names matched against the bank (skinning parity with js).
+        candidates = _NAME_GODOT_RE.findall(source)
         want = bank_names
     else:
         candidates = _PART_PY_RE.findall(source)
@@ -1070,3 +1131,72 @@ function checkpoints(world) {
 _TEMPLATE_GAMES_JS = {"drift": _DRIFT_JS}
 
 _DESIGNS_JS = {"drift": _DESIGNS["drift"]}
+
+
+# --- Built-in v2 game, Godot variant (declarative JSON spec) ------------------
+# The godot lane's artifact is DATA (godotworld/SPEC.md), so the offline fixture
+# is a spec string rather than code. This is the certified `traverse` example
+# verbatim (a grounded-gated climb across three quarry shelves) — a known-good
+# spec so the template backend and the prompt->spec->verify round-trip have a
+# real, passing artifact. Do NOT grow this into a genre library.
+_TRAVERSE_GODOT = '''{
+  "engine": "godot",
+  "spec_version": 1,
+  "meta": {
+    "title": "Quarry Shelves",
+    "prompt": "Climb the three quarry shelves - hop over the spike strips between them and reach the beacon on the top shelf.",
+    "world_size": [1400, 700],
+    "actions": ["run_left", "run_right", "hop"]
+  },
+  "bodies": [
+    {"name": "ground", "shape": "box", "pos": [700, 25], "size": [1400, 50], "static": true, "friction": 0.8},
+    {"name": "ledge", "shape": "box", "pos": [430, 105], "size": [260, 30], "static": true, "friction": 0.8},
+    {"name": "ledge_2", "shape": "box", "pos": [800, 185], "size": [260, 30], "static": true, "friction": 0.8},
+    {"name": "ledge_3", "shape": "box", "pos": [1170, 265], "size": [260, 30], "static": true, "friction": 0.8},
+    {"name": "wall", "shape": "box", "pos": [10, 350], "size": [20, 700], "static": true, "friction": 0.2},
+    {"name": "wall_2", "shape": "box", "pos": [1390, 350], "size": [20, 700], "static": true, "friction": 0.2},
+    {"name": "spike", "shape": "box", "pos": [615, 60], "size": [90, 24], "static": true, "sensor": true},
+    {"name": "spike_2", "shape": "box", "pos": [985, 60], "size": [90, 24], "static": true, "sensor": true},
+    {"name": "tree", "shape": "box", "pos": [180, 115], "size": [70, 130], "static": true, "sensor": true},
+    {"name": "bush", "shape": "box", "pos": [1310, 72], "size": [60, 45], "static": true, "sensor": true},
+    {"name": "goal_zone", "shape": "box", "pos": [1200, 335], "size": [130, 110], "static": true, "sensor": true},
+    {"name": "marble", "shape": "circle", "pos": [80, 66], "radius": 16, "mass": 1.0, "friction": 0.6, "elasticity": 0.05, "control": true}
+  ],
+  "act": {
+    "run_right": [{"verb": "impulse", "body": "marble", "vec": [70, 0]}],
+    "run_left": [{"verb": "impulse", "body": "marble", "vec": [-70, 0]}],
+    "hop": [{"verb": "impulse", "body": "marble", "vec": [0, 430], "when": "grounded(\\"marble\\")"}]
+  },
+  "on_step": [
+    {"kind": "velocity_clamp", "body": "marble", "vx_max": 250, "vy_min": -900, "vy_max": 520}
+  ],
+  "predicates": {
+    "success": "contacts(\\"marble\\", \\"goal_zone\\")",
+    "failure": "contacts(\\"marble\\", \\"spike\\") or contacts(\\"marble\\", \\"spike_2\\")",
+    "checkpoints": {
+      "on_first_shelf": "pos_y(\\"marble\\") > 130 and pos_x(\\"marble\\") > 290",
+      "past_spikes": "pos_x(\\"marble\\") > 680",
+      "on_mid_shelf": "pos_y(\\"marble\\") > 210 and pos_x(\\"marble\\") > 660",
+      "on_top_shelf": "pos_y(\\"marble\\") > 290 and pos_x(\\"marble\\") > 1030",
+      "at_beacon": "contacts(\\"marble\\", \\"goal_zone\\")"
+    }
+  }
+}
+'''
+
+_TEMPLATE_GAMES_GODOT = {"traverse": _TRAVERSE_GODOT}
+
+_DESIGNS_GODOT = {
+    "traverse": ("DESIGN\n"
+                 "Theme: a marble climbing three quarry shelves to a beacon.\n"
+                 "Entities: one controlled marble, three static ledges, two spike "
+                 "sensors, perimeter walls, decor (tree/bush), a goal sensor.\n"
+                 "Mechanic twist: grounded-gated hops - the marble may only jump "
+                 "when it is resting on a surface.\n"
+                 "Actions: run_left/run_right impulse the marble sideways; hop "
+                 "kicks it upward, gated on grounded.\n"
+                 "Milestones: on_first_shelf -> past_spikes -> on_mid_shelf -> "
+                 "on_top_shelf -> at_beacon.\n"
+                 "Win / Lose: win when the marble reaches the beacon zone; lose if "
+                 "it touches either spike strip.\n"),
+}
