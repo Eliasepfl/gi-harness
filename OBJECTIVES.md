@@ -84,6 +84,25 @@ probes, not just reach the goal. New oracle family (working name G4):
 - Games surviving N adversarial episodes get a "bulletproof" grade in the
   report; failures feed the repair loop like any other layer.
 
+DELEGATION ARCHITECTURE (Elias's idea, 13 juil. late — adopted with refinement):
+run cheap/free models IN PARALLEL as attackers on the CERTIFIED game code
+written by the smarter model. Three tiers by cost:
+- **Tier 0 — mechanical fuzzing, NO LLM**: seeded action fuzz at native speed
+  (thousands of episodes/sec). LLMs would be wasted here; this tier is free.
+- **Tier 1 — cheap-LLM attack proposers (the idea's sweet spot)**: multiple
+  free/cheap models in parallel lanes (hy3, qwen-coder, llama... — separate
+  rate limits = free parallelism), each reads the certified game source +
+  report and proposes K attacks. CRITICAL DESIGN RULE: attackers output PURE
+  DATA (JSON action sequences / parameterized strategies), never code — zero
+  sandbox risk, and validation is mechanical replay (did success trigger under
+  avoidance? NaN? escape? faster-than-witness shortcut?). Attack proposal is
+  much easier than game design, so weak models suffice — the verifier is the
+  referee, wrong attacks cost nothing (generator-verifier asymmetry).
+- **Tier 2 — smart-model attacks**: reserved for games surviving tiers 0-1;
+  "bulletproof" grade requires surviving all three.
+Economics: ~1 cheap call per attacker per game + millisecond replays; findings
+are repair material AND robustness evidence (training-signal for GI's framing).
+
 ## Explorations open
 
 - **PARTS BANK — research DONE (13 juil. soir), synthesis in `notes/PARTS_BANK.md`**
