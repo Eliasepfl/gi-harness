@@ -158,9 +158,10 @@
       "required": ["verb", "body"],
       "additionalProperties": false,
       "properties": {
-        "verb": {"enum": ["impulse", "force", "set_velocity"]},
+        "verb": {"enum": ["impulse", "force", "set_velocity", "torque", "thrust"]},
         "body": {"type": "string"},
-        "vec": {"$ref": "#/definitions/vec2"},
+        "vec": {"$ref": "#/definitions/vec2", "description": "impulse/force/set_velocity: the [x, y] vector"},
+        "magnitude": {"type": "number", "description": "torque/thrust: signed scalar. torque -> apply_torque_impulse(magnitude); thrust -> impulse of (magnitude, 0) rotated by the body's current heading"},
         "when": {"$ref": "#/definitions/predicate", "description": "optional gate; the verb applies only when this predicate is true"}
       }
     },

@@ -51,9 +51,10 @@ Naming carries meaning: the renderer skins a body by its NAME (a body named `tre
 `"act": { "<action_name>": [ verb_call, ... ] }`. Each `verb_call`:
 
 ```jsonc
-{ "verb": "impulse" | "force" | "set_velocity",
+{ "verb": "impulse" | "force" | "set_velocity" | "torque" | "thrust",
   "body": "<name>",
-  "vec":  [x, y],
+  "vec":  [x, y],         // impulse / force / set_velocity
+  "magnitude": <number>,  // torque / thrust (signed scalar)
   "when": "<predicate>"   // optional gate, e.g. a grounded-gated jump
 }
 ```
@@ -61,6 +62,8 @@ Naming carries meaning: the renderer skins a body by its NAME (a body named `tre
 - `impulse` -> instantaneous kick, once per decision tick.
 - `set_velocity` -> sets linear velocity, once per decision tick.
 - `force` -> re-applied on each of the 6 sub-steps, so it reads as a sustained push over the tick.
+- `torque` (`magnitude`) -> `apply_torque_impulse` — a signed angular kick (+ spins CCW, − CW); steer a heading-controlled body.
+- `thrust` (`magnitude`) -> impulse of `(magnitude, 0)` rotated by the body's CURRENT heading; drive a car/ship/drill the way it points (pair with `torque`).
 - `when` gates the verb: it applies only when its predicate is true at act-time (contacts/grounded read the previous tick's last step).
 
 Every declared action MUST bind to a verb with a real effect - an empty or missing binding is a dead action and fails the agency check.
@@ -92,6 +95,7 @@ A `velocity_clamp` on the controlled body is the two-field way to satisfy the SP
 | `angle(b)` | rotation (radians) |
 | `grounded(b)` | supported from below (a non-sensor contact under the body) |
 | `contacts(a, b)` | `a` and `b` are touching / overlapping |
+| `contained(a, b)` | `a`'s AABB is FULLY inside `b`'s AABB (full containment, not overlap; `b` is usually a `sensor` zone) - the parking primitive |
 | `dist(a, b)` | distance between the two bodies' centers |
 | `flag(k)` | value of flag `k` (0 / false if unset) |
 

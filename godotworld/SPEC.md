@@ -79,19 +79,34 @@ flag in a predicate.
 `"act": { "<action_name>": [ verb_call, ... ] }`. Each `verb_call`:
 
 ```jsonc
-{ "verb": "impulse" | "force" | "set_velocity",
+{ "verb": "impulse" | "force" | "set_velocity" | "torque" | "thrust",
   "body": "<name>",
-  "vec":  [x, y],
+  "vec":  [x, y],         // impulse / force / set_velocity
+  "magnitude": <number>,  // torque / thrust (signed scalar)
   "when": "<predicate>"   // optional gate (e.g. grounded-gated jump)
 }
 ```
 
-- `impulse` → `apply_central_impulse` (instantaneous kick, once per decision tick).
-- `set_velocity` → sets `linear_velocity` (once per decision tick).
-- `force` → `apply_central_force`, **re-applied on each of the K=6 sub-steps** so it
-  reads as a sustained push over the tick (engineering choice; documented).
+| verb | param | effect |
+|---|---|---|
+| `impulse` | `vec` | `apply_central_impulse` — instantaneous kick, once per decision tick. |
+| `set_velocity` | `vec` | sets `linear_velocity`, once per decision tick. |
+| `force` | `vec` | `apply_central_force`, **re-applied on each of the K=6 sub-steps** so it reads as a sustained push over the tick (engineering choice; documented). |
+| `torque` | `magnitude` | `apply_torque_impulse(magnitude)` — a signed angular kick (`+` spins CCW, `−` CW), once per decision tick. Heading control for cars/ships/drills. |
+| `thrust` | `magnitude` | `apply_central_impulse` of `(magnitude, 0)` **rotated by the body's CURRENT `rotation`** — pushes the body along the way it points, so `torque`+`thrust` steer-and-drive a heading-controlled body. |
+
 - `when` gates the verb: it applies only when the predicate is true at act-time
   (contacts/grounded read the state from the *previous* tick's last step).
+
+Worked example — a heading-controlled drive (steer with `torque`, drive with `thrust`):
+
+```jsonc
+"act": {
+  "spin_left":  [{"verb": "torque",  "body": "car", "magnitude":  180}],
+  "spin_right": [{"verb": "torque",  "body": "car", "magnitude": -180}],
+  "drive":      [{"verb": "thrust",  "body": "car", "magnitude":  90}]
+}
+```
 
 An action absent from `act`, or bound to `[]`, is a no-op — it will fail G1's
 dead-action efficacy check, so bind every declared action to something with an effect.
@@ -169,8 +184,24 @@ reach the interpreter).
 | `angle(b)` | rotation (radians) |
 | `grounded(b)` | true if supported from below (a non-sensor contact under the body) |
 | `contacts(a, b)` | true if `a` and `b` are touching / overlapping |
+| `contained(a, b)` | true iff body `a`'s AABB is **fully inside** body `b`'s AABB (see below) |
 | `dist(a, b)` | distance between the two bodies' centers |
 | `flag(k)` | value of flag `k` (0 / false if unset) |
+
+`contained(a, b)` **AABB semantics.** Both bodies are reduced to the same
+axis-aligned bounding box the G0 init check uses (`_bbox`): a circle → `center ± r`;
+a box/poly/segment → the extents of its **rotated** local vertices. Writing
+`a=[aL,aB,aR,aT]` and `b=[bL,bB,bR,bT]` (left/bottom/right/top, y UP), containment is
+
+```
+aL >= bL  and  aB >= bB  and  aR <= bR  and  aT <= bT
+```
+
+i.e. every side of `a` lies within `b` — full containment, **not** the mere overlap
+`contacts` reports. `b` is typically a `sensor` zone. Because a **rotated** box has a
+larger AABB, a body spun by `torque` is harder to keep contained (the AABB is a
+conservative over-approximation of the true shape). A removed or missing body is never
+contained. This is the 2D-parking primitive: "the car is fully inside the slot".
 
 **Variable:** `steps` (physics steps elapsed this episode).
 

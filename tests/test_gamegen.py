@@ -19,6 +19,17 @@ import pytest
 from harness.gen import gamegen as GG
 
 
+# GODOT_ONLY pivot: _resolve_engine now defaults to godot (was py). This module is
+# the FROZEN py-lane (pymunk) contract suite, so pin HARNESS_ENGINE=py for every
+# test that does not select an engine explicitly — the py lane must keep working
+# when requested. The few tests that exercise the godot default (or drive the
+# resolver directly) override this with their own monkeypatch.delenv/setenv, which
+# wins because it runs inside the test body, after this setup.
+@pytest.fixture(autouse=True)
+def _pin_legacy_py_engine(monkeypatch):
+    monkeypatch.setenv("HARNESS_ENGINE", "py")
+
+
 # --- Helpers ------------------------------------------------------------------
 
 def _no_import(source):
@@ -1301,6 +1312,21 @@ def test_engine_helpers_route_godot():
     assert GG._engine_lang("godot") == ("JSON", "json")
 
 
+def test_default_engine_is_godot(monkeypatch):
+    # The godot-only pivot: no explicit engine + no env -> godot (was py). py/js
+    # stay fully selectable, both explicitly and via HARNESS_ENGINE.
+    monkeypatch.delenv("HARNESS_ENGINE", raising=False)
+    assert GG._resolve_engine(None) == "godot"
+    # ...and the default therefore writes a .spec.json artifact.
+    assert GG._game_ext(GG._resolve_engine(None)) == ".spec.json"
+    monkeypatch.setenv("HARNESS_ENGINE", "py")
+    assert GG._resolve_engine(None) == "py"
+    monkeypatch.setenv("HARNESS_ENGINE", "js")
+    assert GG._resolve_engine(None) == "js"
+    # An explicit arg always beats the env.
+    assert GG._resolve_engine("godot") == "godot"
+
+
 def test_system_prompt_godot_is_compose():
     from harness.gen import prompts as P
     assert GG._system_prompt("godot") == P.compose("godot")
@@ -1365,3 +1391,18 @@ def test_generate_game_godot_template_roundtrip(tmp_path):
     # The certified report carries the engine + a witness the funnel found.
     final = res["attempts"][-1]["report"]
     assert final["engine"] == "godot" and final["passed"]
+
+
+@requires_godot
+def test_game_new_default_engine_writes_spec_json(tmp_path, monkeypatch):
+    """The pivot, end to end: `game new` with NO engine selected (and no env)
+    resolves to godot and promotes a real, re-verifiable .spec.json."""
+    monkeypatch.delenv("HARNESS_ENGINE", raising=False)
+    res = GG.generate_game("guide the puck onto the glowing pad",
+                           out_dir=str(tmp_path), backend="template",
+                           engine=None, max_repairs=1, use_bank=False)
+    assert res["engine"] == "godot"
+    path = res["game_path"]
+    assert path and path.endswith(".spec.json")
+    from harness.verify.gameverify import detect_engine
+    assert detect_engine(path) == "godot"
