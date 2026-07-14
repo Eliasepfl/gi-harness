@@ -426,7 +426,13 @@ def test_bulletproof_requires_clean_tier1(monkeypatch):
 # ====================================================================== #
 # attack_game — verify-then-attack wiring + certification gate
 # ====================================================================== #
-def test_attack_game_end_to_end(tmp_path):
+def test_attack_game_end_to_end(tmp_path, monkeypatch):
+    # GAME_VALID is a legacy-scale fast-win fixture; pin the v2.2 G3 thresholds
+    # (like test_gameverify.legacy_thresholds) so certification passes and this
+    # test exercises the G4 wiring, not the v2.3 duration bar.
+    from harness.verify import gameverify as gv
+    monkeypatch.setattr(gv, "TRIVIAL_TICKS", 5)
+    monkeypatch.setattr(gv, "PROBE_HORIZON", 120)
     path = _write(tmp_path, "valid.py", GAME_VALID)
     out = g4.attack_game(path, tiers=(0,), sandboxed=False, world_factory=factory(),
                          **SMALL)
