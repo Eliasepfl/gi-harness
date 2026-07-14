@@ -149,6 +149,33 @@ def _select_leaves(tree, rng, n, horizon, deaths) -> list:
     return picks
 
 
+def _select_leaves_inverted(tree, rng, n, horizon, deaths) -> list:
+    """INVERTED-OBJECTIVE frontier selector — a fork of :func:`_select_leaves` that
+    steers AWAY from progress instead of toward it (design: stale-state tier-1,
+    ``notes/engines/GODOT_RL_AGENTS_CAPABILITIES.md`` §4 attacker-ladder step 1).
+
+    Where the G3 solver hammers the milestone BOUNDARY, this one hammers the
+    stalest region: the leaf that has latched the FEWEST milestones, stalled the
+    MOST (unproductive restart deaths ~= cycling), and sits DEEPEST (the most
+    action committed with the least to show for it). Used to fuzz a game toward
+    the dead-end pockets the softlock oracle then refutes — a mirror image of the
+    ``deaths``-avoiding, milestone-greedy best-leaf priority, same signature so it
+    drops into :func:`_tree_search` via the ``select`` seam."""
+    frontier = [nd for nd in tree.frontier() if _macro_ticks(nd.prefix) < horizon]
+    if not frontier:
+        return []
+    stalest = min(frontier,
+                  key=lambda nd: (nd.n_latched(), -deaths.get(nd.prefix, 0),
+                                  -_macro_ticks(nd.prefix), nd.visits, nd.prefix))
+    picks: list = []
+    while len(picks) < n:
+        if rng.random() < EPSILON:
+            picks.append(rng.choice(frontier))             # explore: uniform leaf
+        else:
+            picks.append(stalest)                          # exploit: the stalest leaf
+    return picks
+
+
 # ======================================================================== #
 # Rollout insertion (Go-Explore "explore from the returned cell")
 # ======================================================================== #
@@ -193,12 +220,21 @@ def _insert_rollout(tree, leaf, tail_macros, full_flat, base_ticks, ep) -> None:
 # ======================================================================== #
 # The search
 # ======================================================================== #
-def _tree_search(executor, game_source, actions, horizon):
+def _tree_search(executor, game_source, actions, horizon, *, select=None,
+                 budget=None):
     """Drive the state tree with ``executor`` until success or budget exhaustion.
 
     Returns ``(witness | None, episodes, replays, tree)`` where ``episodes`` is
     every rollout episode's dict (for the progress diagnosis) and ``witness`` is
-    ``gameverify``'s witness dict for the first success (in batch order)."""
+    ``gameverify``'s witness dict for the first success (in batch order).
+
+    ``select`` is the frontier leaf selector (default the milestone-greedy
+    :func:`_select_leaves`; the stale-state tier passes
+    :func:`_select_leaves_inverted`). ``budget`` caps total simulated ticks
+    (default :data:`TICK_BUDGET`) — the softlock oracle rides this seam to run the
+    SAME solver on continuations of a suspect prefix under its own budget."""
+    select = select or _select_leaves
+    budget = TICK_BUDGET if budget is None else budget
     tree = StateTree(_macro_names(actions), world_seed=gv.WORLD_SEED, eps=0.0)
     rng = random.Random(SOLVER_SEED)
 
@@ -214,8 +250,8 @@ def _tree_search(executor, game_source, actions, horizon):
     real_ticks = 0
     batch_n = BATCH_SIZE if executor.batched else 1
 
-    while witness is None and real_ticks < TICK_BUDGET:
-        leaves = _select_leaves(tree, rng, batch_n, horizon, deaths)
+    while witness is None and real_ticks < budget:
+        leaves = select(tree, rng, batch_n, horizon, deaths)
         if not leaves:
             break                                          # frontier saturated
         plans = []                                         # (leaf, tail_macros, full_flat, base_ticks)

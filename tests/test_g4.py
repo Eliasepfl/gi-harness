@@ -508,6 +508,242 @@ def test_attack_game_routes_and_hardens_a_godot_spec():
     # ACTIONS were recovered from the G1 efficacy report (the js/godot path).
     assert out["actions"] == ["run_left", "run_right", "hop"]
     assert out["tier0"]["episodes"] > 0
+# ====================================================================== #
+# STALE-STATE TIER — softlock triggers (1a/1b) + tree-refutation oracle (1c)
+# ====================================================================== #
+# Genuine softlock: a momentum pit. "run" builds speed (which DECAYS each step),
+# and only a running leap (two consecutive runs, then leap at the lip) clears the
+# gap. A slow/idle approach steps into the gap (pos 3-5) and is trapped forever —
+# the body then churns in a period-2 cycle and the goal (pos>=12) stays unreached.
+# The decay makes it avoidance-safe: sparse/idle play can never build the speed to
+# cross, so the ONLY hard finding is the certified softlock.
+SOFTLOCK = '''
+TITLE = "Pit"
+PROMPT = "build speed and leap the gap; a slow step falls in"
+ACTIONS = ["run", "leap"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(400, 10), size=(800, 20), static=True)
+    world.add("player", shape="box", pos=(60, 300), size=(20, 20))
+    world.control("player")
+
+def act(world, action):
+    dt = world.flag("dt", 0) + 1
+    world.set_flag("dt", dt)
+    if world.flag("trapped", 0):
+        world.teleport("player", (140 if dt % 2 else 120, 340))
+        world.set_velocity("player", (0, 0))
+        return
+    pos = world.flag("pos", 0)
+    speed = world.flag("speed", 0)
+    if action == "run":
+        pos += 1
+        speed += 10
+    elif action == "leap":
+        if pos == 2 and speed >= 8:
+            pos = 6                 # a running leap clears the gap (pos 3-5)
+            speed = 0
+        else:
+            pos += 1                # a slow leap just steps forward (into the gap)
+    world.set_flag("pos", pos)
+    world.set_flag("speed", speed)
+    if pos in (3, 4, 5):            # anywhere in the gap -> fall in, no way out
+        world.set_flag("trapped", 1)
+    world.teleport("player", (60 + pos * 30, 300))
+    world.set_velocity("player", (0, 0))
+
+def on_step(world):
+    world.set_flag("speed", max(0, world.flag("speed", 0) - 1))   # momentum decays
+
+def success(world):
+    return world.flag("pos", 0) >= 12
+
+def checkpoints(world):
+    return {"lip": world.flag("pos", 0) >= 2,
+            "crossed": world.flag("pos", 0) >= 6}
+'''
+
+# Healthy control: a climb with the SAME decay-and-cycle shape but NO dead end.
+# "push" adds height, which slides back each step ("coast"), so only sustained
+# pushing reaches the top (pos>=48) — yet from ANY state a run of pushes still
+# wins. Alternating push/coast makes a period-2 cycle (the 1a trigger fires), but
+# the oracle always finds a winning continuation -> refuted, never a softlock.
+CONTROL = '''
+TITLE = "Climb"
+PROMPT = "keep pushing to the top; coasting slides back"
+ACTIONS = ["push", "coast"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(400, 10), size=(800, 20), static=True)
+    world.add("player", shape="box", pos=(60, 300), size=(20, 20))
+    world.control("player")
+
+def act(world, action):
+    if action == "push":
+        world.set_flag("pos", world.flag("pos", 0) + 12)
+
+def on_step(world):
+    pos = max(0, world.flag("pos", 0) - 1)
+    world.set_flag("pos", pos)
+    world.teleport("player", (60 + pos, 300))
+    world.set_velocity("player", (0, 0))
+
+def success(world):
+    return world.flag("pos", 0) >= 48
+
+def checkpoints(world):
+    return {"halfway": world.flag("pos", 0) >= 24}
+'''
+
+# Small, fast stale-tier sizing for the tests (bounded oracle + candidate search).
+STALE = dict(stale_H=30, stale_budget=2500, stale_cand_budget=1500, top_m=6)
+
+
+def _frame(tick, x, y=300.0):
+    return {"tick": tick,
+            "entities": {"player": {"pos": [float(x), float(y)],
+                                    "vel": [0.0, 0.0], "angle": 0.0}}}
+
+
+# -- Triggers (1a / 1b) — pure-function unit tests, no physics ------------- #
+def test_trigger_1a_fires_on_a_state_cycle():
+    # Last latch at tick 2, then a period-2 oscillation over the no-progress tail.
+    frames = [_frame(0, 60), _frame(1, 100), _frame(2, 140)]
+    frames += [_frame(t, 120 if t % 2 == 0 else 140, 340) for t in range(3, 40)]
+    fired, info = g4.trigger_state_cycling(frames, {"lip": 2}, 39)
+    assert fired is True
+    assert info["no_recent_latch"] and info["cycle"]
+    assert info["cycle_start"] >= 2 and info["cycle_period"] == 2
+
+
+def test_trigger_1a_silent_while_progressing():
+    # A checkpoint latched near the end -> still progressing -> not stale.
+    frames = [_frame(t, 60 + t) for t in range(40)]
+    fired, info = g4.trigger_state_cycling(frames, {"lip": 38}, 39)
+    assert fired is False and info["no_recent_latch"] is False
+
+
+def test_trigger_1a_silent_on_monotone_drift():
+    # Travels forever without repeating a state -> no cycle, no trigger.
+    frames = [_frame(t, 60 + 5 * t) for t in range(40)]
+    fired, info = g4.trigger_state_cycling(frames, {"lip": None}, 39)
+    assert info["no_recent_latch"] is True
+    assert fired is False and info["cycle"] is False
+
+
+def test_trigger_1b_missing_entity_or_escape():
+    gone, info = g4.trigger_entity_unreachable(
+        {"final_snapshot": {"player": {}}, "oob": []}, {"player": {}, "key": {}})
+    assert gone is True and info["missing"] == ["key"]
+    esc, info2 = g4.trigger_entity_unreachable(
+        {"final_snapshot": {"player": {}, "key": {}}, "oob": ["ball"]},
+        {"player": {}, "key": {}})
+    assert esc is True and info2["escaped"] == ["ball"]
+    ok, _ = g4.trigger_entity_unreachable(
+        {"final_snapshot": {"player": {}}, "oob": []}, {"player": {}})
+    assert ok is False
+
+
+# -- Oracle 1c — bounded tree-refutation --------------------------------- #
+def test_oracle_certifies_softlock_and_refutes_control():
+    ex = PyExecutor(world_factory=factory())
+    soft = g4.refute_prefix(ex, SOFTLOCK, ["run", "leap"],
+                            ["run", "run", "run", "run"], H=30, budget=2500)
+    assert soft["certified"] is True and soft["witness"] is None
+    assert soft["subtree_status"] in ("saturated", "budget_exhausted",
+                                      "terminal_stuck", "exhausted")
+    # A continuation of a benign control prefix WINS -> refuted, not a softlock.
+    ctrl = g4.refute_prefix(ex, CONTROL, ["push", "coast"], ["coast", "coast"],
+                            H=30, budget=2500)
+    assert ctrl["certified"] is False and ctrl["witness"] is not None
+
+
+# -- Grading + registry wiring ------------------------------------------- #
+def test_softlock_is_a_hard_outcome_and_maps_to_repair():
+    assert "softlock" in g4._HARD_OUTCOMES
+    finding = {"outcome": "softlock", "family": "tree_refute", "hard": True,
+               "detail": "d", "evidence": {"result": "budget"},
+               "reproducer": {"engine": "py", "seed": 0, "action_plan":
+                              {"kind": "sequence", "sequence": ["run", "run"]}}}
+    rr = g4.to_repair_report(finding)
+    assert rr["passed"] is False and rr["failure_class"] == "G4_FINDING"
+    assert rr["outcome"] == "softlock" and rr["hint"]
+    assert rr["g4_reproducer"]["action_plan"]["sequence"] == ["run", "run"]
+
+
+def test_stale_seek_registered_but_not_attacker_emittable():
+    # Wired into the strategy registry, but hidden from the Tier-1 attacker menu
+    # (it names a search the harness drives, not a flat plan an attacker emits).
+    assert "stale_seek" in g4.STRATEGY_VOCAB
+    assert "stale_seek" in g4._ORACLE_STRATEGIES
+    assert "stale_seek" not in g4._vocab_text()
+    with pytest.raises(g4._InvalidPlan):
+        g4._expand("stale_seek", {}, ["run", "leap"], 5)
+
+
+# -- End to end through the g4 entry point ------------------------------- #
+def test_stale_tier_certifies_softlock_end_to_end():
+    out = g4.run_g4(SOFTLOCK, _report(["run", "run", "leap"] + ["run"] * 6, 9,
+                                      checkpoints={"lip": 2, "crossed": 3}),
+                    engine="py", world_factory=factory(), tiers=(0,),
+                    stale=True, **STALE, **SMALL)
+    assert out["grade"] == "open" and out["passed"] is False
+    soft = [f for f in out["findings"] if f["outcome"] == "softlock"]
+    assert soft, "the momentum pit must certify a softlock"
+    f = soft[0]
+    assert f["hard"] is True and f["tier"] == "stale" and f["family"] == "tree_refute"
+
+    ap = f["reproducer"]["action_plan"]
+    assert ap["kind"] == "sequence" and ap["sequence"] and all(a == "run"
+                                                               for a in ap["sequence"])
+    prov = f["reproducer"]["provenance"]
+    assert prov["oracle"] == "tree_refute" and prov["engine"] == "py"
+    assert prov["seed"] == 0 and prov["H"] == 30 and prov["budget"] == 2500
+    assert "subtree_status" in prov
+
+    assert out["stale"]["status"] == "run"
+    assert out["stale"]["triggered"] >= 1 and out["stale"]["certified"] >= 1
+    # The softlock is the ONLY thing that opened the game (no incidental hard find).
+    assert {hf["outcome"] for hf in out["hard_findings"]} == {"softlock"}
+
+    # The persisted reproducer genuinely re-certifies on a fresh executor.
+    recheck = g4.refute_prefix(PyExecutor(world_factory=factory()), SOFTLOCK,
+                               out["actions"], ap["sequence"], H=30, budget=2500)
+    assert recheck["certified"] is True
+
+
+def test_stale_tier_refutes_control_and_leaves_grade_unchanged():
+    args = dict(engine="py", world_factory=factory(), tiers=(0,), **SMALL)
+    rpt = _report(["push"] * 8, 8, checkpoints={"halfway": 4})
+    base = g4.run_g4(CONTROL, rpt, **args)
+    withstale = g4.run_g4(CONTROL, rpt, stale=True, **STALE, **args)
+    # The periodic control trips the trigger, but the oracle refutes every suspect.
+    assert withstale["stale"]["triggered"] >= 1
+    assert withstale["stale"]["certified"] == 0
+    assert not [f for f in withstale["findings"] if f["outcome"] == "softlock"]
+    # The stale tier changes nothing about the pre-existing grade.
+    assert base["grade"] != "open"
+    assert withstale["grade"] == base["grade"]
+
+
+def test_stale_tier_is_deterministic():
+    args = dict(engine="py", world_factory=factory(), tiers=(0,), stale=True,
+                **STALE, **SMALL)
+    rpt = _report(["run", "run", "leap"] + ["run"] * 6, 9,
+                  checkpoints={"lip": 2, "crossed": 3})
+    a = g4.run_g4(SOFTLOCK, rpt, **args)
+    b = g4.run_g4(SOFTLOCK, rpt, **args)
+    key = lambda o: json.dumps(o["stale"]["findings"], sort_keys=True, default=str)
+    assert key(a) == key(b)
+    assert a["stale"]["certified"] == b["stale"]["certified"]
+
+
+def test_stale_tier_absent_by_default():
+    out = g4.run_g4(SOFTLOCK, _report(["run", "run", "leap"] + ["run"] * 6, 9),
+                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
+    assert out["stale"]["status"] == "skipped_not_requested"
+    assert not [f for f in out["findings"] if f["outcome"] == "softlock"]
+    assert out["grade"] != "open"          # no certified softlock -> not opened
 
 
 if __name__ == "__main__":
