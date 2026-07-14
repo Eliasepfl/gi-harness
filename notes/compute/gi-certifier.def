@@ -38,6 +38,9 @@ From: ubuntu:22.04
     # (test_gamegen/test_generator import anthropic+httpx at top level; godot schema tests need
     # jsonschema; requests powers the G4 tier-1 LLM attacker lane; pygame for viewer tests).
     /opt/conda/envs/gi/bin/pip install --no-cache-dir anthropic httpx jsonschema requests pygame
+    # Library-first G3' trainer (GODOT_RL_AGENTS_CAPABILITIES.md §6.7): SB3 PPO behind our env
+    # seam. Pin the majors; gymnasium comes as its dependency. Do NOT install godot_rl itself.
+    /opt/conda/envs/gi/bin/pip install --no-cache-dir "stable-baselines3>=2.4,<3"
 
     # --- nodeworld runtime dep, baked at a repo-independent path (runner resolves via NODE_PATH) ---
     # %environment does NOT apply during %post: npm's `#!/usr/bin/env node` shebang needs the env on PATH here.
