@@ -33,7 +33,7 @@ def test_bank_loads_and_validates():
     bank = load_bank("v1", use_cache=False)
     assert isinstance(bank, Bank)
     assert bank.bank_version == "1.0.0"
-    assert len(bank.parts) == 30
+    assert len(bank.parts) == 60
     # Every declared category is populated.
     for cat in CATEGORIES:
         assert bank.by_category(cat), f"no parts in category {cat}"
@@ -51,7 +51,7 @@ def test_bank_loads_and_validates():
 def test_category_counts():
     bank = load_bank("v1", use_cache=False)
     counts = {c: len(bank.by_category(c)) for c in CATEGORIES}
-    assert counts == {"terrain": 8, "prop": 9, "hazard": 4, "mobile": 5, "trigger": 4}
+    assert counts == {"terrain": 15, "prop": 16, "hazard": 7, "mobile": 8, "trigger": 8}
 
 
 def test_unknown_part_raises():
@@ -268,5 +268,5 @@ def test_bank_ci_passes_on_v1():
     failed = [r for r in rows if not r["ok"]]
     assert not failed, "bank-CI failures: " + "; ".join(
         f"{r['name']}({', '.join(r['failed'])})" for r in failed)
-    assert len(rows) == 30
+    assert len(rows) == 60
     assert bank.hash_ok

@@ -8,16 +8,24 @@
     "pivot": "[px, py] fractional anchor (0.5,0.5 = center) for placement/rotation",
     "region": "the SubTexture 'name' in the atlas XML (kept for tools that address by name)",
     "null": "part has no suitable CC0 sprite in the fetched packs; see note",
-    "imagePath_warning": "do NOT use the atlas XML's imagePath attribute \u2014 it is a generic placeholder in this mirror; use atlas_png here."
+    "imagePath_warning": "do NOT use the atlas XML's imagePath attribute — it is a generic placeholder in this mirror; use atlas_png here."
   },
   "coverage": {
-    "total_parts": 28,
-    "mapped": 25,
-    "null": 3,
+    "total_parts": 57,
+    "mapped": 46,
+    "null": 11,
     "null_parts": [
       "ice_floor",
       "target_zone",
-      "pit_zone"
+      "pit_zone",
+      "rolling_log",
+      "heavy_anvil",
+      "ice_block",
+      "wedge_block",
+      "mine",
+      "swing_gate",
+      "button_plate",
+      "cloud_puff"
     ]
   },
   "parts": {
@@ -457,6 +465,395 @@
         0.5
       ],
       "note": "blank wooden sign (decor / prompt-theming)"
+    },
+    "mud_patch": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "dirtMid.png",
+      "rect": [
+        1690,
+        780,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "dirt-topped surface tile reused as a sticky mud patch"
+    },
+    "bounce_pad": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "spring.png",
+      "rect": [
+        1950,
+        1430,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "Kenney spring pad; the bounce is high restitution in physics, not the sprite"
+    },
+    "ramp45": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "grassHill_right.png",
+      "rect": [
+        1560,
+        650,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "45-degree grass slope (right-rising); mirror for left"
+    },
+    "pillar": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "stoneCenter.png",
+      "rect": [
+        1040,
+        780,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "solid stone interior block; tile vertically for a column"
+    },
+    "bridge": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "bridgeA.png",
+      "rect": [
+        2340,
+        0,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "wooden bridge plank tile; tile horizontally to span a gap"
+    },
+    "door_slab": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "doorClosed_mid.png",
+      "rect": [
+        2210,
+        1300,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "closed door panel; pair doorClosed_top.png [2210,1170,128,128] for the head"
+    },
+    "block_tall": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_wood.png",
+      "atlas_xml": "Spritesheet/spritesheet_wood.xml",
+      "region": "elementWood032.png",
+      "rect": [
+        500,
+        850,
+        70,
+        140
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "tall 70x140 wooden block for stacking towers"
+    },
+    "block_wide": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_wood.png",
+      "atlas_xml": "Spritesheet/spritesheet_wood.xml",
+      "region": "elementWood002.png",
+      "rect": [
+        500,
+        70,
+        140,
+        70
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "wide 140x70 wooden block / lintel"
+    },
+    "marble": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_metal.png",
+      "atlas_xml": "Spritesheet/spritesheet_metal.xml",
+      "region": "elementMetal001.png",
+      "rect": [
+        500,
+        640,
+        70,
+        70
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "metal ball (70px, circular) reused as a small marble"
+    },
+    "water_pool": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "water.png",
+      "rect": [
+        1820,
+        1690,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "water body tile; surface variants waterTop_high/low available"
+    },
+    "fire_pit": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "lava.png",
+      "rect": [
+        2210,
+        130,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "lava/flame tile for a fire pit; pair lavaTop_high.png [2210,0,128,128] for the top"
+    },
+    "roller": {
+      "pack": "kenney_physics-assets",
+      "atlas_png": "Spritesheet/spritesheet_stone.png",
+      "atlas_xml": "Spritesheet/spritesheet_stone.xml",
+      "region": "elementStone001.png",
+      "rect": [
+        570,
+        640,
+        70,
+        70
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "stone ball (70px, circular) reused as the spinning roller wheel"
+    },
+    "hammer": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "weight.png",
+      "rect": [
+        1820,
+        1300,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "demolition weight for the swinging hammer head; the arm + anchor are code-drawn"
+    },
+    "lever_switch": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "leverMid.png",
+      "rect": [
+        2080,
+        1560,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "lever handle; the switch itself is an invisible sensor"
+    },
+    "key_gem": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "keyYellow.png",
+      "rect": [
+        2470,
+        1170,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "collectible key; the pickup is an invisible sensor"
+    },
+    "star_target": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "star.png",
+      "rect": [
+        2470,
+        1040,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "collectible star; the target is an invisible sensor"
+    },
+    "bush": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "bush.png",
+      "rect": [
+        2210,
+        1690,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "leafy bush decoration (non-colliding)"
+    },
+    "sign_arrow": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "signRight.png",
+      "rect": [
+        1950,
+        1820,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "wooden arrow sign (non-colliding decor)"
+    },
+    "fence": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "fence.png",
+      "rect": [
+        2210,
+        780,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "wooden fence (non-colliding decor)"
+    },
+    "torch": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "torch1.png",
+      "rect": [
+        1950,
+        130,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "lit wall torch (non-colliding decor)"
+    },
+    "tree": {
+      "pack": "kenney_platformer-pack-redux",
+      "atlas_png": "Spritesheets/spritesheet_complete.png",
+      "atlas_xml": "Spritesheets/spritesheet_complete.xml",
+      "region": "plantPurple.png",
+      "rect": [
+        2080,
+        520,
+        128,
+        128
+      ],
+      "pivot": [
+        0.5,
+        0.5
+      ],
+      "note": "leafy plant used as a small tree (non-colliding decor)"
+    },
+    "rolling_log": {
+      "sprite": null,
+      "note": "no clean CC0 round-log sprite in the fetched packs; renders as a flat circle"
+    },
+    "heavy_anvil": {
+      "sprite": null,
+      "note": "no CC0 anvil sprite; renders as a flat box"
+    },
+    "ice_block": {
+      "sprite": null,
+      "note": "no CC0 ice-block sprite (as with ice_floor); renders as a flat box"
+    },
+    "wedge_block": {
+      "sprite": null,
+      "note": "no CC0 free triangular-wedge sprite; renders as a flat polygon"
+    },
+    "mine": {
+      "sprite": null,
+      "note": "no CC0 contact-mine sprite; renders as a flat amber sensor circle"
+    },
+    "swing_gate": {
+      "sprite": null,
+      "note": "hinged flap has no single sprite; renders as a flat box"
+    },
+    "button_plate": {
+      "sprite": null,
+      "note": "a bare sensor plate has no natural sprite; renderer draws an outline"
+    },
+    "cloud_puff": {
+      "sprite": null,
+      "note": "no cloud sprite in the 3 fetched packs; renders as a flat shape"
     }
   }
 }
