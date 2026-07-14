@@ -88,15 +88,41 @@ harness. `nodeworld/bench.py` benchmarks against the pymunk template games.
 **Not** part of the tracked base manifest (integrity ignores it). Frozen until
 the executor port lands.
 
+## v2.3 — quality bar: solidity, big worlds, duration (LANDED 14 juil., 9f510c2)
+
+Response to the day-2 quality directive (player passing through obstacles,
+cramped field, monotone objectives, 7-tick wins):
+
+| Change | Where |
+|---|---|
+| CCD bullets on all dynamic bodies; maxTranslation 1000→200 px/substep (measured: worst overlap 15.4→7.6px transient) | `nodeworld/world.js` |
+| `solidity` oracle: witness replayed with frames; sustained deep interpenetration (>50% of thinner body, ≥2 ticks) → ENV_ERROR + surgical hint | `gameverify` G3 |
+| `WORLD_SIZE` declarable up to 2400x1600 (G0 `world_size` check, both engines) + smoothed clamped `FollowCamera` at render | contract §2 / render.py |
+| Duration bar: PROBE_HORIZON 120→300, TRIVIAL_TICKS 5→20, GUIDED_EPISODES 20→30 | `gameverify` |
+| Prompts: 7 objective archetypes (traverse/collect/deliver/activate/escape/topple/survive), journey-scale design, solidity speed guidance, 4-6 spread milestones | `gen/prompts/` |
+| Decor sensors render faded (0.55) behind everything — scenery never reads as an obstacle | render.py |
+
+## G4 adversarial suite + state-action tree (LANDED 14 juil., built by Opus agents)
+
+- `harness/core/statetree.py` — Go-Explore-style shared tree: node = action
+  prefix, dedup guaranteed, no-effect edges never spawn children, K=8
+  consecutive no-effect → terminal_stuck, atomic edge claiming for async lanes,
+  versioned JSON persistence. 31 tests.
+- `harness/verify/g4.py` + CLI `game attack` — Tier 0 mechanical (avoidance
+  probes, single-action-win, breaker fuzz families, faster-than-witness
+  shortcut) + Tier 1 cheap-LLM attacker lane (OpenRouter, PURE-DATA attack
+  records, incomprehension/misconception/hit classification, full attacker
+  history). Grades: open / hardened / bulletproof. 25 tests.
+- Wiring the tree in as G3's solver (replacing pure random search) is the next
+  step — the tree API was built for that seam.
+
 ## What lands next
 
-- **Bank expansion 30 → ~60 parts** (decor, surface variants, machines,
-  interactive) — in flight; bank-CI certifies every addition, bank.lock moves.
-- **Sprite-skinned Planck showcase** — one clean generated game with bank
-  sprites, added to the day-1 page (pre-departure deliverable).
-- **G4 adversarial suite + shared state-action tree** — designs frozen on the
-  shelf (`notes/adversarial/G4_DESIGN.md`, `notes/adversarial/STATE_TREE.md`);
-  implementation explicitly deferred until Elias relaunches for an overnight run.
+- **State-tree-driven G3/G4 search** — replace random probing with the shared
+  tree (never explore a branch twice; restart from reached leaves).
+- **Template-backend games below the v2.3 bar** — upgrade the offline template
+  games to 60+ tick wins (backlog; tests pin legacy thresholds meanwhile).
+- **v2.3 showcase batch** — strong-model-authored diverse games (in flight).
 
 ---
 

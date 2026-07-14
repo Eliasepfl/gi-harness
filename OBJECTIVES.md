@@ -1,4 +1,17 @@
-# OBJECTIVES — living roadmap (updated 2026-07-13 evening)
+# OBJECTIVES — living roadmap (updated 2026-07-14)
+
+## Quality directive (14 juil., Elias — CURRENT FOCUS)
+
+The new demo's visual consistency was very poor: player passing through
+obstacles, cramped field, always the same objective/zone types, no prompt
+diversity, 7-tick wins. Directive: iterate to near-perfect; screenshot game
+states/renders for real feedback; validate the METHOD with a strong model
+(Sonnet/Opus) first if the volume model is the bottleneck; target longer,
+varied games useful to an RL framework — not rushed mini-games.
+
+Status: v2.3 landed (solidity oracle + CCD, WORLD_SIZE + camera, duration bar,
+archetype prompts — see VERSIONS.md); G4 + state tree landed; strong-model
+(Opus) authored showcase batch in flight with visual self-review loops.
 
 > Working doc so no context is lost between sessions. The strategy below was set by
 > Elias; the harness serves it. See CONTRACTS.md (normative interfaces) and
