@@ -593,6 +593,51 @@ def cmd_game_demo(args) -> int:
     return 0 if all_completed else 1
 
 
+# ---- game curriculum -------------------------------------------------------
+def cmd_game_curriculum(args) -> int:
+    """Run up to K curriculum rounds: verify(tree) -> G3' -> profile -> directive
+    -> (target? stop : regenerate the next version). Prints one record per round."""
+    try:
+        from harness.gen.curriculum import curriculum_round
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("curriculum", exc, args.json)
+
+    records = []
+    current = args.game_path
+    for _ in range(max(1, args.rounds)):
+        try:
+            rec = curriculum_round(current, backend=args.backend,
+                                   budget_steps=args.budget, out_dir=args.out_dir)
+        except Exception as exc:  # noqa: BLE001
+            return _call_error("game curriculum", exc, args.json)
+        records.append(rec)
+        action = rec.get("action_taken")
+        if action != "regenerated" or not rec.get("new_game_path"):
+            break                         # certified target, or nothing new to grade
+        current = rec["new_game_path"]
+
+    if args.json:
+        _emit_json({"rounds": records})
+        return 0
+
+    for i, rec in enumerate(records, start=1):
+        prof = rec.get("profile") or {}
+        rl = prof.get("rl") or {}
+        print(f"=== round {i} : {rec.get('game_path')} ===")
+        print(f"  grade        : {rec.get('grade')}   action: {rec.get('action_taken')}")
+        if rl:
+            print(f"  learnability : success_rate {rl.get('success_rate')}   "
+                  f"first_success {rl.get('steps_to_first_success')}   "
+                  f"stalls_at {rl.get('stalling_milestone')}")
+        if rec.get("new_game_path"):
+            print(f"  next version : {rec['new_game_path']}")
+        if rec.get("directive"):
+            print("  directive    :")
+            for line in str(rec["directive"]).splitlines():
+                print(f"    {line}")
+    return 0
+
+
 # ---- game stats ------------------------------------------------------------
 def cmd_game_stats(args) -> int:
     """Aggregate the runs ledger (telemetry) per backend/model."""
@@ -734,6 +779,22 @@ def build_parser() -> argparse.ArgumentParser:
     gs.add_argument("--path", default="runs/ledger.jsonl")
     gs.add_argument("--json", action="store_true")
     gs.set_defaults(func=cmd_game_stats)
+
+    gc = gmsub.add_parser(
+        "curriculum",
+        help="run the difficulty-driven curriculum loop (verify -> G3' -> directive)")
+    gc.add_argument("game_path")
+    gc.add_argument("--budget", type=int, default=200_000,
+                    help="G3' RL budget in env-steps per round (default 200k)")
+    gc.add_argument("--rounds", type=int, default=1,
+                    help="max curriculum rounds (default 1; stops early on a "
+                         "target-certified game)")
+    gc.add_argument("--backend", default="auto",
+                    choices=["auto", "anthropic", "openrouter", "template"])
+    gc.add_argument("--out-dir", default="scenes/games/curriculum",
+                    help="where regenerated next-version games are written")
+    gc.add_argument("--json", action="store_true")
+    gc.set_defaults(func=cmd_game_curriculum)
 
     return p
 
