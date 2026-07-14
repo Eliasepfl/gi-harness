@@ -144,20 +144,27 @@ Condensed path:
 
 ## Model config (current)
 
-- `OPENROUTER_MODEL = deepseek/deepseek-v4-flash` (Elias, 14 juil. — autonomous
-  runs; id verified against the OpenRouter models endpoint; smoke generation
-  COMPLETED in 2 attempts using bank parts). Previous volume model:
-  tencent/hy3:free. Routing policy per DIFFICULTY_MAP_R1.md stands.
+- `OPENROUTER_MODEL = deepseek/deepseek-v4-flash` (Elias, 14 juil. — id
+  verified against the OpenRouter models endpoint; smoke generation COMPLETED
+  in 2 attempts using bank parts). Previous volume model: tencent/hy3:free.
+- **DECIDED (Elias, 14 juil.): deepseek-v4-flash is the designer for BOTH
+  autonomous runs AND curriculum revisions / hard games** — one OpenRouter
+  key, no ANTHROPIC_API_KEY, no Opus-designer lane for now. Escalate to a
+  stronger designer only if deepseek's revise/generation failure data says so
+  (the ledger decides, per the telemetry directive).
 - The three Godot example specs were enriched from plumbing fixtures to real
   demo levels (80d4e0b) and published as day-2's "third engine" row
   (demos 15-17, rendered from real Godot engine state).
 
+## Demos format
+
+**DECIDED (Elias, 14 juil.): the gallery stays on GIFs** — no replayer
+switch for now. The canvas replayer remains a live beta pilot at
+`day2/replayer_demo.html` (and the frames-JSON substrate remains the
+cluster→site return format per the ORCD plan); revisit later.
+
 ## Open decisions (Elias's calls)
 
-1. Switch the day-2 gallery from GIFs to the canvas replayer (pilot live at
-   `day2/replayer_demo.html`).
-2. Opus as designer for curriculum revisions / hard games (agent-backend now,
-   `ANTHROPIC_API_KEY` for unattended ORCD campaigns later).
-3. Spec v2 build wave (raycast sensors first) + bank→`.tscn` templates.
-4. Tier-1 LLM attackers live (bulletproof grade).
-5. Day-3 site page when the calendar day warrants it.
+1. Spec v2 build wave (raycast sensors first) + bank→`.tscn` templates.
+2. Tier-1 LLM attackers live (bulletproof grade).
+3. Day-3 site page when the calendar day warrants it.
