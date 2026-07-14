@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 scenes/generated/
 env.py
+# the RL PlanckEnv module is a tracked deliverable, not a local scratch env.py
+!harness/rl/env.py
 runs/
 scenes/games/
 nodeworld/node_modules/
