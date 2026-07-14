@@ -126,6 +126,11 @@ def record_run(result: dict, prompt: str, model, wall_s: float,
         "wall_s": round(float(wall_s), 2),
         "flagrant": flagrant,
     }
+    # Parts-bank pipeline block (retrieved menu / mode / parts used), when the
+    # generator produced one. Passed straight through — gamegen owns its content.
+    pipeline = result.get("pipeline")
+    if isinstance(pipeline, dict):
+        entry["pipeline"] = pipeline
 
     directory = os.path.dirname(path)
     if directory:

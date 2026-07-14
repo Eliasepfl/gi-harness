@@ -1100,3 +1100,180 @@ def test_openrouter_json_returns_none_on_garbage():
             raise ValueError("bad")
 
     assert _openrouter_json(Garbage()) is None
+
+
+# =============================================================================
+#  Tier-1b parts pipeline: retrieval injection, pinning, and ledger block
+# =============================================================================
+
+# A game that instantiates a bank part via world.part (so parts_used is non-empty).
+_PART_GAME_PY = '''TITLE = "wreck"
+PROMPT = "swing a wrecking ball"
+ACTIONS = ["push", "pull"]
+def build(world):
+    world.part("wrecker", "wrecking_ball", pos=(400, 230))
+    world.control("wrecker")
+def act(world, action):
+    world.impulse("wrecker", (60 if action == "push" else -60, 0))
+def success(world):
+    return world.query("wrecker")["pos"][0] > 600
+def checkpoints(world):
+    return {"swung": world.query("wrecker")["pos"][0] > 500}
+'''
+
+
+def test_bank_menu_injected_and_pinned_across_repairs(tmp_path, monkeypatch):
+    # The retrieved Tier-1b menu is spliced into the system prompt and PINNED:
+    # every repair attempt sees the identical system prompt (same menu).
+    systems = []
+
+    def fake_complete(client, system, messages):
+        systems.append(system)
+        return "DESIGN\nParts used: wrecking_ball as \"wrecker\"\n```python\n" + \
+            _PART_GAME_PY + "\n```"
+
+    verify_calls = {"n": 0}
+
+    def fake_verify(path):
+        verify_calls["n"] += 1
+        if verify_calls["n"] == 1:
+            return {"passed": False, "failure_class": "UNSOLVED",
+                    "hint": "0/40 episodes", "witness": None}
+        return {"passed": True, "failure_class": None, "hint": "", "witness": {}}
+
+    monkeypatch.setattr(GG, "_make_client", lambda: object())
+    monkeypatch.setattr(GG, "_llm_complete", fake_complete)
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("swing a wrecking ball to smash a tower",
+                           out_dir=str(tmp_path), backend="anthropic", max_repairs=4)
+
+    assert res["verdict"] == "COMPLETED"
+    assert len(systems) == 2                       # initial + one repair
+    # The menu was injected (the retrieved part shows up in the system prompt)...
+    assert "wrecking_ball (mobile)" in systems[0]
+    assert "world.part(" in systems[0]
+    # ...and it is PINNED — byte-identical system prompt across repair iterations.
+    assert systems[0] == systems[1]
+    # Pipeline telemetry reflects the pinned menu + the part the game used.
+    pipe = res["pipeline"]
+    assert pipe["menu_mode"] == "menu"
+    assert "wrecking_ball" in pipe["retrieved"]
+    assert pipe["parts_used"] == ["wrecking_ball"]
+
+
+def test_ledger_pipeline_block_written(tmp_path, monkeypatch):
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(GG, "_LEDGER_PATH", str(ledger))
+    monkeypatch.setattr(GG, "_make_client", lambda: object())
+    monkeypatch.setattr(
+        GG, "_llm_complete",
+        lambda client, system, messages: "DESIGN\nt\n```python\n" + _PART_GAME_PY + "\n```")
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+
+    GG.generate_game("swing a wrecking ball to smash a tower",
+                     out_dir=str(tmp_path / "out"), backend="anthropic", max_repairs=2)
+
+    entry = json.loads(ledger.read_text(encoding="utf-8").strip().splitlines()[0])
+    assert "pipeline" in entry
+    pipe = entry["pipeline"]
+    assert pipe["menu_mode"] == "menu"
+    assert "wrecking_ball" in pipe["retrieved"]
+    assert pipe["parts_used"] == ["wrecking_ball"]
+
+
+def test_pipeline_off_for_template_backend(tmp_path, monkeypatch):
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+    res = GG.generate_game("swing a wrecking ball to smash a tower",
+                           out_dir=str(tmp_path), backend="template", max_repairs=1)
+    # The offline template backend bypasses retrieval entirely.
+    assert res["pipeline"]["menu_mode"] == "off"
+    assert res["pipeline"]["retrieved"] == []
+
+
+def test_use_bank_false_skips_retrieval(tmp_path, monkeypatch):
+    seen = {"system": None}
+
+    def fake_complete(client, system, messages):
+        seen["system"] = system
+        return "DESIGN\nt\n```python\n" + GG._DRIFT + "\n```"
+
+    monkeypatch.setattr(GG, "_make_client", lambda: object())
+    monkeypatch.setattr(GG, "_llm_complete", fake_complete)
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+
+    res = GG.generate_game("swing a wrecking ball to smash a tower",
+                           out_dir=str(tmp_path), backend="anthropic",
+                           max_repairs=1, use_bank=False)
+
+    assert res["pipeline"]["menu_mode"] == "off"
+    assert res["pipeline"]["retrieved"] == []
+    # With the bank off, the system prompt is the menu-free baseline.
+    assert seen["system"] == GG._SYSTEM_PROMPT
+    assert "world.part(" not in seen["system"]
+
+
+def test_auto_fallback_to_template_records_menu_off(tmp_path, monkeypatch):
+    # A themed prompt would retrieve a menu, but if every LLM backend is down the
+    # run falls to templates and the menu was never used -> honest "off".
+    monkeypatch.setattr(GG, "anthropic", None)
+    monkeypatch.setattr(GG, "requests", None)
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+
+    res = GG.generate_game("swing a wrecking ball to smash a tower",
+                           out_dir=str(tmp_path), backend="auto", max_repairs=1)
+
+    assert res["backend"] == "template"
+    assert res["pipeline"]["menu_mode"] == "off"
+    assert res["pipeline"]["retrieved"] == []
+
+
+def test_legend_only_when_prompt_offtheme(tmp_path, monkeypatch):
+    seen = {"system": None}
+
+    def fake_complete(client, system, messages):
+        seen["system"] = system
+        return "DESIGN\nt\n```python\n" + GG._DRIFT + "\n```"
+
+    monkeypatch.setattr(GG, "_make_client", lambda: object())
+    monkeypatch.setattr(GG, "_llm_complete", fake_complete)
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+
+    res = GG.generate_game("a game about abstract colours and rhythmic music",
+                           out_dir=str(tmp_path), backend="anthropic", max_repairs=1)
+
+    assert res["pipeline"]["menu_mode"] == "legend_only"
+    assert res["pipeline"]["retrieved"] == []
+    # Legend-only falls back to the menu-free baseline prompt.
+    assert seen["system"] == GG._SYSTEM_PROMPT
+
+
+# --- parts_used parsing (unit) -----------------------------------------------
+
+def test_parse_parts_used_py_captures_part_kind():
+    bank_names = {"wrecking_ball", "crate_light", "goal_zone"}
+    src = ('world.part("wrecker", "wrecking_ball", pos=(400, 230))\n'
+           'world.part("box", "crate_light", pos=(200, 60))\n'
+           'world.part("box2", "crate_light", pos=(260, 60))\n'   # dup kind
+           'world.add("floor", "box", pos=(400, 10), static=True)\n')
+    used = GG._parse_parts_used(src, "py", bank_names)
+    assert used == ["wrecking_ball", "crate_light"]   # deduped, in order
+
+
+def test_parse_parts_used_js_matches_bank_names_among_add():
+    bank_names = {"puck", "goal_zone", "wall"}
+    src = ('world.add("puck", "circle", { pos: [180, 150], radius: 16 });\n'
+           'world.add("goal_zone", "box", { pos: [560, 430], sensor: true });\n'
+           'world.add("scenery", "box", { pos: [10, 10] });\n')   # not a bank name
+    used = GG._parse_parts_used(src, "js", bank_names)
+    assert used == ["puck", "goal_zone"]
+
+
+def test_parse_parts_used_empty_when_no_bank_calls():
+    assert GG._parse_parts_used(GG._DRIFT, "py", {"puck", "goal_zone"}) == []
+    assert GG._parse_parts_used("", "py", {"puck"}) == []

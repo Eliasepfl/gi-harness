@@ -12,16 +12,45 @@ Physics is never touched — masking is purely visual.
 
 from __future__ import annotations
 
+import math
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
+
+try:  # cosmetic sprite skinning (raw atlases are gitignored -> optional)
+    from harness.core import spritebank
+except Exception:  # noqa: BLE001 - never let a bank import break rendering
+    spritebank = None
+
+try:  # Pillow >= 9.1 resampling enum, with an old-Pillow fallback
+    _LANCZOS = Image.Resampling.LANCZOS
+    _BICUBIC = Image.Resampling.BICUBIC
+except AttributeError:  # pragma: no cover
+    _LANCZOS, _BICUBIC = Image.LANCZOS, Image.BICUBIC
 
 # ---- runner / capture constants (eng.) -----------------------------------
 K = 6              # physics steps per decision tick (section-2 runner)
 HOLD_FRAMES = 15   # duplicate the final frame this many times (readable end)
 FRAME_MS = 60      # per-frame duration in the GIF
+
+# ---- sprite skinning options (cosmetic; verification never sees pixels) ---
+SPRITE_SKINNING = True   # module default; auto-off when the bank is unavailable
+SPRITE_SHADOW = True     # soft drop shadow under sprites (dark-bg harmony)
+HAZARD_SPRITE_ALPHA = 0.6  # overlay alpha for a sprite inside a hazard sensor
+
+
+def _sprites_ok(sprites) -> bool:
+    """Resolve the effective sprite toggle: explicit arg else module default,
+    always gated on the bank actually being usable."""
+    want = SPRITE_SKINNING if sprites is None else bool(sprites)
+    if not want or spritebank is None:
+        return False
+    try:
+        return spritebank.available()
+    except Exception:  # noqa: BLE001
+        return False
 
 # ---- palette (see CONTRACTS section 5) -----------------------------------
 BG = (18, 19, 26)          # #12131a  dark background
@@ -120,14 +149,124 @@ _Z = {"sensor": 0, "static": 1, "dynamic": 2, "controlled": 3}
 
 
 # ==========================================================================
+#  Sprite skinning (cosmetic overlay drawn from the sprite bank)
+# ==========================================================================
+def _dist(p, q) -> float:
+    return math.hypot(q[0] - p[0], q[1] - p[1])
+
+
+def _fill_tiled(sprite: Image.Image, W: int, H: int) -> Image.Image:
+    """Tile a (roughly square) sprite to fill a W x H box without distortion.
+
+    Kenney surface tiles are square, so a stretched ground/wall reads poorly;
+    tiling with square tiles keeps them crisp. Used only for axis-aligned static
+    boxes whose aspect ratio is far from 1."""
+    side = max(1, min(W, H))
+    tile = sprite.resize((side, side), _LANCZOS)
+    out = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    for x in range(0, W, side):
+        for y in range(0, H, side):
+            out.paste(tile, (x, y), tile)
+    return out
+
+
+def _soft_shadow(spr: Image.Image, pad: int = 4) -> tuple:
+    """Wrap ``spr`` in a padded canvas with a soft dark shadow behind it.
+
+    Returns (canvas, (ox, oy)) where the sprite sits at (ox, oy) in the canvas.
+    Keeps the sprite visually centered (shadow is only slightly offset down)."""
+    w, h = spr.size
+    cw, ch = w + 2 * pad, h + 2 * pad
+    alpha = spr.getchannel("A")
+    shadow_a = Image.new("L", (cw, ch), 0)
+    shadow_a.paste(alpha, (pad, pad + 2))                 # 2px downward offset
+    shadow_a = shadow_a.filter(ImageFilter.GaussianBlur(2))
+    shadow_a = shadow_a.point(lambda a: (a * 130) // 255)  # dark, semi-opaque
+    canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+    canvas.putalpha(shadow_a)                              # black RGB + shadow alpha
+    canvas.paste(spr, (pad, pad), spr)
+    return canvas, (pad, pad)
+
+
+def _oriented_sprite(cropped: Image.Image, q: dict, scale: float,
+                     world_h: float) -> tuple | None:
+    """Return (image, center_xy) for a sprite scaled/rotated to match entity ``q``,
+    or None if the target size is degenerate. Coordinates are screen-space."""
+    shape = q.get("shape", "box")
+    verts = q.get("verts")
+    angle = float(q.get("angle", 0.0) or 0.0)
+    l, b, r, t = q["bbox"]
+    static = bool(q.get("static"))
+
+    # Screen center (default: the body position; segments recentre on their span).
+    px, py = q.get("pos", [(l + r) / 2.0, (b + t) / 2.0])
+    cx, cy = px * scale, (world_h - py) * scale
+    rot_deg = -math.degrees(angle)
+
+    if shape == "segment" and verts and len(verts) == 2:
+        (ax, ay), (bx, by) = verts
+        w_local = _dist((ax, ay), (bx, by))
+        h_local = 2.0 * float(q.get("radius", 4.0))
+        sax, say = ax * scale, (world_h - ay) * scale
+        sbx, sby = bx * scale, (world_h - by) * scale
+        rot_deg = -math.degrees(math.atan2(sby - say, sbx - sax))
+        cx, cy = (sax + sbx) / 2.0, (say + sby) / 2.0
+    elif verts and len(verts) >= 3:            # box / poly: true side lengths
+        w_local = _dist(verts[0], verts[1])
+        h_local = _dist(verts[1], verts[2])
+    else:                                       # circle / no verts: use the bbox
+        w_local, h_local = (r - l), (t - b)
+
+    W, H = max(1, round(w_local * scale)), max(1, round(h_local * scale))
+    if W < 1 or H < 1:
+        return None
+
+    axis_aligned = abs(angle) < 0.02
+    if static and axis_aligned and shape in ("box", "poly") and max(W, H) >= 2 * min(W, H):
+        spr = _fill_tiled(cropped, W, H)       # wide/tall static -> tile, don't stretch
+    else:
+        spr = cropped.resize((W, H), _LANCZOS)
+
+    if abs(rot_deg) > 0.05:
+        spr = spr.rotate(rot_deg, expand=True, resample=_BICUBIC)
+    return spr, (cx, cy)
+
+
+def _paste_sprite(target: Image.Image, cropped: Image.Image, q: dict,
+                  scale: float, world_h: float, *, alpha: float = 1.0,
+                  shadow: bool = True) -> bool:
+    """Composite ``cropped`` onto ``target`` sized/rotated for entity ``q``.
+
+    Returns True on success, False if nothing was drawn (caller falls back to the
+    flat shape)."""
+    oriented = _oriented_sprite(cropped, q, scale, world_h)
+    if oriented is None:
+        return False
+    spr, (cx, cy) = oriented
+    if alpha < 1.0:
+        a = spr.getchannel("A").point(lambda v: int(v * alpha))
+        spr = spr.copy()
+        spr.putalpha(a)
+    if shadow and SPRITE_SHADOW and alpha >= 1.0:
+        spr, _ = _soft_shadow(spr)
+    x0 = round(cx - spr.width / 2.0)
+    y0 = round(cy - spr.height / 2.0)
+    target.paste(spr, (x0, y0), spr)
+    return True
+
+
+# ==========================================================================
 #  Frame drawing
 # ==========================================================================
 def _render_frame(world, tick: int, label: str, scale: float, world_size,
-                  flash: str | None = None) -> Image.Image:
+                  flash: str | None = None, sprites: bool | None = None) -> Image.Image:
     """Redraw the whole scene from world.query() into one RGB frame.
 
     `flash` is an optional short string (a freshly latched milestone name)
-    drawn in sensor-amber under the label."""
+    drawn in sensor-amber under the label. `sprites` toggles cosmetic sprite
+    skinning (None -> module default `SPRITE_SKINNING`, always gated on the bank
+    being usable); when a sprite cannot be produced the flat shape is drawn."""
+    use_sprites = _sprites_ok(sprites)
     world_w, world_h = world_size
     W, H = max(1, int(world_w * scale)), max(1, int(world_h * scale))
     img = Image.new("RGB", (W, H), BG)
@@ -167,23 +306,44 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size,
         box = _inset(_screen_box(q["bbox"], scale, world_h))
         verts = q.get("verts")
 
+        cropped = None
+        if use_sprites:
+            try:
+                cropped = spritebank.crop(spritebank.resolve(name))
+            except Exception:  # noqa: BLE001 - any bank hiccup -> flat fallback
+                cropped = None
+
         if kind == "sensor":
             col = _sensor_colour(name)
             _draw_shape(d, shape, box, fill=(*col, 40),
                         outline=(*col, 230), width=2,
                         verts=verts, scale=scale, world_h=world_h)
+            # Inside a HAZARD sensor (saw/lava/...), overlay the sprite semi-
+            # transparently so the danger reads; goal/neutral zones stay bare.
+            if cropped is not None and col == C_HAZARD:
+                overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                if _paste_sprite(overlay, cropped, q, scale, world_h,
+                                 alpha=HAZARD_SPRITE_ALPHA, shadow=False):
+                    img.paste(overlay, (0, 0), overlay)
         elif kind == "static":
-            _draw_shape(d, shape, box, fill=C_STATIC,
-                        outline=_shade(C_STATIC, 1.35), width=1,
-                        verts=verts, scale=scale, world_h=world_h)
+            if cropped is not None and _paste_sprite(img, cropped, q, scale, world_h):
+                pass  # skinned in place (static bodies define the mask themselves)
+            else:
+                _draw_shape(d, shape, box, fill=C_STATIC,
+                            outline=_shade(C_STATIC, 1.35), width=1,
+                            verts=verts, scale=scale, world_h=world_h)
         else:
-            colour = C_CONTROLLED if kind == "controlled" else _dyn_colour(name)
-            # dedicated layer, then erase the true-shape overlap with statics
             layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-            ld = ImageDraw.Draw(layer)
-            _draw_shape(ld, shape, box, fill=(*colour, 255),
-                        outline=(*_shade(colour, 0.65), 255), width=2,
-                        verts=verts, scale=scale, world_h=world_h)
+            drawn = False
+            if cropped is not None:
+                drawn = _paste_sprite(layer, cropped, q, scale, world_h)
+            if not drawn:
+                colour = C_CONTROLLED if kind == "controlled" else _dyn_colour(name)
+                ld = ImageDraw.Draw(layer)
+                _draw_shape(ld, shape, box, fill=(*colour, 255),
+                            outline=(*_shade(colour, 0.65), 255), width=2,
+                            verts=verts, scale=scale, world_h=world_h)
+            # erase the true-shape overlap with statics (anti-clip, dynamic only)
             layer = Image.composite(transparent, layer, static_mask)
             img.paste(layer, (0, 0), layer)
 
@@ -298,12 +458,14 @@ def _save_gif(frames, out_path: str) -> None:
 # ==========================================================================
 def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
                label=None, max_ticks: int = 400, scale: float = 0.6,
-               every: int = 2, world_factory=None) -> dict:
+               every: int = 2, world_factory=None, sprites: bool = True) -> dict:
     """Render a game replay to an animated GIF.
 
     `actions` is an explicit list of action strings, a G3 witness dict, or None
     (re-verify the game to fetch the witness). `world_factory(seed=...)` overrides
     the real World (used by tests); it defaults to harness.world.World.
+    `sprites` enables cosmetic sprite skinning (default on; auto-off when the
+    sprite bank / raw atlases are unavailable, falling back to flat shapes).
 
     Returns {"ticks": int, "result": "success|failure|timeout|error", ...}.
     """
@@ -343,7 +505,8 @@ def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
     def snap(t: int) -> None:
         nonlocal last_snap
         cur_flash = flash_text if t <= flash_until else None
-        frames.append(_render_frame(world, t, label, scale, world_size, flash=cur_flash))
+        frames.append(_render_frame(world, t, label, scale, world_size,
+                                    flash=cur_flash, sprites=sprites))
         last_snap = t
 
     def latch_new(t: int) -> bool:

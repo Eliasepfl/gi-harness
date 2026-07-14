@@ -24,6 +24,9 @@ import os
 _SKIP_DIRS = {"__pycache__"}
 _CONTRACTS = "CONTRACTS.md"
 _HARNESS = "harness"
+# The generator's prompt SECTION FILES are base content too: a mid-run prompt
+# edit must invalidate a run exactly like a code edit. They live only here.
+_PROMPTS_DIR = os.path.join(_HARNESS, "gen", "prompts")
 
 
 def _sha256(path: str) -> str:
@@ -52,12 +55,18 @@ def tracked_files(root: str = ".") -> list[str]:
     out: list[str] = []
 
     harness_dir = os.path.join(root, _HARNESS)
+    prompts_dir = os.path.join(root, _PROMPTS_DIR)
     if os.path.isdir(harness_dir):
         for dirpath, dirnames, filenames in os.walk(harness_dir):
             # Prune bytecode/cache dirs in place so os.walk does not descend.
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            # In harness/gen/prompts/ the prompt section files (*.md, *.md.tmpl)
+            # are tracked base content alongside every *.py.
+            in_prompts = os.path.abspath(dirpath) == os.path.abspath(prompts_dir)
             for name in filenames:
-                if name.endswith(".py"):
+                if name.endswith(".py") or (
+                        in_prompts and (name.endswith(".md")
+                                        or name.endswith(".md.tmpl"))):
                     out.append(os.path.join(dirpath, name))
 
     contracts = os.path.join(root, _CONTRACTS)

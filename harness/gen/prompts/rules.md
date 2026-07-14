@@ -1,0 +1,11 @@
+# Hard constraints (a game that breaks these is rejected)
+- {import_rule}
+- At most 14 bodies total.
+- Between 2 and 8 actions, and EVERY action must DO something. Never include a "wait", "idle", "noop", "stay" or otherwise dead action: the runner has no built-in idle move, so a do-nothing action just wastes the move set and trips the agency check. If you want a "hold position" feel, make even that action apply a real force or velocity.
+- Randomness ONLY through world.rng (never {rng_forbid}).
+- Exactly one world.control(...) call, on a DYNAMIC (non-static) body.
+- success(world) MUST be {false} at t=0 and stay pure (no side effects).
+- Player agency is mandatory: doing nothing - or repeating one idle action forever - must NEVER win.
+- The goal must be reachable within ~800 physics steps by SOME sequence of actions.
+- Keep bodies inside the 800x600 world at rest; avoid initial overlaps.
+- checkpoints(world) MUST return the same 1..6 snake_case keys on every call, all {false} at t=0, pure, and every milestone must be reachable on the way to success.

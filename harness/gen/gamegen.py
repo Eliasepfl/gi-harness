@@ -31,6 +31,8 @@ import shutil
 import time
 
 from harness.core import integrity
+from harness.gen import prompts
+from harness.gen import retrieval
 from harness.gen.prompts_js import SYSTEM_PROMPT_JS
 
 try:  # lazily needed: the template backend must run without the package
@@ -121,139 +123,16 @@ def _redact(text: str, secret) -> str:
 # --- THE OPEN PROMPT ---------------------------------------------------------
 # This is the whole point of v2: teach the substrate and the format, then get
 # out of the way. It must NOT decide the genre or hand over a worked design.
-
-_SYSTEM_PROMPT = """You are a game designer and a physics programmer. From the user's prompt, design an ORIGINAL small 2D physics game and implement it as a single Python module. The prompt is a seed, not a spec - invent the mechanic and surprise us.
-
-Your code runs against ONE object, `world`, a minimal 2D physics substrate (pymunk underneath). The world is 800x600, y points UP, default gravity is (0, -900), one physics step is 1/60 s. There are no pixels - everything is engine state.
-
-# World API - the ONLY thing your code may touch
-
-## Construction - from build(), and optionally on_step()
-world.add(name, shape="box", *, pos, size=None, radius=None, a=None, b=None,
-          vertices=None, mass=1.0, static=False, sensor=False, friction=0.7,
-          elasticity=0.3, velocity=(0, 0), angle=0.0, locked_rotation=False) -> str
-    # pos=(x,y) is REQUIRED for every shape. shape in {"box","circle","segment","poly"}.
-    # box needs size=(w,h); circle needs radius; poly needs vertices=[(x,y),...];
-    # segment needs a=(x,y), b=(x,y) given LOCAL to pos (use pos=(0,0) for absolute
-    # endpoints). static=True -> immovable; sensor=True -> no collision but detectable.
-world.remove(name)
-world.pin(a, b, anchor_a=None, anchor_b=None)          # rigid PinJoint
-world.pivot(a, b, point)                               # PivotJoint at a world point
-world.spring(a, b, rest_length, stiffness, damping, anchor_a=None, anchor_b=None)
-world.set_gravity(gx, gy)                              # any direction, or (0,0)
-world.control(name)                                    # designate THE controlled body
-
-## Dynamics - from act() and on_step()
-world.impulse(name, vec)        # instantaneous momentum change
-world.force(name, vec)          # continuous force for this step
-world.set_velocity(name, vec)
-world.set_flag(key, value)      # persistent game state
-world.flag(key, default=None)
-world.on_contact(a, b, flag, once=True)   # set `flag` when a and b touch
-world.rng                       # a seeded random.Random - the ONLY randomness allowed
-world.steps                     # int: physics steps elapsed (use for timers)
-
-## Queries - PURE reads, for success()/failure()/on_step()
-world.entities() -> list[str]
-world.query(name) -> {"pos":[x,y], "vel":[vx,vy], "angle":a, "angular_vel":w,
-                      "bbox":[left,bottom,right,top], "shape":str,
-                      "static":bool, "sensor":bool, "controlled":bool}
-world.contacts(a, b) -> bool
-world.touching(name) -> list[str]        # non-sensor bodies in contact with name
-world.grounded(name) -> bool             # supported from below
-world.in_bounds(name, margin=0.0) -> bool
-world.penetration_depth(a, b) -> float
-
-That is the entire API. There is no step(), no snapshot, no rendering, no file
-access, no imports. If it is not listed above, it does not exist for you.
-
-# Module format - define EXACTLY these symbols (no imports; only `world` is used)
-
-TITLE = "short title"
-PROMPT = "the user's original prompt, verbatim"
-ACTIONS = ["...", "..."]        # 2 to 8 short strings YOU choose - the whole move set
-
-def build(world):
-    \"\"\"Create every entity. MUST call world.control(<name>) on exactly one dynamic body.\"\"\"
-
-def act(world, action):
-    \"\"\"Apply ONE action's effect (impulse/force/set_velocity/set_flag). Once per decision tick.\"\"\"
-
-def on_step(world):
-    \"\"\"OPTIONAL. Runs once per physics step - timers, moving hazards, scoring, custom rules.\"\"\"
-
-def success(world) -> bool:
-    \"\"\"PURE win predicate. Reads state only, never mutates. MUST be False at t=0.\"\"\"
-
-def failure(world) -> bool:
-    \"\"\"OPTIONAL. PURE lose predicate.\"\"\"
-
-def checkpoints(world) -> dict[str, bool]:
-    \"\"\"REQUIRED. 1 to 6 ordered milestone predicates - dict insertion order is the
-    intended progression toward success. Short snake_case keys. Pure like success;
-    EVERY value MUST be False at t=0. Decompose YOUR OWN rules into stages.\"\"\"
-
-Milestones are how the harness will tell you exactly where your game is stuck if it
-fails - make them meaningful stages, not restatements of success. The harness latches
-each milestone at the first tick it becomes True, so predicates may be instantaneous
-reads (a ship that once touched the pad keeps that milestone) - never track state
-yourself inside checkpoints. On the winning path every milestone must fire at or
-before the win.
-
-How it runs: each decision tick calls act(world, chosen_action), then advances the
-physics 6 times (calling on_step after each), then checks failure() then success().
-The action is picked by the player/solver; there is no built-in idle move unless you add one.
-
-# Hard constraints (a game that breaks these is rejected)
-- No imports whatsoever. Your only tool is `world`.
-- At most 14 bodies total.
-- Between 2 and 8 actions.
-- Randomness ONLY through world.rng (never import random, never fake it with constants).
-- Exactly one world.control(...) call, on a DYNAMIC (non-static) body.
-- success(world) MUST be False at t=0 and stay pure (no side effects).
-- Player agency is mandatory: doing nothing - or repeating one idle action forever - must NEVER win.
-- The goal must be reachable within ~800 physics steps by SOME sequence of actions.
-- Keep bodies inside the 800x600 world at rest; avoid initial overlaps.
-- checkpoints(world) MUST return the same 1..6 snake_case keys on every call, all
-  False at t=0, pure, and every milestone must be reachable on the way to success.
-
-# Structure-only stub - shows the SHAPE of a module, NOT a design to copy.
-# It is deliberately boring: do NOT imitate its mechanic, entities, or goal.
-```python
-TITLE = "poke"
-PROMPT = "seed prompt"
-ACTIONS = ["go", "wait"]
-def build(world):
-    world.add("dot", "circle", pos=(120, 40), radius=12); world.control("dot")
-    world.add("marker", "box", pos=(680, 40), size=(50, 50), static=True, sensor=True)
-def act(world, action):
-    if action == "go": world.impulse("dot", (130, 0))
-def success(world):
-    return world.query("dot")["pos"][0] > 640
-def checkpoints(world):
-    return {"halfway": world.query("dot")["pos"][0] > 400}
-```
-
-# Invent a mechanic - do NOT default to a platformer with left/right/jump
-Reach into the substrate: custom or flipping gravity (world.set_gravity); pin/pivot/spring
-joints for pendulums, catapults, wrecking balls, tethers, ragdolls; sensors as triggers,
-checkpoints, or hazards; timers and rhythm via world.steps; moving obstacles driven from
-on_step; counters, combos, and multi-stage goals via flags. A slingshot, a gravity maze, a
-juggling act, a falling-sand catcher, a swinging pendulum puzzle - anything but the obvious.
-Make winning require deliberate play.
-
-# Output format
-First a DESIGN block of about six lines, then the code:
-
-DESIGN
-Theme: <one line>
-Entities: <the bodies and their roles>
-Mechanic twist: <what makes it original>
-Actions: <each action and what it does>
-Milestones: <the ordered checkpoints and what stage each marks>
-Win / Lose: <success and, if any, failure>
-
-Then EXACTLY ONE fenced ```python block with the complete module. Nothing after it."""
+#
+# The prompt is no longer one giant literal: it is assembled from single-concern
+# SECTION FILES under harness/gen/prompts/ (contract / api_py / api_js / rules /
+# orientation / design_block / bank_menu) by prompts.compose(engine, menu_text).
+# `_SYSTEM_PROMPT` (py, no menu) and prompts_js.SYSTEM_PROMPT_JS (js, no menu)
+# stay as module-level shims so existing callers and tests keep their names; the
+# per-run system prompt (optionally carrying a retrieved Tier-1b parts menu) is
+# composed fresh inside generate_game. The section files are byte-frozen by the
+# run-integrity manifest exactly like base code.
+_SYSTEM_PROMPT = prompts.compose("py")
 
 
 def _engine_lang(engine):
@@ -261,8 +140,15 @@ def _engine_lang(engine):
     return ("JavaScript", "javascript") if engine == "js" else ("Python", "python")
 
 
-def _system_prompt(engine):
-    """The open system prompt for the target language (py default)."""
+def _system_prompt(engine, menu_text=None):
+    """The open system prompt for the target language (py default).
+
+    With ``menu_text`` (a retrieved Tier-1b parts menu) the prompt is composed
+    fresh so the menu is spliced in; without it the pre-composed, menu-free shim
+    is returned (byte-identical to ``compose(engine)``).
+    """
+    if menu_text:
+        return prompts.compose(engine, menu_text)
     return SYSTEM_PROMPT_JS if engine == "js" else _SYSTEM_PROMPT
 
 
@@ -640,7 +526,7 @@ def _run_template(prompt, run_dir, max_repairs, note, engine="py"):
                         "template", max_repairs, note, _game_ext(engine))
 
 
-def _run_anthropic(prompt, run_dir, max_repairs, engine="py"):
+def _run_anthropic(prompt, run_dir, max_repairs, engine="py", system=None):
     if anthropic is None:
         raise _BackendUnavailable("anthropic package not installed")
     try:
@@ -649,7 +535,8 @@ def _run_anthropic(prompt, run_dir, max_repairs, engine="py"):
             anthropic.AnthropicError) as e:
         raise _BackendUnavailable(type(e).__name__)
 
-    system = _system_prompt(engine)
+    if system is None:
+        system = _system_prompt(engine)
     messages = [{"role": "user", "content": _first_user_msg(prompt, engine)}]
     state = {"first": True}
 
@@ -670,7 +557,7 @@ def _run_anthropic(prompt, run_dir, max_repairs, engine="py"):
                         _game_ext(engine))
 
 
-def _run_openrouter(prompt, run_dir, max_repairs, engine="py"):
+def _run_openrouter(prompt, run_dir, max_repairs, engine="py", system=None):
     """OpenRouter backend: SAME system prompt + repair loop as anthropic.
 
     Availability (requests + configured key/model) is probed up front so that
@@ -683,7 +570,8 @@ def _run_openrouter(prompt, run_dir, max_repairs, engine="py"):
     if not _resolve_secret("OPENROUTER_API_KEY") or not _resolve_secret("OPENROUTER_MODEL"):
         raise _BackendUnavailable("OpenRouter API key or model not configured")
 
-    system = _system_prompt(engine)
+    if system is None:
+        system = _system_prompt(engine)
     messages = [{"role": "user", "content": _first_user_msg(prompt, engine)}]
 
     def produce(feedback):
@@ -703,8 +591,13 @@ def _run_openrouter(prompt, run_dir, max_repairs, engine="py"):
 _LLM_RUNNERS = {"anthropic": _run_anthropic, "openrouter": _run_openrouter}
 
 
-def _dispatch(prompt, run_dir, backend, max_repairs, engine="py"):
-    """Pick and run a backend, honouring the auto fallback chain."""
+def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None):
+    """Pick and run a backend, honouring the auto fallback chain.
+
+    ``system`` is the pre-composed system prompt (optionally carrying a retrieved
+    Tier-1b parts menu); LLM backends reuse it for every attempt so the menu is
+    PINNED for the whole run. The template backend ignores it.
+    """
     if backend == "template":
         return _run_template(prompt, run_dir, max_repairs, None, engine)
 
@@ -716,7 +609,7 @@ def _dispatch(prompt, run_dir, backend, max_repairs, engine="py"):
     notes = []
     for name in order:
         try:
-            return _LLM_RUNNERS[name](prompt, run_dir, max_repairs, engine)
+            return _LLM_RUNNERS[name](prompt, run_dir, max_repairs, engine, system)
         except _BackendUnavailable as e:
             notes.append(f"{name} unavailable ({e})")
     note = "; ".join(notes) + "; falling back to templates" if notes else None
@@ -750,14 +643,76 @@ def _model_used(backend):
     return backend  # "template" (or unknown)
 
 
+# --- Parts-bank pipeline (Tier-1b retrieval + ledger telemetry) --------------
+
+# py: the SECOND positional arg of world.part("<instance>", "<part>", ...) is the
+# bank part KIND (the first is the caller's instance name). js: there is no
+# world.part yet, so the bank part name appears as a world.add("<name>", ...)
+# entity name (the naming rule the menu states).
+_PART_PY_RE = re.compile(
+    r"""world\.part\(\s*["'][^"']*["']\s*,\s*["']([A-Za-z0-9_]+)["']""")
+_ADD_JS_RE = re.compile(r"""world\.add\(\s*["']([A-Za-z0-9_.]+)["']""")
+
+
+def _bank_names():
+    """The set of bank part names (empty on any bank-load problem)."""
+    try:
+        return set(retrieval._bank.load_bank("v1").parts)
+    except Exception:  # noqa: BLE001 - a bank problem must never break a run
+        return set()
+
+
+def _parse_parts_used(source, engine, bank_names):
+    """Bank parts actually instantiated in the final game source (deduped, ordered).
+
+    py -> the KIND arg of every ``world.part(...)`` call. js -> every
+    ``world.add`` entity name that matches a known bank part name.
+    """
+    if not source:
+        return []
+    if str(engine).lower() == "js":
+        candidates = _ADD_JS_RE.findall(source)
+        want = bank_names
+    else:
+        candidates = _PART_PY_RE.findall(source)
+        want = bank_names or None  # py: keep parsed kinds even if bank unavailable
+    seen, out = set(), []
+    for name in candidates:
+        if want is not None and name not in want:
+            continue
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _read_source(path):
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+    return ""
+
+
 def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
-                  engine=None):
+                  engine=None, use_bank=True):
     """Generate an original game for `prompt` and return the loop report.
 
     `engine` picks the target language: "py" (pymunk, default) or "js" (Planck.js
     in Node). It defaults to the HARNESS_ENGINE env var, then "py". The JS path
     swaps the system prompt for the JS variant and writes .js attempt files;
     verify_game routes by extension automatically.
+
+    `use_bank` (default True) turns on the Tier-1b parts pipeline (Option A): the
+    harness retrieves a themed menu of pre-certified bank parts from the prompt
+    BEFORE the call (deterministic lexical retrieval, no LLM, no network), splices
+    it into the system prompt, and PINS it for the whole run — repairs reuse the
+    same menu (a moving retrieved context destabilises the model; pipeline.md B.3).
+    The menu is advisory: world.add stays the escape hatch, and below the score
+    threshold the run falls back to a legend-only prompt. The template backend
+    bypasses retrieval entirely (menu_mode "off").
 
     Each run gets its OWN sandbox dir `<out_dir>/<slug>/` (attempts a1<ext>,
     a2<ext>, ...; the final game promoted to <slug><ext>). The run may write ONLY
@@ -767,7 +722,9 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
     runs/ledger.jsonl); telemetry is best-effort and can never break a run.
 
     -> {"game_path": str|None, "attempts": [...], "verdict", "backend", "design",
-        "engine": "py"|"js", "integrity": "ok" | {"violated": [...]}, "note"?}
+        "engine": "py"|"js", "integrity": "ok" | {"violated": [...]},
+        "pipeline": {"retrieved": [...], "menu_mode": str, "parts_used": [...]},
+        "note"?}
        verdict in COMPLETED | PARTIAL | ENV_ERROR | GOAL_ERROR | UNSOLVED |
        INVALIDATED
     """
@@ -780,15 +737,39 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
     run_dir = os.path.join(out_dir, slug)
     os.makedirs(run_dir, exist_ok=True)
 
+    # --- Tier-1b retrieval (pre-call, harness-side, pinned for the run) --------
+    # Skip for the offline template backend (it ignores the system prompt) and
+    # when use_bank is off. On any retrieval hiccup, degrade to legend-only so a
+    # bank problem can never break generation.
+    menu_text, menu_mode, retrieved = None, "off", []
+    if use_bank and backend != "template":
+        try:
+            menu_text, menu_mode, retrieved = retrieval.retrieve_menu(prompt, engine)
+        except Exception:  # noqa: BLE001 - retrieval must never break a run
+            menu_text, menu_mode, retrieved = None, "legend_only", []
+    system = _system_prompt(engine, menu_text)
+
     # Freeze the base code for the duration of the run.
     root = _repo_root()
     before = integrity.snapshot(root)
 
     t0 = time.time()
-    result = _dispatch(prompt, run_dir, backend, max_repairs, engine)
+    result = _dispatch(prompt, run_dir, backend, max_repairs, engine, system)
     wall_s = time.time() - t0
     result["engine"] = engine
     _finalize_game(run_dir, slug, result, _game_ext(engine))
+
+    # If auto fell all the way back to templates, the menu was never actually
+    # used — record the honest "off" so the ledger is not misleading.
+    if result.get("backend") == "template":
+        menu_mode, retrieved = "off", []
+
+    # Pipeline telemetry: retrieved set (pinned), menu mode, and the bank parts
+    # the final game actually instantiated (parsed from its source).
+    parts_used = _parse_parts_used(_read_source(result.get("game_path")),
+                                   engine, _bank_names())
+    result["pipeline"] = {"retrieved": list(retrieved), "menu_mode": menu_mode,
+                          "parts_used": parts_used}
 
     # Base code must be untouched: a mutation invalidates the whole run.
     violated = integrity.violations(before, root)
