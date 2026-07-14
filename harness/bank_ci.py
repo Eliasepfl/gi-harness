@@ -29,9 +29,9 @@ import json
 import math
 import sys
 
-from harness.bank import load_bank
-from harness.gameverify import ESCAPE_MARGIN, NAN_EVENT_TYPES, PEN_INIT_TOL
-from harness.world import World
+from harness.core.bank import load_bank
+from harness.verify.gameverify import ESCAPE_MARGIN, NAN_EVENT_TYPES, PEN_INIT_TOL
+from harness.core.world import World
 
 # --- Certification constants ([eng.] = engineering choice) --------------- #
 SETTLE_STEPS = 480          # physics steps of noop settle per instantiation [eng.]

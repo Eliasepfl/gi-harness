@@ -1,13 +1,17 @@
-"""Agent harness — génération d'environnements 2D jouables depuis des commandes texte,
-avec vérification physique purement programmatique (aucun VLM sur pixels).
+"""Agent harness — generate playable 2D environments from text commands, verified
+100% programmatically (no VLM, no pixels).
 
-Modules:
-    sdk        — SceneSDK, wrapper instrumenté de pymunk (seule API vue par le code généré)
-    sandbox    — exécution isolée du code de scène (sous-processus, AST-scan, timeout)
-    verifier   — entonnoir L0 statique → L1 settling → L2 objectif
-    generator  — génération LLM (claude-opus-4-8) ou templates hors-ligne + boucle de réparation
-    navigator  — boucle observation-état → action (policy greedy v1, LLM à venir)
-    cli        — point d'entrée `python -m harness`
+Package layout (see VERSIONS.md at the repo root for the version map):
+    core/    version-spanning substrate + services:
+             world, sandbox, integrity, telemetry, bank
+    verify/  v2 universal oracles: gameverify (G0-G3 funnel + episode runner)
+    gen/     v2 open-ended generator + repair loop: gamegen
+    legacy/  frozen v1 stack: sdk, verifier/ (L0-L2), generator, templates, navigator
+    top-level (span versions): cli, render, bank_ci, __main__
+
+Thin compatibility shims remain at the old flat module paths
+(harness/world.py, harness/gameverify.py, ...) and simply re-export from the new
+locations; they are deprecated and kept only for backward compatibility.
 """
 
 __version__ = "0.1.0"

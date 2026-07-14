@@ -29,7 +29,7 @@ import random
 import re
 import traceback
 
-from harness.sandbox import (
+from harness.core.sandbox import (
     SandboxViolation, load_scene_namespace, scan_source,
 )
 
@@ -195,7 +195,7 @@ def _snapshot_delta(a: dict, b: dict) -> float:
 # ======================================================================== #
 def _default_world_factory(seed: int = 0):
     """Real World (module E), imported lazily so tests can inject a fake."""
-    from harness.world import World
+    from harness.core.world import World
     return World(seed=seed)
 
 
@@ -782,7 +782,7 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
                       for tests (default = harness.world.World).
     """
     if sandboxed:
-        from harness.sandbox import run_sandboxed
+        from harness.core.sandbox import run_sandboxed
         # Game verification legitimately includes the G3 probe (tens of thousands
         # of physics steps) plus a Windows spawn re-import; the legacy 20 s default
         # times out under machine load and yields an error-shaped report with no

@@ -30,7 +30,7 @@ import re
 import shutil
 import time
 
-from harness import integrity
+from harness.core import integrity
 
 try:  # lazily needed: the template backend must run without the package
     import anthropic
@@ -76,8 +76,8 @@ class _BackendUnavailable(Exception):
 # The key is NEVER printed, logged, written, or embedded in any exception message.
 
 def _repo_root() -> str:
-    """Repo root = parent of the harness package directory."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """Repo root = grandparent of this module's package dir (harness/gen/)."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _load_env_module():
@@ -524,7 +524,7 @@ def _verify(game_path):
     an INFRASTRUCTURE failure, not a game failure — retry once; if it persists,
     surface it so the loop can stop instead of repairing blind on an empty hint."""
     try:
-        from harness.gameverify import verify_game
+        from harness.verify.gameverify import verify_game
     except ImportError:
         return None
     report = verify_game(game_path)
@@ -564,7 +564,7 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note):
         if report is None:
             attempts.append({"report": {
                 "verdict": "PARTIAL",
-                "note": "harness.gameverify.verify_game unavailable"}})
+                "note": "harness.verify.gameverify.verify_game unavailable"}})
             verdict = "PARTIAL"
             break
 
@@ -755,7 +755,7 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4)
 
     # Telemetry: counting failures/repairs is a first-class statistic.
     try:
-        from harness import telemetry
+        from harness.core import telemetry
         telemetry.record_run(result, prompt, _model_used(result.get("backend")),
                              wall_s, path=_LEDGER_PATH)
     except Exception:  # noqa: BLE001 - telemetry must never break a run

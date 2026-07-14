@@ -15,8 +15,8 @@ import pytest
 # Make `harness` importable regardless of the pytest rootdir.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from harness.sandbox import run_sandboxed, scan_source  # noqa: E402
-from harness.verifier import make_report, verify_scene  # noqa: E402
+from harness.core.sandbox import run_sandboxed, scan_source  # noqa: E402
+from harness.legacy.verifier import make_report, verify_scene  # noqa: E402
 
 WORLD = (800, 600)
 GRAV = 900.0

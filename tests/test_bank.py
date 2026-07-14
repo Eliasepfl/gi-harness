@@ -16,12 +16,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from harness import bank as bankmod  # noqa: E402
-from harness.bank import (  # noqa: E402
+from harness.core import bank as bankmod  # noqa: E402
+from harness.core.bank import (  # noqa: E402
     BankError, BankOverrideError, Bank, content_hash, load_bank, resolve_part,
 )
 from harness.bank_ci import certify_bank  # noqa: E402
-from harness.world import World  # noqa: E402
+from harness.core.world import World  # noqa: E402
 
 CATEGORIES = ("terrain", "prop", "hazard", "mobile", "trigger")
 
@@ -247,7 +247,7 @@ def checkpoints(world):
 
 
 def test_minigame_passes_full_verify_funnel(tmp_path):
-    from harness.gameverify import verify_game
+    from harness.verify.gameverify import verify_game
 
     path = tmp_path / "minigame.py"
     path.write_text(_MINIGAME, encoding="utf-8")

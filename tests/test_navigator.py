@@ -9,8 +9,8 @@ import json
 
 import pytest
 
-from harness import navigator
-from harness.navigator import (
+from harness.legacy import navigator
+from harness.legacy.navigator import (
     _GreedyPolicy,
     _load_scene,
     _run_episode,
@@ -232,9 +232,9 @@ def test_load_scene_missing_function(tmp_path):
 
 def test_load_scene_rejects_import(tmp_path):
     try:
-        import harness.sandbox  # noqa: F401
+        import harness.core.sandbox  # noqa: F401
     except Exception:
-        pytest.skip("harness.sandbox absent (module B in progress) — import rejection not testable")
+        pytest.skip("harness.core.sandbox absent (module B in progress) — import rejection not testable")
     p = tmp_path / "scene_import.py"
     p.write_text(BAD_SCENE, encoding="utf-8")
     with pytest.raises(navigator.SceneError):

@@ -229,7 +229,7 @@ def _local_load(game_path: str) -> dict:
     """Execute a game module in a restricted namespace (sandbox scan if available)."""
     src = Path(game_path).read_text(encoding="utf-8")
     try:
-        from harness.sandbox import scan_source  # lazy import
+        from harness.core.sandbox import scan_source  # lazy import
     except Exception:
         scan_source = None
     if scan_source is not None:
@@ -244,7 +244,7 @@ def _local_load(game_path: str) -> dict:
 def _load_game(game_path: str) -> SimpleNamespace:
     """Load a game via harness.gameverify's loader if present, else local exec."""
     try:
-        from harness import gameverify  # lazy import (module F may not exist yet)
+        from harness.verify import gameverify  # lazy import (module F may not exist yet)
         for fname in ("load_game", "_load_game", "load_game_module"):
             loader = getattr(gameverify, fname, None)
             if callable(loader):
@@ -256,7 +256,7 @@ def _load_game(game_path: str) -> SimpleNamespace:
 
 def _import_world():
     """Lazy import of the real World (module E may not exist yet)."""
-    from harness.world import World
+    from harness.core.world import World
     return World
 
 
@@ -279,7 +279,7 @@ def _resolve_actions(game_path: str, actions, seed: int):
         return list(actions.get("actions", [])), int(actions.get("seed", seed))
     if actions is not None:
         return list(actions), seed
-    from harness import gameverify  # lazy import
+    from harness.verify import gameverify  # lazy import
     report = gameverify.verify_game(game_path)
     witness = report.get("witness") or {}
     return list(witness.get("actions", [])), int(witness.get("seed", seed))

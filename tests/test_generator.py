@@ -14,8 +14,8 @@ import httpx
 import anthropic
 import pytest
 
-from harness import generator as G
-from harness import templates as T
+from harness.legacy import generator as G
+from harness.legacy import templates as T
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -33,14 +33,14 @@ def _exec_module(source):
 
 
 def _install_verifier(monkeypatch, fn):
-    """Inject a fake harness.verifier module with verify_scene=fn."""
-    mod = types.ModuleType("harness.verifier")
+    """Inject a fake harness.legacy.verifier module with verify_scene=fn."""
+    mod = types.ModuleType("harness.legacy.verifier")
     mod.verify_scene = fn
-    monkeypatch.setitem(sys.modules, "harness.verifier", mod)
+    monkeypatch.setitem(sys.modules, "harness.legacy.verifier", mod)
 
 
 def _remove_verifier(monkeypatch):
-    monkeypatch.delitem(sys.modules, "harness.verifier", raising=False)
+    monkeypatch.delitem(sys.modules, "harness.legacy.verifier", raising=False)
 
 
 # Legacy bilingual commands kept as-is: they exercise the French->template path.

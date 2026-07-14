@@ -55,7 +55,7 @@ def _failed_checks(report: dict) -> list[str]:
 # ---- generate ------------------------------------------------------------
 def cmd_generate(args) -> int:
     try:
-        from harness.generator import generate
+        from harness.legacy.generator import generate
     except Exception as exc:  # noqa: BLE001
         return _module_missing("generator", exc, args.json)
 
@@ -72,7 +72,7 @@ def cmd_generate(args) -> int:
 # ---- verify --------------------------------------------------------------
 def cmd_verify(args) -> int:
     try:
-        from harness.verifier import verify_scene
+        from harness.legacy.verifier import verify_scene
     except Exception as exc:  # noqa: BLE001
         return _module_missing("verifier", exc, args.json)
 
@@ -94,7 +94,7 @@ def cmd_verify(args) -> int:
 # ---- play ----------------------------------------------------------------
 def cmd_play(args) -> int:
     try:
-        from harness.navigator import navigate
+        from harness.legacy.navigator import navigate
     except Exception as exc:  # noqa: BLE001
         return _module_missing("navigator", exc, args.json)
 
@@ -124,11 +124,11 @@ def cmd_play(args) -> int:
 def cmd_demo(args) -> int:
     """Full offline pipeline over scenes/examples/: verify -> play -> table."""
     try:
-        from harness.verifier import verify_scene
+        from harness.legacy.verifier import verify_scene
     except Exception:  # noqa: BLE001
         verify_scene = None
     try:
-        from harness.navigator import navigate
+        from harness.legacy.navigator import navigate
     except Exception as exc:  # noqa: BLE001
         return _module_missing("navigator", exc, args.json)
 
@@ -209,7 +209,7 @@ def cmd_demo(args) -> int:
 def cmd_game_new(args) -> int:
     """Generate a whole game from an open-ended prompt (gamegen)."""
     try:
-        from harness.gamegen import generate_game
+        from harness.gen.gamegen import generate_game
     except Exception as exc:  # noqa: BLE001
         return _module_missing("gamegen", exc, args.json)
 
@@ -233,7 +233,7 @@ def cmd_game_new(args) -> int:
 def cmd_game_verify(args) -> int:
     """Run the universal oracles (gameverify) on a generated game."""
     try:
-        from harness.gameverify import verify_game
+        from harness.verify.gameverify import verify_game
     except Exception as exc:  # noqa: BLE001
         return _module_missing("gameverify", exc, args.json)
 
@@ -380,7 +380,7 @@ def cmd_game_demo(args) -> int:
     Exit 0 iff every prompt reached COMPLETED. No LLM narration anywhere.
     """
     try:
-        from harness.gamegen import generate_game
+        from harness.gen.gamegen import generate_game
     except Exception as exc:  # noqa: BLE001
         return _module_missing("gamegen", exc, args.json)
     try:
@@ -405,7 +405,7 @@ def cmd_game_demo(args) -> int:
 def cmd_game_stats(args) -> int:
     """Aggregate the runs ledger (telemetry) per backend/model."""
     try:
-        from harness.telemetry import stats
+        from harness.core.telemetry import stats
     except Exception as exc:  # noqa: BLE001
         return _module_missing("telemetry", exc, args.json)
 

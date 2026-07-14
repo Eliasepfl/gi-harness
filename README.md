@@ -38,12 +38,17 @@ LLM-generated — only ever talks to `SceneSDK`; it never imports the physics en
 
 | Module | Role |
 |---|---|
-| `harness/sdk.py` | `SceneSDK`: instrumented wrapper over pymunk. Build API + white-box queries. |
-| `harness/sandbox.py` | AST scan (import/`open`/`exec` whitelist) + subprocess isolation with a hard timeout. |
-| `harness/verifier/` | The L0 → L1 → L2 funnel; emits a 4-way verdict + JSON feedback. |
-| `harness/generator.py` | Command → scene, `anthropic` or offline `template` backend, bounded repair loop. |
-| `harness/navigator.py` | Closed-loop play: observe state → act → step. Greedy policy (no LLM); LLM policy stubbed. |
+| `harness/legacy/sdk.py` | `SceneSDK`: instrumented wrapper over pymunk. Build API + white-box queries. |
+| `harness/core/sandbox.py` | AST scan (import/`open`/`exec` whitelist) + subprocess isolation with a hard timeout. |
+| `harness/legacy/verifier/` | The L0 → L1 → L2 funnel; emits a 4-way verdict + JSON feedback. |
+| `harness/legacy/generator.py` | Command → scene, `anthropic` or offline `template` backend, bounded repair loop. |
+| `harness/legacy/navigator.py` | Closed-loop play: observe state → act → step. Greedy policy (no LLM); LLM policy stubbed. |
 | `harness/cli.py` | `python -m harness {generate,verify,play,demo}`. |
+
+> Layout note: the table above is the v1 (legacy) stack. The repo is now split into
+> `harness/core/` (world, sandbox, integrity, telemetry, bank), `harness/verify/`
+> (gameverify), `harness/gen/` (gamegen), and `harness/legacy/` (the v1 modules above).
+> Thin shims remain at the old flat paths. See `VERSIONS.md` for the full version map.
 
 **Verification funnel** (cost-ordered, stops at the first failure):
 

@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from harness.world import World
+from harness.core.world import World
 
 
 # --------------------------------------------------------------------- #

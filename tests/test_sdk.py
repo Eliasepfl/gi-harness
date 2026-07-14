@@ -9,7 +9,7 @@ import math
 
 import pytest
 
-from harness.sdk import SceneSDK
+from harness.legacy.sdk import SceneSDK
 
 
 # --------------------------------------------------------------------- #

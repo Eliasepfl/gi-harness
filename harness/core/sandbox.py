@@ -117,14 +117,14 @@ def _sandbox_worker(scene_path: str, job: str, conn) -> None:
     """Top-level function (picklable for spawn) executed in the subprocess."""
     try:
         if job == "verify":
-            from harness.verifier import verify_scene
+            from harness.legacy.verifier import verify_scene
             result = verify_scene(scene_path, sandboxed=False)
         elif job == "gameverify":
-            from harness.gameverify import verify_game
+            from harness.verify.gameverify import verify_game
             result = verify_game(scene_path, sandboxed=False)
         elif job == "navigate":
             try:
-                from harness.navigator import navigate
+                from harness.legacy.navigator import navigate
             except ImportError as exc:
                 result = {"error": {"type": "not_implemented",
                                     "message": f"navigator unavailable: {exc}"}}

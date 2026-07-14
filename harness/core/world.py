@@ -217,7 +217,7 @@ class World:
     def _bank(self):
         """Lazily load + cache the parts bank for this World (v2.2)."""
         if self._bank_obj is None:
-            from harness.bank import load_bank
+            from harness.core.bank import load_bank
             self._bank_obj = load_bank(self._bank_version)
         return self._bank_obj
 

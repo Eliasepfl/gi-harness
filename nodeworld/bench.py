@@ -102,9 +102,9 @@ def bench_throughput_node(source):
 
 
 def bench_throughput_pymunk():
-    from harness.gameverify import run_episode, load_game
-    from harness.gamegen import _TEMPLATE_GAMES
-    from harness.world import World
+    from harness.verify.gameverify import run_episode, load_game
+    from harness.gen.gamegen import _TEMPLATE_GAMES
+    from harness.core.world import World
 
     game = load_game(_TEMPLATE_GAMES["drift"])
     plans = [macro_plan(e) for e in range(E_EPISODES)]

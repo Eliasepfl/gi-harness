@@ -16,7 +16,7 @@ import httpx
 import anthropic
 import pytest
 
-from harness import gamegen as GG
+from harness.gen import gamegen as GG
 
 
 # --- Helpers ------------------------------------------------------------------
@@ -33,13 +33,13 @@ def _exec_module(source):
 
 
 def _install_gameverify(monkeypatch, fn):
-    mod = types.ModuleType("harness.gameverify")
+    mod = types.ModuleType("harness.verify.gameverify")
     mod.verify_game = fn
-    monkeypatch.setitem(sys.modules, "harness.gameverify", mod)
+    monkeypatch.setitem(sys.modules, "harness.verify.gameverify", mod)
 
 
 def _remove_gameverify(monkeypatch):
-    monkeypatch.delitem(sys.modules, "harness.gameverify", raising=False)
+    monkeypatch.delitem(sys.modules, "harness.verify.gameverify", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -862,7 +862,7 @@ def test_game_demo_json_from_mocked_generate(tmp_path, monkeypatch, capsys):
             fh.write("gif")
         return {"ticks": 12, "result": "success", "out_path": out_path}
 
-    monkeypatch.setattr("harness.gamegen.generate_game", fake_generate)
+    monkeypatch.setattr("harness.gen.gamegen.generate_game", fake_generate)
     monkeypatch.setattr("harness.render.replay_gif", fake_replay)
 
     rc = cli.main(["game", "demo", "--prompts", "p one", "p two",
@@ -899,7 +899,7 @@ def test_game_demo_exit_code_reflects_completion(tmp_path, monkeypatch, capsys):
                                            "hint": "never solved", "witness": None}}]
         return res
 
-    monkeypatch.setattr("harness.gamegen.generate_game", fake_generate)
+    monkeypatch.setattr("harness.gen.gamegen.generate_game", fake_generate)
     monkeypatch.setattr("harness.render.replay_gif",
                         lambda gp, op, **kw: {"result": "success", "out_path": op})
 
@@ -1054,7 +1054,7 @@ def test_telemetry_failure_never_breaks_a_run(tmp_path, monkeypatch):
     def boom(*a, **kw):
         raise OSError("disk full")
 
-    import harness.telemetry as Tel
+    import harness.core.telemetry as Tel
     monkeypatch.setattr(Tel, "record_run", boom)
     _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
                                                 "hint": "", "witness": {}})
@@ -1080,7 +1080,7 @@ class _PaddedResp:
 
 
 def test_openrouter_content_tolerates_keepalive_padding():
-    from harness.gamegen import _openrouter_content, _openrouter_json
+    from harness.gen.gamegen import _openrouter_content, _openrouter_json
     payload = {"choices": [{"message": {"content": "DESIGN\nok\n```python\nX=1\n```"}}]}
     padding = (": OPENROUTER PROCESSING\n" * 40) + ("\n" * 900)
     assert _openrouter_content(_PaddedResp(payload, "")) is not None
@@ -1089,7 +1089,7 @@ def test_openrouter_content_tolerates_keepalive_padding():
 
 
 def test_openrouter_json_returns_none_on_garbage():
-    from harness.gamegen import _openrouter_json
+    from harness.gen.gamegen import _openrouter_json
     assert _openrouter_json(_PaddedResp({}, "")) == {}
 
     class Garbage:

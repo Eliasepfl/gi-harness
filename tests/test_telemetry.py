@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from harness import telemetry as TEL
+from harness.core import telemetry as TEL
 
 
 # --- Synthetic generate_game results ------------------------------------------

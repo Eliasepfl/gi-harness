@@ -17,7 +17,7 @@ __all__ = ["verify_scene", "run_l0", "run_l1", "run_l2", "make_report"]
 
 def _default_factory():
     """Build a real SDK (module A). Imported lazily (depends on pymunk)."""
-    from harness.sdk import SceneSDK
+    from harness.legacy.sdk import SceneSDK
     return SceneSDK()
 
 
@@ -86,7 +86,7 @@ def verify_scene(scene_path: str, sandboxed: bool = True, *, sdk_factory=None) -
     sdk_factory     : SDK factory (default = harness.sdk.SceneSDK); injectable for tests.
     """
     if sandboxed:
-        from harness.sandbox import run_sandboxed
+        from harness.core.sandbox import run_sandboxed
         return run_sandboxed(scene_path, "verify")
 
     report = make_report()

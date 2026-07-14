@@ -17,7 +17,7 @@ v2 (this contract): the LLM designs a WHOLE GAME against a minimal physics subst
 per-tick rules, and its own win/lose conditions. The harness keeps only:
 substrate + sandbox + universal oracles (checks no game can redefine) + solvability probe.
 
-## 1. `harness/world.py` — World (minimal substrate)
+## 1. `harness/core/world.py` — World (minimal substrate)
 
 ```python
 class World:
@@ -118,7 +118,7 @@ may leave the pad it once touched); game predicates stay pure and stateless.
 lesson — hack-resistant). Checkpoints are the *structure of progress between t=0 and
 success*, and double as the dense programmatic signal a reward model can later train on.
 
-## 3. `harness/gamegen.py` — open-ended generator
+## 3. `harness/gen/gamegen.py` — open-ended generator
 
 ```python
 def generate_game(prompt: str, out_dir: str = "scenes/games", backend: str = "auto",
@@ -148,7 +148,7 @@ def generate_game(prompt: str, out_dir: str = "scenes/games", backend: str = "au
   "no random rollout reached success — make the goal easier to reach".
 - Backend "template": 2 tiny built-in v2 games (offline tests/demo fallback only).
 
-## 4. `harness/gameverify.py` — universal oracles (game-agnostic)
+## 4. `harness/verify/gameverify.py` — universal oracles (game-agnostic)
 
 The game defines WHAT the game is; it can never define what SANITY is. These checks are
 outside the game's reach:
@@ -201,7 +201,7 @@ Report schema:
 ```
 Also expose `run_episode(game, world, actions_iter, max_ticks) -> dict` (the §2 runner) —
 single implementation reused by G1/G3, the replay renderer, and future policies.
-Sandbox: reuse `harness/sandbox.py` (AST scan; only `math` importable; worker job "gameverify").
+Sandbox: reuse `harness/core/sandbox.py` (AST scan; only `math` importable; worker job "gameverify").
 Constants live in `gameverify.py`, marked `[eng.]` where they are engineering choices.
 
 ## 5. `harness/render.py` — generic replay renderer (GIFs for demos/site)
@@ -242,10 +242,10 @@ python -m harness game replay scenes/games/<file>.py [--gif out.gif]
 
 | Agent | Owns (create/edit) |
 |---|---|
-| E | `harness/world.py`, `tests/test_world.py`; translate `harness/sdk.py`, `scenes/examples/*.py` |
-| F | `harness/gameverify.py`, `tests/test_gameverify.py`; translate `harness/sandbox.py`, `harness/verifier/*`, `tests/test_verifier.py` |
-| G | `harness/gamegen.py`, `tests/test_gamegen.py`; translate `harness/generator.py`, `harness/templates.py`, `tests/test_generator.py` |
-| H | `harness/render.py`, `tests/test_render.py`, `harness/cli.py` (+ translate), translate `harness/navigator.py` + `tests/test_navigator.py`; site day-1 layout (`C:\Users\Elias\OneDrive\Bureau\gi-site\day1\index.html`) |
+| E | `harness/core/world.py`, `tests/test_world.py`; translate `harness/legacy/sdk.py`, `scenes/examples/*.py` |
+| F | `harness/verify/gameverify.py`, `tests/test_gameverify.py`; translate `harness/core/sandbox.py`, `harness/legacy/verifier/*`, `tests/test_verifier.py` |
+| G | `harness/gen/gamegen.py`, `tests/test_gamegen.py`; translate `harness/legacy/generator.py`, `harness/legacy/templates.py`, `tests/test_generator.py` |
+| H | `harness/render.py`, `tests/test_render.py`, `harness/cli.py` (+ translate), translate `harness/legacy/navigator.py` + `tests/test_navigator.py`; site day-1 layout (`C:\Users\Elias\OneDrive\Bureau\gi-site\day1\index.html`) |
 
 `harness/__init__.py`, `requirements.txt`, `CONTRACTS.md`: orchestrator only.
 Each agent runs its own tests (`python -m pytest tests/test_<x>.py -q`) plus the legacy suite
@@ -270,7 +270,7 @@ name that was already proven correct". Rationale + prior art: `notes/parts_bank/
   entries.
 - `bank.lock = {schema_version, bank_version, content_hash, n_parts}`. The hash is
   SHA-256 over the CANONICAL catalog serialization (sorted keys, no whitespace),
-  so it is stable across reformatting. `harness/bank.py` (`load_bank`, `content_hash`,
+  so it is stable across reformatting. `harness/core/bank.py` (`load_bank`, `content_hash`,
   `write_lock`) owns loading/validation/hashing/resolution.
 - Pinning: the integrity-manifest extension (hashing the pinned catalog into
   `integrity.snapshot`) and the `ledger.bank_version` field land with the

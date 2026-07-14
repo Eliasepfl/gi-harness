@@ -22,7 +22,7 @@ try:  # effectively a lazy import: the template backend must work without the pa
 except ImportError:  # pragma: no cover - environment dependent
     anthropic = None
 
-from harness import templates
+from harness.legacy import templates
 
 _MODEL = "claude-opus-4-8"
 _MAX_TOKENS = 16000
@@ -163,7 +163,7 @@ def _write_scene(out_dir, command, attempt, code):
 def _verify(scene_path):
     """Lazy import of verify_scene; None if module B does not exist."""
     try:
-        from harness.verifier import verify_scene
+        from harness.legacy.verifier import verify_scene
     except ImportError:
         return None
     return verify_scene(scene_path)
@@ -194,7 +194,7 @@ def _repair_loop(command, out_dir, produce, backend_used, max_repairs, note):
 
         if report is None:
             attempts.append({"report": {"verdict": "PARTIAL",
-                                        "note": "harness.verifier.verify_scene unavailable"}})
+                                        "note": "harness.legacy.verifier.verify_scene unavailable"}})
             verdict = "PARTIAL"
             break
 

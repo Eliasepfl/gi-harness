@@ -7,7 +7,7 @@ and secrets may change freely without invalidating a run).
 """
 from __future__ import annotations
 
-from harness import integrity as INT
+from harness.core import integrity as INT
 
 
 def _make_tree(root):

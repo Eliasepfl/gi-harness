@@ -20,7 +20,7 @@ import pytest
 # Make `harness` importable regardless of the pytest rootdir.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from harness.gameverify import (  # noqa: E402
+from harness.verify.gameverify import (  # noqa: E402
     GUIDED_SEED_BASE, K_STEPS, TRIVIAL_TICKS, load_game, run_episode, verify_game,
 )
 
@@ -752,7 +752,7 @@ def test_sandboxed_smoke(tmp_path, job):
     # Sandboxed path routes through the subprocess with the real World factory;
     # World may be absent, so we only require a well-formed report/error dict.
     path = _write(tmp_path, "valid.py", GAME_VALID)
-    from harness.sandbox import run_sandboxed
+    from harness.core.sandbox import run_sandboxed
     rep = run_sandboxed(path, job, timeout_s=30)
     assert isinstance(rep, dict)
     assert "error" in rep or "passed" in rep
@@ -761,9 +761,9 @@ def test_sandboxed_smoke(tmp_path, job):
 def test_smoke_real_world(tmp_path):
     # End-to-end against the real World once module E exists; skip otherwise.
     try:
-        from harness.world import World  # noqa: F401
+        from harness.core.world import World  # noqa: F401
     except ImportError:
-        pytest.skip("harness.world not available yet")
+        pytest.skip("harness.core.world not available yet")
     path = _write(tmp_path, "valid.py", GAME_VALID)
     rep = verify_game(path, sandboxed=False,
                       world_factory=lambda seed=0: World(seed=seed))

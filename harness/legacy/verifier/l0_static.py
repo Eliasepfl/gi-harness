@@ -9,7 +9,7 @@ from __future__ import annotations
 import traceback
 from itertools import combinations
 
-from harness.sandbox import SandboxViolation, load_scene_namespace, scan_source
+from harness.core.sandbox import SandboxViolation, load_scene_namespace, scan_source
 
 from .report import PEN_INIT_TOL, check
 

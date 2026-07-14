@@ -45,7 +45,7 @@ def _load_scene(scene_path: str):
     src = Path(scene_path).read_text(encoding="utf-8")
 
     try:
-        from harness.sandbox import scan_source  # lazy import
+        from harness.core.sandbox import scan_source  # lazy import
     except Exception:
         scan_source = None
     if scan_source is not None:
@@ -408,10 +408,10 @@ def navigate(scene_path: str, policy: str = "greedy", max_steps: int = 1200,
         return {"success": False, "steps": 0, "actions": [], "reason": "error", "error": str(exc)}
 
     try:
-        from harness.sdk import SceneSDK
+        from harness.legacy.sdk import SceneSDK
     except Exception as exc:  # noqa: BLE001
         return {"success": False, "steps": 0, "actions": [], "reason": "error",
-                "error": f"harness.sdk unavailable: {exc}"}
+                "error": f"harness.legacy.sdk unavailable: {exc}"}
 
     try:
         sdk = SceneSDK()

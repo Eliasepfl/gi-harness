@@ -69,8 +69,8 @@ class BankOverrideError(BankError):
 # Paths
 # ======================================================================== #
 def _repo_root() -> str:
-    """Repo root = parent of the harness package directory."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """Repo root = grandparent of this module's package dir (harness/core/)."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def bank_dir(version: str = "v1") -> str:
