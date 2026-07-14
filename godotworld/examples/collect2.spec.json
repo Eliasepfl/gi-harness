@@ -1,0 +1,38 @@
+{
+  "engine": "godot",
+  "spec_version": 1,
+  "meta": {
+    "title": "Twin Gems",
+    "prompt": "Slide the collector left and right across the ice to pick up both gems.",
+    "world_size": [1000, 600],
+    "actions": ["push_left", "push_right"]
+  },
+  "bodies": [
+    {"name": "floor", "shape": "box", "pos": [500, 30], "size": [1000, 60], "static": true, "friction": 0.04, "elasticity": 0.1},
+    {"name": "left_wall", "shape": "box", "pos": [10, 300], "size": [20, 600], "static": true, "friction": 0.2},
+    {"name": "right_wall", "shape": "box", "pos": [990, 300], "size": [20, 600], "static": true, "friction": 0.2},
+    {"name": "collector", "shape": "circle", "pos": [500, 80], "radius": 16, "mass": 1.0, "friction": 0.04, "elasticity": 0.1, "control": true},
+    {"name": "gem_left", "shape": "circle", "pos": [180, 82], "radius": 26, "static": true, "sensor": true},
+    {"name": "gem_right", "shape": "circle", "pos": [820, 82], "radius": 26, "static": true, "sensor": true}
+  ],
+  "on_contact": [
+    {"a": "collector", "b": "gem_left", "flag": "got_left", "once": true},
+    {"a": "collector", "b": "gem_right", "flag": "got_right", "once": true}
+  ],
+  "act": {
+    "push_right": [{"verb": "impulse", "body": "collector", "vec": [120, 0]}],
+    "push_left": [{"verb": "impulse", "body": "collector", "vec": [-120, 0]}]
+  },
+  "on_step": [
+    {"kind": "velocity_clamp", "body": "collector", "vx_max": 240},
+    {"kind": "remove_when", "flag": "got_left", "body": "gem_left"},
+    {"kind": "remove_when", "flag": "got_right", "body": "gem_right"}
+  ],
+  "predicates": {
+    "success": "flag(\"got_left\") and flag(\"got_right\")",
+    "checkpoints": {
+      "first_gem": "flag(\"got_left\") or flag(\"got_right\")",
+      "both_gems": "flag(\"got_left\") and flag(\"got_right\")"
+    }
+  }
+}

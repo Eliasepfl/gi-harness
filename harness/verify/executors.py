@@ -41,6 +41,10 @@ import json
 import os
 import subprocess
 
+# The Godot lane's executor lives in its own module (keeps this file's diff small);
+# re-exported here so the funnel imports all three engines from one place. The
+# import sits AFTER VerifyError is defined below, at the bottom of the module.
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -356,3 +360,12 @@ def render_js_replay(game_source, out_path, *, actions, seed: int = 0, label=Non
     render._save_gif(imgs, out_path)
     return {"ticks": ep.get("ticks", 0), "result": ep.get("result"),
             "frames": len(imgs), "out_path": str(out_path)}
+
+
+# ---------------------------------------------------------------------------
+# Godot (declarative-spec) executor — third engine seam. Imported at the bottom
+# so godot_exec (which references VerifyError lazily) never forms an import cycle.
+# ---------------------------------------------------------------------------
+from harness.verify.godot_exec import (  # noqa: E402,F401
+    GodotExecutor, find_godot_exe, default_godot_project,
+)
