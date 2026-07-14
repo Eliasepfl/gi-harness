@@ -321,22 +321,17 @@ class _FrameWorld:
         return self._ents[name]
 
 
-def render_js_replay(game_source, out_path, *, actions, seed: int = 0, label=None,
-                     max_ticks: int = 400, scale: float = 0.6, every: int = 2,
-                     node=None, runner_path=None, timeout_s: float = 60.0) -> dict:
-    """Render a JS game end-to-end via the executor's frames path to a GIF.
+def _episode_frames_to_gif(ep, out_path, *, label=None, scale: float = 0.6) -> dict:
+    """Draw an executor episode record's ``frames`` (tick + per-entity query
+    dicts, exactly the format render.py consumes) to a GIF via render's
+    ``_render_frame``, following the controlled body with a ``FollowCamera``.
 
-    Node computes the physics and emits ``frames`` (tick + per-entity query dicts,
-    exactly the format render.py consumes); this adapter draws each with render's
-    ``_render_frame`` and saves the GIF — reusing render.py WITHOUT touching it.
-    """
+    Engine-agnostic: the js and godot GIF adapters share it (godot's bbox-only
+    entities fall back to the axis-aligned shape inside render). Reuses render.py
+    WITHOUT touching it. Returns the CLI result dict (``ticks``/``result``/
+    ``frames``/``out_path``, or an ``error`` on a failed/empty replay)."""
     from harness import render  # PIL-only; imported lazily
 
-    ex = JsExecutor(node=node, runner_path=runner_path, timeout_s=timeout_s)
-    every = max(1, int(every))
-    recs = ex.run_batch(game_source, [{"seed": seed, "actions": list(actions)}],
-                        max_ticks, frames_every=every)
-    ep = recs[0]
     if ep.get("result") == "error":
         return {"ticks": ep.get("ticks", 0), "result": "error",
                 "error": ep.get("error")}
@@ -362,6 +357,41 @@ def render_js_replay(game_source, out_path, *, actions, seed: int = 0, label=Non
             "frames": len(imgs), "out_path": str(out_path)}
 
 
+def render_js_replay(game_source, out_path, *, actions, seed: int = 0, label=None,
+                     max_ticks: int = 400, scale: float = 0.6, every: int = 2,
+                     node=None, runner_path=None, timeout_s: float = 60.0) -> dict:
+    """Render a JS game end-to-end via the executor's frames path to a GIF.
+
+    Node computes the physics and emits ``frames`` (tick + per-entity query dicts,
+    exactly the format render.py consumes); ``_episode_frames_to_gif`` draws each
+    with render's ``_render_frame`` and saves the GIF — reusing render.py WITHOUT
+    touching it.
+    """
+    ex = JsExecutor(node=node, runner_path=runner_path, timeout_s=timeout_s)
+    every = max(1, int(every))
+    recs = ex.run_batch(game_source, [{"seed": seed, "actions": list(actions)}],
+                        max_ticks, frames_every=every)
+    return _episode_frames_to_gif(recs[0], out_path, label=label, scale=scale)
+
+
+def render_godot_replay(game_source, out_path, *, actions, seed: int = 0, label=None,
+                        max_ticks: int = 400, scale: float = 0.6, every: int = 2,
+                        timeout_s: float = 120.0) -> dict:
+    """Render a Godot-spec game to a GIF via the executor's frames path — the
+    Godot twin of ``render_js_replay``.
+
+    GodotExecutor computes the physics headlessly and emits ``frames`` in the same
+    shape render.py consumes (``bbox`` + ``shape`` per entity); the flat bbox
+    fallback in render covers the ``verts`` / ``radius`` the Godot frames omit, so
+    the renderer stays untouched.
+    """
+    ex = GodotExecutor(timeout_s=timeout_s)
+    every = max(1, int(every))
+    recs = ex.run_batch(game_source, [{"seed": int(seed), "actions": list(actions)}],
+                        max_ticks, frames_every=every)
+    return _episode_frames_to_gif(recs[0], out_path, label=label, scale=scale)
+
+
 # ---------------------------------------------------------------------------
 # Frames substrate — persist a scrubbable replay for the web canvas player
 # ---------------------------------------------------------------------------
@@ -379,6 +409,30 @@ def _round_floats(obj, dp: int = 2):
     return obj
 
 
+def normalize_godot_record(rec, source):
+    """Map a ``GodotExecutor`` episode record + its spec source onto the engine-
+    agnostic replay-doc pieces the js/py lanes already produce -> ``(title,
+    prompt, frames)``.
+
+    Godot's ``runner.gd`` emits ``world_size`` on the record but not ``title`` /
+    ``prompt`` (harvested here from the spec's ``meta`` block), and its per-frame
+    entities already carry the shared query shape (``pos``/``vel``/``angle``/
+    ``bbox``/``shape``/``static``/``sensor``/``controlled``) — the renderer and
+    the web player fall back to the axis-aligned ``bbox`` for the ``verts`` /
+    ``radius`` the Godot frames omit, so no field synthesis is needed. Frames are
+    stripped to the shared ``{tick, entities}`` shape (dropping any sensor
+    ``obs`` tail the runner appends for observation specs)."""
+    title = prompt = None
+    try:
+        meta = (json.loads(source) or {}).get("meta") or {}
+        title, prompt = meta.get("title"), meta.get("prompt")
+    except (ValueError, TypeError, AttributeError):
+        pass  # meta is cosmetic, never break the export
+    frames = [{"tick": fr.get("tick", 0), "entities": fr.get("entities", {})}
+              for fr in (rec.get("frames") or [])]
+    return title, prompt, frames
+
+
 def replay_frames_doc(game_source, *, engine, actions, witness=None, seed: int = 0,
                       max_ticks: int = 400, round_dp: int = 2, node=None,
                       runner_path=None, timeout_s: float = 60.0) -> dict:
@@ -390,29 +444,37 @@ def replay_frames_doc(game_source, *, engine, actions, witness=None, seed: int =
 
     Engine-agnostic: js goes through the Node runner (which now echoes
     title/prompt in a frames record), py through the in-process PyExecutor (title/
-    prompt are harvested from the loaded game). ``actions`` is the witness plan
-    replayed on ``seed`` (the world seed the frames are generated on); ``witness``
-    (from a fresh verify) supplies ticks + checkpoints for the meta. Floats are
-    rounded to ``round_dp`` decimals. Returns the document plus ``result`` /
-    ``error`` keys describing the replay's terminal classification."""
+    prompt are harvested from the loaded game), and godot through the out-of-
+    process GodotExecutor (title/prompt harvested from the spec ``meta`` via
+    ``normalize_godot_record``). ``actions`` is the witness plan replayed on
+    ``seed`` (the world seed the frames are generated on); ``witness`` (from a
+    fresh verify) supplies ticks + checkpoints for the meta. Floats are rounded to
+    ``round_dp`` decimals. Returns the document plus ``result`` / ``error`` keys
+    describing the replay's terminal classification."""
     if engine == "js":
         ex = JsExecutor(node=node, runner_path=runner_path, timeout_s=timeout_s)
+    elif engine == "godot":
+        ex = GodotExecutor(timeout_s=timeout_s)
     else:
         ex = PyExecutor()
     recs = ex.run_batch(game_source, [{"seed": int(seed), "actions": list(actions)}],
                         int(max_ticks), frames_every=1)
     rec = recs[0]
 
-    title = rec.get("title")
-    prompt = rec.get("prompt")
-    if title is None or prompt is None:  # py path: harvest from the loaded game
-        try:
-            from harness.verify.gameverify import load_game
-            game = game_source if not isinstance(game_source, str) else load_game(game_source)
-            title = getattr(game, "title", None) if title is None else title
-            prompt = getattr(game, "prompt", None) if prompt is None else prompt
-        except Exception:  # noqa: BLE001 — meta is cosmetic, never break the export
-            pass
+    if engine == "godot":
+        title, prompt, frames_raw = normalize_godot_record(rec, game_source)
+    else:
+        title = rec.get("title")
+        prompt = rec.get("prompt")
+        if title is None or prompt is None:  # py path: harvest from the loaded game
+            try:
+                from harness.verify.gameverify import load_game
+                game = game_source if not isinstance(game_source, str) else load_game(game_source)
+                title = getattr(game, "title", None) if title is None else title
+                prompt = getattr(game, "prompt", None) if prompt is None else prompt
+            except Exception:  # noqa: BLE001 — meta is cosmetic, never break the export
+                pass
+        frames_raw = rec.get("frames", [])
 
     witness = witness or {}
     meta = {
@@ -427,7 +489,7 @@ def replay_frames_doc(game_source, *, engine, actions, witness=None, seed: int =
             "checkpoints": dict(witness.get("checkpoints") or {}),
         },
     }
-    frames = _round_floats(rec.get("frames", []), int(round_dp))
+    frames = _round_floats(frames_raw, int(round_dp))
     return {"meta": meta, "frames": frames,
             "result": rec.get("result"), "error": rec.get("error")}
 
