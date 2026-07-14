@@ -26,6 +26,7 @@ future policies. `verify_game` orchestrates the funnel.
 from __future__ import annotations
 
 import math
+import os
 import random
 import re
 import traceback
@@ -68,6 +69,26 @@ SOLIDITY_FRAC = 0.5         # witness replay: max solid-pair overlap depth as a 
 SOLIDITY_TICKS = 2          # consecutive sampled ticks the overlap must persist to fail (transient impact slop is physics) [eng.]
 GUIDED_EPISODES = 30        # checkpoint-guided second-pass episodes (longer horizons need more) [eng.]
 GUIDED_SEED_BASE = 1000     # probe seeds 1000+i for the guided pass (v2.1)
+
+# G3 solver selection (v2.4): the Go-Explore state-action tree is the default —
+# it chains precise stages random search cannot (see harness/verify/treesolve.py).
+# The legacy random path stays intact and selectable. Override per call with the
+# HARNESS_G3_SOLVER env var ("random" | "tree"), read at call time.
+G3_SOLVER = "tree"
+
+
+def _g3_solver() -> str:
+    """Active G3 solver: HARNESS_G3_SOLVER env override, else the module default."""
+    return os.environ.get("HARNESS_G3_SOLVER", G3_SOLVER).strip().lower() or G3_SOLVER
+
+
+def _run_g3(executor, game_source, actions, declared):
+    """Dispatch to the tree solver (default) or the legacy random search."""
+    if _g3_solver() == "random":
+        return run_g3(executor, game_source, actions, declared)
+    from harness.verify.treesolve import run_g3_tree
+    return run_g3_tree(executor, game_source, actions, declared)
+
 
 _REQUIRED_SYMBOLS = ("TITLE", "PROMPT", "ACTIONS", "build", "act", "success",
                      "checkpoints")
@@ -1143,7 +1164,7 @@ def _verify_py(source: str, report: dict, world_factory) -> dict:
     # --- G3 ---
     declared = _declared_order(factory, game)
     try:
-        g3 = run_g3(executor, game, game.actions, declared)
+        g3 = _run_g3(executor, game, game.actions, declared)
     except Exception:
         g3 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
     return _finish_g3(report, g3)
@@ -1191,7 +1212,7 @@ def _verify_js(source: str, report: dict) -> dict:
 
         # --- G3 ---
         try:
-            g3 = run_g3(executor, source, actions, declared)
+            g3 = _run_g3(executor, source, actions, declared)
         except VerifyError:
             raise
         except Exception:

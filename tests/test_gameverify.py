@@ -618,10 +618,14 @@ def test_misordered_milestones_warn_but_pass(tmp_path, legacy_thresholds):
     assert "halfway" in rep["warnings"][0] and "almost" in rep["warnings"][0]
 
 
-def test_guided_second_pass_solves_two_stage_game(tmp_path, legacy_thresholds):
+def test_guided_second_pass_solves_two_stage_game(tmp_path, legacy_thresholds,
+                                                  monkeypatch):
     # Pure random search misses the combo-lock game (empirically, seeds 0..39
     # never both arm early enough AND blast far enough); the checkpoint-guided
-    # second pass reuses the best arming prefix and finds a witness.
+    # second pass reuses the best arming prefix and finds a witness. This asserts
+    # RANDOM-search specifics (guided flag, guided probe seed), so pin the legacy
+    # solver; the tree solver is exercised in tests/test_treesolve.py.
+    monkeypatch.setenv("HARNESS_G3_SOLVER", "random")
     path = _write(tmp_path, "twostage.py", GAME_TWO_STAGE)
     rep = verify_game(path, sandboxed=False, world_factory=factory())
     assert rep["passed"] is True, rep
