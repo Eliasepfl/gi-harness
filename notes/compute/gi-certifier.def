@@ -1,0 +1,61 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    org.gi.role   canonical-certifier
+    org.gi.godot  4.7-stable
+    org.gi.rapier v0.8.39
+    org.gi.pymunk 7.3.0
+
+%environment
+    export PATH=/opt/conda/envs/gi/bin:/opt/conda/bin:/usr/local/bin:$PATH
+    export HARNESS_GODOT_EXE=/opt/godot/godot
+    export HARNESS_NODE=/opt/conda/envs/gi/bin/node
+    export NODE_PATH=/opt/nodeworld/node_modules
+    export PYTHONHASHSEED=0
+    export PYTHONNOUSERSITE=1          # never leak ~/.local into the env (ORCD §2 rule)
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    # Godot headless still dlopen's these even with --headless; dos2unix for CRLF hygiene.
+    apt-get install -y --no-install-recommends \
+        curl ca-certificates git unzip xz-utils dos2unix \
+        libx11-6 libxcursor1 libxinerama1 libxrandr2 libxi6 libxext6 \
+        libgl1 libglu1-mesa libglx-mesa0 libasound2 libpulse0 \
+        fontconfig libfontconfig1 libfreetype6
+    rm -rf /var/lib/apt/lists/*
+
+    # --- miniforge + the gi env (Python 3.12; pin pymunk to the certifying engine) ---
+    curl -fsSL -o /tmp/mf.sh https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+    bash /tmp/mf.sh -b -p /opt/conda && rm /tmp/mf.sh
+    /opt/conda/bin/mamba create -y -n gi -c conda-forge \
+        python=3.12 pillow pytest numpy nodejs=22
+    /opt/conda/envs/gi/bin/pip install --no-cache-dir pymunk==7.3.0
+    /opt/conda/envs/gi/bin/pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+    # Test/optional deps from requirements.txt so the day-1 `pytest tests/` gate can collect
+    # (test_gamegen/test_generator import anthropic+httpx at top level; godot schema tests need
+    # jsonschema; requests powers the G4 tier-1 LLM attacker lane; pygame for viewer tests).
+    /opt/conda/envs/gi/bin/pip install --no-cache-dir anthropic httpx jsonschema requests pygame
+
+    # --- nodeworld runtime dep, baked at a repo-independent path (runner resolves via NODE_PATH) ---
+    # %environment does NOT apply during %post: npm's `#!/usr/bin/env node` shebang needs the env on PATH here.
+    export PATH=/opt/conda/envs/gi/bin:$PATH
+    mkdir -p /opt/nodeworld && cd /opt/nodeworld
+    /opt/conda/envs/gi/bin/npm install --no-audit --no-fund planck@1.5.0
+    # If nodeworld/package.json grows past planck, run `npm ci` in the home checkout on the login node.
+
+    # --- Godot 4.7 headless + rapier addon (multi-platform zip → Linux .so is inside) ---
+    mkdir -p /opt/godot && cd /opt/godot
+    curl -fsSL -o g.zip https://github.com/godotengine/godot/releases/download/4.7-stable/Godot_v4.7-stable_linux.x86_64.zip
+    unzip -q g.zip && rm g.zip && mv Godot_v4.7-stable_linux.x86_64 godot && chmod +x godot
+    ln -sf /opt/godot/godot /usr/local/bin/godot
+    mkdir -p /opt/rapier && cd /opt/rapier
+    curl -fsSL -o r.zip https://github.com/appsinacup/godot-rapier-physics/releases/download/v0.8.39/godot-rapier-2d-single-simd-parallel.zip
+    unzip -q r.zip && rm r.zip   # → /opt/rapier/addons/godot-rapier2d/{bin,godot-rapier2d.gdextension}
+
+    /opt/godot/godot --headless --version    # boot/lib-deps smoke (fails the build if libs missing)
+
+%runscript
+    exec "$@"
