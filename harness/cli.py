@@ -214,7 +214,8 @@ def cmd_game_new(args) -> int:
         return _module_missing("gamegen", exc, args.json)
 
     try:
-        result = generate_game(args.prompt, out_dir=args.out_dir, backend=args.backend)
+        result = generate_game(args.prompt, out_dir=args.out_dir, backend=args.backend,
+                               engine=getattr(args, "engine", None))
     except Exception as exc:  # noqa: BLE001
         return _call_error("game new", exc, args.json)
     if args.json:
@@ -549,6 +550,9 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("prompt", help="open-ended natural-language prompt")
     gn.add_argument("--backend", default="auto",
                     choices=["auto", "anthropic", "openrouter", "template"])
+    gn.add_argument("--engine", default=None, choices=["py", "js"],
+                    help="physics engine: py (pymunk) or js (Planck.js); "
+                         "default from HARNESS_ENGINE env, else py")
     gn.add_argument("--out-dir", default="scenes/games")
     gn.add_argument("--json", action="store_true")
     gn.set_defaults(func=cmd_game_new)

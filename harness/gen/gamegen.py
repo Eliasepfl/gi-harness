@@ -31,6 +31,7 @@ import shutil
 import time
 
 from harness.core import integrity
+from harness.gen.prompts_js import SYSTEM_PROMPT_JS
 
 try:  # lazily needed: the template backend must run without the package
     import anthropic
@@ -255,10 +256,25 @@ Win / Lose: <success and, if any, failure>
 Then EXACTLY ONE fenced ```python block with the complete module. Nothing after it."""
 
 
-def _first_user_msg(prompt):
+def _engine_lang(engine):
+    """(language name, code-fence) for a given engine."""
+    return ("JavaScript", "javascript") if engine == "js" else ("Python", "python")
+
+
+def _system_prompt(engine):
+    """The open system prompt for the target language (py default)."""
+    return SYSTEM_PROMPT_JS if engine == "js" else _SYSTEM_PROMPT
+
+
+def _game_ext(engine):
+    return ".js" if engine == "js" else ".py"
+
+
+def _first_user_msg(prompt, engine="py"):
+    _, fence = _engine_lang(engine)
     return (f'User prompt: "{prompt}"\n'
             "Design an original 2D physics game for this prompt. Return the "
-            "DESIGN block, then exactly one ```python module that follows the "
+            f"DESIGN block, then exactly one ```{fence} module that follows the "
             "required format and every hard constraint.")
 
 
@@ -483,11 +499,17 @@ def _openrouter_complete(system, messages):
         raise _BackendUnavailable(_openrouter_error(resp, key))
 
 
-def _extract_code(text):
-    """First ```python block (fallback: first fenced block, else raw text)."""
-    m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
-    if m:
-        return m.group(1)
+def _extract_code(text, engine="py"):
+    """First fenced code block for the engine (fallback: any fenced block, raw text)."""
+    if engine == "js":
+        for lang in ("javascript", "js"):
+            m = re.search(rf"```{lang}\s*\n(.*?)```", text, re.DOTALL)
+            if m:
+                return m.group(1)
+    else:
+        m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
+        if m:
+            return m.group(1)
     m = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1)
@@ -509,9 +531,9 @@ def _slug(prompt):
     return s[:40] or "game"
 
 
-def _write_attempt(run_dir, attempt, code):
-    """Write one attempt into the per-run sandbox dir as a{n}.py."""
-    path = os.path.join(run_dir, f"a{attempt}.py")
+def _write_attempt(run_dir, attempt, code, ext=".py"):
+    """Write one attempt into the per-run sandbox dir as a{n}<ext>."""
+    path = os.path.join(run_dir, f"a{attempt}{ext}")
     with open(path, "w", encoding="utf-8") as f:
         f.write(code)
     return path
@@ -539,12 +561,12 @@ def _is_verify_error(report) -> bool:
     return isinstance(report, dict) and "error" in report and "layers" not in report
 
 
-def _repair_loop(run_dir, produce, backend_used, max_repairs, note):
+def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
     """Shared write -> verify -> repair loop for every backend.
 
     Attempts are written ONLY into `run_dir` (the per-run sandbox), one file
-    per attempt (a1.py, a2.py, ...). The winning/final attempt is later promoted
-    to <slug>.py by generate_game.
+    per attempt (a1<ext>, a2<ext>, ...). The winning/final attempt is later
+    promoted to <slug><ext> by generate_game. verify_game routes by extension.
     """
     attempts = []
     feedback = None
@@ -558,7 +580,7 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note):
     while True:
         n += 1
         code, design = produce(feedback)
-        game_path = _write_attempt(run_dir, n, code)
+        game_path = _write_attempt(run_dir, n, code, ext)
         report = _verify(game_path)
 
         if report is None:
@@ -606,15 +628,19 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note):
     return result
 
 
-def _run_template(prompt, run_dir, max_repairs, note):
+def _run_template(prompt, run_dir, max_repairs, note, engine="py"):
     name = _select_template(prompt)
-    code = _TEMPLATE_GAMES[name]
-    design = _DESIGNS[name]
+    if engine == "js":
+        code = _TEMPLATE_GAMES_JS.get(name, _DRIFT_JS)
+        design = _DESIGNS_JS.get(name, _DESIGNS_JS["drift"])
+    else:
+        code = _TEMPLATE_GAMES[name]
+        design = _DESIGNS[name]
     return _repair_loop(run_dir, lambda feedback: (code, design),
-                        "template", max_repairs, note)
+                        "template", max_repairs, note, _game_ext(engine))
 
 
-def _run_anthropic(prompt, run_dir, max_repairs):
+def _run_anthropic(prompt, run_dir, max_repairs, engine="py"):
     if anthropic is None:
         raise _BackendUnavailable("anthropic package not installed")
     try:
@@ -623,26 +649,28 @@ def _run_anthropic(prompt, run_dir, max_repairs):
             anthropic.AnthropicError) as e:
         raise _BackendUnavailable(type(e).__name__)
 
-    messages = [{"role": "user", "content": _first_user_msg(prompt)}]
+    system = _system_prompt(engine)
+    messages = [{"role": "user", "content": _first_user_msg(prompt, engine)}]
     state = {"first": True}
 
     def produce(feedback):
         if feedback is not None:
             messages.append({"role": "user", "content": _repair_user_msg(feedback)})
         try:
-            text = _llm_complete(client, _SYSTEM_PROMPT, messages)
+            text = _llm_complete(client, system, messages)
         except (anthropic.AuthenticationError, anthropic.APIConnectionError) as e:
             if state["first"]:
                 raise _BackendUnavailable(type(e).__name__)
             raise
         state["first"] = False
         messages.append({"role": "assistant", "content": text})
-        return _extract_code(text), _extract_design(text)
+        return _extract_code(text, engine), _extract_design(text)
 
-    return _repair_loop(run_dir, produce, "anthropic", max_repairs, None)
+    return _repair_loop(run_dir, produce, "anthropic", max_repairs, None,
+                        _game_ext(engine))
 
 
-def _run_openrouter(prompt, run_dir, max_repairs):
+def _run_openrouter(prompt, run_dir, max_repairs, engine="py"):
     """OpenRouter backend: SAME system prompt + repair loop as anthropic.
 
     Availability (requests + configured key/model) is probed up front so that
@@ -655,16 +683,18 @@ def _run_openrouter(prompt, run_dir, max_repairs):
     if not _resolve_secret("OPENROUTER_API_KEY") or not _resolve_secret("OPENROUTER_MODEL"):
         raise _BackendUnavailable("OpenRouter API key or model not configured")
 
-    messages = [{"role": "user", "content": _first_user_msg(prompt)}]
+    system = _system_prompt(engine)
+    messages = [{"role": "user", "content": _first_user_msg(prompt, engine)}]
 
     def produce(feedback):
         if feedback is not None:
             messages.append({"role": "user", "content": _repair_user_msg(feedback)})
-        text = _openrouter_complete(_SYSTEM_PROMPT, messages)
+        text = _openrouter_complete(system, messages)
         messages.append({"role": "assistant", "content": text})
-        return _extract_code(text), _extract_design(text)
+        return _extract_code(text, engine), _extract_design(text)
 
-    return _repair_loop(run_dir, produce, "openrouter", max_repairs, None)
+    return _repair_loop(run_dir, produce, "openrouter", max_repairs, None,
+                        _game_ext(engine))
 
 
 # --- Public API --------------------------------------------------------------
@@ -673,10 +703,10 @@ def _run_openrouter(prompt, run_dir, max_repairs):
 _LLM_RUNNERS = {"anthropic": _run_anthropic, "openrouter": _run_openrouter}
 
 
-def _dispatch(prompt, run_dir, backend, max_repairs):
+def _dispatch(prompt, run_dir, backend, max_repairs, engine="py"):
     """Pick and run a backend, honouring the auto fallback chain."""
     if backend == "template":
-        return _run_template(prompt, run_dir, max_repairs, None)
+        return _run_template(prompt, run_dir, max_repairs, None, engine)
 
     if backend == "auto":
         order = ["anthropic", "openrouter"]
@@ -686,18 +716,25 @@ def _dispatch(prompt, run_dir, backend, max_repairs):
     notes = []
     for name in order:
         try:
-            return _LLM_RUNNERS[name](prompt, run_dir, max_repairs)
+            return _LLM_RUNNERS[name](prompt, run_dir, max_repairs, engine)
         except _BackendUnavailable as e:
             notes.append(f"{name} unavailable ({e})")
     note = "; ".join(notes) + "; falling back to templates" if notes else None
-    return _run_template(prompt, run_dir, max_repairs, note)
+    return _run_template(prompt, run_dir, max_repairs, note, engine)
 
 
-def _finalize_game(run_dir, slug, result):
-    """Promote the final attempt to <slug>.py inside the run dir; repoint path."""
+def _resolve_engine(engine):
+    """Target language: explicit arg > HARNESS_ENGINE env > 'py' default."""
+    if engine is None:
+        engine = os.environ.get("HARNESS_ENGINE", "py")
+    return "js" if str(engine).lower() == "js" else "py"
+
+
+def _finalize_game(run_dir, slug, result, ext=".py"):
+    """Promote the final attempt to <slug><ext> inside the run dir; repoint path."""
     src = result.get("game_path")
     if src and os.path.isfile(src):
-        final = os.path.join(run_dir, f"{slug}.py")
+        final = os.path.join(run_dir, f"{slug}{ext}")
         if os.path.abspath(src) != os.path.abspath(final):
             shutil.copyfile(src, final)
         result["game_path"] = final
@@ -713,23 +750,30 @@ def _model_used(backend):
     return backend  # "template" (or unknown)
 
 
-def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4):
+def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
+                  engine=None):
     """Generate an original game for `prompt` and return the loop report.
 
-    Each run gets its OWN sandbox dir `<out_dir>/<slug>/` (attempts a1.py, a2.py,
-    ...; the final game promoted to <slug>.py). The run may write ONLY there. The
-    whole run is bracketed by an integrity manifest check over the tracked base
-    files: any base-code mutation mid-run forces verdict INVALIDATED. Every run
-    is appended to the telemetry ledger (harness.telemetry, runs/ledger.jsonl);
-    telemetry is best-effort and can never break a run.
+    `engine` picks the target language: "py" (pymunk, default) or "js" (Planck.js
+    in Node). It defaults to the HARNESS_ENGINE env var, then "py". The JS path
+    swaps the system prompt for the JS variant and writes .js attempt files;
+    verify_game routes by extension automatically.
+
+    Each run gets its OWN sandbox dir `<out_dir>/<slug>/` (attempts a1<ext>,
+    a2<ext>, ...; the final game promoted to <slug><ext>). The run may write ONLY
+    there. The whole run is bracketed by an integrity manifest check over the
+    tracked base files: any base-code mutation mid-run forces verdict INVALIDATED.
+    Every run is appended to the telemetry ledger (harness.telemetry,
+    runs/ledger.jsonl); telemetry is best-effort and can never break a run.
 
     -> {"game_path": str|None, "attempts": [...], "verdict", "backend", "design",
-        "integrity": "ok" | {"violated": [...]}, "note"?}
+        "engine": "py"|"js", "integrity": "ok" | {"violated": [...]}, "note"?}
        verdict in COMPLETED | PARTIAL | ENV_ERROR | GOAL_ERROR | UNSOLVED |
        INVALIDATED
     """
     if backend not in ("auto", "anthropic", "openrouter", "template"):
         backend = "auto"
+    engine = _resolve_engine(engine)
     os.makedirs(out_dir, exist_ok=True)
 
     slug = _slug(prompt)
@@ -741,9 +785,10 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4)
     before = integrity.snapshot(root)
 
     t0 = time.time()
-    result = _dispatch(prompt, run_dir, backend, max_repairs)
+    result = _dispatch(prompt, run_dir, backend, max_repairs, engine)
     wall_s = time.time() - t0
-    _finalize_game(run_dir, slug, result)
+    result["engine"] = engine
+    _finalize_game(run_dir, slug, result, _game_ext(engine))
 
     # Base code must be untouched: a mutation invalidates the whole run.
     violated = integrity.violations(before, root)
@@ -904,3 +949,56 @@ _DESIGNS = {
              "Win / Lose: win when the ball rests on the paddle; lose if the "
              "ball reaches the floor.\n"),
 }
+
+
+# --- Built-in v2 games, JS variant (Planck.js substrate) ----------------------
+# The JS §2 module format: plain top-level `const`/`function` declarations, no
+# require/import/exports, world.add takes an options object, checkpoints returns
+# a plain object. Same "drift" design as the pymunk template, random-solvable by
+# the seeded macro-action probe on the Node engine.
+_DRIFT_JS = '''const TITLE = "Drift";
+const PROMPT = "guide the puck across the ice onto the glowing pad";
+const ACTIONS = ["left", "right", "up", "down"];
+
+function build(world) {
+  world.set_gravity(0.0, 0.0);
+  world.add("puck", "circle", { pos: [180.0, 150.0], radius: 16.0, mass: 1.0, friction: 0.2, elasticity: 0.6 });
+  world.control("puck");
+  world.add("pad", "box", { pos: [560.0, 430.0], size: [200.0, 200.0], static: true, sensor: true });
+  world.add("w_left", "segment", { pos: [0.0, 0.0], a: [8.0, 0.0], b: [8.0, 600.0], static: true, elasticity: 0.9 });
+  world.add("w_right", "segment", { pos: [0.0, 0.0], a: [792.0, 0.0], b: [792.0, 600.0], static: true, elasticity: 0.9 });
+  world.add("w_bottom", "segment", { pos: [0.0, 0.0], a: [0.0, 8.0], b: [800.0, 8.0], static: true, elasticity: 0.9 });
+  world.add("w_top", "segment", { pos: [0.0, 0.0], a: [0.0, 592.0], b: [800.0, 592.0], static: true, elasticity: 0.9 });
+}
+
+function act(world, action) {
+  const j = 70.0;
+  if (action === "left") world.impulse("puck", [-j, 0.0]);
+  else if (action === "right") world.impulse("puck", [j, 0.0]);
+  else if (action === "up") world.impulse("puck", [0.0, j]);
+  else if (action === "down") world.impulse("puck", [0.0, -j]);
+}
+
+function success(world) {
+  const p = world.query("puck");
+  const z = world.query("pad");
+  const cx = (p.bbox[0] + p.bbox[2]) / 2.0;
+  const cy = (p.bbox[1] + p.bbox[3]) / 2.0;
+  return z.bbox[0] <= cx && cx <= z.bbox[2] && z.bbox[1] <= cy && cy <= z.bbox[3];
+}
+
+function checkpoints(world) {
+  const p = world.query("puck").pos;
+  const dx = p[0] - 180.0;
+  const dy = p[1] - 150.0;
+  return {
+    moved_off_start: dx * dx + dy * dy > 1600.0,
+    crossed_midline: p[0] > 400.0,
+    entered_upper_half: p[1] > 300.0,
+  };
+}
+'''
+
+_TEMPLATE_GAMES_JS = {"drift": _DRIFT_JS}
+
+_DESIGNS_JS = {"drift": _DESIGNS["drift"]}

@@ -5,30 +5,48 @@
  * emits JSONL. The harness's oracles stay in Python and consume this output.
  *
  * PROTOCOL
- *   stdin : ONE JSON job:
- *     { "source": <game module JS source string>,
- *       "episodes": [ { "seed": int, "actions": [str, ...] }, ... ],
+ *   stdin : ONE JSON job. Two modes selected by "mode":
+ *
+ *   (1) "episodes" (default) -- run rollouts, one JSONL line per episode:
+ *     { "mode": "episodes",                 // optional; default
+ *       "source": <game module JS source string>,
+ *       "episodes": [ { "seed": int, "actions": [str|null, ...] }, ... ],
  *       "max_ticks": int,
- *       "frames_every": int|0 }
- *   stdout: ONE JSON line per episode (in order):
- *     { "result": "success|failure|budget|exhausted|error",
- *       "ticks": int,
- *       "checkpoints": { name: tick|null },
- *       "final_snapshot": { name: {pos,vel,angle} },
- *       "frames": [ { "tick": t, "entities": { name: query-dict } }, ... ]  // only if frames_every>0
- *       "error": null|string }
- *   exit  : 0 (episode-level errors are reported in-band, not via exit code)
+ *       "frames_every": int|0,
+ *       "escape_margin": number|null }      // if a number, each record adds
+ *                                           // nan + oob (bodies out of bounds)
+ *     -> stdout: ONE JSON line per episode (in order):
+ *       { "result": "success|failure|budget|exhausted|error",
+ *         "ticks": int,
+ *         "checkpoints": { name: tick|null },
+ *         "final_snapshot": { name: {pos,vel,angle} },
+ *         "frames": [...],                  // only if frames_every>0
+ *         "nan": bool,                      // only if escape_margin is a number
+ *         "oob": [name, ...],               // only if escape_margin is a number
+ *         "error": null|string }
+ *
+ *   (2) "check" -- static + goal probes (G0/G2), ONE JSON object on stdout:
+ *     { "mode": "check", "source": <game source> }
+ *     -> stdout: ONE JSON object of RAW engine facts (thresholds/gating stay in
+ *        Python; see runCheck for the exact schema).
+ *
+ *   exit  : 0 (per-item errors are reported in-band, not via exit code)
  *
  * DECISION-TICK SEMANTICS (CONTRACTS §2, K=6):
  *   act(world, action)  then  6 x [ world.step(1); on_step?(world) ]
  *   then latch checkpoints  then check failure  then check success.
  *   Episode ends on success/failure/step-budget/exhausted-actions/error.
+ *
+ * BYTE-DETERMINISM: no Date, no Math.random -- the only randomness is the game's
+ * world.rng (seeded mulberry32). The same job piped to two node processes yields
+ * byte-identical stdout (SPIKE_REPORT.md criterion (c)).
  */
 
 const vm = require("node:vm");
 const { World } = require("./world.js");
 
 const K_STEPS = 6; // physics steps per decision tick (CONTRACTS §2)
+const WORLD_SEED = 0; // physics seed for check-mode worlds (mirror gameverify)
 
 // ===========================================================================
 // SANDBOX
@@ -124,9 +142,11 @@ function frozenMath() {
   return Object.freeze(m);
 }
 
-// Load the game once: evaluate the source in a locked vm context and pull out the
-// CONTRACTS §2 symbols. Reused across episodes (mirrors gameverify.load_game).
-function loadGame(source) {
+// Evaluate the source in a locked vm context and harvest the CONTRACTS §2
+// symbols. Does NOT validate them -- callers decide what "valid" means (episode
+// mode requires all symbols; check mode reports which are missing). Throws only
+// on a sandbox-scan rejection or a syntax/eval error.
+function evalHarvest(source) {
   const violations = scanSource(source);
   if (violations.length) {
     throw new Error("sandbox scan rejected source: " + violations.join(", "));
@@ -144,8 +164,13 @@ function loadGame(source) {
     " success: (typeof success!=='undefined'?success:undefined)," +
     " checkpoints: (typeof checkpoints!=='undefined'?checkpoints:undefined) })";
   const script = new vm.Script(source + harvest, { filename: "<game>" });
-  const g = script.runInContext(context, { timeout: 5000 });
+  return script.runInContext(context, { timeout: 5000 });
+}
 
+// Load the game once for episode mode: harvest + validate the required symbols.
+// Reused across episodes (mirrors gameverify.load_game).
+function loadGame(source) {
+  const g = evalHarvest(source);
   for (const req of ["TITLE", "PROMPT", "ACTIONS", "build", "act", "success", "checkpoints"]) {
     if (g[req] === undefined) throw new Error(`game module missing required symbol: ${req}`);
   }
@@ -164,7 +189,27 @@ function frameOf(world) {
   return entities;
 }
 
-function runEpisode(game, world, actions, maxTicks, framesEvery) {
+// dynamic (non-static) entity names, insertion order (mirror _dynamic_entities).
+function dynamicEntities(world) {
+  const out = [];
+  for (const name of world.entities()) {
+    try {
+      if (!world.query(name).static) out.push(name);
+    } catch (e) {
+      /* skip unqueryable */
+    }
+  }
+  return out;
+}
+
+function hadNan(world) {
+  for (const e of world.events()) {
+    if (e.type === "nan_detected" || e.type === "nan" || e.type === "explosion") return true;
+  }
+  return false;
+}
+
+function runEpisode(game, world, actions, maxTicks, framesEvery, escapeMargin) {
   const applied = [];
   const latches = {};
   const frames = [];
@@ -213,6 +258,168 @@ function runEpisode(game, world, actions, maxTicks, framesEvery) {
     error: null,
   };
   if (framesEvery > 0) out.frames = frames;
+  // G1 extras: only when the Python side asks (escape_margin is a number). Kept
+  // off the default record so determinism/efficacy batches stay lean and the
+  // spike bench output is unchanged.
+  if (typeof escapeMargin === "number" && Number.isFinite(escapeMargin)) {
+    out.nan = hadNan(world);
+    out.oob = dynamicEntities(world).filter((n) => !world.in_bounds(n, escapeMargin));
+  }
+  return out;
+}
+
+// ===========================================================================
+// CHECK MODE -- raw G0/G2 facts (thresholds + gating live in Python)
+// ===========================================================================
+// Returns a single object of engine facts the Python G0/G2 layers consume to
+// assemble the SAME check dicts they build for pymunk games (so the report
+// schema and hints are identical across engines). Gated like the Python funnel:
+// downstream fields are present only when upstream gates passed, so the Python
+// side reconstructs the same early-return check shape.
+function buildFreshWorld(game) {
+  const world = new World(WORLD_SEED);
+  game.build(world);
+  return world;
+}
+
+function probePredicate(game, fn) {
+  // Mirror gameverify._check_predicate: two calls on a fresh t=0 world; report
+  // is-bool, value, determinism, and whether the snapshot was left unchanged.
+  const world = buildFreshWorld(game);
+  const before = JSON.stringify(world.snapshot());
+  let r1, r2;
+  try {
+    r1 = fn(world);
+    r2 = fn(world);
+  } catch (e) {
+    return { is_bool: false, value: null, deterministic: false, state_unchanged: false, error: String((e && e.message) || e) };
+  }
+  const after = JSON.stringify(world.snapshot());
+  const isBool = typeof r1 === "boolean" && typeof r2 === "boolean";
+  return {
+    is_bool: isBool,
+    value: isBool ? r1 : null,
+    deterministic: r1 === r2,
+    state_unchanged: before === after,
+    error: null,
+  };
+}
+
+function probeCheckpoints(game) {
+  // Mirror gameverify._check_checkpoints: dict shape, keys, bool values,
+  // truthy-at-t0 keys, determinism, snapshot-unchanged.
+  const world = buildFreshWorld(game);
+  const before = JSON.stringify(world.snapshot());
+  let c1, c2;
+  try {
+    c1 = game.checkpoints(world);
+    c2 = game.checkpoints(world);
+  } catch (e) {
+    return { is_dict: false, keys: [], n: null, non_bool_keys: [], true_keys: [], deterministic: false, state_unchanged: false, error: String((e && e.message) || e) };
+  }
+  const after = JSON.stringify(world.snapshot());
+  const isDict = c1 !== null && typeof c1 === "object" && !Array.isArray(c1) && c2 !== null && typeof c2 === "object" && !Array.isArray(c2);
+  if (!isDict) {
+    return { is_dict: false, keys: [], n: null, non_bool_keys: [], true_keys: [], deterministic: false, state_unchanged: false, error: null };
+  }
+  const keys = Object.keys(c1);
+  const nonBool = keys.filter((k) => typeof c1[k] !== "boolean");
+  const trueKeys = keys.filter((k) => c1[k]);
+  return {
+    is_dict: true,
+    keys,
+    n: keys.length,
+    non_bool_keys: nonBool,
+    true_keys: trueKeys,
+    deterministic: JSON.stringify(c1) === JSON.stringify(c2),
+    state_unchanged: before === after,
+    error: null,
+  };
+}
+
+function runCheck(source) {
+  const out = { mode: "check" };
+
+  // 1. Static scan (G0 sandbox_scan).
+  const violations = scanSource(source);
+  out.scan = violations;
+  if (violations.length) return out;
+
+  // 2. Evaluate + harvest (G0 loads).
+  let g;
+  try {
+    g = evalHarvest(source);
+  } catch (e) {
+    out.load = { ok: false, error: String((e && e.message) || e) };
+    return out;
+  }
+  out.load = { ok: true, error: null };
+
+  // 3. Required symbols (G0 symbols).
+  const required = ["TITLE", "PROMPT", "ACTIONS", "build", "act", "success", "checkpoints"];
+  const callable = ["build", "act", "success", "checkpoints"];
+  const defined = {};
+  for (const s of required) defined[s] = g[s] !== undefined;
+  const isCallable = {};
+  for (const s of callable) isCallable[s] = typeof g[s] === "function";
+  out.symbols = { defined, callable: isCallable };
+  const missing = required.filter((s) => !defined[s]);
+  const notCallable = callable.filter((s) => defined[s] && !isCallable[s]);
+  if (missing.length || notCallable.length) return out;
+
+  // 4. ACTIONS well-formedness (G0 actions). `values` echoes the declared move
+  // set so the Python G1/G3 layers can build macro-plans / efficacy batches.
+  out.actions = {
+    is_list: Array.isArray(g.ACTIONS),
+    length: Array.isArray(g.ACTIONS) ? g.ACTIONS.length : null,
+    all_str: Array.isArray(g.ACTIONS) && g.ACTIONS.every((a) => typeof a === "string"),
+    values: Array.isArray(g.ACTIONS) ? g.ACTIONS.slice() : null,
+  };
+  const actionsOk = out.actions.is_list && out.actions.length >= 2 && out.actions.length <= 8 && out.actions.all_str;
+  if (!actionsOk) return out;
+
+  // 5. build(world) runs (G0 builds) -> a queryable world.
+  let world;
+  try {
+    world = buildFreshWorld(g);
+  } catch (e) {
+    out.build = { ok: false, error: String((e && e.stack ? e.stack.split("\n").slice(0, 3).join(" | ") : e)) };
+    return out;
+  }
+  out.build = { ok: true, error: null };
+
+  // 6. Post-build world facts (G0 controlled / counts / penetration / in_bounds).
+  const entities = world.entities();
+  out.entities = entities;
+  const queries = {};
+  for (const name of entities) {
+    const q = world.query(name);
+    queries[name] = {
+      static: q.static,
+      sensor: q.sensor,
+      controlled: q.controlled,
+      in_bounds: world.in_bounds(name, 0.0),
+    };
+  }
+  out.queries = queries;
+  const pen = [];
+  for (let i = 0; i < entities.length; i++) {
+    for (let j = i + 1; j < entities.length; j++) {
+      const a = entities[i];
+      const b = entities[j];
+      if (queries[a].static && queries[b].static) continue;
+      const d = world.penetration_depth(a, b) || 0.0;
+      if (d > 0.0) pen.push([a, b, d]);
+    }
+  }
+  out.penetration = pen;
+
+  // 7. Goal probes (G2 success / failure / checkpoints), each on a fresh world.
+  out.g2 = {
+    success: probePredicate(g, g.success),
+    failure: g.failure ? probePredicate(g, g.failure) : null,
+    checkpoints: probeCheckpoints(g),
+  };
   return out;
 }
 
@@ -239,8 +446,22 @@ async function main() {
     return;
   }
 
+  // Check mode: one structured object of raw G0/G2 facts.
+  if (job.mode === "check") {
+    let obj;
+    try {
+      obj = runCheck(job.source);
+    } catch (e) {
+      obj = { mode: "check", error: "check fatal: " + String((e && e.stack) || e) };
+    }
+    process.stdout.write(JSON.stringify(obj) + "\n");
+    return;
+  }
+
+  // Episode mode (default).
   const maxTicks = job.max_ticks | 0;
   const framesEvery = job.frames_every | 0;
+  const escapeMargin = typeof job.escape_margin === "number" ? job.escape_margin : null;
   const episodes = job.episodes || [];
 
   let game = null;
@@ -260,7 +481,7 @@ async function main() {
     try {
       const world = new World(ep.seed | 0);
       game.build(world);
-      const rec = runEpisode(game, world, ep.actions || [], maxTicks, framesEvery);
+      const rec = runEpisode(game, world, ep.actions || [], maxTicks, framesEvery, escapeMargin);
       lines.push(JSON.stringify(rec));
     } catch (e) {
       lines.push(JSON.stringify({ result: "error", ticks: 0, checkpoints: {}, final_snapshot: {}, error: String((e && e.stack) || e).split("\n").slice(0, 4).join(" | ") }));

@@ -32,6 +32,7 @@ import traceback
 from harness.core.sandbox import (
     SandboxViolation, load_scene_namespace, scan_source,
 )
+from harness.verify.executors import JsExecutor, PyExecutor, VerifyError
 
 # --- Constants ([eng.] = engineering choice to calibrate) ---------------- #
 K_STEPS = 6                 # physics steps per decision tick (CONTRACTS §2)
@@ -345,44 +346,43 @@ def _truthy(fn) -> bool:
 # ======================================================================== #
 # G1 — noop rollout, agency, determinism, action efficacy
 # ======================================================================== #
-def run_g1(factory, game: Game):
+def run_g1(executor, game_source, actions):
+    """G1 rollout via an executor (CONTRACTS §4). Engine-agnostic: reads the
+    episode dicts the executor returns (``final_snapshot`` + the ``nan``/``oob``
+    extras the ``escape_margin`` rollout carries). With ``PyExecutor`` this is a
+    byte-for-byte refactor of the pre-seam in-process funnel."""
     layer = {"passed": False, "checks": {}}
     checks = layer["checks"]
+    actions = list(actions or [])
+    noop_spec = {"seed": WORLD_SEED, "actions": [None] * NOOP_TICKS}
 
-    # --- Full noop rollout: agency + NaN + escape ---
-    world = _fresh(factory, game)
-    noop = run_episode(game, world, _repeat(None, NOOP_TICKS), NOOP_TICKS)
-
-    nan_event = any(e.get("type") in NAN_EVENT_TYPES for e in _safe_events(world))
-    checks["no_nan"] = check(noop["result"] != "error" and not nan_event,
+    # --- Full noop rollout: agency + NaN + escape (extras via escape_margin) ---
+    noop = executor.run_batch(game_source, [noop_spec], NOOP_TICKS,
+                              escape_margin=ESCAPE_MARGIN)[0]
+    checks["no_nan"] = check(noop["result"] != "error" and not noop.get("nan", False),
                              result=noop["result"])
 
-    escaped = [n for n in _dynamic_entities(world)
-               if not _truthy(lambda n=n: world.in_bounds(n, ESCAPE_MARGIN))]
+    escaped = list(noop.get("oob", []))
     checks["no_escape"] = check(not escaped, offenders=escaped)
 
     # Agency: success must never fire with zero actions.
     checks["agency"] = check(noop["result"] != "success", result=noop["result"])
 
     # --- Determinism: two fresh seeded worlds, identical noop rollout ---
-    w1 = _fresh(factory, game)
-    w2 = _fresh(factory, game)
-    r1 = run_episode(game, w1, _repeat(None, NOOP_TICKS), NOOP_TICKS)
-    r2 = run_episode(game, w2, _repeat(None, NOOP_TICKS), NOOP_TICKS)
-    delta = _snapshot_delta(r1["snapshot"], r2["snapshot"])
+    r1, r2 = executor.run_batch(game_source, [dict(noop_spec), dict(noop_spec)],
+                                NOOP_TICKS)
+    delta = _snapshot_delta(r1["final_snapshot"], r2["final_snapshot"])
     checks["determinism"] = check(delta <= DETERMINISM_EPS, delta=_round_inf(delta))
 
     # --- Action efficacy: each declared action must move the world ---
-    base_world = _fresh(factory, game)
-    baseline = run_episode(game, base_world, _repeat(None, EFFICACY_TICKS),
-                           EFFICACY_TICKS)["snapshot"]
+    eff_specs = [{"seed": WORLD_SEED, "actions": [None] * EFFICACY_TICKS}]
+    eff_specs += [{"seed": WORLD_SEED, "actions": [a] * EFFICACY_TICKS} for a in actions]
+    eff = executor.run_batch(game_source, eff_specs, EFFICACY_TICKS)
+    baseline = eff[0]["final_snapshot"]
     dead = []
     effect = {}
-    for action in (game.actions or []):
-        aw = _fresh(factory, game)
-        snap = run_episode(game, aw, _repeat(action, EFFICACY_TICKS),
-                           EFFICACY_TICKS)["snapshot"]
-        d = _snapshot_delta(snap, baseline)
+    for action, rec in zip(actions, eff[1:]):
+        d = _snapshot_delta(rec["final_snapshot"], baseline)
         effect[action] = _round_inf(d)
         if d <= EFFICACY_EPS:
             dead.append(action)
@@ -495,8 +495,35 @@ def _check_checkpoints(factory, game, checks) -> bool:
 # ======================================================================== #
 # G3 — solvability probe (seeded random search + checkpoint guidance)
 # ======================================================================== #
-def run_g3(factory, game: Game):
-    """Random macro-action search -> witness, UNSOLVED, or a trivial goal.
+def _collect_pass(executor, game_source, specs, seeds, horizon, episodes):
+    """Run a probe pass and append every finished episode to `episodes`, stopping
+    (and returning a witness) at the first success.
+
+    A batched executor (JS) runs the WHOLE pass in one process, then we walk the
+    records in order — appending up to (and including) the first success — so the
+    resulting `episodes` list and witness are identical to the per-episode,
+    early-stopping stream a non-batched executor (Py) produces."""
+    seeds = list(seeds)
+    if executor.batched:
+        recs = executor.run_batch(game_source, specs, horizon)
+        for seed, ep in zip(seeds, recs):
+            episodes.append(ep)
+            if ep["result"] == "success":
+                return _make_witness(seed, ep)
+        return None
+    for seed, spec in zip(seeds, specs):
+        ep = executor.run_batch(game_source, [spec], horizon)[0]
+        episodes.append(ep)
+        if ep["result"] == "success":
+            return _make_witness(seed, ep)
+    return None
+
+
+def run_g3(executor, game_source, actions, declared):
+    """Random macro-action search -> witness, UNSOLVED, or a trivial goal, driven
+    by an executor (CONTRACTS §4). All the diagnostic logic (dead milestones,
+    order mismatch, guided second pass, progress) is pure and engine-agnostic —
+    it eats the returned episode dicts and never touches the engine.
 
     v2.1: each episode's checkpoint latches feed (a) the dead-milestone check
     on the witness, (b) a declared-vs-empirical order warning, (c) a guided
@@ -505,21 +532,15 @@ def run_g3(factory, game: Game):
     """
     layer = {"passed": False, "checks": {}, "warnings": [], "progress": None}
     checks = layer["checks"]
-
-    declared = _declared_order(factory, game)
+    actions = list(actions or [])
     episodes: list[dict] = []      # every finished (non-witness) episode's data
-    witness = None
 
     # --- First pass: pure random macro-action search ---
-    for episode in range(PROBE_EPISODES):
-        probe_rng = random.Random(episode)
-        plan = _macro_plan(probe_rng, game.actions, PROBE_HORIZON)
-        world = _fresh(factory, game)
-        ep = run_episode(game, world, iter(plan), PROBE_HORIZON)
-        episodes.append(ep)
-        if ep["result"] == "success":
-            witness = _make_witness(episode, ep)
-            break
+    specs = [{"seed": WORLD_SEED,
+              "actions": _macro_plan(random.Random(e), actions, PROBE_HORIZON)}
+             for e in range(PROBE_EPISODES)]
+    witness = _collect_pass(executor, game_source, specs, range(PROBE_EPISODES),
+                            PROBE_HORIZON, episodes)
 
     # --- Checkpoint-guided second pass (v2.1) ---
     # If pure random failed but some episode latched >= 1 milestone, replay the
@@ -529,17 +550,13 @@ def run_g3(factory, game: Game):
         prefix = _best_prefix(episodes, declared)
         if prefix:
             guided_ran = True
-            for i in range(GUIDED_EPISODES):
-                seed = GUIDED_SEED_BASE + i
-                cont_rng = random.Random(seed)
-                plan = prefix + _macro_plan(cont_rng, game.actions,
-                                            PROBE_HORIZON - len(prefix))
-                world = _fresh(factory, game)
-                ep = run_episode(game, world, iter(plan), PROBE_HORIZON)
-                episodes.append(ep)
-                if ep["result"] == "success":
-                    witness = _make_witness(seed, ep)
-                    break
+            gseeds = [GUIDED_SEED_BASE + i for i in range(GUIDED_EPISODES)]
+            gspecs = [{"seed": WORLD_SEED,
+                       "actions": prefix + _macro_plan(random.Random(s), actions,
+                                                       PROBE_HORIZON - len(prefix))}
+                      for s in gseeds]
+            witness = _collect_pass(executor, game_source, gspecs, gseeds,
+                                    PROBE_HORIZON, episodes)
 
     checks["episodes"] = check(True, run=len(episodes), budget=PROBE_EPISODES,
                                guided=guided_ran)
@@ -571,9 +588,9 @@ def run_g3(factory, game: Game):
             f"[{', '.join(declared)}], observed [{', '.join(mismatch)}]")
 
     # --- The witness must be EXACTLY replayable from a fresh seeded world ---
-    replay_world = _fresh(factory, game)
-    replay = run_episode(game, replay_world, iter(witness["actions"]),
-                         len(witness["actions"]))
+    replay = executor.run_batch(game_source,
+                                [{"seed": WORLD_SEED, "actions": witness["actions"]}],
+                                len(witness["actions"]))[0]
     checks["replayable"] = check(replay["result"] == "success", result=replay["result"])
 
     layer["passed"] = all(c["pass"] for c in checks.values())
@@ -771,6 +788,157 @@ def _hint_unsolved(checks: dict, progress: dict | None) -> str:
 
 
 # ======================================================================== #
+# JS engine: G0/G2 layers over the runner's "check" facts
+# ======================================================================== #
+# The JS runner (nodeworld/runner.js "check" mode) returns RAW engine facts;
+# these layers apply the SAME thresholds/gating/formatting the pymunk G0/G2 use,
+# so the report `checks` dicts — and hence `_hint_g0`/`_hint_g2` — are identical
+# across engines. Thresholds stay here in Python (CONTRACTS §4).
+
+def run_g0_js(facts: dict) -> dict:
+    """G0 static layer for a JS game, from the runner's check facts."""
+    layer = {"passed": False, "checks": {}}
+    checks = layer["checks"]
+
+    violations = list(facts.get("scan", []) or [])
+    checks["sandbox_scan"] = check(not violations, violations=violations)
+    if violations:
+        return layer
+
+    load = facts.get("load") or {}
+    if not load.get("ok"):
+        checks["loads"] = check(False, error=load.get("error", "load failed"))
+        return layer
+    checks["loads"] = check(True)
+
+    symbols = facts.get("symbols") or {}
+    defined = symbols.get("defined", {})
+    is_callable = symbols.get("callable", {})
+    missing = [s for s in _REQUIRED_SYMBOLS if not defined.get(s)]
+    not_callable = [s for s in _CALLABLE_SYMBOLS
+                    if defined.get(s) and not is_callable.get(s)]
+    checks["symbols"] = check(not missing and not not_callable,
+                              missing=missing, not_callable=not_callable)
+    if missing or not_callable:
+        return layer
+
+    actions = facts.get("actions") or {}
+    n = actions.get("length")
+    actions_ok = (bool(actions.get("is_list")) and isinstance(n, int) and n
+                  and bool(actions.get("all_str"))
+                  and MIN_ACTIONS <= n <= MAX_ACTIONS)
+    checks["actions"] = check(bool(actions_ok),
+                              n=n if actions.get("is_list") else None)
+    if not actions_ok:
+        return layer
+
+    build = facts.get("build") or {}
+    if not build.get("ok"):
+        checks["builds"] = check(False, error=build.get("error", "build failed"))
+        return layer
+    checks["builds"] = check(True)
+
+    entities = list(facts.get("entities", []) or [])
+    queries = facts.get("queries") or {}
+
+    controlled = [name for name in entities if queries.get(name, {}).get("controlled")]
+    one_controlled = (len(controlled) == 1
+                      and not queries.get(controlled[0], {}).get("static", False))
+    checks["controlled"] = check(one_controlled, controlled=controlled)
+
+    checks["counts"] = check(len(entities) >= MIN_ENTITIES, n=len(entities))
+
+    offenders = [[a, b, round(float(d), 3)]
+                 for a, b, d in (facts.get("penetration") or [])
+                 if float(d) > PEN_INIT_TOL]
+    checks["no_penetration"] = check(not offenders, offenders=offenders)
+
+    oob = [name for name in entities
+           if not queries.get(name, {}).get("static", False)
+           and not queries.get(name, {}).get("in_bounds", True)]
+    checks["in_bounds"] = check(not oob, offenders=oob)
+
+    layer["passed"] = all(c["pass"] for c in checks.values())
+    return layer
+
+
+def run_g2_js(g2: dict) -> dict:
+    """G2 goal layer for a JS game, from the runner's check facts."""
+    layer = {"passed": False, "checks": {}}
+    checks = layer["checks"]
+
+    ok = _g2js_predicate(g2.get("success") or {}, "success", checks)
+    failure = g2.get("failure")
+    if ok and failure is not None:
+        ok = _g2js_predicate(failure, "failure", checks)
+    if ok:
+        _g2js_checkpoints(g2.get("checkpoints") or {}, checks)
+
+    layer["passed"] = all(c["pass"] for c in checks.values())
+    return layer
+
+
+def _g2js_predicate(facts: dict, label: str, checks: dict) -> bool:
+    if facts.get("error"):
+        checks[f"{label}_callable_bool"] = check(False, error=facts["error"])
+        return False
+    is_bool = bool(facts.get("is_bool"))
+    value = facts.get("value")
+    checks[f"{label}_callable_bool"] = check(is_bool, value=bool(value) if is_bool else None)
+    if not is_bool:
+        return False
+    checks[f"{label}_false_at_t0"] = check(not value, value=bool(value))
+    pure = bool(facts.get("deterministic")) and bool(facts.get("state_unchanged"))
+    checks[f"{label}_pure"] = check(pure, deterministic=bool(facts.get("deterministic")),
+                                    state_unchanged=bool(facts.get("state_unchanged")))
+    return all(checks[f"{label}_{k}"]["pass"]
+               for k in ("callable_bool", "false_at_t0", "pure")
+               if f"{label}_{k}" in checks)
+
+
+def _g2js_checkpoints(facts: dict, checks: dict) -> bool:
+    if facts.get("error"):
+        checks["checkpoints_wellformed"] = check(False, error=facts["error"])
+        return False
+    is_dict = bool(facts.get("is_dict"))
+    keys = list(facts.get("keys", []) or [])
+    n = facts.get("n")
+    bad_keys = ([k for k in keys if not (isinstance(k, str) and _SNAKE_CASE.match(k))]
+                if is_dict else [])
+    non_bool = list(facts.get("non_bool_keys", []) or []) if is_dict else []
+    wellformed = (is_dict and isinstance(n, int) and CP_MIN <= n <= CP_MAX
+                  and not bad_keys and not non_bool)
+    checks["checkpoints_wellformed"] = check(wellformed, n=n, bad_keys=bad_keys,
+                                             non_bool=non_bool)
+    if not wellformed:
+        return False
+
+    true_at_t0 = list(facts.get("true_keys", []) or [])
+    checks["checkpoints_false_at_t0"] = check(not true_at_t0, offenders=true_at_t0)
+
+    pure = bool(facts.get("deterministic")) and bool(facts.get("state_unchanged"))
+    checks["checkpoints_pure"] = check(pure, deterministic=bool(facts.get("deterministic")),
+                                       state_unchanged=bool(facts.get("state_unchanged")))
+    return not true_at_t0 and pure
+
+
+# ======================================================================== #
+# Engine detection
+# ======================================================================== #
+_JS_MARKER = re.compile(r"(?m)^\s*(?:#|//)\s*engine\s*:\s*js\b")
+
+
+def detect_engine(game_path: str, source: str = "") -> str:
+    """Game language: 'js' if the path ends in .js or the source carries an
+    `# engine: js` / `// engine: js` marker; otherwise 'py' (default)."""
+    if str(game_path).lower().endswith(".js"):
+        return "js"
+    if _JS_MARKER.search(source or ""):
+        return "js"
+    return "py"
+
+
+# ======================================================================== #
 # Orchestration
 # ======================================================================== #
 def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -> dict:
@@ -790,8 +958,6 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
         return run_sandboxed(game_path, "gameverify", timeout_s=GAMEVERIFY_TIMEOUT_S)
 
     report = make_report()
-    factory = world_factory or _default_world_factory
-
     try:
         with open(game_path, "r", encoding="utf-8") as fh:
             source = fh.read()
@@ -799,6 +965,19 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
         report["failure_class"] = "ENV_ERROR"
         report["hint"] = f"game unreadable: {exc}"
         return report
+
+    # Route by game language. The pymunk (py) path is unchanged; the Planck (js)
+    # path runs the same funnel over a Node executor + the runner's check facts.
+    if detect_engine(game_path, source) == "js":
+        return _verify_js(source, report)
+    return _verify_py(source, report, world_factory)
+
+
+def _verify_py(source: str, report: dict, world_factory) -> dict:
+    """The pymunk funnel: G0/G2 in-process; G1/G3 through a PyExecutor (a pure,
+    byte-identical refactor of the pre-seam in-process path)."""
+    factory = world_factory or _default_world_factory
+    executor = PyExecutor(world_factory=factory)
 
     # --- G0 ---
     g0, game = run_g0(factory, source)
@@ -810,7 +989,7 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
 
     # --- G1 ---
     try:
-        g1 = run_g1(factory, game)
+        g1 = run_g1(executor, game, game.actions)
     except Exception:
         g1 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
     report["layers"]["G1_rollout"] = g1
@@ -831,10 +1010,70 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
         return report
 
     # --- G3 ---
+    declared = _declared_order(factory, game)
     try:
-        g3 = run_g3(factory, game)
+        g3 = run_g3(executor, game, game.actions, declared)
     except Exception:
         g3 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
+    return _finish_g3(report, g3)
+
+
+def _verify_js(source: str, report: dict) -> dict:
+    """The Planck (Node) funnel: G0/G2 from the runner's check facts, G1/G3 through
+    a JsExecutor (one node process per layer batch). Adds "engine": "js"."""
+    report["engine"] = "js"
+    executor = JsExecutor()
+    try:
+        # G0 + G2 facts come from ONE "check" job.
+        facts = executor.run_check(source)
+
+        g0 = run_g0_js(facts)
+        report["layers"]["G0_static"] = g0
+        if not g0["passed"]:
+            report["failure_class"] = "ENV_ERROR"
+            report["hint"] = _hint_g0(g0["checks"])
+            return report
+
+        actions = (facts.get("actions") or {}).get("values") or []
+        declared = list(((facts.get("g2") or {}).get("checkpoints") or {}).get("keys", []))
+
+        # --- G1 ---
+        try:
+            g1 = run_g1(executor, source, actions)
+        except VerifyError:
+            raise
+        except Exception:
+            g1 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
+        report["layers"]["G1_rollout"] = g1
+        if not g1["passed"]:
+            report["failure_class"] = "ENV_ERROR"
+            report["hint"] = _hint_g1(g1["checks"])
+            return report
+
+        # --- G2 ---
+        g2 = run_g2_js((facts.get("g2") or {}))
+        report["layers"]["G2_goal"] = g2
+        if not g2["passed"]:
+            report["failure_class"] = "GOAL_ERROR"
+            report["hint"] = _hint_g2(g2["checks"])
+            return report
+
+        # --- G3 ---
+        try:
+            g3 = run_g3(executor, source, actions, declared)
+        except VerifyError:
+            raise
+        except Exception:
+            g3 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
+        return _finish_g3(report, g3)
+    except VerifyError as exc:
+        # Node missing / crash / timeout / unparseable output -> VERIFY_ERROR
+        # shape (no funnel layers), exactly like sandbox.run_sandboxed trouble.
+        return exc.as_report()
+
+
+def _finish_g3(report: dict, g3: dict) -> dict:
+    """Shared G3 finalisation + verdict classification (engine-agnostic)."""
     report["layers"]["G3_solve"] = g3
     report["witness"] = g3.get("witness")
     report["warnings"].extend(g3.get("warnings") or [])
