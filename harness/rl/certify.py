@@ -18,13 +18,28 @@ from __future__ import annotations
 
 import time
 
-from harness.rl import ppo
 from harness.rl.env import PlanckEnv
 
 # --- Constants ([eng.]) ------------------------------------------------------
 DEFAULT_BUDGET = 2_000_000       # env-steps per game (LLM_RL_SYSTEMS §4.1) [eng.]
 N_EVAL = 32                      # greedy eval episodes (fixed seeds) [eng.]
 LEARNABLE_SUCCESS_RATE = 0.5     # greedy success rate to call a game learnable [eng.]
+TRAINERS = ("vendored", "sb3")   # RL trainer backends (vendored default; sb3 = [LF])
+
+
+def _resolve_trainer(trainer: str):
+    """Return the trainer module exposing ``train`` / ``greedy_episode`` /
+    ``sample_episode``. ``vendored`` is the CleanRL-mirror PPO (`harness.rl.ppo`,
+    the unchanged default); ``sb3`` is the library-first SB3 migration
+    (`harness.rl.sb3_trainer`, GODOT_RL_AGENTS_CAPABILITIES.md §6.7). Imported
+    lazily so the vendored lane never touches the optional stable-baselines3 dep."""
+    if trainer == "vendored":
+        from harness.rl import ppo
+        return ppo
+    if trainer == "sb3":
+        from harness.rl import sb3_trainer
+        return sb3_trainer
+    raise ValueError(f"unknown trainer {trainer!r} (expected one of {TRAINERS})")
 
 
 def _pick_witness(greedy_eps: list[dict], sampled_eps: list[dict]) -> dict | None:
@@ -56,8 +71,15 @@ def _bridge_replay(game_source: str, witness: dict) -> dict:
 
 def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              n_eval: int = N_EVAL, seed: int = 0, log=None,
-             wall_clock_budget_s=None, **train_kwargs) -> dict:
+             wall_clock_budget_s=None, trainer: str = "vendored",
+             **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
+
+    `trainer` selects the RL backend: ``"vendored"`` (default, the CleanRL-mirror
+    PPO in `harness.rl.ppo`) or ``"sb3"`` (the library-first SB3 PPO migration,
+    GODOT_RL_AGENTS_CAPABILITIES.md §6.7). BOTH drive the same PlanckEnv seam and
+    the same greedy/sampled eval-episode emission, so the witness ORACLE below
+    (`_pick_witness`/`_bridge_replay`) is identical regardless of trainer.
 
     Returns (task-required keys + provenance extras):
         learnable, steps_to_first_success, checkpoints_curve (per-update mean
@@ -65,6 +87,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         rl_witness ({seed, actions, ticks} | None), wall_clock_s.
     """
     t0 = time.time()
+    trainer_mod = _resolve_trainer(trainer)
 
     # Probe the game once to size the policy (spaces are frozen at construction).
     probe = PlanckEnv(game_path)
@@ -79,9 +102,10 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         return PlanckEnv(game_path)
 
     # --- Train ---
-    train_res = ppo.train(make_env, obs_dim, n_actions, total_steps=budget_steps,
-                          seed=seed, log=log, wall_clock_budget_s=wall_clock_budget_s,
-                          **train_kwargs)
+    train_res = trainer_mod.train(make_env, obs_dim, n_actions,
+                                  total_steps=budget_steps, seed=seed, log=log,
+                                  wall_clock_budget_s=wall_clock_budget_s,
+                                  **train_kwargs)
     agent = train_res["agent"]
 
     # --- Evaluation over fixed seeds ---
@@ -91,8 +115,10 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # STOCHASTIC (sampled) rollouts; greedy is reported too (it is the witness's
     # preferred form and the determinism-first certificate).
     eval_env = PlanckEnv(game_path)
-    greedy_eps = [ppo.greedy_episode(eval_env, agent, seed=s) for s in range(n_eval)]
-    sampled_eps = [ppo.sample_episode(eval_env, agent, seed=s, torch_seed=1000 + s)
+    greedy_eps = [trainer_mod.greedy_episode(eval_env, agent, seed=s)
+                  for s in range(n_eval)]
+    sampled_eps = [trainer_mod.sample_episode(eval_env, agent, seed=s,
+                                              torch_seed=1000 + s)
                    for s in range(n_eval)]
     eval_env.close()
     n_greedy = sum(1 for e in greedy_eps if e["success"])
@@ -132,6 +158,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         # --- provenance / diagnostics ---
         "title": title,
         "game_path": game_path,
+        "trainer": trainer,
         "stochastic_success_rate": stochastic_success_rate,   # graded learnability
         "budget_steps": budget_steps,
         "trained_steps": train_res["global_steps"],

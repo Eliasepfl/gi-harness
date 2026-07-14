@@ -669,6 +669,38 @@ def cmd_ledger_merge(args) -> int:
     return 0
 
 
+# ---- rl probe --------------------------------------------------------------
+def cmd_rl_probe(args) -> int:
+    """G3' RL-learnability probe on one game — a thin `g3_prime` wrapper (replaces
+    the inline scratch driver of the ORCD plan §3b). Trains the chosen backend
+    (`--trainer vendored|sb3`), greedily+stochastically evaluates, and asserts the
+    RL witness replays via JsExecutor; emits ONE JSON line (ledger-friendly) whose
+    keys are g3_prime's own — learnable, stochastic_success_rate, bridge_ok, ..."""
+    try:
+        from harness.rl.certify import g3_prime
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("rl.certify", exc, args.json)
+    try:
+        result = g3_prime(args.game_path, budget_steps=args.budget,
+                          trainer=args.trainer)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("rl probe", exc, args.json)
+
+    if args.json:
+        # One compact line so a farm of probes concatenates into a JSONL ledger
+        # the orchestrator diffs against the vendored difficulty map.
+        print(json.dumps(result, ensure_ascii=False, default=str))
+    else:
+        wit = result.get("rl_witness")
+        print(f"{result.get('game_path')}  trainer={result.get('trainer')}  "
+              f"learnable={result.get('learnable')}  "
+              f"stochastic_sr={result.get('stochastic_success_rate')}  "
+              f"greedy_sr={result.get('final_success_rate')}  "
+              f"bridge_ok={result.get('bridge_ok')}  "
+              f"witness_ticks={None if wit is None else wit.get('ticks')}")
+    return 0
+
+
 # ---- game stats ------------------------------------------------------------
 def cmd_game_stats(args) -> int:
     """Aggregate the runs ledger (telemetry) per backend/model."""
@@ -831,6 +863,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="where next-version games are written")
     gc.add_argument("--json", action="store_true")
     gc.set_defaults(func=cmd_game_curriculum)
+
+    # ---- rl group ----
+    rl = sub.add_parser("rl", help="RL-learnability tools (the G3' probe)")
+    rlsub = rl.add_subparsers(dest="rl_command", required=True)
+    rp = rlsub.add_parser(
+        "probe",
+        help="G3' RL-learnability probe on one game "
+             "(train -> greedy/stochastic eval -> witness bridge)")
+    rp.add_argument("game_path")
+    rp.add_argument("--budget", type=int, default=200_000,
+                    help="RL budget in env-steps (default 200k screen; "
+                         "2000000 for the full rung)")
+    rp.add_argument("--trainer", default="vendored", choices=["vendored", "sb3"],
+                    help="RL trainer backend: 'vendored' CleanRL-mirror PPO "
+                         "(default) or 'sb3' SB3 PPO (the [LF] migration, "
+                         "GODOT_RL_AGENTS_CAPABILITIES.md §6.7)")
+    rp.add_argument("--json", action="store_true")
+    rp.set_defaults(func=cmd_rl_probe)
 
     lg = sub.add_parser("ledger", help="run-ledger utilities (cluster shard merge)")
     lgsub = lg.add_subparsers(dest="ledger_command", required=True)
