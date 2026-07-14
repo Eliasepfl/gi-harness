@@ -1,0 +1,33 @@
+; Engine configuration file for the godotworld spike (rung-4 step 2).
+;
+; This is the STOCK-physics project (Godot Physics 2D). The rapier variant is a
+; byte-identical copy of this file with one extra line
+;   2d/physics_engine="Rapier2D"
+; plus the godot-rapier2d GDExtension present under addons/ (see SPIKE_REPORT.md).
+;
+; Determinism discipline (mirrors nodeworld/world.js + notes/engines/GODOT_MIGRATION.md
+; §2.4): fixed 60 Hz physics tick, jitter-fix off, physics on the main thread, a fresh
+; deterministic world built per episode, ALL mutation inside the physics loop.
+
+config_version=5
+
+[application]
+
+config/name="godotworld-spike"
+config/features=PackedStringArray("4.7")
+run/disable_stdout=false
+
+[physics]
+
+common/physics_ticks_per_second=60
+common/max_physics_steps_per_frame=8
+common/physics_jitter_fix=0.0
+2d/default_gravity=900.0
+2d/default_gravity_vector=Vector2(0, -1)
+2d/default_linear_damp=0.0
+2d/default_angular_damp=0.0
+2d/run_on_separate_thread=false
+
+[debug]
+
+settings/stdout/verbose_stdout=false

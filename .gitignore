@@ -7,5 +7,6 @@ runs/
 scenes/games/
 nodeworld/node_modules/
 banks/sprites/raw/
+godotworld/tools/
 
 .claude/
