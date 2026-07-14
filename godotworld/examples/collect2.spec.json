@@ -2,37 +2,47 @@
   "engine": "godot",
   "spec_version": 1,
   "meta": {
-    "title": "Twin Gems",
-    "prompt": "Slide the collector left and right across the ice to pick up both gems.",
-    "world_size": [1000, 600],
-    "actions": ["push_left", "push_right"]
+    "title": "Gem Ledges",
+    "prompt": "Grab the gem on each ledge - the lava pool between them is lethal - then step into the exit by the far wall with both gems in hand.",
+    "world_size": [1200, 650],
+    "actions": ["run_left", "run_right", "hop"]
   },
   "bodies": [
-    {"name": "floor", "shape": "box", "pos": [500, 30], "size": [1000, 60], "static": true, "friction": 0.04, "elasticity": 0.1},
-    {"name": "left_wall", "shape": "box", "pos": [10, 300], "size": [20, 600], "static": true, "friction": 0.2},
-    {"name": "right_wall", "shape": "box", "pos": [990, 300], "size": [20, 600], "static": true, "friction": 0.2},
-    {"name": "collector", "shape": "circle", "pos": [500, 80], "radius": 16, "mass": 1.0, "friction": 0.04, "elasticity": 0.1, "control": true},
-    {"name": "gem_left", "shape": "circle", "pos": [180, 82], "radius": 26, "static": true, "sensor": true},
-    {"name": "gem_right", "shape": "circle", "pos": [820, 82], "radius": 26, "static": true, "sensor": true}
+    {"name": "ground", "shape": "box", "pos": [600, 25], "size": [1200, 50], "static": true, "friction": 0.7},
+    {"name": "ledge", "shape": "box", "pos": [260, 135], "size": [220, 30], "static": true, "friction": 0.7},
+    {"name": "ledge_2", "shape": "box", "pos": [940, 135], "size": [220, 30], "static": true, "friction": 0.7},
+    {"name": "wall", "shape": "box", "pos": [10, 325], "size": [20, 650], "static": true, "friction": 0.2},
+    {"name": "wall_2", "shape": "box", "pos": [1190, 325], "size": [20, 650], "static": true, "friction": 0.2},
+    {"name": "lava", "shape": "box", "pos": [600, 62], "size": [170, 28], "static": true, "sensor": true},
+    {"name": "gem", "shape": "circle", "pos": [420, 78], "radius": 22, "static": true, "sensor": true},
+    {"name": "gem_2", "shape": "circle", "pos": [820, 78], "radius": 22, "static": true, "sensor": true},
+    {"name": "tree", "shape": "box", "pos": [450, 110], "size": [65, 125], "static": true, "sensor": true},
+    {"name": "bush", "shape": "box", "pos": [1080, 70], "size": [55, 42], "static": true, "sensor": true},
+    {"name": "goal_zone", "shape": "box", "pos": [1120, 115], "size": [100, 120], "static": true, "sensor": true},
+    {"name": "marble", "shape": "circle", "pos": [80, 66], "radius": 16, "mass": 1.0, "friction": 0.6, "elasticity": 0.05, "control": true}
   ],
   "on_contact": [
-    {"a": "collector", "b": "gem_left", "flag": "got_left", "once": true},
-    {"a": "collector", "b": "gem_right", "flag": "got_right", "once": true}
+    {"a": "marble", "b": "gem", "flag": "got_a", "once": true},
+    {"a": "marble", "b": "gem_2", "flag": "got_b", "once": true}
   ],
   "act": {
-    "push_right": [{"verb": "impulse", "body": "collector", "vec": [120, 0]}],
-    "push_left": [{"verb": "impulse", "body": "collector", "vec": [-120, 0]}]
+    "run_right": [{"verb": "impulse", "body": "marble", "vec": [70, 0]}],
+    "run_left": [{"verb": "impulse", "body": "marble", "vec": [-70, 0]}],
+    "hop": [{"verb": "impulse", "body": "marble", "vec": [0, 460], "when": "grounded(\"marble\")"}]
   },
   "on_step": [
-    {"kind": "velocity_clamp", "body": "collector", "vx_max": 240},
-    {"kind": "remove_when", "flag": "got_left", "body": "gem_left"},
-    {"kind": "remove_when", "flag": "got_right", "body": "gem_right"}
+    {"kind": "velocity_clamp", "body": "marble", "vx_max": 250, "vy_min": -900, "vy_max": 540},
+    {"kind": "remove_when", "flag": "got_a", "body": "gem"},
+    {"kind": "remove_when", "flag": "got_b", "body": "gem_2"}
   ],
   "predicates": {
-    "success": "flag(\"got_left\") and flag(\"got_right\")",
+    "success": "flag(\"got_a\") and flag(\"got_b\") and contacts(\"marble\", \"goal_zone\")",
+    "failure": "contacts(\"marble\", \"lava\")",
     "checkpoints": {
-      "first_gem": "flag(\"got_left\") or flag(\"got_right\")",
-      "both_gems": "flag(\"got_left\") and flag(\"got_right\")"
+      "first_gem": "flag(\"got_a\") or flag(\"got_b\")",
+      "past_lava": "pos_x(\"marble\") > 720",
+      "both_gems": "flag(\"got_a\") and flag(\"got_b\")",
+      "at_exit": "contacts(\"marble\", \"goal_zone\")"
     }
   }
 }

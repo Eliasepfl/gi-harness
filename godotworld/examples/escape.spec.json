@@ -2,37 +2,42 @@
   "engine": "godot",
   "spec_version": 1,
   "meta": {
-    "title": "Rising Tide",
-    "prompt": "Water is rising in the cavern. Run (and hop) to the exit before it drowns you.",
-    "world_size": [1000, 600],
+    "title": "Lava Field Flight",
+    "prompt": "The quarry floor is molten - flee across the three shelves above the lava field and reach the safe bunker before the collapse timer runs out.",
+    "world_size": [1300, 650],
     "actions": ["run_left", "run_right", "hop"]
   },
   "bodies": [
-    {"name": "floor", "shape": "box", "pos": [500, 30], "size": [1000, 60], "static": true, "friction": 0.06, "elasticity": 0.1},
-    {"name": "left_wall", "shape": "box", "pos": [10, 300], "size": [20, 600], "static": true, "friction": 0.2},
-    {"name": "right_wall", "shape": "box", "pos": [990, 300], "size": [20, 600], "static": true, "friction": 0.2},
-    {"name": "runner", "shape": "circle", "pos": [90, 80], "radius": 16, "mass": 1.0, "friction": 0.06, "elasticity": 0.1, "control": true},
-    {"name": "exit", "shape": "box", "pos": [905, 95], "size": [70, 130], "static": true, "sensor": true}
-  ],
-  "on_contact": [
-    {"a": "runner", "b": "exit", "flag": "escaped", "once": true}
+    {"name": "ground", "shape": "box", "pos": [140, 25], "size": [280, 50], "static": true, "friction": 0.8},
+    {"name": "lava", "shape": "box", "pos": [790, 30], "size": [1020, 60], "static": true, "sensor": true},
+    {"name": "ledge", "shape": "box", "pos": [450, 120], "size": [210, 30], "static": true, "friction": 0.8},
+    {"name": "ledge_2", "shape": "box", "pos": [750, 140], "size": [210, 30], "static": true, "friction": 0.8},
+    {"name": "ledge_3", "shape": "box", "pos": [1060, 160], "size": [230, 30], "static": true, "friction": 0.8},
+    {"name": "wall", "shape": "box", "pos": [10, 325], "size": [20, 650], "static": true, "friction": 0.2},
+    {"name": "wall_2", "shape": "box", "pos": [1290, 325], "size": [20, 650], "static": true, "friction": 0.2},
+    {"name": "tree", "shape": "box", "pos": [90, 115], "size": [65, 130], "static": true, "sensor": true},
+    {"name": "torch", "shape": "box", "pos": [700, 205], "size": [30, 70], "static": true, "sensor": true},
+    {"name": "goal_zone", "shape": "box", "pos": [1120, 230], "size": [130, 110], "static": true, "sensor": true},
+    {"name": "marble", "shape": "circle", "pos": [80, 66], "radius": 16, "mass": 1.0, "friction": 0.6, "elasticity": 0.05, "control": true}
   ],
   "act": {
-    "run_right": [{"verb": "impulse", "body": "runner", "vec": [125, 0]}],
-    "run_left": [{"verb": "impulse", "body": "runner", "vec": [-125, 0]}],
-    "hop": [{"verb": "impulse", "body": "runner", "vec": [0, 260], "when": "grounded(\"runner\")"}]
+    "run_right": [{"verb": "impulse", "body": "marble", "vec": [70, 0]}],
+    "run_left": [{"verb": "impulse", "body": "marble", "vec": [-70, 0]}],
+    "hop": [{"verb": "impulse", "body": "marble", "vec": [0, 460], "when": "grounded(\"marble\")"}]
   },
   "on_step": [
-    {"kind": "velocity_clamp", "body": "runner", "vx_max": 240},
-    {"kind": "rising_level", "flag": "water", "rate": 0.11, "start": 8}
+    {"kind": "velocity_clamp", "body": "marble", "vx_max": 250, "vy_min": -900, "vy_max": 540},
+    {"kind": "timer_flag", "flag": "doom", "after_steps": 1500}
   ],
   "predicates": {
-    "success": "flag(\"escaped\")",
-    "failure": "pos_y(\"runner\") < flag(\"water\")",
+    "success": "contacts(\"marble\", \"goal_zone\")",
+    "failure": "contacts(\"marble\", \"lava\") or flag(\"doom\")",
     "checkpoints": {
-      "fled": "pos_x(\"runner\") > 260",
-      "midway": "pos_x(\"runner\") > 520",
-      "almost": "pos_x(\"runner\") > 760"
+      "fled_the_ground": "pos_x(\"marble\") > 380",
+      "first_shelf": "pos_y(\"marble\") > 145 and pos_x(\"marble\") > 350",
+      "midway": "pos_x(\"marble\") > 660",
+      "final_shelf": "pos_x(\"marble\") > 960",
+      "in_bunker": "contacts(\"marble\", \"goal_zone\")"
     }
   }
 }

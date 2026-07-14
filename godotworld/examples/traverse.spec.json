@@ -2,30 +2,42 @@
   "engine": "godot",
   "spec_version": 1,
   "meta": {
-    "title": "Slick Traverse",
-    "prompt": "A puck slides across a slick rink; push it all the way to the far wall.",
-    "world_size": [1100, 600],
-    "actions": ["push_left", "push_right"]
+    "title": "Quarry Shelves",
+    "prompt": "Climb the three quarry shelves - hop over the spike strips between them and reach the beacon on the top shelf.",
+    "world_size": [1400, 700],
+    "actions": ["run_left", "run_right", "hop"]
   },
   "bodies": [
-    {"name": "floor", "shape": "box", "pos": [550, 30], "size": [1100, 60], "static": true, "friction": 0.04, "elasticity": 0.1},
-    {"name": "left_wall", "shape": "box", "pos": [10, 300], "size": [20, 600], "static": true, "friction": 0.2},
-    {"name": "right_wall", "shape": "box", "pos": [1090, 300], "size": [20, 600], "static": true, "friction": 0.2},
-    {"name": "puck", "shape": "circle", "pos": [95, 82], "radius": 18, "mass": 1.0, "friction": 0.04, "elasticity": 0.1, "control": true}
+    {"name": "ground", "shape": "box", "pos": [700, 25], "size": [1400, 50], "static": true, "friction": 0.8},
+    {"name": "ledge", "shape": "box", "pos": [430, 105], "size": [260, 30], "static": true, "friction": 0.8},
+    {"name": "ledge_2", "shape": "box", "pos": [800, 185], "size": [260, 30], "static": true, "friction": 0.8},
+    {"name": "ledge_3", "shape": "box", "pos": [1170, 265], "size": [260, 30], "static": true, "friction": 0.8},
+    {"name": "wall", "shape": "box", "pos": [10, 350], "size": [20, 700], "static": true, "friction": 0.2},
+    {"name": "wall_2", "shape": "box", "pos": [1390, 350], "size": [20, 700], "static": true, "friction": 0.2},
+    {"name": "spike", "shape": "box", "pos": [615, 60], "size": [90, 24], "static": true, "sensor": true},
+    {"name": "spike_2", "shape": "box", "pos": [985, 60], "size": [90, 24], "static": true, "sensor": true},
+    {"name": "tree", "shape": "box", "pos": [180, 115], "size": [70, 130], "static": true, "sensor": true},
+    {"name": "bush", "shape": "box", "pos": [1310, 72], "size": [60, 45], "static": true, "sensor": true},
+    {"name": "goal_zone", "shape": "box", "pos": [1200, 335], "size": [130, 110], "static": true, "sensor": true},
+    {"name": "marble", "shape": "circle", "pos": [80, 66], "radius": 16, "mass": 1.0, "friction": 0.6, "elasticity": 0.05, "control": true}
   ],
   "act": {
-    "push_right": [{"verb": "impulse", "body": "puck", "vec": [120, 0]}],
-    "push_left": [{"verb": "impulse", "body": "puck", "vec": [-120, 0]}]
+    "run_right": [{"verb": "impulse", "body": "marble", "vec": [70, 0]}],
+    "run_left": [{"verb": "impulse", "body": "marble", "vec": [-70, 0]}],
+    "hop": [{"verb": "impulse", "body": "marble", "vec": [0, 430], "when": "grounded(\"marble\")"}]
   },
   "on_step": [
-    {"kind": "velocity_clamp", "body": "puck", "vx_max": 240}
+    {"kind": "velocity_clamp", "body": "marble", "vx_max": 250, "vy_min": -900, "vy_max": 520}
   ],
   "predicates": {
-    "success": "pos_x(\"puck\") > 900",
+    "success": "contacts(\"marble\", \"goal_zone\")",
+    "failure": "contacts(\"marble\", \"spike\") or contacts(\"marble\", \"spike_2\")",
     "checkpoints": {
-      "reached_q1": "pos_x(\"puck\") > 330",
-      "reached_half": "pos_x(\"puck\") > 560",
-      "reached_q3": "pos_x(\"puck\") > 780"
+      "on_first_shelf": "pos_y(\"marble\") > 130 and pos_x(\"marble\") > 290",
+      "past_spikes": "pos_x(\"marble\") > 680",
+      "on_mid_shelf": "pos_y(\"marble\") > 210 and pos_x(\"marble\") > 660",
+      "on_top_shelf": "pos_y(\"marble\") > 290 and pos_x(\"marble\") > 1030",
+      "at_beacon": "contacts(\"marble\", \"goal_zone\")"
     }
   }
 }
