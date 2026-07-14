@@ -30,6 +30,28 @@
  *     -> stdout: ONE JSON object of RAW engine facts (thresholds/gating stay in
  *        Python; see runCheck for the exact schema).
  *
+ *   (3) "serve" -- INTERACTIVE per-decision-tick stepping for the RL probe (G3').
+ *     The batch modes above run whole episodes; the RL policy needs to act one
+ *     tick at a time. This mode keeps ONE game+world alive across line-delimited
+ *     JSON ops on stdin, replying with one JSON line per op. Semantics per act
+ *     are IDENTICAL to runEpisode (act + K=6 [step, on_step] + latch + failure +
+ *     success), so a witness recorded here replays byte-exactly through the
+ *     batch "episodes" mode -- the certificate bridge (harness/rl/certify.py).
+ *       first line (init): { "mode": "serve", "source": <game source> }
+ *         -> { "ready": true, "actions": [str,...], "world_size": [w,h],
+ *              "title": str }   (or { "ready": false, "error": str } on load fail)
+ *       then, line-delimited ops:
+ *         { "op": "reset", "seed": int }
+ *           -> { "obs_state": { name: <full query dict>, ... },
+ *                "world_size": [w,h], "latched": { name: null, ... },
+ *                "result": null, "tick": 0, "error": null }
+ *         { "op": "act", "action": str|null }   // ONE decision tick
+ *           -> same shape, with "latched": { name: tick|null }, "tick": n, and
+ *              "result": null | "success" | "failure" | "error"
+ *         { "op": "close" }  -> exit 0
+ *     Deterministic: identical (seed, actions) sequences yield byte-identical
+ *     obs_state. The "episodes"/"check" modes are untouched by this addition.
+ *
  *   exit  : 0 (per-item errors are reported in-band, not via exit code)
  *
  * DECISION-TICK SEMANTICS (CONTRACTS §2, K=6):
@@ -43,6 +65,7 @@
  */
 
 const vm = require("node:vm");
+const readline = require("node:readline");
 const { World } = require("./world.js");
 
 const K_STEPS = 6; // physics steps per decision tick (CONTRACTS §2)
@@ -271,6 +294,120 @@ function runEpisode(game, world, actions, maxTicks, framesEvery, escapeMargin) {
 }
 
 // ===========================================================================
+// SERVE MODE -- interactive per-decision-tick stepping for the RL probe (G3').
+// ---------------------------------------------------------------------------
+// One game+world stays alive across ops; "act" advances exactly ONE decision
+// tick with the SAME semantics as runEpisode, so a greedy witness recorded here
+// replays bit-for-bit through the batch "episodes" mode. Additive: the batch
+// modes above never call any of this.
+// ===========================================================================
+function serveStepOnce(game, world, action, latches, tick) {
+  // One decision tick: act + K*[step, on_step] + latch + failure + success.
+  // Mirrors runEpisode's body exactly (latch BEFORE terminal checks).
+  try {
+    if (action !== null && action !== undefined) game.act(world, action);
+    for (let s = 0; s < K_STEPS; s++) {
+      world.step(1);
+      if (game.on_step) game.on_step(world);
+    }
+    if (game.checkpoints) {
+      const cps = game.checkpoints(world);
+      for (const key of Object.keys(cps)) {
+        if (!(key in latches)) latches[key] = null;
+        if (latches[key] === null && cps[key]) latches[key] = tick;
+      }
+    }
+    if (game.failure && game.failure(world)) return { result: "failure", error: null };
+    if (game.success(world)) return { result: "success", error: null };
+    return { result: null, error: null };
+  } catch (e) {
+    return { result: "error", error: String((e && e.stack) || e).split("\n").slice(0, 4).join(" | ") };
+  }
+}
+
+function serveObserve(world, game, latches, result, tick, error) {
+  return {
+    obs_state: frameOf(world),          // full per-body query dicts (the RL obs)
+    world_size: world.size.slice(),
+    latched: Object.assign({}, latches),
+    result: result === undefined ? null : result,
+    tick: tick,
+    error: error === undefined ? null : error,
+  };
+}
+
+async function serveLoop(initJob, lineIter) {
+  const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
+
+  let game = null;
+  try {
+    game = loadGame(initJob.source);
+  } catch (e) {
+    emit({ ready: false, error: String((e && e.message) || e) });
+    process.exit(0);
+    return;
+  }
+  // Handshake: declare the action set + world size so the Python env can build
+  // its observation/action spaces before the first reset.
+  emit({ ready: true, actions: game.ACTIONS.slice(), world_size: worldSizeOf(game), title: game.TITLE });
+
+  let world = null;
+  let latches = {};
+  let done = null; // null | "success" | "failure" | "error" (episode terminal)
+  let tick = 0;
+
+  for await (const line of lineIter) {
+    const s = String(line).trim();
+    if (!s) continue;
+    let op;
+    try {
+      op = JSON.parse(s);
+    } catch (e) {
+      emit({ error: "bad op JSON: " + e.message });
+      continue;
+    }
+    const kind = op.op;
+    if (kind === "close") break;
+    if (kind === "reset") {
+      world = new World(op.seed | 0, worldSizeOf(game));
+      game.build(world);
+      latches = {};
+      // Seed the latch KEYS (all null) from the t=0 checkpoints so the full key
+      // set + declared order are on the reset frame. Checkpoints are False at
+      // t=0 (G2), so this registers keys without ever latching one.
+      if (game.checkpoints) {
+        try {
+          for (const k of Object.keys(game.checkpoints(world))) latches[k] = null;
+        } catch (e) {
+          /* a throwing checkpoints() will surface on the first act */
+        }
+      }
+      done = null;
+      tick = 0;
+      emit(serveObserve(world, game, latches, null, 0, null));
+    } else if (kind === "act") {
+      if (world === null) {
+        emit({ error: "act before reset" });
+        continue;
+      }
+      if (done !== null) {
+        // Episode already terminal: echo the terminal frame (the env should
+        // reset; this keeps the stream one-reply-per-op and never re-steps).
+        emit(serveObserve(world, game, latches, done, tick, null));
+        continue;
+      }
+      tick += 1;
+      const rec = serveStepOnce(game, world, op.action, latches, tick);
+      done = rec.result;
+      emit(serveObserve(world, game, latches, done, tick, rec.error));
+    } else {
+      emit({ error: "unknown op: " + String(kind) });
+    }
+  }
+  process.exit(0);
+}
+
+// ===========================================================================
 // CHECK MODE -- raw G0/G2 facts (thresholds + gating live in Python)
 // ===========================================================================
 // Returns a single object of engine facts the Python G0/G2 layers consume to
@@ -446,24 +583,42 @@ function runCheck(source) {
 // ===========================================================================
 // MAIN
 // ===========================================================================
-function readStdin() {
-  return new Promise((resolve, reject) => {
-    let buf = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (d) => (buf += d));
-    process.stdin.on("end", () => resolve(buf));
-    process.stdin.on("error", reject);
-  });
-}
-
 async function main() {
-  const raw = await readStdin();
-  let job;
+  // Peek the FIRST line so the interactive "serve" mode can reply without
+  // waiting for stdin EOF. The batch executors send a compact single-line job,
+  // so that first line is the whole job for "episodes"/"check"; a (hypothetical)
+  // multi-line pretty-printed job falls back to read-until-EOF below. This keeps
+  // the existing modes byte-identical while enabling streaming for serve.
+  const lineIter = readline
+    .createInterface({ input: process.stdin, crlfDelay: Infinity })
+    [Symbol.asyncIterator]();
+  const first = await lineIter.next();
+  const firstLine = first.done ? "" : first.value;
+
+  let job = null;
   try {
-    job = JSON.parse(raw);
+    job = JSON.parse(firstLine);
   } catch (e) {
-    process.stdout.write(JSON.stringify({ result: "error", ticks: 0, checkpoints: {}, final_snapshot: {}, error: "bad job JSON: " + e.message }) + "\n");
+    job = null; // incomplete/multi-line job -> reassemble from the rest of stdin
+  }
+
+  // Serve mode: keep one world alive and step it interactively, one op per line.
+  if (job && job.mode === "serve") {
+    await serveLoop(job, lineIter);
     return;
+  }
+
+  // Non-serve: reassemble the full job if the first line was not itself valid
+  // JSON (a compact single-line job needs no reassembly).
+  if (job === null) {
+    let buf = firstLine;
+    for await (const line of lineIter) buf += "\n" + line;
+    try {
+      job = JSON.parse(buf);
+    } catch (e) {
+      process.stdout.write(JSON.stringify({ result: "error", ticks: 0, checkpoints: {}, final_snapshot: {}, error: "bad job JSON: " + e.message }) + "\n");
+      return;
+    }
   }
 
   // Check mode: one structured object of raw G0/G2 facts.
