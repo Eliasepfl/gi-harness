@@ -210,3 +210,76 @@ def test_godot_bank_menu_reuses_the_js_renderer():
     names = ["wrecking_ball"]
     assert R.build_menu(names, "godot") == R.build_menu(names, "js")
     assert R.build_menu(names, "godot") != R.build_menu(names, "py")
+
+
+# --- Track P: designer-prompt overhaul (variety + precision + mined physics) --
+
+def test_godot_has_mined_physics_block_with_attribution():
+    sp = P.compose("godot")
+    # The mined "## Physics guidance" block is folded in, with its numeric priors.
+    assert "## Physics guidance (mined)" in sp
+    assert "SPEED PRIORS" in sp
+    assert "SOLID THICK SUPPORTS" in sp
+    # Apache-2.0 §4(d) NOTICE + MIT credit must ride along with the lifted prose.
+    assert "awesome-gamedev-agent-skills" in sp
+    assert "Apache-2.0" in sp
+    assert "godogen" in sp
+
+
+def test_godot_archetype_variety_section():
+    sp = P.compose("godot")
+    # A menu of genuinely DISTINCT, DSL-expressible mechanic archetypes...
+    assert "pick ONE mechanic archetype and COMMIT" in sp
+    for arch in ("PRECISION HOPS", "HEAVY-BODY MOMENTUM", "RISING-HAZARD ESCAPE",
+                 "COLLECT-UNDER-PRESSURE", "SWITCH-GATED PATH", "TOPPLE / KNOCKDOWN",
+                 "PENDULUM SWING"):
+        assert arch in sp, arch
+    # ...and an explicit instruction to name the committed archetype in metadata.
+    assert "meta.archetype" in sp
+    # Honesty about what the DSL cannot express (drops, not false promises).
+    assert "NOT yet expressible" in sp
+
+
+def test_godot_fun_and_precision_section():
+    sp = P.compose("godot")
+    assert "Fun and precision" in sp
+    for rule in ("TIGHT FEEDBACK", "NEAR-MISS TENSION", "ESCALATION",
+                 "TIMING IN TICKS", "MASS / IMPULSE COHERENCE"):
+        assert rule in sp, rule
+    # The forbidden anti-patterns, each stated with a reason.
+    for anti in ("DEAD ACTIONS", "DECORATIVE BODIES THAT NEVER MATTER",
+                 "SINGLE-ACTION WIN"):
+        assert anti in sp, anti
+
+
+def test_godot_common_failures_table():
+    sp = P.compose("godot")
+    assert "Common failures" in sp
+    # A few of the silent-at-load / break-at-replay quirk rows.
+    assert "G3 grounded-gated jump never fires" in sp
+    assert "G1 containment escape" in sp
+    assert "joint has no effect" in sp
+
+
+def test_godot_designer_sections_ordered_stably():
+    sp = P.compose("godot")
+    # The vocabulary tables come first, then the mined physics, then the design
+    # guidance (variety -> precision -> failures), then the worked example.
+    order = [
+        "the whitelisted expression DSL",      # predicates reference table
+        "## Physics guidance (mined)",
+        "pick ONE mechanic archetype and COMMIT",
+        "Fun and precision",
+        "Common failures",
+        "Worked mini-example",
+    ]
+    idx = [sp.index(s) for s in order]
+    assert idx == sorted(idx), idx
+
+
+def test_godot_designer_sections_do_not_leak_into_js():
+    js = P.compose("js")
+    for marker in ("## Physics guidance (mined)", "PRECISION HOPS",
+                   "meta.archetype", "Common failures - pass the loader",
+                   "awesome-gamedev-agent-skills", "pick ONE mechanic archetype"):
+        assert marker not in js, marker
