@@ -671,10 +671,16 @@ async function main() {
   process.stdout.write(lines.join("\n") + (lines.length ? "\n" : ""));
 }
 
+// Exit only after stdout drains: on Linux a pipe write is async and process.exit()
+// truncates anything past the 64 KiB pipe buffer (Windows flushes synchronously,
+// so this never reproduced locally). An empty write's callback is queued behind
+// every pending write, so it fires exactly when the stream has flushed.
 main().then(
-  () => process.exit(0),
+  () => process.stdout.write("", () => process.exit(0)),
   (e) => {
-    process.stdout.write(JSON.stringify({ result: "error", ticks: 0, checkpoints: {}, final_snapshot: {}, error: "runner fatal: " + String(e) }) + "\n");
-    process.exit(0);
+    process.stdout.write(
+      JSON.stringify({ result: "error", ticks: 0, checkpoints: {}, final_snapshot: {}, error: "runner fatal: " + String(e) }) + "\n",
+      () => process.exit(0)
+    );
   }
 );
