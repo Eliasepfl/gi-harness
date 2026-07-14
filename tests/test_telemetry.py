@@ -224,3 +224,76 @@ def test_cli_game_stats_table_and_empty(tmp_path, capsys):
 
     rc_empty = cli.main(["game", "stats", "--path", str(tmp_path / "none.jsonl")])
     assert rc_empty == 1
+
+
+# --- ledger merge (cluster shards -> canonical ledger) ---------------------------
+def _shard(tmp_path, name: str, lines: list) -> str:
+    path = tmp_path / name
+    with open(path, "w", encoding="utf-8") as fh:
+        for obj in lines:
+            fh.write((obj if isinstance(obj, str) else json.dumps(obj)) + "\n")
+    return str(path)
+
+
+def _farm_line(game: str, seed: int = 0, passed: bool = True, ts: str = "t0") -> dict:
+    return {"ts": ts, "game": game,
+            "report": {"passed": passed, "witness": {"seed": seed, "actions": []}}}
+
+
+def test_merge_shards_dedupes_and_appends(tmp_path):
+    into = str(tmp_path / "ledger.jsonl")
+    a = _shard(tmp_path, "ledger.1.0.jsonl",
+               [_farm_line("g1.js"), _farm_line("g2.js", seed=3)])
+    b = _shard(tmp_path, "ledger.1.1.jsonl",
+               [_farm_line("g1.js"), _farm_line("g3.js")])  # g1 duplicated across shards
+
+    summary = TEL.merge_shards([a, b], into=into)
+    assert summary["appended"] == 3 and summary["duplicates"] == 1
+    with open(into, encoding="utf-8") as fh:
+        games = [json.loads(l)["game"] for l in fh]
+    assert sorted(games) == ["g1.js", "g2.js", "g3.js"]
+
+
+def test_merge_shards_idempotent(tmp_path):
+    into = str(tmp_path / "ledger.jsonl")
+    a = _shard(tmp_path, "ledger.2.0.jsonl", [_farm_line("g1.js")])
+    TEL.merge_shards([a], into=into)
+    summary = TEL.merge_shards([a], into=into)  # re-merge: nothing new
+    assert summary["appended"] == 0 and summary["duplicates"] == 1
+    assert sum(1 for _ in open(into, encoding="utf-8")) == 1
+
+
+def test_merge_shards_distinct_verdicts_kept(tmp_path):
+    into = str(tmp_path / "ledger.jsonl")
+    a = _shard(tmp_path, "ledger.3.0.jsonl",
+               [_farm_line("g1.js", passed=True), _farm_line("g1.js", passed=False)])
+    summary = TEL.merge_shards([a], into=into)
+    assert summary["appended"] == 2  # same (game, seed), different verdict_hash
+
+
+def test_merge_shards_volatile_fields_ignored(tmp_path):
+    into = str(tmp_path / "ledger.jsonl")
+    a = _shard(tmp_path, "ledger.4.0.jsonl",
+               [_farm_line("g1.js", ts="t0"), _farm_line("g1.js", ts="t1")])
+    summary = TEL.merge_shards([a], into=into)
+    assert summary["appended"] == 1 and summary["duplicates"] == 1  # ts is volatile
+
+
+def test_merge_shards_skips_corrupt_lines(tmp_path):
+    into = str(tmp_path / "ledger.jsonl")
+    a = _shard(tmp_path, "ledger.5.0.jsonl",
+               [_farm_line("g1.js"), "{not json", _farm_line("g2.js")])
+    summary = TEL.merge_shards([a], into=into)
+    assert summary["appended"] == 2 and summary["corrupt"] == 1
+
+
+def test_cli_ledger_merge(tmp_path, capsys):
+    from harness import cli
+    into = str(tmp_path / "ledger.jsonl")
+    _shard(tmp_path, "ledger.6.0.jsonl", [_farm_line("g1.js")])
+    _shard(tmp_path, "ledger.6.1.jsonl", [_farm_line("g2.js")])
+
+    rc = cli.main(["ledger", "merge", str(tmp_path), "--into", into, "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert out["appended"] == 2 and out["shards"] == 2

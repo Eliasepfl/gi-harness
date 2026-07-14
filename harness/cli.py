@@ -644,6 +644,31 @@ def cmd_game_curriculum(args) -> int:
     return 0
 
 
+# ---- ledger merge ------------------------------------------------------------
+def cmd_ledger_merge(args) -> int:
+    """Merge per-task cluster ledger shards into the canonical ledger."""
+    try:
+        from harness.core.telemetry import merge_shards
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("telemetry", exc, args.json)
+
+    shards: list[str] = []
+    for item in args.shards:
+        p = Path(item)
+        if p.is_dir():
+            shards.extend(str(x) for x in sorted(p.glob("ledger.*.jsonl")))
+        else:
+            shards.append(item)
+    summary = merge_shards(shards, into=args.into)
+    if args.json:
+        _emit_json(summary)
+    else:
+        print(f"merged {summary['shards']} shard(s), {summary['lines']} line(s): "
+              f"{summary['appended']} appended, {summary['duplicates']} duplicate(s) "
+              f"dropped, {summary['corrupt']} corrupt -> {args.into}")
+    return 0
+
+
 # ---- game stats ------------------------------------------------------------
 def cmd_game_stats(args) -> int:
     """Aggregate the runs ledger (telemetry) per backend/model."""
@@ -806,6 +831,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="where next-version games are written")
     gc.add_argument("--json", action="store_true")
     gc.set_defaults(func=cmd_game_curriculum)
+
+    lg = sub.add_parser("ledger", help="run-ledger utilities (cluster shard merge)")
+    lgsub = lg.add_subparsers(dest="ledger_command", required=True)
+    lm = lgsub.add_parser(
+        "merge",
+        help="merge per-task ledger shards into the canonical ledger "
+             "(dedupe on (game_id, seed, verdict_hash); idempotent)")
+    lm.add_argument("shards", nargs="+",
+                    help="shard files, or directories scanned for ledger.*.jsonl")
+    lm.add_argument("--into", default="runs/ledger.jsonl",
+                    help="canonical ledger to append into (default runs/ledger.jsonl)")
+    lm.add_argument("--json", action="store_true")
+    lm.set_defaults(func=cmd_ledger_merge)
 
     return p
 

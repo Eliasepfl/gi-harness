@@ -141,6 +141,79 @@ def record_run(result: dict, prompt: str, model, wall_s: float,
 
 
 # --------------------------------------------------------------------------
+# Shard merge (cluster farms -> canonical ledger)
+# --------------------------------------------------------------------------
+_VOLATILE_KEYS = ("ts", "wall_s")  # differ across re-runs of the same verdict
+
+
+def _dedupe_key(obj: dict) -> tuple:
+    """(game_id, seed, verdict_hash) — the merge identity of one ledger line.
+
+    game_id comes from whichever id field the line carries (farm shards write
+    `game`, generation entries write `prompt`); seed from the embedded witness
+    when present. verdict_hash covers the whole line minus volatile fields, so
+    identical re-runs collapse while genuinely different verdicts survive.
+    """
+    import hashlib
+
+    game = obj.get("game") or obj.get("game_path") or obj.get("game_id") or obj.get("prompt")
+    seed = obj.get("seed")
+    if seed is None:
+        report = obj.get("report")
+        witness = report.get("witness") if isinstance(report, dict) else None
+        if isinstance(witness, dict):
+            seed = witness.get("seed")
+    stable = {k: v for k, v in obj.items() if k not in _VOLATILE_KEYS}
+    payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
+    return (str(game), seed, hashlib.sha256(payload.encode("utf-8")).hexdigest())
+
+
+def merge_shards(shards: list[str], into: str = DEFAULT_LEDGER) -> dict:
+    """Merge per-task ledger shards into the canonical ledger, idempotently.
+
+    Cross-node NFS appends are racy, so cluster arrays write one shard per
+    task (`ledger.$JOBID.$TASKID.jsonl`, ORCD_DEPLOYMENT §5); this merge is
+    the single-writer step that owns `into`. Lines already present (by
+    `_dedupe_key`) are never re-appended, so re-merging after a preemption
+    requeue or a partial rsync is safe. Corrupt lines are counted, not fatal.
+
+    -> {"shards": n, "lines": m, "appended": k, "duplicates": d, "corrupt": c}
+    """
+    seen = {_dedupe_key(e) for e in _read_ledger(into)}
+    summary = {"shards": 0, "lines": 0, "appended": 0, "duplicates": 0, "corrupt": 0}
+
+    directory = os.path.dirname(into)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(into, "a", encoding="utf-8") as out:
+        for shard in sorted(shards):
+            summary["shards"] += 1
+            if not os.path.isfile(shard):
+                continue
+            with open(shard, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    summary["lines"] += 1
+                    try:
+                        obj = json.loads(line)
+                        if not isinstance(obj, dict):
+                            raise ValueError("not an object")
+                    except (json.JSONDecodeError, ValueError):
+                        summary["corrupt"] += 1
+                        continue
+                    key = _dedupe_key(obj)
+                    if key in seen:
+                        summary["duplicates"] += 1
+                        continue
+                    seen.add(key)
+                    out.write(line + "\n")
+                    summary["appended"] += 1
+    return summary
+
+
+# --------------------------------------------------------------------------
 # Aggregation
 # --------------------------------------------------------------------------
 def _read_ledger(path: str) -> list[dict]:
