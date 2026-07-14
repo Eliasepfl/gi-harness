@@ -12,9 +12,10 @@ Like writing a paper: reference previous methods, compress them into general
 1. **NOW — reliable base of games.** Generate many games across varied prompts.
    Every repair the loop needed is a LESSON (a specific we had to impose).
 2. **Harvest → revise the main prompt.** Compress recurring lessons into general
-   rules in `gamegen._SYSTEM_PROMPT` (slightly more general tools, clearer
-   interaction instructions). No game-specific hardcoding in prompts, ever.
-   Reusable "skills" (helper tools for future games) may emerge here.
+   rules in the modular prompt sections (`harness/gen/prompts/*.md` — contract,
+   api, rules, orientation; composed per engine, frozen by the integrity
+   manifest). No game-specific hardcoding in prompts, ever. Reusable "skills"
+   (helper tools for future games) may emerge here.
 3. **Exotic prompts.** Only once the base is solid.
 4. **Real 2D game engines.** Last step, drawing on all accumulated knowledge.
    (Assignment: "produce playable environments in a game or physics engine" —
@@ -116,6 +117,11 @@ are repair material AND robustness evidence (training-signal for GI's framing).
   = verb mistakes → prompt rules. No MCP needed (local-first); PixelLab API
   optional build-time later. Sequencing: v2.2 after current campaign, then A/B
   re-run WITH bank to quantify the repair-rate delta.
+  **Status 13 juil. (nuit): v2.2 step 2 LANDED (c02de14)** — BM25 retrieval →
+  pinned advisory menu in the composed prompt, modular prompt sections,
+  render-time Kenney sprite skinning (cosmetic only), kenney_usage.md
+  orientation notes. Bank expansion 30 → ~60 in flight (bank-CI certified).
+  Still open: dense-retrieval second stage, A/B repair-rate delta.
 
 - **Real game engines (rung 4) — research DONE (13 juil.), synthesis in
   `notes/GAME_ENGINE_INTEGRATIONS.md`** (details per engine in `notes/engines/`).
