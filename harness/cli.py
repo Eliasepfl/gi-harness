@@ -876,7 +876,7 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--budget", type=int, default=200_000,
                     help="RL budget in env-steps (default 200k screen; "
                          "2000000 for the full rung)")
-    rp.add_argument("--trainer", default="vendored", choices=["vendored", "sb3"],
+    rp.add_argument("--trainer", default="sb3", choices=["vendored", "sb3"],
                     help="RL trainer backend: 'vendored' CleanRL-mirror PPO "
                          "(default) or 'sb3' SB3 PPO (the [LF] migration, "
                          "GODOT_RL_AGENTS_CAPABILITIES.md §6.7)")

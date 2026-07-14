@@ -24,7 +24,7 @@ from harness.rl.env import PlanckEnv
 DEFAULT_BUDGET = 2_000_000       # env-steps per game (LLM_RL_SYSTEMS §4.1) [eng.]
 N_EVAL = 32                      # greedy eval episodes (fixed seeds) [eng.]
 LEARNABLE_SUCCESS_RATE = 0.5     # greedy success rate to call a game learnable [eng.]
-TRAINERS = ("vendored", "sb3")   # RL trainer backends (vendored default; sb3 = [LF])
+TRAINERS = ("vendored", "sb3")   # RL trainer backends (sb3 default post-parity R1; vendored kept until one live curriculum round confirms)
 
 
 def _resolve_trainer(trainer: str):
@@ -71,7 +71,7 @@ def _bridge_replay(game_source: str, witness: dict) -> dict:
 
 def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              n_eval: int = N_EVAL, seed: int = 0, log=None,
-             wall_clock_budget_s=None, trainer: str = "vendored",
+             wall_clock_budget_s=None, trainer: str = "sb3",
              **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 

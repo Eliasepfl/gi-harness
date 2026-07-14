@@ -395,13 +395,17 @@ def _stable(result: dict) -> dict:
 
 
 @requires_serve
-def test_vendored_trainer_default_and_byte_identical(corridor):
+def test_trainer_default_is_sb3_and_vendored_stays_deterministic(corridor):
+    # Default flipped to sb3 after parity R1 (notes/rl_agent/SB3_PARITY_R1.md);
+    # the vendored path must stay byte-identical run-to-run until it is retired.
+    pytest.importorskip("stable_baselines3")
     from harness.rl.certify import g3_prime
 
     kw = dict(budget_steps=6000, seed=0, n_eval=4,
               num_envs=4, num_steps=64, patience=999)
     default = g3_prime(corridor, **kw)                       # trainer defaults here
     vendored = g3_prime(corridor, trainer="vendored", **kw)
+    vendored2 = g3_prime(corridor, trainer="vendored", **kw)
 
-    assert default["trainer"] == "vendored"                 # default IS vendored
-    assert _stable(default) == _stable(vendored)            # + deterministic, unchanged
+    assert default["trainer"] == "sb3"                       # default IS sb3 (post-parity)
+    assert _stable(vendored) == _stable(vendored2)           # vendored: deterministic, unchanged
