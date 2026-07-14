@@ -157,10 +157,10 @@ verify+G3' arrays over the produced games.
 
 ## 7. Follow-ups
 
-* **Multi-round LIVE campaign.** This deliverable wires the loop and stops at the
-  directive (no API spend). Next: an actual `--rounds K --backend anthropic` run that
-  regenerates, re-certifies, and shows the grade migrating hard → target across rounds —
-  the ACCEL curriculum trajectory, logged per round.
+* **Multi-round LIVE campaign.** The first live campaign (§8) is done — a `--rounds 2
+  --backend openrouter` run that revises, re-certifies and re-grades across rounds. It
+  showed learnability *moving* (sr 0.0 → 0.125) but not yet crossing into `target` at
+  500 k; the trajectory hard → target across rounds still wants the full 2 M budget.
 * **Get two_switch_vault over the line first** (spike §6): it flipped grades with more
   budget/capacity once (meteor did), so before trusting a `hard` directive to *ease* the
   game, try the cheap levers (2×256 net, full 2 M budget, entropy anneal). A premature
@@ -171,4 +171,92 @@ verify+G3' arrays over the produced games.
 * **Grade-aware regenerate budget.** `not_learnable`/`hard` rounds could get a bigger G3'
   budget on the *next* version to avoid re-labelling a fixed game as still-hard from a
   too-small probe.
+
+## 8. Revise mode — the minimal-edit curriculum operator (default)
+
+`curriculum_round(game_path, ..., mode="revise" | "regenerate")`, **default `revise`**;
+CLI `--mode revise|regenerate` on `game curriculum`.
+
+**Why it exists.** The first LIVE round (commit `26b3fc4`) ran `mode="regenerate"`: the
+directive rode the ORIGINAL PROMPT into `generate_game`, which re-designed the game FROM
+SCRATCH. hy3:free then failed **5/5** attempts to rebuild `two_switch_vault` under the
+v2.3/v2.4 bar — from-scratch generation THREW AWAY the certified design the directive only
+wanted to *tweak* (it rebuilt the world with a different `WORLD_SIZE`, different entity
+names and a different layout, then couldn't re-solve it). ACCEL edits levels; it does not
+regenerate them. `revise` is that missing edit operator.
+
+**What it does.** On a non-`target` grade, the CERTIFIED source seeds the SAME
+verify→repair loop as a minimal EDIT task (`gamegen.revise_game` →
+`gamegen._revise_user_msg`): the model gets the full current module + a task block —
+*"this game is CERTIFIED; apply ONLY this directive with a minimal edit; keep entities,
+ACTIONS, checkpoint names, the PROMPT line and every other stage intact"* — and returns the
+FULL revised module, which then goes through the identical oracles + `max_repairs` repair
+ledger (engine unchanged). It reuses the existing repair machinery via a single
+`first_user` override threaded through `_dispatch` / the backend runners; the from-scratch
+`generate_game` path is byte-unchanged (tests protect it). `action_taken`:
+`"revised"` on verdict COMPLETED / `"revise_failed"` (verdict + last repair hint appended
+to the directive trail, exactly as the regenerate path does after `26b3fc4`). The revised
+game keeps the ORIGINAL PROMPT (provenance); TITLE may gain a version suffix.
+
+Seams (tests monkeypatch, no torch/network): `verify_fn`, `g3_prime_fn`, `generate_fn`,
+**`revise_fn`**. Ledger + return record now carry `"mode"`. The CLI chain advances on
+`"revised"` OR `"regenerated"` (with a `new_game_path`), and stops otherwise.
+
+### 8.1 The first LIVE revise round (the acceptance)
+
+Ran from the agent worktree, `NODE_PATH` → main-checkout `nodeworld/node_modules`,
+`OPENROUTER_API_KEY`/`_MODEL` injected into the process env from the main-checkout
+`env.py` (gamegen's `_repo_root()` resolves to the *worktree*, which has no `env.py`):
+
 ```
+python -m harness game curriculum \
+  scenes/games/v23_showcase/two_switch_vault/game.js \
+  --mode revise --budget 500000 --rounds 2 --backend openrouter \
+  --out-dir scenes/games/curriculum_r1_revise --json
+```
+
+Backend **openrouter / tencent/hy3:free**. Whole 2-round CLI run ≈ **200 s** wall.
+
+| Round | Input game | verify (tree) | G3′ @500 k (`sr`, first-succ, `cleared_gap1` mastery, plateau_latched) | grade | action | round wall |
+|---|---|---|---|---|---|---|
+| 1 | original `two_switch_vault` | ✓ 102 ticks, 26 replays | `sr` **0.0**, 1136, **0.155**, 1.155 | **hard** (stall `cleared_gap1`) | **revised** (hy3, 1 attempt, COMPLETED) | 104.7 s |
+| 2 | round-1 revised (chained ✓) | ✓ 77 ticks, 45 replays | `sr` **0.125**, 792, **0.485**, 1.485 | **hard** (stall `cleared_gap1`) | **revised** (hy3, 1 attempt, COMPLETED) | 94.4 s |
+
+**Did hy3 produce a COMPLETED minimal edit?** YES — round 1, verdict COMPLETED on the
+*first* attempt (zero repairs), where from-scratch regeneration had failed 5/5.
+
+**Does the diff target `cleared_gap1` only?** YES — the entire content diff (EOL-normalised)
+is **3 edits**, all on the first gap:
+* `TITLE` → `"Two-Switch Vault (eased gap1)"` (the allowed version suffix);
+* `ground_stone` (the middle shelf) `pos [930,150] size [460,300]` → `pos [910,150]
+  size [500,300]` — extended leftward to NARROW gap1;
+* `spike` (the gap1 hazard) `pos [630,215] size [130,90]` → `pos [610,215] size [80,90]`
+  — narrowed, annotated `// EASED gap1`.
+
+`PROMPT` is byte-identical (provenance ✓), `ACTIONS` identical, and every later stage —
+`switch_b`, `cleared_gap2`, `at_vault`, both gates, `on_step`, `success`, `failure`, all
+checkpoint names/logic, the hero, `spike_2`, decor — is untouched. This is exactly the ACCEL
+"ease HERE, keep the rest" edit the `hard` directive asked for, which from-scratch
+regeneration could not do.
+
+**Did round 2's grade move (hard → target/easy)?** NO — it stayed `hard`. BUT the ease
+*measurably* improved learnability at a fixed 500 k budget: `sr` 0.0 → 0.125, first-success
+1136 → 792 steps, and the localiser confirms the stall is loosening — `cleared_gap1`
+per-milestone mastery **0.155 → 0.485** (≈3× further past the eased gate),
+`plateau_mean_latched` 1.155 → 1.485. The agent gets meaningfully further past gap1; one
+ease round at 500 k did not cross the `TARGET_RATE_LO = 0.50` band. This corroborates the §7
+"budget-limited hard" caveat: the honest next lever is the full 2 M budget (and/or a second
+ease round), not a bigger structural change. Revise mode did NOT fail — no `revise_failed`
+this campaign — so the 5/5 from-scratch failure mode is retired for this game.
+
+### 8.2 Notes / follow-ups from the live round
+
+* **Round chaining overwrites the intermediate artifact.** Because the PROMPT is preserved,
+  every round slugs into the SAME `<out_dir>/<slug>/` — round 2 reads the round-1 file
+  (curriculum_round captures the source string first) and then `revise_game` promotes its
+  own output to the same path, overwriting round 1's game. Functionally safe (the source is
+  read before the overwrite), but the per-round artifacts are lost. A versioned per-round
+  subdir (`.../round_k/`) would keep the full trajectory.
+* **500 k is boundary-thin for `hard`.** Same caveat as the 200 k demo (§4): a production
+  campaign should run 2 M so a still-`hard` grade after an ease is trustworthy, not a
+  budget artefact.

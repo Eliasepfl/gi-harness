@@ -390,15 +390,32 @@ def _default_generate(prompt: str, *, out_dir: str, backend: str, engine: str) -
     return generate_game(prompt, out_dir=out_dir, backend=backend, engine=engine)
 
 
+def _default_revise(source: str, directive: str, *, out_dir: str, backend: str,
+                    engine: str) -> dict:
+    from harness.gen.gamegen import revise_game
+    return revise_game(source, directive, out_dir=out_dir, backend=backend,
+                       engine=engine)
+
+
 # Module-level indirection: tests monkeypatch these names on the module.
 verify_fn = _default_verify
 g3_prime_fn = _default_g3_prime
 generate_fn = _default_generate
+revise_fn = _default_revise
 
 
 # ======================================================================== #
 # Ledger
 # ======================================================================== #
+def _last_repair_hint(gen: dict) -> str | None:
+    """The most recent non-empty repair hint from a gamegen result's attempts."""
+    for att in reversed((gen or {}).get("attempts") or []):
+        hint = (att.get("report") or {}).get("hint")
+        if hint:
+            return hint
+    return None
+
+
 def _append_ledger_event(entry: dict, path: str) -> dict:
     """Append ONE curriculum event line to the runs ledger (creates the dir).
 
@@ -416,7 +433,7 @@ def _append_ledger_event(entry: dict, path: str) -> dict:
 
 def _ledger_entry(profile: dict, directive_text: str, *, backend: str,
                   budget_steps: int, action_taken: str, new_game_path,
-                  wall_s: float) -> dict:
+                  wall_s: float, mode: str | None = None) -> dict:
     rl = profile.get("rl") or {}
     solver = profile.get("solver") or {}
     return {
@@ -427,6 +444,7 @@ def _ledger_entry(profile: dict, directive_text: str, *, backend: str,
         "grade": profile.get("grade"),
         "backend": backend,
         "budget_steps": budget_steps,
+        "mode": mode,
         "action_taken": action_taken,
         "new_game_path": new_game_path,
         "directive": directive_text,
@@ -451,27 +469,44 @@ def curriculum_round(game_path: str, *, backend: str = "auto",
                      budget_steps: int = 200_000,
                      out_dir: str = "scenes/games/curriculum",
                      ledger_path: str | None = None,
-                     g3p_kwargs: dict | None = None) -> dict:
+                     g3p_kwargs: dict | None = None,
+                     mode: str = "revise") -> dict:
     """One iteration of the curriculum loop on the game at `game_path`.
 
     verify (tree G3) -> G3' (RL, `budget_steps`) -> difficulty_profile -> directive.
     If the grade is ``target`` the game is CERTIFIED at frontier difficulty and the
-    round stops. Otherwise the original PROMPT + directive are composed and handed
-    to ``gamegen.generate_game`` (the directive rides the USER prompt — additive,
-    no frozen-section edit) to produce the NEXT version into `out_dir`.
+    round stops. Otherwise the directive is applied to produce the NEXT version into
+    `out_dir`, in one of two ``mode``s:
+
+    * ``"revise"`` (default) — the CERTIFIED source seeds the SAME verify->repair
+      loop as a minimal EDIT task (``gamegen.revise_game``): keep the entities,
+      actions, checkpoint names and every intact stage; apply ONLY the directive.
+      This preserves the certified design the directive wants to keep (the first
+      live round found from-scratch regeneration threw it away). action_taken:
+      ``"revised"`` on verdict COMPLETED, else ``"revise_failed"``.
+    * ``"regenerate"`` — the original PROMPT + directive are composed and handed to
+      ``gamegen.generate_game`` (directive rides the USER prompt) to design a fresh
+      game. action_taken: ``"regenerated"`` / ``"regenerate_failed"``.
+
+    Either way the directive is additive (never a frozen-section edit) and the new
+    game goes through the identical oracles + repair ledger. On a failed
+    generate/revise the verdict + last repair hint are appended to the directive
+    trail (as the regenerate path does after 26b3fc4) and the chain stops.
 
     A ``curriculum_round`` event line is appended to the runs ledger. Returns the
     round record::
 
         {"game_path", "grade", "profile", "directive", "action_taken",
-         "new_game_path", "verify_passed", "backend", "budget_steps", "wall_s"}
+         "new_game_path", "verify_passed", "backend", "budget_steps", "mode",
+         "wall_s"}
 
-    `action_taken` in {"certified_target", "regenerated", "verify_failed",
-    "regenerate_failed"}.
+    `action_taken` in {"certified_target", "revised", "regenerated",
+    "verify_failed", "revise_failed", "regenerate_failed"}.
     """
     t0 = time.time()
     ledger_path = ledger_path or _LEDGER_PATH
     g3p_kwargs = dict(g3p_kwargs or {})
+    mode = "regenerate" if str(mode).lower() == "regenerate" else "revise"
 
     with open(game_path, "r", encoding="utf-8") as fh:
         source = fh.read()
@@ -492,12 +527,13 @@ def curriculum_round(game_path: str, *, backend: str = "auto",
             "game_path": game_path, "grade": None, "profile": profile,
             "directive": None, "action_taken": "verify_failed",
             "new_game_path": None, "verify_passed": False, "backend": backend,
-            "budget_steps": budget_steps, "wall_s": round(time.time() - t0, 2),
+            "budget_steps": budget_steps, "mode": mode,
+            "wall_s": round(time.time() - t0, 2),
         }
         _append_ledger_event(
             _ledger_entry(profile, None, backend=backend, budget_steps=budget_steps,
                           action_taken="verify_failed", new_game_path=None,
-                          wall_s=time.time() - t0),
+                          wall_s=time.time() - t0, mode=mode),
             ledger_path)
         return record
 
@@ -511,7 +547,33 @@ def curriculum_round(game_path: str, *, backend: str = "auto",
     new_game_path = None
     if grade == "target":
         action_taken = "certified_target"
-    else:
+    elif mode == "revise":
+        # Seed the SAME verify->repair loop with the CERTIFIED source as a
+        # minimal EDIT task (keeps the design the directive wants to preserve —
+        # the first live round found from-scratch regeneration threw it away).
+        engine = _engine_of(game_path, source)
+        try:
+            gen = revise_fn(source, directive_text, out_dir=out_dir,
+                            backend=backend, engine=engine)
+            new_game_path = gen.get("game_path")
+            gen_verdict = gen.get("verdict")
+            # revise_game (like generate_game) writes its best attempt to
+            # game_path even when the run FAILED — a round only counts as
+            # "revised" when the edited game actually re-certified.
+            if gen_verdict == "COMPLETED" and new_game_path:
+                action_taken = "revised"
+            else:
+                action_taken = "revise_failed"
+                last_hint = _last_repair_hint(gen)
+                directive_text = (directive_text
+                                  + f"\n[revise verdict: {gen_verdict}"
+                                  + (f"; last hint: {last_hint}" if last_hint else "")
+                                  + "]")
+        except Exception as exc:  # noqa: BLE001 - a bad revise must not crash the loop
+            action_taken = "revise_failed"
+            new_game_path = None
+            directive_text = directive_text + f"\n[revise error: {exc}]"
+    else:  # mode == "regenerate"
         # Compose the ORIGINAL prompt + directive; regenerate the NEXT version.
         engine = _engine_of(game_path, source)
         original_prompt = _extract_prompt(source) or (profile.get("title") or "game")
@@ -529,11 +591,7 @@ def curriculum_round(game_path: str, *, backend: str = "auto",
                 action_taken = "regenerated"
             else:
                 action_taken = "regenerate_failed"
-                last_hint = None
-                for att in reversed(gen.get("attempts") or []):
-                    last_hint = (att.get("report") or {}).get("hint")
-                    if last_hint:
-                        break
+                last_hint = _last_repair_hint(gen)
                 directive_text = (directive_text
                                   + f"\n[regenerate verdict: {gen_verdict}"
                                   + (f"; last hint: {last_hint}" if last_hint else "")
@@ -547,7 +605,7 @@ def curriculum_round(game_path: str, *, backend: str = "auto",
     _append_ledger_event(
         _ledger_entry(profile, directive_text, backend=backend,
                       budget_steps=budget_steps, action_taken=action_taken,
-                      new_game_path=new_game_path, wall_s=wall_s),
+                      new_game_path=new_game_path, wall_s=wall_s, mode=mode),
         ledger_path)
 
     return {
@@ -560,5 +618,6 @@ def curriculum_round(game_path: str, *, backend: str = "auto",
         "verify_passed": True,
         "backend": backend,
         "budget_steps": budget_steps,
+        "mode": mode,
         "wall_s": round(wall_s, 2),
     }

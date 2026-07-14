@@ -164,6 +164,44 @@ def _first_user_msg(prompt, engine="py"):
             "required format and every hard constraint.")
 
 
+_PROMPT_PY_RE = re.compile(r"""(?m)^\s*PROMPT\s*=\s*(['"])(.*?)\1""")
+_PROMPT_JS_RE = re.compile(r"""(?m)^\s*(?:const|let|var)\s+PROMPT\s*=\s*(['"])(.*?)\1""")
+
+
+def _extract_prompt(source):
+    """The game's declared PROMPT string (py or js), or None if not found."""
+    for rx in (_PROMPT_PY_RE, _PROMPT_JS_RE):
+        m = rx.search(source or "")
+        if m:
+            return m.group(2)
+    return None
+
+
+def _revise_user_msg(source, directive, engine="py"):
+    """Seed the loop with a CERTIFIED game + a MINIMAL-EDIT task (revise mode).
+
+    Unlike ``_first_user_msg`` (design a whole new game from a prompt) this hands
+    the model the full current module and asks for the smallest edit that applies
+    ``directive`` — keeping entities, actions, checkpoint names, the PROMPT line
+    and every other stage intact. The model returns the FULL revised module, which
+    then goes through the SAME verify->repair loop as a fresh generation.
+    """
+    _, fence = _engine_lang(engine)
+    return (
+        "This game is CERTIFIED — it already passes every verification oracle. "
+        "Apply ONLY the following curriculum directive, as a MINIMAL EDIT: change "
+        "as little as possible. KEEP every entity, the ACTIONS list, all "
+        "checkpoint names, and every other stage exactly as they are; edit only "
+        "what the directive asks for.\n\n"
+        f"{directive}\n\n"
+        "Current CERTIFIED game module:\n"
+        f"```{fence}\n{source}\n```\n\n"
+        f"Return the DESIGN block, then exactly one ```{fence} module: the FULL "
+        "revised game (not a diff), same required format and every hard "
+        "constraint. Preserve the PROMPT string verbatim (provenance); you may "
+        "add a short version suffix to TITLE.")
+
+
 def _repair_user_msg(report):
     fc = report.get("failure_class") if isinstance(report, dict) else None
     hint = report.get("hint", "") if isinstance(report, dict) else ""
@@ -526,7 +564,8 @@ def _run_template(prompt, run_dir, max_repairs, note, engine="py"):
                         "template", max_repairs, note, _game_ext(engine))
 
 
-def _run_anthropic(prompt, run_dir, max_repairs, engine="py", system=None):
+def _run_anthropic(prompt, run_dir, max_repairs, engine="py", system=None,
+                   first_user=None):
     if anthropic is None:
         raise _BackendUnavailable("anthropic package not installed")
     try:
@@ -537,7 +576,8 @@ def _run_anthropic(prompt, run_dir, max_repairs, engine="py", system=None):
 
     if system is None:
         system = _system_prompt(engine)
-    messages = [{"role": "user", "content": _first_user_msg(prompt, engine)}]
+    first = first_user if first_user is not None else _first_user_msg(prompt, engine)
+    messages = [{"role": "user", "content": first}]
     state = {"first": True}
 
     def produce(feedback):
@@ -557,7 +597,8 @@ def _run_anthropic(prompt, run_dir, max_repairs, engine="py", system=None):
                         _game_ext(engine))
 
 
-def _run_openrouter(prompt, run_dir, max_repairs, engine="py", system=None):
+def _run_openrouter(prompt, run_dir, max_repairs, engine="py", system=None,
+                    first_user=None):
     """OpenRouter backend: SAME system prompt + repair loop as anthropic.
 
     Availability (requests + configured key/model) is probed up front so that
@@ -572,7 +613,8 @@ def _run_openrouter(prompt, run_dir, max_repairs, engine="py", system=None):
 
     if system is None:
         system = _system_prompt(engine)
-    messages = [{"role": "user", "content": _first_user_msg(prompt, engine)}]
+    first = first_user if first_user is not None else _first_user_msg(prompt, engine)
+    messages = [{"role": "user", "content": first}]
 
     def produce(feedback):
         if feedback is not None:
@@ -591,12 +633,16 @@ def _run_openrouter(prompt, run_dir, max_repairs, engine="py", system=None):
 _LLM_RUNNERS = {"anthropic": _run_anthropic, "openrouter": _run_openrouter}
 
 
-def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None):
+def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None,
+              first_user=None):
     """Pick and run a backend, honouring the auto fallback chain.
 
     ``system`` is the pre-composed system prompt (optionally carrying a retrieved
     Tier-1b parts menu); LLM backends reuse it for every attempt so the menu is
-    PINNED for the whole run. The template backend ignores it.
+    PINNED for the whole run. The template backend ignores it. ``first_user``, when
+    given, overrides the initial user message for the LLM backends (revise mode
+    seeds the loop with the certified source + a minimal-edit task instead of the
+    from-scratch design prompt); the template backend ignores it too.
     """
     if backend == "template":
         return _run_template(prompt, run_dir, max_repairs, None, engine)
@@ -609,7 +655,8 @@ def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None):
     notes = []
     for name in order:
         try:
-            return _LLM_RUNNERS[name](prompt, run_dir, max_repairs, engine, system)
+            return _LLM_RUNNERS[name](prompt, run_dir, max_repairs, engine, system,
+                                      first_user)
         except _BackendUnavailable as e:
             notes.append(f"{name} unavailable ({e})")
     note = "; ".join(notes) + "; falling back to templates" if notes else None
@@ -728,6 +775,45 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
        verdict in COMPLETED | PARTIAL | ENV_ERROR | GOAL_ERROR | UNSOLVED |
        INVALIDATED
     """
+    return _generate_core(prompt, out_dir=out_dir, backend=backend,
+                          max_repairs=max_repairs, engine=engine,
+                          use_bank=use_bank, first_user=None)
+
+
+def revise_game(source, directive, out_dir="scenes/games", backend="auto",
+                max_repairs=4, engine=None, use_bank=True):
+    """Revise a CERTIFIED game by the SMALLEST edit that applies `directive`.
+
+    This is generate_game's twin for the curriculum loop's *revise* mode: instead
+    of designing a whole new game from a prompt, it seeds the SAME
+    write->verify->repair loop with the certified `source` + a minimal-edit task
+    block (``_revise_user_msg``, carrying `directive`). The model returns the FULL
+    revised module, which is verified and repaired up to `max_repairs` exactly like
+    a fresh generation — same oracles, same sandbox layout, same integrity check,
+    same ledger telemetry, engine unchanged. The original PROMPT string is meant to
+    be preserved (provenance; the task block asks for it), and the run is slugged /
+    logged under that original prompt.
+
+    Returns the same report dict as generate_game (game_path, attempts, verdict,
+    backend, design, engine, integrity, pipeline, note?).
+    """
+    engine = _resolve_engine(engine)
+    prompt = _extract_prompt(source) or "game"
+    first_user = _revise_user_msg(source, directive, engine)
+    return _generate_core(prompt, out_dir=out_dir, backend=backend,
+                          max_repairs=max_repairs, engine=engine,
+                          use_bank=use_bank, first_user=first_user)
+
+
+def _generate_core(prompt, *, out_dir, backend, max_repairs, engine, use_bank,
+                   first_user):
+    """Shared body of generate_game / revise_game.
+
+    ``first_user`` is the initial user message override: None -> the from-scratch
+    design prompt (``generate_game``); a revise task block -> ``revise_game``. Every
+    other step — sandbox layout, Tier-1b retrieval, integrity freeze, dispatch,
+    finalize, pipeline telemetry, ledger record — is identical for both entries.
+    """
     if backend not in ("auto", "anthropic", "openrouter", "template"):
         backend = "auto"
     engine = _resolve_engine(engine)
@@ -754,7 +840,8 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
     before = integrity.snapshot(root)
 
     t0 = time.time()
-    result = _dispatch(prompt, run_dir, backend, max_repairs, engine, system)
+    result = _dispatch(prompt, run_dir, backend, max_repairs, engine, system,
+                       first_user)
     wall_s = time.time() - t0
     result["engine"] = engine
     _finalize_game(run_dir, slug, result, _game_ext(engine))
