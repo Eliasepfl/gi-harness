@@ -276,6 +276,39 @@ def cmd_game_replay(args) -> int:
     return 0 if result.get("result") in ("success", "failure", "timeout") else 1
 
 
+def cmd_game_watch(args) -> int:
+    """Watch a game play live in a pygame window (real-time witness replay)."""
+    as_json = getattr(args, "json", False)
+    try:
+        from harness.viewer import watch
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("viewer", exc, as_json)
+
+    try:
+        result = watch(args.game_path, seed=args.seed, speed=args.speed,
+                       scale=args.scale, loop=args.loop)
+    except RuntimeError as exc:   # pygame missing / unavailable -> clean hint
+        msg = str(exc)
+        if as_json:
+            _emit_json({"error": msg})
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game watch", exc, as_json)
+
+    if as_json:
+        _emit_json(result)
+    else:
+        if result.get("result") == "error":
+            print(f"ERROR  {args.game_path}", file=sys.stderr)
+            print(f"  {result.get('error')}", file=sys.stderr)
+        else:
+            print(f"{str(result.get('result')).upper()}  {args.game_path}")
+            print(f"  ticks : {result.get('ticks')}   closed by : {result.get('closed_by')}")
+    return 0 if result.get("result") in ("success", "failure", "timeout") else 1
+
+
 # ---- game demo -----------------------------------------------------------
 # Plain-English seeds, varied mechanics, NO design hints: the prompt is all the
 # model gets. Demos are generated ON THE FLY at demo start (nothing pre-baked).
@@ -374,11 +407,44 @@ def _print_demo(demos: list[dict], backend: str, all_completed: bool) -> None:
           f"({ok}/{total} COMPLETED)")
 
 
+def cmd_game_demo_live(args) -> int:
+    """`game demo --live`: generate + WATCH each prompt in a pygame window."""
+    try:
+        from harness.viewer import demo_live
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("viewer", exc, args.json)
+    try:
+        summary = demo_live(prompts=args.prompts, backend=args.backend)
+    except RuntimeError as exc:   # pygame missing -> clean hint
+        msg = str(exc)
+        if args.json:
+            _emit_json({"error": msg})
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game demo --live", exc, args.json)
+
+    demos = summary.get("demos") or []
+    all_completed = bool(demos) and all(d.get("verdict") == "COMPLETED" for d in demos)
+    if args.json:
+        _emit_json(summary)
+    else:
+        print(f"\n{'-' * 60}\nRESULT: {'OK' if all_completed else 'gaps detected'} "
+              f"({sum(1 for d in demos if d.get('verdict') == 'COMPLETED')}/{len(demos)} "
+              f"COMPLETED)")
+    return 0 if all_completed else 1
+
+
 def cmd_game_demo(args) -> int:
     """Live product demo: generate + verify + replay N prompts on the fly.
 
     Exit 0 iff every prompt reached COMPLETED. No LLM narration anywhere.
+    With --live, each generated game is WATCHED in a pygame window instead of
+    being baked to a GIF.
     """
+    if getattr(args, "live", False):
+        return cmd_game_demo_live(args)
     try:
         from harness.gen.gamegen import generate_game
     except Exception as exc:  # noqa: BLE001
@@ -500,12 +566,24 @@ def build_parser() -> argparse.ArgumentParser:
     gr.add_argument("--json", action="store_true")
     gr.set_defaults(func=cmd_game_replay)
 
+    gw = gmsub.add_parser("watch", help="watch a game play live in a pygame window")
+    gw.add_argument("game_path")
+    gw.add_argument("--speed", type=float, default=1.0,
+                    help="real-time multiplier (2.0 = 2x, 0.5 = slow-mo)")
+    gw.add_argument("--seed", type=int, default=0)
+    gw.add_argument("--scale", type=float, default=1.0, help="window scale factor")
+    gw.add_argument("--loop", action="store_true", help="restart the episode on end")
+    gw.add_argument("--json", action="store_true")
+    gw.set_defaults(func=cmd_game_watch)
+
     gd = gmsub.add_parser(
         "demo", help="live product demo: generate + verify + replay N prompts")
     gd.add_argument("--prompts", nargs="+", default=None,
                     help="one or more prompts (default: 3 built-in demo prompts)")
     gd.add_argument("--backend", default="auto",
                     choices=["auto", "anthropic", "openrouter", "template"])
+    gd.add_argument("--live", action="store_true",
+                    help="watch each game in a pygame window instead of baking GIFs")
     gd.add_argument("--json", action="store_true")
     gd.set_defaults(func=cmd_game_demo)
 
