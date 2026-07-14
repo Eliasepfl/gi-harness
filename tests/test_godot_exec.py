@@ -32,7 +32,7 @@ from harness.verify.gameverify import (  # noqa: E402
 )
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_EXAMPLES = os.path.join(_ROOT, "godotworld", "examples")
+_EXAMPLES = os.path.join(_ROOT, "tests", "fixtures", "godot_specs")
 _SCHEMA = os.path.join(_ROOT, "godotworld", "spec.schema.json")
 _SPEC_NAMES = ["traverse", "collect2", "escape"]
 

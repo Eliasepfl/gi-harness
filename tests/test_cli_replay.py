@@ -37,7 +37,7 @@ requires_world = pytest.mark.skipif(not _HAVE_WORLD, reason="pymunk unavailable"
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
 _GODOT_SPEC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "godotworld", "examples", "traverse.spec.json")
+                           "tests", "fixtures", "godot_specs", "traverse.spec.json")
 
 
 def _args(**kw):

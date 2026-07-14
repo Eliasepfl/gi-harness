@@ -483,7 +483,7 @@ def test_to_repair_report_shape():
 from harness.verify.executors import find_godot_exe  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_TRAVERSE_SPEC = os.path.join(_ROOT, "godotworld", "examples", "traverse.spec.json")
+_TRAVERSE_SPEC = os.path.join(_ROOT, "tests", "fixtures", "godot_specs", "traverse.spec.json")
 requires_godot = pytest.mark.skipif(
     find_godot_exe() is None, reason="Godot binary not present")
 

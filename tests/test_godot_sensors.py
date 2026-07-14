@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness.verify.executors import GodotExecutor, find_godot_exe  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_EXAMPLES = os.path.join(_ROOT, "godotworld", "examples")
+_EXAMPLES = os.path.join(_ROOT, "tests", "fixtures", "godot_specs")
 _SCHEMA = os.path.join(_ROOT, "godotworld", "spec.schema.json")
 _SENSORS_DIR = os.path.join(_ROOT, "godotworld", "addons", "sensors")
 
