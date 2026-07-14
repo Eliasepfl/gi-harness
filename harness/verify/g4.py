@@ -60,7 +60,13 @@ import random
 # it): its loader, engine detector and default World factory are stable handles.
 from harness.verify.executors import JsExecutor, PyExecutor, VerifyError
 from harness.verify.gameverify import (
-    _default_world_factory, detect_engine, load_game,
+    EFFICACY_EPS, _default_world_factory, detect_engine, load_game,
+)
+# The shared state-tree substrate — reused (never forked) for the stale-state
+# tier: fingerprint()/fp_delta() power trigger 1a's cycle test and the SAME
+# Go-Explore solver (treesolve) certifies/refutes softlocks (oracle 1c).
+from harness.core.statetree import (
+    EXHAUSTED, TERMINAL_STUCK, fingerprint, fp_delta,
 )
 
 SCHEMA = "g4_report/v1"
@@ -92,8 +98,16 @@ DEFAULT_ANTI_VARIANTS = 3  # anti-witness permutation variants
 # Tier-1 defaults.
 DEFAULT_ATTACKS_PER_CALL = 5
 
-# Which outcomes are HARD (route-to-repair) vs SOFT (warning/flag).
-_HARD_OUTCOMES = {"unintended_success", "nan", "escape"}
+# Stale-state tier (softlock oracle) defaults ([eng.]).
+STALE_H = 60               # exploration horizon BEYOND the suspect prefix P (len(P)+H)
+STALE_TOP_M = 8            # cap on suspect prefixes escalated to the 1c oracle
+STALE_CAND_BUDGET = 6000   # tick budget for the inverted-objective candidate search
+# The oracle budget defaults to treesolve.TICK_BUDGET (one full G3 solve) — read at
+# call time so a test can shrink it; see _stale_oracle_budget().
+
+# Which outcomes are HARD (route-to-repair) vs SOFT (warning/flag). `softlock` is a
+# 1c-certified prefix (design §4 grading); the heuristic `stuck` stays SOFT.
+_HARD_OUTCOMES = {"unintended_success", "nan", "escape", "softlock"}
 
 
 class _InvalidPlan(Exception):
@@ -118,7 +132,16 @@ STRATEGY_VOCAB = {
     "avoid": "mostly idle (noop-heavy) — try NOT to progress. params: {seed}",
     "noop": "do nothing at all. params: {}",
     "sequence": "an explicit per-tick action list. params: {sequence: [action, ...]}",
+    "stale_seek": "steer a Go-Explore search toward stale/cycling dead-ends "
+                  "(inverted-objective frontier) and refute reachability there. "
+                  "ORACLE-DRIVEN: the stale tier drives it, not a per-tick expander.",
 }
+
+# Registry entries that are NOT stateless per-tick expanders: they name a search
+# STRATEGY the harness drives (the softlock oracle steers `stale_seek` via the
+# inverted-objective frontier). Excluded from the Tier-1 attacker menu — an
+# attacker cannot emit a flat plan for them; _expand rejects them as it should.
+_ORACLE_STRATEGIES = {"stale_seek"}
 
 
 def _expand(pattern, params, actions, horizon, *, witness_actions=None):
@@ -603,7 +626,9 @@ def _short_model(model):
 
 
 def _vocab_text():
-    return "\n".join(f"  - {name}: {desc}" for name, desc in STRATEGY_VOCAB.items())
+    # Oracle-driven strategies are not attacker-emittable flat plans -> hide them.
+    return "\n".join(f"  - {name}: {desc}" for name, desc in STRATEGY_VOCAB.items()
+                     if name not in _ORACLE_STRATEGIES)
 
 
 def _tier1_system():
@@ -798,6 +823,268 @@ def _run_tier1(executor, game_source, engine, actions, report, *,
 
 
 # ======================================================================== #
+# STALE-STATE TIER — softlock triggers (1a/1b) + bounded tree-refutation (1c)
+# Design: notes/engines/GODOT_RL_AGENTS_CAPABILITIES.md §4. Cheap high-recall
+# TRIGGERS gate one expensive high-precision ORACLE; a trigger NEVER fails a game
+# on its own — only a 1c-certified prefix does (a hard `softlock` finding).
+# ======================================================================== #
+def _frame_snapshot(frame) -> dict:
+    """A frame's per-entity ``query`` dicts already carry pos/vel/angle, which is
+    all :func:`statetree.fingerprint` reads — so a frame IS a snapshot for it."""
+    return frame.get("entities", {}) or {}
+
+
+def _last_latch(checkpoints) -> int:
+    latched = [t for t in (checkpoints or {}).values() if t is not None]
+    return max(latched) if latched else 0
+
+
+def trigger_state_cycling(frames, checkpoints, ticks, *, window=STUCK_WINDOW,
+                          eps=EFFICACY_EPS):
+    """TRIGGER 1a — state-hash cycling. Fires when NO checkpoint latched for the
+    last ``window`` ticks AND the statetree fingerprint trajectory closes a cycle
+    (a later state within ``eps`` of an earlier one — ``fp_delta < EFFICACY_EPS``).
+
+    Rides an already-replayed (framed) episode; legit periodic motion trips it too
+    (that is intended — the oracle, not the trigger, decides softlock vs healthy).
+    Returns ``(fired, info)`` where ``info['cycle_start']`` is the tick the cycle
+    opens (the natural cut point for the suspect prefix P)."""
+    info = {"no_recent_latch": False, "last_latch": _last_latch(checkpoints),
+            "cycle": False, "cycle_start": None, "cycle_period": None}
+    info["no_recent_latch"] = info["last_latch"] <= ticks - window
+    if not info["no_recent_latch"] or ticks < window or not frames:
+        return False, info
+    # Fingerprint the no-progress tail (frames at/after the last latch) and look
+    # for a recurrence — the fingerprint SET closing a cycle.
+    last = info["last_latch"]
+    tail = [(int(fr.get("tick", i)), fingerprint(_frame_snapshot(fr)))
+            for i, fr in enumerate(frames) if int(fr.get("tick", i)) >= last]
+    for i in range(len(tail)):
+        for j in range(i + 1, len(tail)):
+            if fp_delta(tail[i][1], tail[j][1]) < eps:
+                info.update(cycle=True, cycle_start=tail[i][0],
+                            cycle_period=tail[j][0] - tail[i][0])
+                return True, info
+    return False, info
+
+
+def trigger_entity_unreachable(ep, initial_snapshot):
+    """TRIGGER 1b — entity out-of-reach. Fires when a body present at the start is
+    ABSENT from the final snapshot (a success-required entity destroyed/removed ->
+    structurally unreachable) OR a dynamic body escaped world+ESCAPE_MARGIN (the
+    existing oob machinery, ``ep['oob']``). A TRIGGER — never fails a game alone."""
+    final = ep.get("final_snapshot") or {}
+    missing = sorted(set(initial_snapshot or {}) - set(final))
+    escaped = list(ep.get("oob", []) or [])
+    fired = bool(missing or escaped)
+    return fired, {"missing": missing, "escaped": escaped}
+
+
+class _PrefixExecutor:
+    """Executor adapter that re-roots the world AFTER a fixed prefix ``P``: every
+    replay is silently ``P + actions`` and every returned episode is expressed in
+    the AFTER-P frame (ticks/checkpoints shifted by ``len(P)``). This lets the SAME
+    treesolve Go-Explore search explore *continuations of P* with zero solver
+    changes — its ``actions:[]`` root replay becomes the post-P state (oracle 1c)."""
+
+    def __init__(self, inner, prefix):
+        self._inner = inner
+        self._prefix = list(prefix)
+        self.batched = getattr(inner, "batched", False)
+
+    def run_batch(self, game_source, episodes, max_ticks, frames_every=0,
+                  escape_margin=None):
+        p, plen = self._prefix, len(self._prefix)
+        specs = [{"seed": e.get("seed", WORLD_SEED),
+                  "actions": p + list(e.get("actions", []))} for e in episodes]
+        recs = self._inner.run_batch(game_source, specs, int(max_ticks) + plen,
+                                     frames_every=frames_every,
+                                     escape_margin=escape_margin)
+        out = []
+        for rec in recs:
+            local = dict(rec)
+            local["ticks"] = max(0, int(rec.get("ticks", 0)) - plen)
+            cps = {}
+            for k, t in (rec.get("checkpoints") or {}).items():
+                cps[k] = None if t is None else (0 if t <= plen else t - plen)
+            local["checkpoints"] = cps
+            if "actions" in rec:
+                local["actions"] = list(rec["actions"])[plen:]
+            out.append(local)
+        return out
+
+
+def _stale_oracle_budget(budget):
+    if budget is not None:
+        return budget
+    from harness.verify import treesolve as ts
+    return ts.TICK_BUDGET
+
+
+def refute_prefix(executor, game_source, actions, prefix, *, H=STALE_H,
+                  budget=None, engine="py", seed=WORLD_SEED):
+    """ORACLE 1c — bounded tree-refutation. Plant ``prefix`` (P) as a realised leaf
+    in a fresh StateTree and run the SAME Go-Explore solver that certifies G3 on
+    continuations of P at horizon ``len(P)+H`` under ``budget`` (default
+    ``treesolve.TICK_BUDGET`` = one G3 solve).
+
+    Verdict: budget exhausted with NO ``TERMINAL_SUCCESS`` under P -> the prefix is
+    a CERTIFIED softlock witness (``certified=True``); a continuation that wins
+    REFUTES it (``certified=False`` with the winning ``witness``). Subtree
+    saturation to all-terminal (STUCK/EXHAUSTED) is the stronger verdict
+    (``subtree_status='saturated'``). A budgeted refutation, not a proof."""
+    from harness.verify import treesolve as ts
+    budget = _stale_oracle_budget(budget)
+    wrapped = _PrefixExecutor(executor, prefix)
+    witness, episodes, replays, tree = ts._tree_search(
+        wrapped, game_source, list(actions), H, budget=budget)
+    frontier = tree.frontier()
+    root = tree.root
+    saturated = not frontier
+    subtree_status = ("saturated" if saturated
+                      else ("terminal_stuck" if root.status == TERMINAL_STUCK
+                            else ("exhausted" if root.status == EXHAUSTED
+                                  else "budget_exhausted")))
+    return {
+        "certified": witness is None,
+        "witness": witness,
+        "subtree_status": subtree_status,
+        "H": H, "budget": budget, "engine": engine, "seed": seed,
+        "nodes": len(tree), "replays": replays,
+        "ticks_simulated": tree.ticks_simulated,
+    }
+
+
+def _stale_candidate_plans(executor, game_source, actions, horizon, seed,
+                           cand_budget):
+    """The suspect-prefix generators: deterministic coverage (spam each action;
+    each ordered pair alternated) PLUS the inverted-objective tree search (req 5,
+    steering fuzz toward stale regions). Returns a de-duplicated list of flat
+    action plans — the raw material triggers 1a/1b then filter."""
+    plans: list = []
+    for a in actions:
+        plans.append([a] * horizon)
+    for a in actions:
+        for b in actions:
+            if a != b:
+                plans.append(([a, b] * (horizon // 2 + 1))[:horizon])
+    try:
+        from harness.verify import treesolve as ts
+        _, inv_eps, _, _ = ts._tree_search(
+            executor, game_source, list(actions), horizon,
+            select=ts._select_leaves_inverted, budget=cand_budget)
+        for ep in inv_eps:
+            acts = list(ep.get("actions") or [])
+            if acts:
+                plans.append(acts)
+    except VerifyError:
+        pass                               # steering is best-effort; seeds stand alone
+    seen, uniq = set(), []
+    for p in plans:
+        key = tuple(p)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
+
+
+def _run_stale(executor, game_source, engine, actions, report, *,
+               controlled, initial, horizon, seed, requested,
+               stale_H, stale_budget, stale_cand_budget, top_m):
+    """The stale-state tier: generate stale-seeking episodes, gate them through the
+    triggers, dedup suspect prefixes by fingerprint (cap top-M), and refute each
+    with oracle 1c. A certified prefix -> a hard `softlock` finding."""
+    block = {"status": "skipped_not_requested", "reason": "", "candidates": [],
+             "triggered": 0, "certified": 0, "findings": [], "episodes": 0,
+             "passed": True}
+    if not requested:
+        block["reason"] = "stale tier not requested"
+        return block
+
+    if not actions:
+        block["status"] = "skipped"
+        block["reason"] = "no ACTIONS to explore"
+        return block
+
+    block["status"] = "run"
+    try:
+        plans = _stale_candidate_plans(executor, game_source, actions, horizon,
+                                       seed, stale_cand_budget)
+        specs = [{"seed": WORLD_SEED, "actions": p} for p in plans]
+        episodes = executor.run_batch(game_source, specs, horizon, frames_every=1)
+    except VerifyError as exc:
+        block["status"] = "error"
+        block["reason"] = f"engine failure during stale candidate replay: {exc}"
+        return block
+
+    block["episodes"] = len(episodes)
+    # -- Triggers: keep budget episodes that cycle (1a) or lose an entity (1b) --
+    suspects: list = []
+    seen_fp = set()
+    for plan, ep in zip(plans, episodes):
+        if ep.get("result") != "budget":
+            continue
+        fired_a, info_a = trigger_state_cycling(ep.get("frames", []),
+                                                ep.get("checkpoints", {}),
+                                                int(ep.get("ticks", 0)))
+        fired_b, info_b = trigger_entity_unreachable(ep, initial)
+        if not (fired_a or fired_b):
+            continue
+        # Cut P at the cycle opening (1a) — the moves that led INTO the stale
+        # region; fall back to the last-latch boundary for a 1b-only trigger.
+        cut = (info_a["cycle_start"] if fired_a and info_a["cycle_start"] is not None
+               else _last_latch(ep.get("checkpoints", {})))   # 1b-only -> last progress
+        cut = max(1, min(int(cut), len(ep.get("actions", plan))))
+        prefix = list(ep.get("actions", plan))[:cut]
+        fp = fingerprint(ep.get("final_snapshot", {}) or {})
+        if fp in seen_fp:
+            continue                       # dedup suspects by their end-state
+        seen_fp.add(fp)
+        suspects.append({"prefix": prefix, "trigger_1a": fired_a,
+                         "trigger_1b": fired_b, "info_1a": info_a,
+                         "info_1b": info_b, "evidence": _evidence(ep, engine)})
+        if len(suspects) >= top_m:
+            break
+
+    block["triggered"] = len(suspects)
+    block["candidates"] = [{"prefix": s["prefix"], "trigger_1a": s["trigger_1a"],
+                            "trigger_1b": s["trigger_1b"]} for s in suspects]
+
+    # -- Oracle 1c: refute each suspect; a certified prefix is a softlock finding --
+    findings = []
+    for s in suspects:
+        try:
+            res = refute_prefix(executor, game_source, actions, s["prefix"],
+                                H=stale_H, budget=stale_budget, engine=engine,
+                                seed=seed)
+        except VerifyError:
+            continue                       # a dead refutation must not sink the tier
+        if not res["certified"]:
+            continue
+        block["certified"] += 1
+        prefix = s["prefix"]
+        findings.append({
+            "outcome": "softlock", "tier": "stale", "family": "tree_refute",
+            "hard": True,
+            "detail": (f"action prefix (len {len(prefix)}) soft-locks the game — the "
+                       f"G3 solver found no win in {res['budget']} ticks under it "
+                       f"(subtree {res['subtree_status']})"),
+            "reproducer": {
+                "engine": engine, "seed": seed,
+                "action_plan": {"kind": "sequence", "sequence": list(prefix)},
+                "provenance": {"oracle": "tree_refute", "H": res["H"],
+                               "budget": res["budget"], "engine": engine,
+                               "seed": seed, "subtree_status": res["subtree_status"]},
+            },
+            "evidence": s["evidence"],
+        })
+
+    block["findings"] = findings
+    block["passed"] = not findings
+    return block
+
+
+# ======================================================================== #
 # Grade + public entry points
 # ======================================================================== #
 def _grade(findings, tier1_block, tiers):
@@ -816,13 +1103,19 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
            fuzz_random=DEFAULT_FUZZ_RANDOM, fuzz_long=DEFAULT_FUZZ_LONG,
            noop_heavy=DEFAULT_NOOP_HEAVY, alt_periods=DEFAULT_ALT_PERIODS,
            anti_variants=DEFAULT_ANTI_VARIANTS,
-           k=DEFAULT_ATTACKS_PER_CALL, models=None):
+           k=DEFAULT_ATTACKS_PER_CALL, models=None,
+           stale=False, stale_H=STALE_H, stale_budget=None,
+           stale_cand_budget=STALE_CAND_BUDGET, top_m=STALE_TOP_M):
     """Run the adversarial suite on a certified game (source + its G0-G3 report).
 
     Returns the g4 report block (a machine-readable dict, schema `g4_report/v1`).
     Deterministic under `seed`: same inputs -> identical findings. `tiers` selects
     which tiers to run (0 always runs; include 1 for the LLM lane). Tier 1 degrades
     gracefully when no OpenRouter key is configured.
+
+    `stale=True` also runs the stale-state tier (softlock triggers 1a/1b + the
+    bounded tree-refutation oracle 1c); a certified prefix is a hard `softlock`
+    finding -> grade `open`. It rides the SAME executor + treesolve solver.
     """
     tiers = tuple(sorted(set(tiers) | {0}))   # tier 0 always runs (free, seeds facts)
     engine = engine or "py"
@@ -861,13 +1154,21 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
                        k=k, models=models, controlled=controlled, initial=initial,
                        horizon=horizon, requested=1 in tiers)
 
-    findings = list(tier0["findings"]) + list(tier1["findings"])
+    stale_block = _run_stale(executor, game_source, engine, actions, report,
+                             controlled=controlled, initial=initial, horizon=horizon,
+                             seed=seed, requested=bool(stale), stale_H=stale_H,
+                             stale_budget=stale_budget,
+                             stale_cand_budget=stale_cand_budget, top_m=top_m)
+
+    findings = (list(tier0["findings"]) + list(tier1["findings"])
+                + list(stale_block["findings"]))
     grade = _grade(findings, tier1, tiers)
     out.update({
         "grade": grade,
         "passed": grade != "open",
         "tier0": tier0,
         "tier1": tier1,
+        "stale": stale_block,
         "findings": findings,
         "hard_findings": [f for f in findings if f["hard"]],
     })
@@ -942,6 +1243,9 @@ _REPAIR_HINTS = {
     "escape": "adversarial input drove a body out of the world; add bounds or damping",
     "stuck": "an adversarial player soft-locked the controlled body; avoid dead-end states",
     "single_action_win": "one repeated action alone solves the game; require real play",
+    "softlock": "an action prefix drives the game into a state from which no continuation "
+                "can win (certified by the tree-refutation oracle); ensure every reachable "
+                "state can still reach the goal, or add an escape/reset from dead ends",
 }
 
 

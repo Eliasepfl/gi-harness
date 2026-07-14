@@ -277,5 +277,63 @@ def test_run_g3_dispatches_by_solver(small_thresholds, monkeypatch):
     assert "solver" not in rnd_layer["checks"]["episodes"]
 
 
+# ====================================================================== #
+# Inverted-objective frontier selector (stale-state tier fork) + search seam
+# ====================================================================== #
+def _seed_two_leaves():
+    """A tree with two open frontier leaves: a PRODUCTIVE one (a milestone latched,
+    shallow) and a STALE one (no milestone, deeper). Returns (tree, productive,
+    stale) so the two selectors can be compared head to head."""
+    tree = StateTree(ts._macro_names(ACTIONS), world_seed=gv.WORLD_SEED, eps=0.0)
+    ex = FakeExecutor()
+    tree.init_root(ex.run_batch("trek", [{"seed": 0, "actions": []}], 0)[0])
+    # fwd*3 -> x=3 latches m_near (productive, depth 1, 3 ticks).
+    fwd = ex.run_batch("trek", [{"seed": 0, "actions": ["fwd"] * 3}], gv.PROBE_HORIZON)[0]
+    ts._insert_rollout(tree, tree.root, ["fwd*3"], ["fwd"] * 3, 0, fwd)
+    # back*3 then idle*1 -> x=-3, no milestone (stale, deeper, 4 ticks).
+    stale_flat = ["back"] * 3 + ["idle"]
+    stl = ex.run_batch("trek", [{"seed": 0, "actions": stale_flat}], gv.PROBE_HORIZON)[0]
+    ts._insert_rollout(tree, tree.root, ["back*3", "idle*1"], stale_flat, 0, stl)
+    productive = tree.get(("fwd*3",))
+    stale = tree.get(("back*3", "idle*1"))
+    assert productive is not None and stale is not None
+    return tree, productive, stale
+
+
+def test_inverted_selector_targets_stalest_leaf(monkeypatch):
+    monkeypatch.setattr(ts, "EPSILON", 0.0)          # pure exploit -> deterministic pick
+    tree, productive, stale = _seed_two_leaves()
+    rng = ts.random.Random(0)
+    # The G3 solver exploits the PRODUCTIVE boundary (most milestones latched)...
+    greedy = ts._select_leaves(tree, rng, 4, gv.PROBE_HORIZON, {})
+    assert all(nd.prefix == productive.prefix for nd in greedy)
+    # ...the inverted fork exploits the STALEST leaf (fewest milestones, deepest).
+    inv = ts._select_leaves_inverted(tree, rng, 4, gv.PROBE_HORIZON, {})
+    assert all(nd.prefix == stale.prefix for nd in inv)
+
+
+def test_inverted_selector_prefers_more_cycling(monkeypatch):
+    # Between two equally-stale leaves, the one that stalled MORE (deaths ~= cycling)
+    # is exploited.
+    monkeypatch.setattr(ts, "EPSILON", 0.0)
+    tree, _productive, stale = _seed_two_leaves()
+    root = tree.root
+    inv = ts._select_leaves_inverted(tree, ts.random.Random(0), 1, gv.PROBE_HORIZON,
+                                     {stale.prefix: 5})       # stale leaf has cycled a lot
+    assert inv and inv[0].prefix == stale.prefix
+
+
+def test_tree_search_select_and_budget_seam(small_thresholds):
+    # The stale-oracle seam: a custom budget caps the search and the inverted
+    # selector drops into the SAME solver with no other change.
+    ex = FakeExecutor(win=10_000)                    # unreachable -> no witness
+    w, eps, replays, tree = ts._tree_search(
+        ex, "trek", ACTIONS, gv.PROBE_HORIZON,
+        select=ts._select_leaves_inverted, budget=800)
+    assert w is None
+    assert tree.ticks_simulated <= 800 + gv.PROBE_HORIZON
+    assert replays == len(eps) >= 1
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
