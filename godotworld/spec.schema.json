@@ -1,0 +1,204 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://gi-harness/godotworld/spec.schema.json",
+  "title": "Godot game-spec v1",
+  "description": "Declarative, engine-neutral-in-spirit game specification interpreted by the FROZEN godotworld/runner.gd. The LLM emits DATA only; no GDScript ever runs from a spec. See godotworld/SPEC.md.",
+  "type": "object",
+  "required": ["meta", "bodies", "act", "predicates"],
+  "additionalProperties": true,
+  "properties": {
+    "engine": {
+      "description": "Optional engine marker. When present must be \"godot\"; the harness also routes any *.spec.json path to this lane.",
+      "const": "godot"
+    },
+    "spec_version": {"type": "integer", "enum": [1]},
+    "meta": {
+      "type": "object",
+      "required": ["title", "prompt", "actions"],
+      "additionalProperties": true,
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "prompt": {"type": "string"},
+        "world_size": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "Optional [w, h]; width 800..2400, height 600..1600 (G0 validates). Omitted -> [800, 600]."
+        },
+        "actions": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 2,
+          "maxItems": 8,
+          "description": "2..8 game-chosen action names."
+        }
+      }
+    },
+    "bodies": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/definitions/body"}
+    },
+    "joints": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/joint"}
+    },
+    "on_contact": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/contact_rule"}
+    },
+    "act": {
+      "type": "object",
+      "description": "Per-action list of verb calls. Keys should be a subset of meta.actions; an action with no binding (or [] ) is a no-op (and will fail G1 efficacy).",
+      "additionalProperties": {
+        "type": "array",
+        "items": {"$ref": "#/definitions/verb_call"}
+      }
+    },
+    "on_step": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/behavior"}
+    },
+    "predicates": {
+      "type": "object",
+      "required": ["success", "checkpoints"],
+      "additionalProperties": false,
+      "properties": {
+        "success": {"$ref": "#/definitions/predicate"},
+        "failure": {"$ref": "#/definitions/predicate"},
+        "checkpoints": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 6,
+          "description": "1..6 ordered milestone expressions (insertion order = intended progression). Keys are snake_case; every expression must be a bool that is False at t=0.",
+          "additionalProperties": {"$ref": "#/definitions/predicate"}
+        }
+      }
+    }
+  },
+  "definitions": {
+    "body": {
+      "type": "object",
+      "required": ["name", "shape", "pos"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "shape": {"enum": ["box", "circle", "segment", "poly"]},
+        "pos": {"$ref": "#/definitions/vec2"},
+        "size": {"$ref": "#/definitions/vec2", "description": "box only: [w, h]"},
+        "radius": {"type": "number", "exclusiveMinimum": 0, "description": "circle only"},
+        "a": {"$ref": "#/definitions/vec2", "description": "segment only: endpoint A (local)"},
+        "b": {"$ref": "#/definitions/vec2", "description": "segment only: endpoint B (local)"},
+        "vertices": {
+          "type": "array",
+          "minItems": 3,
+          "items": {"$ref": "#/definitions/vec2"},
+          "description": "poly only: local convex vertices"
+        },
+        "mass": {"type": "number", "exclusiveMinimum": 0},
+        "static": {"type": "boolean"},
+        "sensor": {"type": "boolean", "description": "non-colliding overlap zone (realised as Area2D)"},
+        "friction": {"type": "number", "minimum": 0},
+        "elasticity": {"type": "number", "minimum": 0},
+        "locked_rotation": {"type": "boolean"},
+        "angle": {"type": "number", "description": "initial rotation (radians)"},
+        "velocity": {"$ref": "#/definitions/vec2", "description": "initial linear velocity"},
+        "control": {"type": "boolean", "description": "exactly one dynamic body must set this true"}
+      }
+    },
+    "joint": {
+      "type": "object",
+      "required": ["type", "a", "b"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"enum": ["pin", "pivot", "spring"]},
+        "a": {"type": "string"},
+        "b": {"type": "string"},
+        "point": {"$ref": "#/definitions/vec2", "description": "pivot: world anchor point"},
+        "anchor_a": {"$ref": "#/definitions/vec2"},
+        "anchor_b": {"$ref": "#/definitions/vec2"},
+        "rest_length": {"type": "number", "description": "spring only"},
+        "stiffness": {"type": "number", "description": "spring only"},
+        "damping": {"type": "number", "description": "spring only"}
+      }
+    },
+    "contact_rule": {
+      "type": "object",
+      "required": ["a", "b", "flag"],
+      "additionalProperties": false,
+      "properties": {
+        "a": {"type": "string"},
+        "b": {"type": "string"},
+        "flag": {"type": "string", "minLength": 1},
+        "once": {"type": "boolean", "default": true}
+      }
+    },
+    "verb_call": {
+      "type": "object",
+      "required": ["verb", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "verb": {"enum": ["impulse", "force", "set_velocity"]},
+        "body": {"type": "string"},
+        "vec": {"$ref": "#/definitions/vec2"},
+        "when": {"$ref": "#/definitions/predicate", "description": "optional gate; the verb applies only when this predicate is true"}
+      }
+    },
+    "behavior": {
+      "type": "object",
+      "required": ["kind"],
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {"const": "velocity_clamp"},
+            "body": {"type": "string"},
+            "vx_max": {"type": "number"},
+            "vy_min": {"type": "number"},
+            "vy_max": {"type": "number"}
+          },
+          "required": ["kind", "body"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": {"const": "timer_flag"},
+            "flag": {"type": "string"},
+            "after_steps": {"type": "integer", "minimum": 0}
+          },
+          "required": ["kind", "flag", "after_steps"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": {"const": "remove_when"},
+            "flag": {"type": "string"},
+            "body": {"type": "string"}
+          },
+          "required": ["kind", "flag", "body"],
+          "additionalProperties": false
+        },
+        {
+          "properties": {
+            "kind": {"const": "rising_level"},
+            "flag": {"type": "string"},
+            "rate": {"type": "number"},
+            "start": {"type": "number"}
+          },
+          "required": ["kind", "flag", "rate"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "predicate": {
+      "type": "string",
+      "description": "A whitelisted expression over the query DSL (pos_x/pos_y/vel_x/vel_y/speed/angle/grounded/contacts/dist/flag + steps + abs/min/max/clamp/sqrt/floor/ceil + and/or/not). No attribute access, no arbitrary identifiers. See SPEC.md."
+    },
+    "vec2": {
+      "type": "array",
+      "items": {"type": "number"},
+      "minItems": 2,
+      "maxItems": 2
+    }
+  }
+}

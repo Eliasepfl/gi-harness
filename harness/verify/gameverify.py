@@ -34,7 +34,9 @@ import traceback
 from harness.core.sandbox import (
     SandboxViolation, load_scene_namespace, scan_source,
 )
-from harness.verify.executors import JsExecutor, PyExecutor, VerifyError
+from harness.verify.executors import (
+    GodotExecutor, JsExecutor, PyExecutor, VerifyError,
+)
 
 # --- Constants ([eng.] = engineering choice to calibrate) ---------------- #
 K_STEPS = 6                 # physics steps per decision tick (CONTRACTS §2)
@@ -1078,12 +1080,19 @@ def _g2js_checkpoints(facts: dict, checks: dict) -> bool:
 # Engine detection
 # ======================================================================== #
 _JS_MARKER = re.compile(r"(?m)^\s*(?:#|//)\s*engine\s*:\s*js\b")
+# The Godot lane's artifact is a declarative JSON spec (godotworld/SPEC.md): a
+# `.spec.json` path, or JSON carrying a top-level `"engine": "godot"` marker.
+_GODOT_MARKER = re.compile(r'"engine"\s*:\s*"godot"')
 
 
 def detect_engine(game_path: str, source: str = "") -> str:
-    """Game language: 'js' if the path ends in .js or the source carries an
-    `# engine: js` / `// engine: js` marker; otherwise 'py' (default)."""
-    if str(game_path).lower().endswith(".js"):
+    """Game engine: 'godot' for a `.spec.json` path or an `"engine":"godot"` JSON
+    marker; 'js' for a `.js` path or an `# engine: js` / `// engine: js` marker;
+    otherwise 'py' (default)."""
+    path = str(game_path).lower()
+    if path.endswith(".spec.json") or _GODOT_MARKER.search(source or ""):
+        return "godot"
+    if path.endswith(".js"):
         return "js"
     if _JS_MARKER.search(source or ""):
         return "js"
@@ -1118,9 +1127,13 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
         report["hint"] = f"game unreadable: {exc}"
         return report
 
-    # Route by game language. The pymunk (py) path is unchanged; the Planck (js)
-    # path runs the same funnel over a Node executor + the runner's check facts.
-    if detect_engine(game_path, source) == "js":
+    # Route by game engine. The pymunk (py) path is unchanged; the Planck (js) and
+    # Godot (declarative-spec) paths run the SAME funnel over their executor + the
+    # runner's check facts.
+    engine = detect_engine(game_path, source)
+    if engine == "godot":
+        return _verify_godot(source, report)
+    if engine == "js":
         return _verify_js(source, report)
     return _verify_py(source, report, world_factory)
 
@@ -1220,6 +1233,63 @@ def _verify_js(source: str, report: dict) -> dict:
         return _finish_g3(report, g3)
     except VerifyError as exc:
         # Node missing / crash / timeout / unparseable output -> VERIFY_ERROR
+        # shape (no funnel layers), exactly like sandbox.run_sandboxed trouble.
+        return exc.as_report()
+
+
+def _verify_godot(source: str, report: dict) -> dict:
+    """The Godot (declarative-spec) funnel: a line-for-line twin of ``_verify_js``.
+    G0/G2 come from the FROZEN runner.gd's "check" facts (reusing ``run_g0_js`` /
+    ``run_g2_js`` verbatim — the runner emits the SAME fact shape as runner.js);
+    G1/G3 batch through a ``GodotExecutor``. The tree solver runs unchanged (it only
+    needs ``run_batch``). Adds ``"engine": "godot"``."""
+    report["engine"] = "godot"
+    executor = GodotExecutor()
+    try:
+        # G0 + G2 facts come from ONE "check" job.
+        facts = executor.run_check(source)
+
+        g0 = run_g0_js(facts)
+        report["layers"]["G0_static"] = g0
+        if not g0["passed"]:
+            report["failure_class"] = "ENV_ERROR"
+            report["hint"] = _hint_g0(g0["checks"])
+            return report
+
+        actions = (facts.get("actions") or {}).get("values") or []
+        declared = list(((facts.get("g2") or {}).get("checkpoints") or {}).get("keys", []))
+
+        # --- G1 ---
+        try:
+            g1 = run_g1(executor, source, actions)
+        except VerifyError:
+            raise
+        except Exception:
+            g1 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
+        report["layers"]["G1_rollout"] = g1
+        if not g1["passed"]:
+            report["failure_class"] = "ENV_ERROR"
+            report["hint"] = _hint_g1(g1["checks"])
+            return report
+
+        # --- G2 ---
+        g2 = run_g2_js((facts.get("g2") or {}))
+        report["layers"]["G2_goal"] = g2
+        if not g2["passed"]:
+            report["failure_class"] = "GOAL_ERROR"
+            report["hint"] = _hint_g2(g2["checks"])
+            return report
+
+        # --- G3 ---
+        try:
+            g3 = _run_g3(executor, source, actions, declared)
+        except VerifyError:
+            raise
+        except Exception:
+            g3 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
+        return _finish_g3(report, g3)
+    except VerifyError as exc:
+        # Godot binary missing / crash / timeout / unparseable output -> VERIFY_ERROR
         # shape (no funnel layers), exactly like sandbox.run_sandboxed trouble.
         return exc.as_report()
 

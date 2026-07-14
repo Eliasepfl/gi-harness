@@ -1,0 +1,31 @@
+{
+  "engine": "godot",
+  "spec_version": 1,
+  "meta": {
+    "title": "Slick Traverse",
+    "prompt": "A puck slides across a slick rink; push it all the way to the far wall.",
+    "world_size": [1100, 600],
+    "actions": ["push_left", "push_right"]
+  },
+  "bodies": [
+    {"name": "floor", "shape": "box", "pos": [550, 30], "size": [1100, 60], "static": true, "friction": 0.04, "elasticity": 0.1},
+    {"name": "left_wall", "shape": "box", "pos": [10, 300], "size": [20, 600], "static": true, "friction": 0.2},
+    {"name": "right_wall", "shape": "box", "pos": [1090, 300], "size": [20, 600], "static": true, "friction": 0.2},
+    {"name": "puck", "shape": "circle", "pos": [95, 82], "radius": 18, "mass": 1.0, "friction": 0.04, "elasticity": 0.1, "control": true}
+  ],
+  "act": {
+    "push_right": [{"verb": "impulse", "body": "puck", "vec": [120, 0]}],
+    "push_left": [{"verb": "impulse", "body": "puck", "vec": [-120, 0]}]
+  },
+  "on_step": [
+    {"kind": "velocity_clamp", "body": "puck", "vx_max": 240}
+  ],
+  "predicates": {
+    "success": "pos_x(\"puck\") > 900",
+    "checkpoints": {
+      "reached_q1": "pos_x(\"puck\") > 330",
+      "reached_half": "pos_x(\"puck\") > 560",
+      "reached_q3": "pos_x(\"puck\") > 780"
+    }
+  }
+}

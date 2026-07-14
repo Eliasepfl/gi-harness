@@ -1,0 +1,38 @@
+{
+  "engine": "godot",
+  "spec_version": 1,
+  "meta": {
+    "title": "Rising Tide",
+    "prompt": "Water is rising in the cavern. Run (and hop) to the exit before it drowns you.",
+    "world_size": [1000, 600],
+    "actions": ["run_left", "run_right", "hop"]
+  },
+  "bodies": [
+    {"name": "floor", "shape": "box", "pos": [500, 30], "size": [1000, 60], "static": true, "friction": 0.06, "elasticity": 0.1},
+    {"name": "left_wall", "shape": "box", "pos": [10, 300], "size": [20, 600], "static": true, "friction": 0.2},
+    {"name": "right_wall", "shape": "box", "pos": [990, 300], "size": [20, 600], "static": true, "friction": 0.2},
+    {"name": "runner", "shape": "circle", "pos": [90, 80], "radius": 16, "mass": 1.0, "friction": 0.06, "elasticity": 0.1, "control": true},
+    {"name": "exit", "shape": "box", "pos": [905, 95], "size": [70, 130], "static": true, "sensor": true}
+  ],
+  "on_contact": [
+    {"a": "runner", "b": "exit", "flag": "escaped", "once": true}
+  ],
+  "act": {
+    "run_right": [{"verb": "impulse", "body": "runner", "vec": [125, 0]}],
+    "run_left": [{"verb": "impulse", "body": "runner", "vec": [-125, 0]}],
+    "hop": [{"verb": "impulse", "body": "runner", "vec": [0, 260], "when": "grounded(\"runner\")"}]
+  },
+  "on_step": [
+    {"kind": "velocity_clamp", "body": "runner", "vx_max": 240},
+    {"kind": "rising_level", "flag": "water", "rate": 0.11, "start": 8}
+  ],
+  "predicates": {
+    "success": "flag(\"escaped\")",
+    "failure": "pos_y(\"runner\") < flag(\"water\")",
+    "checkpoints": {
+      "fled": "pos_x(\"runner\") > 260",
+      "midway": "pos_x(\"runner\") > 520",
+      "almost": "pos_x(\"runner\") > 760"
+    }
+  }
+}
