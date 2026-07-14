@@ -25,6 +25,7 @@ future policies. `verify_game` orchestrates the funnel.
 
 from __future__ import annotations
 
+import math
 import random
 import re
 import traceback
@@ -648,6 +649,23 @@ def _make_witness(seed: int, ep: dict) -> dict:
             "checkpoints": dict(ep.get("checkpoints", {}))}
 
 
+def _aabb_reliable(q: dict) -> bool:
+    """AABB overlap depth is meaningful only for circles and axis-aligned boxes.
+
+    Polys (ramps!) and rotated boxes inflate their AABB: a ball riding a 45deg
+    ramp reads as ~100% 'inside' the ramp's bounding box on honest contact.
+    Such bodies are excluded from the solidity scan rather than producing
+    false rejections (observed: a legal poly ramp flagged at 52px depth)."""
+    shape = q.get("shape", "box")
+    if shape == "circle":
+        return True
+    if shape != "box":
+        return False
+    ang = float(q.get("angle") or 0.0)
+    a = ang % (math.pi / 2.0)
+    return min(a, math.pi / 2.0 - a) < 0.10  # within ~5.7deg of axis-aligned
+
+
 def _solidity_scan(frames: list) -> dict | None:
     """Engine-agnostic solidity scan over a frames list ({tick, entities:{query}}).
 
@@ -661,7 +679,8 @@ def _solidity_scan(frames: list) -> dict | None:
     worst: dict | None = None
     for fr in frames:
         ents = fr.get("entities", {})
-        names = [n for n, q in ents.items() if not q.get("sensor") and q.get("bbox")]
+        names = [n for n, q in ents.items()
+                 if not q.get("sensor") and q.get("bbox") and _aabb_reliable(q)]
         over_now = set()
         for i, a in enumerate(names):
             qa = ents[a]

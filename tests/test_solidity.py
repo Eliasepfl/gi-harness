@@ -55,6 +55,30 @@ def test_zero_thickness_segment_pairs_skipped():
     assert _solidity_scan(frames) is None
 
 
+def test_poly_and_rotated_boxes_are_not_judged():
+    # A ball riding a poly ramp overlaps the ramp's AABB massively on honest
+    # contact — polys and tilted boxes must be excluded, not flagged.
+    ramp = _q(100, 50, 120, 120, static=True)
+    ramp["shape"] = "poly"
+    tilted = _q(300, 50, 40, 40)
+    tilted["angle"] = 0.7  # ~40deg mid-topple crate
+    frames = [_frame(t, {"ramp": ramp,
+                         "ball": _q(100, 50, 30, 30),
+                         "tilted": tilted,
+                         "ball2": _q(305, 50, 30, 30)}) for t in range(4)]
+    assert _solidity_scan(frames) is None
+
+
+def test_right_angle_rotated_box_still_judged():
+    # An upright crate rotated a full 90deg keeps a tight AABB — still judged.
+    crate = _q(107, 50, 40, 40)
+    crate["angle"] = 1.5707963  # pi/2
+    frames = [_frame(t, {"crate": crate,
+                         "ball": _q(100, 50, 30, 30)}) for t in range(3)]
+    worst = _solidity_scan(frames)
+    assert worst is not None and set(worst["pair"]) == {"ball", "crate"}
+
+
 def test_worst_offender_reported():
     frames = [_frame(t, {
         "a": _q(100, 50, 30, 30), "b": _q(119, 50, 40, 40),    # 16px deep (53%)

@@ -501,16 +501,29 @@ def _world_size(world) -> tuple[int, int]:
     return 800, 600
 
 
+def _world_seed() -> int:
+    """The world seed every verification episode runs on (gameverify.WORLD_SEED)."""
+    try:
+        from harness.verify.gameverify import WORLD_SEED  # lazy import
+        return int(WORLD_SEED)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _resolve_actions(game_path: str, actions, seed: int):
-    """Return (action_list, seed): explicit list, witness dict, or verify witness."""
+    """Return (action_list, seed): explicit list, witness dict, or verify witness.
+
+    A witness's "seed" field is the G3 PROBE seed (plan provenance), NOT the
+    world seed — verification always builds worlds on WORLD_SEED. Replaying a
+    witness on the probe seed diverges for any game touching world.rng."""
     if isinstance(actions, dict):  # a G3 witness
-        return list(actions.get("actions", [])), int(actions.get("seed", seed))
+        return list(actions.get("actions", [])), _world_seed()
     if actions is not None:
         return list(actions), seed
     from harness.verify import gameverify  # lazy import
     report = gameverify.verify_game(game_path)
     witness = report.get("witness") or {}
-    return list(witness.get("actions", [])), int(witness.get("seed", seed))
+    return list(witness.get("actions", [])), _world_seed()
 
 
 def _save_gif(frames, out_path: str) -> None:
