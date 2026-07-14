@@ -315,11 +315,17 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size,
 
         if kind == "sensor":
             col = _sensor_colour(name)
+            # A NEUTRAL sensor with a sprite is scenery (bank decor: bush, tree,
+            # fence...): draw the sprite alone, no zone box. Goal zones stay bare
+            # (semantic green); hazards keep the zone + translucent overlay.
+            if cropped is not None and col == C_SENSOR:
+                overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                if _paste_sprite(overlay, cropped, q, scale, world_h, shadow=False):
+                    img.paste(overlay, (0, 0), overlay)
+                    continue
             _draw_shape(d, shape, box, fill=(*col, 40),
                         outline=(*col, 230), width=2,
                         verts=verts, scale=scale, world_h=world_h)
-            # Inside a HAZARD sensor (saw/lava/...), overlay the sprite semi-
-            # transparently so the danger reads; goal/neutral zones stay bare.
             if cropped is not None and col == C_HAZARD:
                 overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                 if _paste_sprite(overlay, cropped, q, scale, world_h,

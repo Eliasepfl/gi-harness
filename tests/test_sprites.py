@@ -222,6 +222,25 @@ def test_sprites_change_render_output(tmp_path):
     assert flat.read_bytes() != skin.read_bytes()        # skinning actually drew
 
 
+@pytest.mark.skipif(not _raw_present(), reason="raw atlases absent (gitignored)")
+def test_neutral_decor_sensor_renders_sprite_not_zone():
+    # Bank decor is static+sensor (bush, tree, fence...). A NEUTRAL sensor whose
+    # name resolves to a sprite must be drawn as scenery, not as a bare amber
+    # zone box — before the fix the sprite path skipped neutral sensors and the
+    # two frames below were byte-identical.
+    w = FakeWorld()
+    w.add("tree", "box", pos=(200, 120), size=(60, 90), static=True, sensor=True)
+    flat = render._render_frame(w, 0, "", 0.6, w.size, sprites=False)
+    skin = render._render_frame(w, 0, "", 0.6, w.size, sprites=True)
+    assert flat.tobytes() != skin.tobytes()
+    # Goal sensors stay bare semantic zones: sprites on/off must not differ.
+    g = FakeWorld()
+    g.add("goal", "box", pos=(700, 60), size=(60, 60), static=True, sensor=True)
+    gflat = render._render_frame(g, 0, "", 0.6, g.size, sprites=False)
+    gskin = render._render_frame(g, 0, "", 0.6, g.size, sprites=True)
+    assert gflat.tobytes() == gskin.tobytes()
+
+
 # ==========================================================================
 #  Byte-stability with sprites OFF (deterministic flat render)
 # ==========================================================================

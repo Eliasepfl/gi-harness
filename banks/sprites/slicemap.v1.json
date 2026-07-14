@@ -8,7 +8,7 @@
     "pivot": "[px, py] fractional anchor (0.5,0.5 = center) for placement/rotation",
     "region": "the SubTexture 'name' in the atlas XML (kept for tools that address by name)",
     "null": "part has no suitable CC0 sprite in the fetched packs; see note",
-    "imagePath_warning": "do NOT use the atlas XML's imagePath attribute — it is a generic placeholder in this mirror; use atlas_png here."
+    "imagePath_warning": "do NOT use the atlas XML's imagePath attribute \u00e2\u20ac\u201d it is a generic placeholder in this mirror; use atlas_png here."
   },
   "coverage": {
     "total_parts": 57,
@@ -810,10 +810,10 @@
       "pack": "kenney_platformer-pack-redux",
       "atlas_png": "Spritesheets/spritesheet_complete.png",
       "atlas_xml": "Spritesheets/spritesheet_complete.xml",
-      "region": "plantPurple.png",
+      "region": "cactus.png",
       "rect": [
-        2080,
-        520,
+        2210,
+        1560,
         128,
         128
       ],
@@ -821,7 +821,7 @@
         0.5,
         0.5
       ],
-      "note": "leafy plant used as a small tree (non-colliding decor)"
+      "note": "tall cactus used as tree stand-in (no true tree sprite in the CC0 packs; non-colliding decor)"
     },
     "rolling_log": {
       "sprite": null,
