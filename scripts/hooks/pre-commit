@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# gi-harness designer-cage pre-commit hook (DESIGNER_AGENT_PLAN.md §4, layer 3).
+#
+# The between-run gate: it blocks a designer-attributed commit from touching any
+# Tier-C surface, and rejects any designer artifact that overruns its budget. It
+# is the belt to designer_write's braces (a commit is the only other way bytes
+# reach the tree).
+#
+# ---------------------------------------------------------------------------
+# INSTALL (manual — this hook is NEVER auto-installed):
+#
+#     ln -s ../../scripts/hooks/pre-commit .git/hooks/pre-commit
+#     chmod +x scripts/hooks/pre-commit
+#
+#   (or `cp scripts/hooks/pre-commit .git/hooks/pre-commit`). A CI job should
+#   mirror this same check on push so the gate holds even if a hook is skipped.
+#
+# ATTRIBUTION: a commit is "designer-attributed" when the environment variable
+#   DESIGNER_SESSION is set (the designer entrypoint exports its session id
+#   before committing, and writes the `Co-Authored-By: designer-session-<id>`
+#   trailer). Human commits leave it unset and are only budget-checked, never
+#   Tier-C-blocked. To bypass in an emergency: `DESIGNER_SESSION= git commit ...`.
+#
+# EXTENSION (documented, not implemented here): a golden-checksum compare over
+#   harness/**/*.py + the G-gate/[eng.] thresholds would additionally catch a
+#   verifier/integrity mutation on ANY commit; wire it in the CI mirror.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+budgets="${repo_root}/designer/BUDGETS.md"
+
+# Read a cap from BUDGETS.md's machine block; fall back to the plan default.
+cap() {
+    local key="$1" default="$2" val
+    val="$(grep -oE "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*[0-9]+" "${budgets}" 2>/dev/null \
+           | grep -oE '[0-9]+' | tail -n1 || true)"
+    echo "${val:-$default}"
+}
+
+skill_max_lines="$(cap skill_max_lines 200)"
+
+# Staged files (added / copied / modified).
+staged="$(git diff --cached --name-only --diff-filter=ACM || true)"
+[ -z "${staged}" ] && exit 0
+
+designer_attributed=0
+[ -n "${DESIGNER_SESSION:-}" ] && designer_attributed=1
+
+fail=0
+err() { printf 'pre-commit: BLOCKED %s\n' "$1" >&2; fail=1; }
+
+is_designer_allowed() {
+    # The only paths a designer-attributed commit may stage (Tier-A + its ledger).
+    case "$1" in
+        designer/skills/*.md) return 0 ;;
+        designer/memory/*)    return 0 ;;
+        designer/proposals/*) return 0 ;;
+        designer/workspace/*) return 0 ;;
+        designer/ledger/designer.jsonl) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+while IFS= read -r f; do
+    [ -z "${f}" ] && continue
+
+    # (1) Tier-C block for designer-attributed commits: anything off the
+    #     designer Tier-A allowlist (every *.py, CONTRACTS/BUDGETS/SYSTEM.md,
+    #     hooks, ...) is rejected.
+    if [ "${designer_attributed}" -eq 1 ] && ! is_designer_allowed "${f}"; then
+        err "Tier-C: designer-attributed commit may not touch '${f}'"
+        continue
+    fi
+
+    # (2) Budget: a committed skill must fit its line cap (runs on every commit).
+    case "${f}" in
+        designer/skills/INDEX.md) ;;  # the router index is cap-exempt
+        designer/skills/*.md)
+            if [ -f "${repo_root}/${f}" ]; then
+                n="$(wc -l < "${repo_root}/${f}" | tr -d '[:space:]')"
+                if [ "${n}" -gt "${skill_max_lines}" ]; then
+                    err "budget: skill '${f}' has ${n} lines > cap ${skill_max_lines}"
+                fi
+            fi
+            ;;
+    esac
+done <<< "${staged}"
+
+if [ "${fail}" -ne 0 ]; then
+    printf 'pre-commit: commit rejected by the designer cage.\n' >&2
+    exit 1
+fi
+exit 0
