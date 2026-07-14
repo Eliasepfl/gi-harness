@@ -312,6 +312,39 @@ def test_curriculum_round_hard_regenerates_and_logs(tmp_path, game_file, monkeyp
     assert ev["budget_steps"] == 1234
 
 
+def test_curriculum_round_unsolved_regeneration_is_a_failure(tmp_path, game_file,
+                                                             monkeypatch):
+    # REGRESSION (first live round): generate_game writes its best attempt to
+    # game_path even when the verdict is UNSOLVED — the round must NOT count
+    # that as "regenerated" (the CLI would chain a doomed round on it).
+    keys = ["switch_a", "cleared_gap1", "switch_b"]
+    result = g3p(stochastic=0.188, steps_first=1136, cp_keys=keys,
+                 cp_curve=[0.1, 0.5, 1.0, 1.3, 1.5, 1.5, 1.5, 1.5],
+                 game_path=game_file, title="Vault")
+
+    def unsolved_gen(prompt, *, out_dir, backend, engine):
+        path = str(tmp_path / "next" / "failed.py")
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_GAME_SRC)
+        return {"game_path": path, "verdict": "UNSOLVED",
+                "attempts": [{"report": {"hint": "stuck between 'a' and 'b'"}}]}
+
+    _install_seams(monkeypatch, g3p_result=result, gen_spy=unsolved_gen)
+    ledger = tmp_path / "ledger.jsonl"
+
+    rec = C.curriculum_round(game_file, backend="template", budget_steps=1234,
+                             out_dir=str(tmp_path / "next"),
+                             ledger_path=str(ledger))
+
+    assert rec["action_taken"] == "regenerate_failed"
+    assert "UNSOLVED" in rec["directive"]
+    assert "stuck between 'a' and 'b'" in rec["directive"]
+    ev = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert ev["action_taken"] == "regenerate_failed"
+
+
 def test_curriculum_round_target_stops_no_regenerate(tmp_path, game_file, monkeypatch):
     result = g3p(stochastic=0.656, steps_first=1832,
                  cp_keys=["switch_a", "cleared_gap1", "switch_b"],

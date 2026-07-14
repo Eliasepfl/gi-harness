@@ -520,7 +520,24 @@ def curriculum_round(game_path: str, *, backend: str = "auto",
             gen = generate_fn(augmented, out_dir=out_dir, backend=backend,
                               engine=engine)
             new_game_path = gen.get("game_path")
-            action_taken = "regenerated" if new_game_path else "regenerate_failed"
+            gen_verdict = gen.get("verdict")
+            # generate_game writes its best attempt to game_path even when the
+            # run FAILED (verdict != COMPLETED) — a round only counts as
+            # "regenerated" when the new game actually certified. (First live
+            # round bug: an UNSOLVED artifact was chained into round 2.)
+            if gen_verdict == "COMPLETED" and new_game_path:
+                action_taken = "regenerated"
+            else:
+                action_taken = "regenerate_failed"
+                last_hint = None
+                for att in reversed(gen.get("attempts") or []):
+                    last_hint = (att.get("report") or {}).get("hint")
+                    if last_hint:
+                        break
+                directive_text = (directive_text
+                                  + f"\n[regenerate verdict: {gen_verdict}"
+                                  + (f"; last hint: {last_hint}" if last_hint else "")
+                                  + "]")
         except Exception as exc:  # noqa: BLE001 - a bad regenerate must not crash the loop
             action_taken = "regenerate_failed"
             new_game_path = None
