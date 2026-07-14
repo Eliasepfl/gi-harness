@@ -256,25 +256,113 @@ def cmd_game_verify(args) -> int:
     return 0 if report.get("passed") else 1
 
 
-def cmd_game_replay(args) -> int:
-    """Replay a generated game (using its witness) to an animated GIF."""
-    try:
-        from harness.render import replay_gif
-    except Exception as exc:  # noqa: BLE001
-        return _module_missing("render", exc, args.json)
+def _game_witness(game_path: str) -> dict:
+    """Resolve a game's winning witness ({seed, actions, ticks, checkpoints}) via
+    a fresh verify (engine-agnostic: verify_game routes py/js internally)."""
+    from harness.verify import gameverify
+    report = gameverify.verify_game(game_path)
+    return report.get("witness") or {}
 
-    gif = args.gif or str(Path(args.game_path).with_suffix(".gif"))
-    result = replay_gif(args.game_path, gif, seed=args.seed)
-    if args.json:
-        _emit_json(result)
-    else:
-        if result.get("result") == "error":
-            print(f"ERROR  {args.game_path}", file=sys.stderr)
-            print(f"  {result.get('error')}", file=sys.stderr)
+
+def cmd_game_replay(args) -> int:
+    """Replay a game's witness to a GIF and/or a scrubbable frames-JSON substrate.
+
+    Dispatches by ENGINE (py -> render.replay_gif unchanged; js -> the executors'
+    render_js_replay, which previously had no CLI verb and made `game replay
+    foo.js` crash in the py-only loader). ``--frames PATH`` additionally persists
+    the replay substrate ({meta, frames}) for both engines. When ``--frames`` is
+    given without an explicit ``--gif``, only the substrate is written."""
+    game_path = args.game_path
+    try:
+        source = Path(game_path).read_text(encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001
+        return _call_error("game replay", exc, args.json)
+    try:
+        from harness.verify.gameverify import detect_engine, WORLD_SEED
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("gameverify", exc, args.json)
+    engine = detect_engine(game_path, source)
+
+    frames_path = getattr(args, "frames", None)
+    want_gif = (frames_path is None) or (args.gif is not None)
+
+    _witness_cache: dict = {}
+
+    def witness() -> dict:
+        if "w" not in _witness_cache:
+            _witness_cache["w"] = _game_witness(game_path)
+        return _witness_cache["w"]
+
+    out: dict = {"engine": engine}
+
+    # --- frames substrate (both engines) ---
+    if frames_path:
+        try:
+            from harness.verify.executors import replay_frames_doc
+        except Exception as exc:  # noqa: BLE001
+            return _module_missing("executors", exc, args.json)
+        try:
+            w = witness()
+            doc = replay_frames_doc(source, engine=engine, actions=w.get("actions", []),
+                                    witness=w, seed=int(WORLD_SEED))
+        except Exception as exc:  # noqa: BLE001
+            return _call_error("game replay --frames", exc, args.json)
+        import gzip
+        # The persisted substrate is exactly {meta, frames}; result/error stay
+        # in-memory for the CLI's verdict + reporting.
+        file_doc = {"meta": doc["meta"], "frames": doc["frames"]}
+        text = json.dumps(file_doc, ensure_ascii=False, separators=(",", ":"))
+        fpath = Path(frames_path)
+        if fpath.parent and not fpath.parent.exists():
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(text, encoding="utf-8")
+        raw = len(text.encode("utf-8"))
+        gz = len(gzip.compress(text.encode("utf-8")))
+        out["frames"] = {"out_path": str(fpath), "n_frames": len(doc.get("frames", [])),
+                         "raw_bytes": raw, "gzip_bytes": gz, "result": doc.get("result")}
+
+    # --- GIF (default output; skipped for a frames-only run) ---
+    if want_gif:
+        gif = args.gif or str(Path(game_path).with_suffix(".gif"))
+        if engine == "js":
+            try:
+                from harness.verify.executors import render_js_replay
+            except Exception as exc:  # noqa: BLE001
+                return _module_missing("executors", exc, args.json)
+            try:
+                w = witness()
+                gif_res = render_js_replay(source, gif, actions=w.get("actions", []),
+                                           seed=int(WORLD_SEED))
+            except Exception as exc:  # noqa: BLE001
+                return _call_error("game replay", exc, args.json)
         else:
-            print(f"{str(result.get('result')).upper()}  {args.game_path}")
-            print(f"  ticks : {result.get('ticks')}   gif : {result.get('out_path')}")
-    return 0 if result.get("result") in ("success", "failure", "timeout") else 1
+            try:
+                from harness.render import replay_gif
+            except Exception as exc:  # noqa: BLE001
+                return _module_missing("render", exc, args.json)
+            gif_res = replay_gif(game_path, gif, seed=args.seed)
+        out["gif"] = gif_res
+
+    if args.json:
+        _emit_json(out)
+    else:
+        gif_res = out.get("gif") or {}
+        fr = out.get("frames")
+        if gif_res.get("result") == "error":
+            print(f"ERROR  {game_path}", file=sys.stderr)
+            print(f"  {gif_res.get('error')}", file=sys.stderr)
+        else:
+            verdict = str((gif_res.get("result") or (fr or {}).get("result"))).upper()
+            print(f"{verdict}  {game_path}  [{engine}]")
+            if gif_res:
+                print(f"  ticks : {gif_res.get('ticks')}   gif : {gif_res.get('out_path')}")
+        if fr:
+            print(f"  frames: {fr['n_frames']}   json: {fr['out_path']}   "
+                  f"raw {fr['raw_bytes']}B / gzip {fr['gzip_bytes']}B")
+
+    verdicts = {(out.get("gif") or {}).get("result"),
+                (out.get("frames") or {}).get("result")}
+    return 0 if verdicts & {"success", "failure", "timeout"} else 1
 
 
 def cmd_game_attack(args) -> int:
@@ -600,9 +688,14 @@ def build_parser() -> argparse.ArgumentParser:
     gv.add_argument("--json", action="store_true")
     gv.set_defaults(func=cmd_game_verify)
 
-    gr = gmsub.add_parser("replay", help="replay a game's witness to a GIF")
+    gr = gmsub.add_parser("replay",
+                          help="replay a game's witness to a GIF and/or frames JSON")
     gr.add_argument("game_path")
     gr.add_argument("--gif", default=None, help="output GIF path (default: <game>.gif)")
+    gr.add_argument("--frames", default=None,
+                    help="persist the scrubbable replay substrate (every-frame "
+                         "{meta,frames} JSON) to this path; if set without --gif, "
+                         "only the JSON is written")
     gr.add_argument("--seed", type=int, default=0)
     gr.add_argument("--json", action="store_true")
     gr.set_defaults(func=cmd_game_replay)

@@ -38,6 +38,7 @@ const POSITION_ITERATIONS = 3; // Box2D solver position passes [eng., fixed]
 const CONTACT_TOL = 1.0; // px: separation below which two shapes count as touching
 const VMAX = 1.0e5; // beyond this |v|: numerical explosion
 const GROUND_NORMAL_TOL = 0.5; // max |n.x| for a contact to count as "below" a body
+const SEGMENT_RADIUS = 1.0; // default thickness for segment shapes (mirror world.py)
 
 // ---------------------------------------------------------------------------
 // Deterministic RNG (mulberry32) -- determinism matters more than quality.
@@ -388,19 +389,34 @@ class World {
   query(name) {
     const body = this._require(name);
     const fixture = this._fixtures.get(name);
+    const g = this._geom.get(name);
     const p = body.getPosition();
     const v = body.getLinearVelocity();
-    return {
+    const out = {
       pos: [p.x, p.y],
       vel: [v.x, v.y],
       angle: body.getAngle(),
       angular_vel: body.getAngularVelocity(),
       bbox: this._bbox(name),
-      shape: this._geom.get(name).kind,
+      shape: g.kind,
       static: body.isStatic(),
       sensor: fixture.isSensor(),
       controlled: name === this._controlled,
     };
+    // World-space outline so renderers can draw ROTATED shapes truthfully
+    // (an axis-aligned bbox turns a tilted plank into a bloated slab). Verts are
+    // DERIVED from the body transform (pure query, not simulated state), so this
+    // adds fidelity without touching determinism. Mirrors world.py:query.
+    if (g.kind === "circle") {
+      out.radius = g.radius;
+    } else if (g.kind === "segment") {
+      out.verts = g.verts.map(([lx, ly]) => this._toWorld(body, lx, ly));
+      out.radius = SEGMENT_RADIUS;
+    } else {
+      // box / poly: the stored local verts transformed to world space.
+      out.verts = g.verts.map(([lx, ly]) => this._toWorld(body, lx, ly));
+    }
+    return out;
   }
 
   // Iterate every touching contact that involves `name`.

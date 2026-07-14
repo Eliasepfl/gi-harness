@@ -259,7 +259,13 @@ function runEpisode(game, world, actions, maxTicks, framesEvery, escapeMargin) {
     world_size: world.size.slice(),
     error: null,
   };
-  if (framesEvery > 0) out.frames = frames;
+  if (framesEvery > 0) {
+    out.frames = frames;
+    // Meta for the persisted replay substrate (only when frames are captured, so
+    // verify batches stay lean). TITLE/PROMPT were harvested by loadGame.
+    out.title = game.TITLE == null ? "" : game.TITLE;
+    out.prompt = game.PROMPT == null ? "" : game.PROMPT;
+  }
   // G1 extras: only when the Python side asks (escape_margin is a number). Kept
   // off the default record so determinism/efficacy batches stay lean and the
   // spike bench output is unchanged.

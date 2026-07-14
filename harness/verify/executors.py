@@ -356,3 +356,73 @@ def render_js_replay(game_source, out_path, *, actions, seed: int = 0, label=Non
     render._save_gif(imgs, out_path)
     return {"ticks": ep.get("ticks", 0), "result": ep.get("result"),
             "frames": len(imgs), "out_path": str(out_path)}
+
+
+# ---------------------------------------------------------------------------
+# Frames substrate — persist a scrubbable replay for the web canvas player
+# ---------------------------------------------------------------------------
+def _round_floats(obj, dp: int = 2):
+    """Recursively round every float to ``dp`` decimals (shrinks the JSON without
+    changing structure). Booleans/ints/strings/None pass through untouched."""
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        return round(obj, dp)
+    if isinstance(obj, list):
+        return [_round_floats(v, dp) for v in obj]
+    if isinstance(obj, dict):
+        return {k: _round_floats(v, dp) for k, v in obj.items()}
+    return obj
+
+
+def replay_frames_doc(game_source, *, engine, actions, witness=None, seed: int = 0,
+                      max_ticks: int = 400, round_dp: int = 2, node=None,
+                      runner_path=None, timeout_s: float = 60.0) -> dict:
+    """Run ONE every-frame episode and assemble the replay SUBSTRATE document::
+
+        {"meta": {"title", "prompt", "world_size", "engine",
+                  "witness": {"seed", "ticks", "checkpoints"}},
+         "frames": [{"tick", "entities": {name: query-dict}}, ...]}
+
+    Engine-agnostic: js goes through the Node runner (which now echoes
+    title/prompt in a frames record), py through the in-process PyExecutor (title/
+    prompt are harvested from the loaded game). ``actions`` is the witness plan
+    replayed on ``seed`` (the world seed the frames are generated on); ``witness``
+    (from a fresh verify) supplies ticks + checkpoints for the meta. Floats are
+    rounded to ``round_dp`` decimals. Returns the document plus ``result`` /
+    ``error`` keys describing the replay's terminal classification."""
+    if engine == "js":
+        ex = JsExecutor(node=node, runner_path=runner_path, timeout_s=timeout_s)
+    else:
+        ex = PyExecutor()
+    recs = ex.run_batch(game_source, [{"seed": int(seed), "actions": list(actions)}],
+                        int(max_ticks), frames_every=1)
+    rec = recs[0]
+
+    title = rec.get("title")
+    prompt = rec.get("prompt")
+    if title is None or prompt is None:  # py path: harvest from the loaded game
+        try:
+            from harness.verify.gameverify import load_game
+            game = game_source if not isinstance(game_source, str) else load_game(game_source)
+            title = getattr(game, "title", None) if title is None else title
+            prompt = getattr(game, "prompt", None) if prompt is None else prompt
+        except Exception:  # noqa: BLE001 — meta is cosmetic, never break the export
+            pass
+
+    witness = witness or {}
+    meta = {
+        "title": title or "",
+        "prompt": prompt or "",
+        "world_size": [int(x) if float(x).is_integer() else x
+                       for x in (rec.get("world_size") or (800, 600))],
+        "engine": engine,
+        "witness": {
+            "seed": int(seed),
+            "ticks": witness.get("ticks", rec.get("ticks")),
+            "checkpoints": dict(witness.get("checkpoints") or {}),
+        },
+    }
+    frames = _round_floats(rec.get("frames", []), int(round_dp))
+    return {"meta": meta, "frames": frames,
+            "result": rec.get("result"), "error": rec.get("error")}
