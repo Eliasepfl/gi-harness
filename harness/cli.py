@@ -596,7 +596,10 @@ def cmd_game_demo(args) -> int:
 # ---- game curriculum -------------------------------------------------------
 def cmd_game_curriculum(args) -> int:
     """Run up to K curriculum rounds: verify(tree) -> G3' -> profile -> directive
-    -> (target? stop : regenerate the next version). Prints one record per round."""
+    -> (target? stop : apply the directive to the next version). ``--mode revise``
+    (default) applies the directive as a minimal edit to the certified source;
+    ``--mode regenerate`` designs a fresh game from PROMPT + directive. Prints one
+    record per round."""
     try:
         from harness.gen.curriculum import curriculum_round
     except Exception as exc:  # noqa: BLE001
@@ -607,12 +610,15 @@ def cmd_game_curriculum(args) -> int:
     for _ in range(max(1, args.rounds)):
         try:
             rec = curriculum_round(current, backend=args.backend,
-                                   budget_steps=args.budget, out_dir=args.out_dir)
+                                   budget_steps=args.budget, out_dir=args.out_dir,
+                                   mode=args.mode)
         except Exception as exc:  # noqa: BLE001
             return _call_error("game curriculum", exc, args.json)
         records.append(rec)
         action = rec.get("action_taken")
-        if action != "regenerated" or not rec.get("new_game_path"):
+        # A round advances the chain only when it produced a NEW certified game —
+        # "revised" (revise mode) or "regenerated" (regenerate mode).
+        if action not in ("revised", "regenerated") or not rec.get("new_game_path"):
             break                         # certified target, or nothing new to grade
         current = rec["new_game_path"]
 
@@ -791,8 +797,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "target-certified game)")
     gc.add_argument("--backend", default="auto",
                     choices=["auto", "anthropic", "openrouter", "template"])
+    gc.add_argument("--mode", default="revise", choices=["revise", "regenerate"],
+                    help="how a non-target game is advanced: 'revise' (default) "
+                         "applies the directive as a minimal edit to the certified "
+                         "source; 'regenerate' designs a fresh game from PROMPT + "
+                         "directive")
     gc.add_argument("--out-dir", default="scenes/games/curriculum",
-                    help="where regenerated next-version games are written")
+                    help="where next-version games are written")
     gc.add_argument("--json", action="store_true")
     gc.set_defaults(func=cmd_game_curriculum)
 

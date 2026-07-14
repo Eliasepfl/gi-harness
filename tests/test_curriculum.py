@@ -245,7 +245,8 @@ def game_file(tmp_path):
     return str(p)
 
 
-def _install_seams(monkeypatch, *, g3p_result, verify_passed=True, gen_spy=None):
+def _install_seams(monkeypatch, *, g3p_result, verify_passed=True, gen_spy=None,
+                   revise_spy=None):
     monkeypatch.setattr(C, "verify_fn",
                         lambda gp: vreport(witness_ticks=102,
                                            checkpoints={"switch_a": 15,
@@ -253,7 +254,7 @@ def _install_seams(monkeypatch, *, g3p_result, verify_passed=True, gen_spy=None)
                                                         "switch_b": 70},
                                            passed=verify_passed))
 
-    calls = {"g3p": [], "gen": []}
+    calls = {"g3p": [], "gen": [], "revise": []}
 
     def fake_g3p(game_path, budget_steps, **kw):
         calls["g3p"].append((game_path, budget_steps))
@@ -269,8 +270,20 @@ def _install_seams(monkeypatch, *, g3p_result, verify_passed=True, gen_spy=None)
             fh.write(_GAME_SRC)
         return {"game_path": path, "verdict": "COMPLETED"}
 
+    def fake_revise(source, directive, *, out_dir, backend, engine):
+        calls["revise"].append({"source": source, "directive": directive,
+                                "out_dir": out_dir, "backend": backend,
+                                "engine": engine})
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, "revised.py")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_GAME_SRC)
+        return {"game_path": path, "verdict": "COMPLETED"}
+
     monkeypatch.setattr(C, "g3_prime_fn", fake_g3p)
     monkeypatch.setattr(C, "generate_fn", gen_spy or fake_gen)
+    monkeypatch.setattr(C, "revise_fn", revise_spy or fake_revise)
     return calls
 
 
@@ -284,13 +297,16 @@ def test_curriculum_round_hard_regenerates_and_logs(tmp_path, game_file, monkeyp
     out_dir = tmp_path / "next"
 
     rec = C.curriculum_round(game_file, backend="template", budget_steps=1234,
-                             out_dir=str(out_dir), ledger_path=str(ledger))
+                             out_dir=str(out_dir), ledger_path=str(ledger),
+                             mode="regenerate")
 
     # --- loop wiring ---
     assert rec["grade"] == "hard"
     assert rec["action_taken"] == "regenerated"
+    assert rec["mode"] == "regenerate"
     assert calls["g3p"] == [(game_file, 1234)]          # G3' called with the budget
     assert len(calls["gen"]) == 1                        # regenerate fired
+    assert calls["revise"] == []                         # regenerate mode: revise not fired
     gen_call = calls["gen"][0]
     # The ORIGINAL prompt + the directive were composed into the USER prompt.
     assert "guide the puck" in gen_call["prompt"]
@@ -336,13 +352,138 @@ def test_curriculum_round_unsolved_regeneration_is_a_failure(tmp_path, game_file
 
     rec = C.curriculum_round(game_file, backend="template", budget_steps=1234,
                              out_dir=str(tmp_path / "next"),
-                             ledger_path=str(ledger))
+                             ledger_path=str(ledger), mode="regenerate")
 
     assert rec["action_taken"] == "regenerate_failed"
     assert "UNSOLVED" in rec["directive"]
     assert "stuck between 'a' and 'b'" in rec["directive"]
     ev = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
     assert ev["action_taken"] == "regenerate_failed"
+
+
+# ======================================================================== #
+# curriculum_round — REVISE mode (the default): certified source + directive
+# ======================================================================== #
+def test_curriculum_round_revise_is_default_and_edits_certified_source(
+        tmp_path, game_file, monkeypatch):
+    """Default mode is 'revise': the CERTIFIED source + directive seed the revise
+    seam; a COMPLETED verdict -> 'revised' with a chainable new_game_path."""
+    keys = ["switch_a", "cleared_gap1", "switch_b"]
+    result = g3p(stochastic=0.188, steps_first=1136, cp_keys=keys,
+                 cp_curve=[0.1, 0.5, 1.0, 1.3, 1.5, 1.5, 1.5, 1.5],
+                 game_path=game_file, title="Vault")
+    calls = _install_seams(monkeypatch, g3p_result=result)
+    ledger = tmp_path / "ledger.jsonl"
+    out_dir = tmp_path / "next"
+
+    # No mode= argument -> default is revise.
+    rec = C.curriculum_round(game_file, backend="template", budget_steps=1234,
+                             out_dir=str(out_dir), ledger_path=str(ledger))
+
+    assert rec["grade"] == "hard"
+    assert rec["mode"] == "revise"
+    assert rec["action_taken"] == "revised"
+    assert calls["g3p"] == [(game_file, 1234)]           # G3' called with the budget
+    assert calls["gen"] == []                            # revise mode: regenerate not fired
+    assert len(calls["revise"]) == 1                     # the revise seam fired
+    rv = calls["revise"][0]
+    # The seam received the FULL certified source + the directive (a minimal EDIT,
+    # NOT a from-scratch prompt).
+    assert rv["source"] == _GAME_SRC
+    assert "[CURRICULUM DIRECTIVE" in rv["directive"]
+    assert "cleared_gap1" in rv["directive"]             # anchored to the stall
+    assert rv["engine"] == "py"
+    assert rv["out_dir"] == str(out_dir)
+    # A new certified version was produced -> the path is chainable.
+    assert rec["new_game_path"] and rec["new_game_path"].endswith("revised.py")
+
+    ev = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert ev["event"] == "curriculum_round"
+    assert ev["action_taken"] == "revised" and ev["mode"] == "revise"
+
+
+def test_curriculum_round_revise_unsolved_is_a_failure_no_chain(
+        tmp_path, game_file, monkeypatch):
+    """A revise whose verdict is UNSOLVED -> 'revise_failed' (not 'revised'), and
+    the verdict + last repair hint are recorded in the directive trail so the CLI
+    chain stops (mirrors the regenerate path after 26b3fc4)."""
+    keys = ["switch_a", "cleared_gap1", "switch_b"]
+    result = g3p(stochastic=0.188, steps_first=1136, cp_keys=keys,
+                 cp_curve=[0.1, 0.5, 1.0, 1.3, 1.5, 1.5, 1.5, 1.5],
+                 game_path=game_file, title="Vault")
+
+    def unsolved_revise(source, directive, *, out_dir, backend, engine):
+        import os
+        path = str(tmp_path / "next" / "revised_failed.py")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_GAME_SRC)
+        return {"game_path": path, "verdict": "UNSOLVED",
+                "attempts": [{"report": {"hint": "still stuck at cleared_gap1"}}]}
+
+    _install_seams(monkeypatch, g3p_result=result, revise_spy=unsolved_revise)
+    ledger = tmp_path / "ledger.jsonl"
+
+    rec = C.curriculum_round(game_file, backend="template", budget_steps=1234,
+                             out_dir=str(tmp_path / "next"),
+                             ledger_path=str(ledger))     # default revise
+
+    assert rec["action_taken"] == "revise_failed"
+    assert "revise verdict: UNSOLVED" in rec["directive"]
+    assert "still stuck at cleared_gap1" in rec["directive"]
+    # The action is NOT a chain-advancing verdict -> the CLI loop would stop here.
+    assert rec["action_taken"] not in ("revised", "regenerated")
+    ev = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    assert ev["action_taken"] == "revise_failed"
+
+
+def test_revise_user_msg_carries_source_and_minimal_edit_instruction():
+    """The revise prompt (gamegen._revise_user_msg) embeds the full certified
+    source verbatim and the minimal-edit task instruction."""
+    from harness.gen import gamegen as GG
+    directive = ("[CURRICULUM DIRECTIVE — grade: hard]\n"
+                 "EASE the 'cleared_gap1' gate; keep every later stage intact.")
+    msg = GG._revise_user_msg(_GAME_SRC, directive, engine="py")
+    assert _GAME_SRC in msg                              # full source, not a diff
+    assert directive in msg                              # the directive rides along
+    assert "CERTIFIED" in msg                            # framed as a certified edit
+    assert "MINIMAL EDIT" in msg                         # the minimal-edit instruction
+    assert "PROMPT" in msg                               # preserve provenance
+    # JS variant fences the source as javascript.
+    msg_js = GG._revise_user_msg(_GAME_SRC, directive, engine="js")
+    assert "```javascript" in msg_js
+
+
+def test_cli_curriculum_chains_on_revised_stops_on_failed(tmp_path, monkeypatch):
+    """The CLI advances the chain on a 'revised' round (feeding its new_game_path
+    into the next round) and stops on a 'revise_failed' round; default mode is
+    revise."""
+    from harness import cli
+    import harness.gen.curriculum as CC
+
+    v2 = str(tmp_path / "v2.js")
+    seq = iter([
+        {"action_taken": "revised", "new_game_path": v2, "grade": "hard",
+         "profile": {}, "directive": "d1", "game_path": "g0"},
+        {"action_taken": "revise_failed", "new_game_path": str(tmp_path / "x.js"),
+         "grade": "hard", "profile": {}, "directive": "d2", "game_path": v2},
+    ])
+    seen = []
+
+    def fake_round(game_path, **kw):
+        seen.append((game_path, kw.get("mode")))
+        return next(seq)
+
+    monkeypatch.setattr(CC, "curriculum_round", fake_round)
+
+    args = cli.build_parser().parse_args(
+        ["game", "curriculum", "g0", "--rounds", "3", "--json"])
+    rc = args.func(args)
+
+    assert rc == 0
+    assert len(seen) == 2                                 # round 3 never ran (chain stopped)
+    assert seen[0] == ("g0", "revise")                    # default mode is revise
+    assert seen[1][0] == v2                               # round 2 got the revised path
 
 
 def test_curriculum_round_target_stops_no_regenerate(tmp_path, game_file, monkeypatch):
