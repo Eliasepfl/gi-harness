@@ -39,6 +39,9 @@ FRAME_MS = 60      # per-frame duration in the GIF
 SPRITE_SKINNING = True   # module default; auto-off when the bank is unavailable
 SPRITE_SHADOW = True     # soft drop shadow under sprites (dark-bg harmony)
 HAZARD_SPRITE_ALPHA = 0.6  # overlay alpha for a sprite inside a hazard sensor
+DECOR_SPRITE_ALPHA = 0.55  # neutral-sensor scenery is faded: it must read as
+                           # BACKGROUND, never as a solid obstacle the player
+                           # then "passes through"
 
 
 def _sprites_ok(sprites) -> bool:
@@ -146,6 +149,51 @@ def _kind(q: dict) -> str:
 
 
 _Z = {"sensor": 0, "static": 1, "dynamic": 2, "controlled": 3}
+
+# ---- follow camera (worlds larger than the view window get a camera) ------
+VIEW_W, VIEW_H = 800, 600   # view window in world units; <= this renders whole
+CAM_SMOOTH = 0.35           # per-frame lerp toward the tracked body (no jitter)
+
+
+class FollowCamera:
+    """Camera for worlds larger than the view window: follows a target point
+    (the controlled body), smoothed and clamped to the world rectangle.
+
+    ``update(target)`` returns a ``(left, bottom, view_w, view_h)`` box in
+    world units for the frame — or ``None`` when the whole world fits the
+    view, preserving the exact pre-camera rendering for 800x600 games."""
+
+    def __init__(self, world_size):
+        self.world_w, self.world_h = world_size
+        self.vw = min(self.world_w, VIEW_W)
+        self.vh = min(self.world_h, VIEW_H)
+        self.active = self.world_w > VIEW_W or self.world_h > VIEW_H
+        self._cx = self._cy = None
+
+    def update(self, target=None):
+        if not self.active:
+            return None
+        tx, ty = target if target else (self.world_w / 2.0, self.world_h / 2.0)
+        if self._cx is None:
+            self._cx, self._cy = tx, ty
+        else:
+            self._cx += CAM_SMOOTH * (tx - self._cx)
+            self._cy += CAM_SMOOTH * (ty - self._cy)
+        left = min(max(self._cx - self.vw / 2.0, 0.0), self.world_w - self.vw)
+        bottom = min(max(self._cy - self.vh / 2.0, 0.0), self.world_h - self.vh)
+        return (left, bottom, self.vw, self.vh)
+
+
+def _controlled_pos(world):
+    """World position of the controlled body, or None (display-only helper)."""
+    try:
+        for name in world.entities():
+            q = world.query(name)
+            if q.get("controlled"):
+                return tuple(q["pos"])
+    except Exception:  # noqa: BLE001 — camera must never break a replay
+        pass
+    return None
 
 
 # ==========================================================================
@@ -259,7 +307,8 @@ def _paste_sprite(target: Image.Image, cropped: Image.Image, q: dict,
 #  Frame drawing
 # ==========================================================================
 def _render_frame(world, tick: int, label: str, scale: float, world_size,
-                  flash: str | None = None, sprites: bool | None = None) -> Image.Image:
+                  flash: str | None = None, sprites: bool | None = None,
+                  camera=None) -> Image.Image:
     """Redraw the whole scene from world.query() into one RGB frame.
 
     `flash` is an optional short string (a freshly latched milestone name)
@@ -320,7 +369,8 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size,
             # (semantic green); hazards keep the zone + translucent overlay.
             if cropped is not None and col == C_SENSOR:
                 overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-                if _paste_sprite(overlay, cropped, q, scale, world_h, shadow=False):
+                if _paste_sprite(overlay, cropped, q, scale, world_h,
+                                 alpha=DECOR_SPRITE_ALPHA, shadow=False):
                     img.paste(overlay, (0, 0), overlay)
                     continue
             _draw_shape(d, shape, box, fill=(*col, 40),
@@ -353,6 +403,17 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size,
             layer = Image.composite(transparent, layer, static_mask)
             img.paste(layer, (0, 0), layer)
 
+    # Follow camera: the frame above is the WHOLE world; crop the view window
+    # (world units -> screen px), then draw the HUD on the cropped frame so
+    # text stays screen-anchored.
+    if camera is not None:
+        cl, cb, vw, vh = camera
+        x0 = int(round(cl * scale))
+        y0 = int(round((world_h - cb - vh) * scale))
+        img = img.crop((x0, y0,
+                        x0 + int(round(vw * scale)), y0 + int(round(vh * scale))))
+        d = ImageDraw.Draw(img, "RGBA")
+
     if label:
         d.text((8, 6), label, fill=C_TEXT)
     if flash:
@@ -362,7 +423,7 @@ def _render_frame(world, tick: int, label: str, scale: float, world_size,
         tw = d.textlength(tick_str)
     except Exception:  # noqa: BLE001
         tw = 7 * len(tick_str)
-    d.text((max(8.0, W - tw - 8), 6), tick_str, fill=C_TEXT)
+    d.text((max(8.0, img.width - tw - 8), 6), tick_str, fill=C_TEXT)
     return img
 
 
@@ -388,6 +449,7 @@ def _symbols(obj) -> SimpleNamespace:
         success=success,
         failure=failure if callable(failure) else None,
         checkpoints=checkpoints if callable(checkpoints) else None,
+        WORLD_SIZE=get("WORLD_SIZE"),
     )
 
 
@@ -489,7 +551,12 @@ def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
 
     try:
         make_world = world_factory or _import_world()
-        world = make_world(seed=seed)
+        ws = getattr(game, "WORLD_SIZE", None)
+        if (isinstance(ws, (list, tuple)) and len(ws) == 2
+                and all(isinstance(v, (int, float)) and v > 0 for v in ws)):
+            world = make_world(seed=seed, size=tuple(ws))
+        else:
+            world = make_world(seed=seed)
     except Exception as exc:  # noqa: BLE001
         return {"ticks": 0, "result": "error", "error": f"world unavailable: {exc}"}
 
@@ -508,11 +575,14 @@ def replay_gif(game_path: str, out_path: str, *, actions=None, seed: int = 0,
     flash_until = -1              # tick until which the flash stays visible
     FLASH_TICKS = 8               # (eng.) how long a latched milestone stays on screen
 
+    cam = FollowCamera(world_size)
+
     def snap(t: int) -> None:
         nonlocal last_snap
         cur_flash = flash_text if t <= flash_until else None
         frames.append(_render_frame(world, t, label, scale, world_size,
-                                    flash=cur_flash, sprites=sprites))
+                                    flash=cur_flash, sprites=sprites,
+                                    camera=cam.update(_controlled_pos(world))))
         last_snap = t
 
     def latch_new(t: int) -> bool:

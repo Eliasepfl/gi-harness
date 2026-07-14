@@ -82,6 +82,10 @@ A Python module containing EXACTLY these symbols (no imports — only `world` is
 TITLE = "short game title"
 PROMPT = "the original user prompt"
 ACTIONS = ["thrust", "tilt_left", "tilt_right", "wait"]   # 2..8 short strings, game-chosen
+WORLD_SIZE = (2000, 700)  # OPTIONAL (v2.3): world rectangle, width 800..2400,
+                          # height 600..1600; omitted -> (800, 600). G0 validates
+                          # bounds; the renderer follows the controlled body with
+                          # a camera when the world exceeds the 800x600 view.
 
 def build(world):
     """Create all entities; MUST call world.control(<name>) on exactly one dynamic body."""
@@ -117,6 +121,17 @@ may leave the pad it once touched); game predicates stay pure and stateless.
 `success` remains the terminal authority: a binary, unshaped certificate (OMNI-EPIC
 lesson — hack-resistant). Checkpoints are the *structure of progress between t=0 and
 success*, and double as the dense programmatic signal a reward model can later train on.
+
+V2.3 AMENDMENTS (game-quality bar):
+- `WORLD_SIZE` (optional, above): games may declare worlds up to 2400x1600; both
+  engines build the world at the declared size; G0 gains a `world_size` check.
+- SOLIDITY (G3): the witness is replayed with per-tick frames and the report FAILS
+  (`ENV_ERROR`) if two non-sensor bodies (one dynamic) interpenetrate deeper than
+  50% of the thinner body's smaller dimension for >= 2 consecutive ticks — "the
+  player passes through obstacles" is now a caught, repairable defect, not a
+  cosmetic one. JS engine: all dynamic bodies are CCD bullets; maxTranslation 200.
+- DURATION: G3 probe horizon 120 -> 300 decision ticks; anti-triviality floor
+  5 -> 20 ticks (target band for real games: 60-200 ticks, set via prompts).
 
 ## 3. `harness/gen/gamegen.py` — open-ended generator
 

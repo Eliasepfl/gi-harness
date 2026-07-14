@@ -22,7 +22,10 @@ const pl = require("planck");
 
 // ---- Pixel-scale retuning (must happen before any World is built) ----
 pl.Settings.lengthUnitsPerMeter = 50; // treat ~50 px as 1 "Box2D meter" of tolerance
-pl.Settings.maxTranslation = 1000; // px a body may travel per step before clamping
+// 200 px per 1/60s substep (= 12000 px/s) is far above any sane gameplay speed
+// but low enough that the solver keeps contacts coherent; 1000 allowed bodies to
+// cross a crate-sized obstacle in one substep (measured 15px interpenetration).
+pl.Settings.maxTranslation = 200;
 
 const { World: PlWorld, Vec2, Circle, Box, Edge, Polygon } = pl;
 
@@ -233,6 +236,9 @@ class World {
       position: new Vec2(pos[0], pos[1]),
       angle,
       fixedRotation: lockedRotation, // mirror pymunk moment=inf
+      bullet: !isStatic, // CCD for every dynamic body: gameplay speeds routinely
+      // exceed one body-width per substep, and dynamic-vs-dynamic tunneling was
+      // observed (player half-inside a crate). Body counts are tiny (<=14).
       userData: name,
     });
 

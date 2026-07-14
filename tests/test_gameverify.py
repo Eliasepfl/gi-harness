@@ -20,11 +20,24 @@ import pytest
 # Make `harness` importable regardless of the pytest rootdir.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from harness.verify import gameverify as gv  # noqa: E402
 from harness.verify.gameverify import (  # noqa: E402
-    GUIDED_SEED_BASE, K_STEPS, TRIVIAL_TICKS, load_game, run_episode, verify_game,
+    GUIDED_SEED_BASE, K_STEPS, load_game, run_episode, verify_game,
 )
 
 DT = 1.0 / 60.0
+
+
+@pytest.fixture()
+def legacy_thresholds(monkeypatch):
+    """Pin the v2.2-scale G3 thresholds for fixtures calibrated on them.
+
+    The v2.3 bar (TRIVIAL_TICKS=20, PROBE_HORIZON=300) targets real generated
+    games; these unit fixtures are deliberately tiny fast-win worlds that test
+    OTHER oracle behaviours (progress diagnosis, dead milestones, ordering,
+    guided pass), so they run under the thresholds they were calibrated for."""
+    monkeypatch.setattr(gv, "TRIVIAL_TICKS", 5)
+    monkeypatch.setattr(gv, "PROBE_HORIZON", 120)
 
 
 # ====================================================================== #
@@ -478,7 +491,7 @@ def checkpoints(world):
 # ====================================================================== #
 # Full-funnel tests
 # ====================================================================== #
-def test_valid_game_passes_and_yields_replayable_witness(tmp_path):
+def test_valid_game_passes_and_yields_replayable_witness(tmp_path, legacy_thresholds):
     path = _write(tmp_path, "valid.py", GAME_VALID)
     rep = verify_game(path, sandboxed=False, world_factory=factory())
     assert rep["passed"] is True, rep
@@ -487,7 +500,7 @@ def test_valid_game_passes_and_yields_replayable_witness(tmp_path):
         assert rep["layers"][layer]["passed"], (layer, rep["layers"][layer])
 
     w = rep["witness"]
-    assert w is not None and w["ticks"] >= TRIVIAL_TICKS
+    assert w is not None and w["ticks"] >= gv.TRIVIAL_TICKS
     assert isinstance(w["actions"], list) and len(w["actions"]) == w["ticks"]
 
     # v2.1: the witness carries the milestone latch map, in declared order,
@@ -557,7 +570,7 @@ def test_checkpoint_true_at_t0_fails_g2(tmp_path):
     assert "already_here" in rep["hint"]
 
 
-def test_impossible_goal_is_unsolved_with_progress(tmp_path):
+def test_impossible_goal_is_unsolved_with_progress(tmp_path, legacy_thresholds):
     path = _write(tmp_path, "impossible.py", GAME_IMPOSSIBLE)
     rep = verify_game(path, sandboxed=False, world_factory=factory())
     assert rep["layers"]["G2_goal"]["passed"] is True
@@ -584,7 +597,7 @@ def test_instant_win_is_trivial(tmp_path):
     assert "trivial" in rep["hint"].lower()
 
 
-def test_dead_milestone_is_goal_error(tmp_path):
+def test_dead_milestone_is_goal_error(tmp_path, legacy_thresholds):
     # The game is winnable, but "reached_sky" never latches on the witness.
     path = _write(tmp_path, "deadcp.py", GAME_DEAD_MILESTONE)
     rep = verify_game(path, sandboxed=False, world_factory=factory())
@@ -595,7 +608,7 @@ def test_dead_milestone_is_goal_error(tmp_path):
     assert "reached_sky" in rep["hint"]
 
 
-def test_misordered_milestones_warn_but_pass(tmp_path):
+def test_misordered_milestones_warn_but_pass(tmp_path, legacy_thresholds):
     # Declared [almost, halfway]; empirically halfway latches first.
     path = _write(tmp_path, "misordered.py", GAME_MISORDERED)
     rep = verify_game(path, sandboxed=False, world_factory=factory())
@@ -605,7 +618,7 @@ def test_misordered_milestones_warn_but_pass(tmp_path):
     assert "halfway" in rep["warnings"][0] and "almost" in rep["warnings"][0]
 
 
-def test_guided_second_pass_solves_two_stage_game(tmp_path):
+def test_guided_second_pass_solves_two_stage_game(tmp_path, legacy_thresholds):
     # Pure random search misses the combo-lock game (empirically, seeds 0..39
     # never both arm early enough AND blast far enough); the checkpoint-guided
     # second pass reuses the best arming prefix and finds a witness.

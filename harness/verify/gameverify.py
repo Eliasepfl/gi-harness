@@ -57,11 +57,15 @@ _SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # G3
 PROBE_EPISODES = 40         # random-search episodes [eng.]
-PROBE_HORIZON = 120         # decision ticks per episode [eng.]
+PROBE_HORIZON = 300         # decision ticks per episode (~30s of play; RL-scale levels) [eng.]
 MACRO_MIN, MACRO_MAX = 1, 4  # macro-action hold length (ticks) [eng.]
 WORLD_SEED = 0              # physics seed shared by every fresh world [eng.]
-TRIVIAL_TICKS = 5           # a witness shorter than this marks a degenerate goal [eng.]
-GUIDED_EPISODES = 20        # checkpoint-guided second-pass episodes (v2.1) [eng.]
+WORLD_W_BOUNDS = (800, 2400)   # declared WORLD_SIZE width bounds (px) [eng.]
+WORLD_H_BOUNDS = (600, 1600)   # declared WORLD_SIZE height bounds (px) [eng.]
+TRIVIAL_TICKS = 20          # a witness shorter than this marks a degenerate goal (~2s of decisions; v2.3 raised from 5) [eng.]
+SOLIDITY_FRAC = 0.5         # witness replay: max solid-pair overlap depth as a fraction of the thinner body's smaller bbox dimension [eng.]
+SOLIDITY_TICKS = 2          # consecutive sampled ticks the overlap must persist to fail (transient impact slop is physics) [eng.]
+GUIDED_EPISODES = 30        # checkpoint-guided second-pass episodes (longer horizons need more) [eng.]
 GUIDED_SEED_BASE = 1000     # probe seeds 1000+i for the guided pass (v2.1)
 
 _REQUIRED_SYMBOLS = ("TITLE", "PROMPT", "ACTIONS", "build", "act", "success",
@@ -86,6 +90,7 @@ class Game:
         self.success = ns.get("success")
         self.failure = ns.get("failure")      # optional
         self.checkpoints = ns.get("checkpoints")  # required by v2.1 (G0 enforces)
+        self.world_size = ns.get("WORLD_SIZE")    # optional (v2.3; G0 validates bounds)
 
 
 def load_game(source: str) -> Game:
@@ -194,15 +199,26 @@ def _snapshot_delta(a: dict, b: dict) -> float:
 # ======================================================================== #
 # World construction
 # ======================================================================== #
-def _default_world_factory(seed: int = 0):
+def _default_world_factory(seed: int = 0, size=(800, 600)):
     """Real World (module E), imported lazily so tests can inject a fake."""
     from harness.core.world import World
-    return World(seed=seed)
+    return World(seed=seed, size=size)
+
+
+def _world_size_of(game) -> tuple | None:
+    """The game's declared WORLD_SIZE as a (w, h) tuple if it is shaped like
+    one (bounds are G0's job), else None (default world)."""
+    ws = getattr(game, "world_size", None)
+    if (isinstance(ws, (list, tuple)) and len(ws) == 2
+            and all(isinstance(v, (int, float)) and v > 0 for v in ws)):
+        return (ws[0], ws[1])
+    return None
 
 
 def _fresh(factory, game: Game):
     """A fresh world with the game built into it. Raises on build failure."""
-    world = factory(seed=WORLD_SEED)
+    size = _world_size_of(game)
+    world = factory(seed=WORLD_SEED, size=size) if size else factory(seed=WORLD_SEED)
     game.build(world)
     return world
 
@@ -292,6 +308,12 @@ def run_g0(factory, source: str):
     if not actions_ok:
         return layer, game
 
+    # Declared WORLD_SIZE (optional) is well-shaped and within bounds.
+    ws_ok, ws_detail = _world_size_check(game.world_size)
+    checks["world_size"] = check(ws_ok, **ws_detail)
+    if not ws_ok:
+        return layer, game
+
     # build(world) runs.
     try:
         world = _fresh(factory, game)
@@ -341,6 +363,25 @@ def _truthy(fn) -> bool:
         return bool(fn())
     except Exception:
         return False
+
+
+def _world_size_check(declared) -> tuple[bool, dict]:
+    """Validate an optional declared WORLD_SIZE: None passes with the default;
+    otherwise it must be a 2-sequence of numbers within the engineering bounds."""
+    if declared is None:
+        return True, {"declared": None, "effective": [800, 600]}
+    shaped = (isinstance(declared, (list, tuple)) and len(declared) == 2
+              and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                      for v in declared))
+    if not shaped:
+        return False, {"declared": repr(declared), "error": "not a [w, h] pair"}
+    w, h = declared
+    in_bounds = (WORLD_W_BOUNDS[0] <= w <= WORLD_W_BOUNDS[1]
+                 and WORLD_H_BOUNDS[0] <= h <= WORLD_H_BOUNDS[1])
+    if not in_bounds:
+        return False, {"declared": [w, h],
+                       "bounds": [list(WORLD_W_BOUNDS), list(WORLD_H_BOUNDS)]}
+    return True, {"declared": [w, h], "effective": [w, h]}
 
 
 # ======================================================================== #
@@ -588,10 +629,15 @@ def run_g3(executor, game_source, actions, declared):
             f"[{', '.join(declared)}], observed [{', '.join(mismatch)}]")
 
     # --- The witness must be EXACTLY replayable from a fresh seeded world ---
+    # (frames_every=1 so the same replay feeds the solidity scan below)
     replay = executor.run_batch(game_source,
                                 [{"seed": WORLD_SEED, "actions": witness["actions"]}],
-                                len(witness["actions"]))[0]
+                                len(witness["actions"]), frames_every=1)[0]
     checks["replayable"] = check(replay["result"] == "success", result=replay["result"])
+
+    # --- Solidity: no sustained deep interpenetration on the winning path ---
+    worst = _solidity_scan(replay.get("frames", []))
+    checks["solidity"] = check(worst is None, **(worst or {}))
 
     layer["passed"] = all(c["pass"] for c in checks.values())
     return layer
@@ -600,6 +646,51 @@ def run_g3(executor, game_source, actions, declared):
 def _make_witness(seed: int, ep: dict) -> dict:
     return {"seed": seed, "actions": ep["actions"], "ticks": ep["ticks"],
             "checkpoints": dict(ep.get("checkpoints", {}))}
+
+
+def _solidity_scan(frames: list) -> dict | None:
+    """Engine-agnostic solidity scan over a frames list ({tick, entities:{query}}).
+
+    Flags SUSTAINED deep interpenetration between two non-sensor bodies (at
+    least one dynamic): AABB overlap depth > SOLIDITY_FRAC x the thinner body's
+    smaller bbox dimension, persisting >= SOLIDITY_TICKS consecutive sampled
+    frames. A body sitting half inside another on the WINNING path means the
+    game plays as "passes through obstacles"; one-frame solver slop under an
+    impact does not. Returns the worst offender or None."""
+    runs: dict = {}
+    worst: dict | None = None
+    for fr in frames:
+        ents = fr.get("entities", {})
+        names = [n for n, q in ents.items() if not q.get("sensor") and q.get("bbox")]
+        over_now = set()
+        for i, a in enumerate(names):
+            qa = ents[a]
+            for b in names[i + 1:]:
+                qb = ents[b]
+                if qa.get("static") and qb.get("static"):
+                    continue
+                ba, bb = qa["bbox"], qb["bbox"]
+                ox = min(ba[2], bb[2]) - max(ba[0], bb[0])
+                oy = min(ba[3], bb[3]) - max(ba[1], bb[1])
+                if ox <= 0.0 or oy <= 0.0:
+                    continue
+                depth = min(ox, oy)
+                thin = min(ba[2] - ba[0], ba[3] - ba[1], bb[2] - bb[0], bb[3] - bb[1])
+                if thin < 1.0:  # zero-thickness segments: AABB depth is meaningless
+                    continue
+                if depth <= SOLIDITY_FRAC * thin:
+                    continue
+                pair = (a, b)
+                over_now.add(pair)
+                runs[pair] = runs.get(pair, 0) + 1
+                if runs[pair] >= SOLIDITY_TICKS:
+                    frac = depth / thin
+                    if worst is None or frac > worst["frac"]:
+                        worst = {"pair": [a, b], "depth": round(depth, 1),
+                                 "frac": round(frac, 2), "tick": fr.get("tick")}
+        for pair in [p for p in runs if p not in over_now]:
+            del runs[pair]
+    return worst
 
 
 def _declared_order(factory, game) -> list[str]:
@@ -697,6 +788,13 @@ def _hint_g0(checks: dict) -> str:
         return (f"exactly one controlled dynamic body required (found {c or 'none'})")
     if not checks.get("counts", {}).get("pass", True):
         return f"too few entities ({checks['counts'].get('n')}); need at least {MIN_ENTITIES}"
+    if not checks.get("world_size", {"pass": True}).get("pass", True):
+        c = checks["world_size"]
+        if c.get("error"):
+            return f"WORLD_SIZE malformed ({c.get('declared')}): {c['error']}"
+        return (f"WORLD_SIZE {c.get('declared')} out of bounds — width "
+                f"{WORLD_W_BOUNDS[0]}..{WORLD_W_BOUNDS[1]}, height "
+                f"{WORLD_H_BOUNDS[0]}..{WORLD_H_BOUNDS[1]}")
     if not checks.get("no_penetration", {}).get("pass", True):
         a, b, d = checks["no_penetration"]["offenders"][0]
         return f"initial interpenetration between {a} and {b} ({d}px)"
@@ -766,6 +864,14 @@ def _hint_g3(checks: dict, layer: dict) -> str:
         return _hint_unsolved(checks, layer.get("progress"))
     if not checks.get("replayable", {}).get("pass", True):
         return "the discovered witness does not replay to success (non-deterministic engine)"
+    if not checks.get("solidity", {"pass": True}).get("pass", True):
+        c = checks["solidity"]
+        a, b = c.get("pair", ["?", "?"])
+        pct = int(100 * (c.get("frac") or 0))
+        return (f"solid bodies interpenetrate on the winning path: {a} sits "
+                f"{c.get('depth')}px inside {b} (~{pct}% of the thinner body) around "
+                f"tick {c.get('tick')} — reduce impulse/velocity magnitudes, enlarge "
+                f"or slow the bodies so collisions stay coherent")
     return "solvability failure (G3)"
 
 
@@ -830,6 +936,12 @@ def run_g0_js(facts: dict) -> dict:
     checks["actions"] = check(bool(actions_ok),
                               n=n if actions.get("is_list") else None)
     if not actions_ok:
+        return layer
+
+    ws = facts.get("world_size") or {}
+    ws_ok, ws_detail = _world_size_check(ws.get("declared"))
+    checks["world_size"] = check(ws_ok, **ws_detail)
+    if not ws_ok:
         return layer
 
     build = facts.get("build") or {}
@@ -1085,6 +1197,9 @@ def _finish_g3(report: dict, g3: dict) -> dict:
             report["failure_class"] = "GOAL_ERROR"
         elif not checks3.get("milestones_latched", {"pass": True}).get("pass", True):
             report["failure_class"] = "GOAL_ERROR"
+        elif not checks3.get("solidity", {"pass": True}).get("pass", True):
+            # Broken physics on the winning path is an ENVIRONMENT error.
+            report["failure_class"] = "ENV_ERROR"
         else:
             report["failure_class"] = "UNSOLVED"
             report["progress"] = g3.get("progress")

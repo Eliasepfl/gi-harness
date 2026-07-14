@@ -82,3 +82,8 @@ def success(world):
 def checkpoints(world):
     return {"halfway": world.query("dot")["pos"][0] > 400}
 ```
+
+## Optional world size (module-level constant, next to TITLE)
+WORLD_SIZE = (w, h)   # width 800..2400, height 600..1600; omit for the 800x600 default.
+    # The world rectangle spans x in [0, w], y in [0, h], y UP, gravity (0, -900).
+    # The renderer follows the controlled body with a camera - design multi-screen levels.

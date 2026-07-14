@@ -6,6 +6,7 @@
 - Exactly one world.control(...) call, on a DYNAMIC (non-static) body.
 - success(world) MUST be {false} at t=0 and stay pure (no side effects).
 - Player agency is mandatory: doing nothing - or repeating one idle action forever - must NEVER win.
-- The goal must be reachable within ~800 physics steps by SOME sequence of actions.
-- Keep bodies inside the 800x600 world at rest; avoid initial overlaps.
-- checkpoints(world) MUST return the same 1..6 snake_case keys on every call, all {false} at t=0, pure, and every milestone must be reachable on the way to success.
+- You may declare WORLD_SIZE = [w, h] (width 800..2400, height 600..1600; default 800x600). Keep every body inside YOUR world at rest; avoid initial overlaps.
+- The goal must be reachable within ~300 decision ticks (~1800 physics steps) by SOME action sequence - but any win in under 20 decision ticks is rejected as trivial. Aim for a winning run of 60-200 ticks with distinct stages.
+- SOLIDITY: the verifier replays the winning run and REJECTS the game if solid bodies interpenetrate deeply for multiple ticks (a player half inside a crate = broken game). Keep gameplay speeds moderate (roughly under 600 px/s; size impulses to mass), and never use paper-thin (<12px) solid bodies as walls.
+- checkpoints(world) MUST return the same 1..6 snake_case keys on every call, all {false} at t=0, pure, and every milestone must be reachable on the way to success. Aim for 4-6 milestones that mark genuinely distinct stages of the run, spread across it - not four ways to say "moved a bit".

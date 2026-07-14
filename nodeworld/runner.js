@@ -162,6 +162,7 @@ function evalHarvest(source) {
     " on_step: (typeof on_step!=='undefined'?on_step:undefined)," +
     " failure: (typeof failure!=='undefined'?failure:undefined)," +
     " success: (typeof success!=='undefined'?success:undefined)," +
+    " WORLD_SIZE: (typeof WORLD_SIZE!=='undefined'?WORLD_SIZE:undefined)," +
     " checkpoints: (typeof checkpoints!=='undefined'?checkpoints:undefined) })";
   const script = new vm.Script(source + harvest, { filename: "<game>" });
   return script.runInContext(context, { timeout: 5000 });
@@ -255,6 +256,7 @@ function runEpisode(game, world, actions, maxTicks, framesEvery, escapeMargin) {
     ticks: applied.length,
     checkpoints: latches,
     final_snapshot: world.snapshot(),
+    world_size: world.size.slice(),
     error: null,
   };
   if (framesEvery > 0) out.frames = frames;
@@ -276,8 +278,20 @@ function runEpisode(game, world, actions, maxTicks, framesEvery, escapeMargin) {
 // schema and hints are identical across engines). Gated like the Python funnel:
 // downstream fields are present only when upstream gates passed, so the Python
 // side reconstructs the same early-return check shape.
+// Effective world size for a game: its declared WORLD_SIZE when it looks like
+// [w, h] with finite numbers, else the 800x600 default. Bounds VALIDATION
+// (min/max) lives in the Python G0 layer; this only guards world construction.
+function worldSizeOf(game) {
+  const ws = game.WORLD_SIZE;
+  if (Array.isArray(ws) && ws.length === 2 &&
+      Number.isFinite(ws[0]) && Number.isFinite(ws[1]) && ws[0] > 0 && ws[1] > 0) {
+    return [ws[0], ws[1]];
+  }
+  return [800, 600];
+}
+
 function buildFreshWorld(game) {
-  const world = new World(WORLD_SEED);
+  const world = new World(WORLD_SEED, worldSizeOf(game));
   game.build(world);
   return world;
 }
@@ -377,6 +391,12 @@ function runCheck(source) {
   };
   const actionsOk = out.actions.is_list && out.actions.length >= 2 && out.actions.length <= 8 && out.actions.all_str;
   if (!actionsOk) return out;
+
+  // 4b. Declared world size (G0 world_size: bounds/shape validated in Python).
+  out.world_size = {
+    declared: g.WORLD_SIZE === undefined ? null : g.WORLD_SIZE,
+    effective: worldSizeOf(g),
+  };
 
   // 5. build(world) runs (G0 builds) -> a queryable world.
   let world;
@@ -479,7 +499,7 @@ async function main() {
       continue;
     }
     try {
-      const world = new World(ep.seed | 0);
+      const world = new World(ep.seed | 0, worldSizeOf(game));
       game.build(world);
       const rec = runEpisode(game, world, ep.actions || [], maxTicks, framesEvery, escapeMargin);
       lines.push(JSON.stringify(rec));

@@ -108,15 +108,17 @@ class PyExecutor:
     def run_batch(self, game_source, episodes, max_ticks, frames_every=0,
                   escape_margin=None) -> list[dict]:
         from harness.verify.gameverify import (
-            NAN_EVENT_TYPES, _dynamic_entities, _safe_events, _truthy, run_episode,
+            NAN_EVENT_TYPES, _dynamic_entities, _safe_events, _truthy,
+            _world_size_of, run_episode,
         )
         game = self._as_game(game_source)
         factory = self._factory_or_default()
+        size = _world_size_of(game)
         out: list[dict] = []
         for ep in episodes:
             seed = int(ep.get("seed", 0))
             actions = list(ep.get("actions", []))
-            world = factory(seed=seed)
+            world = factory(seed=seed, size=size) if size else factory(seed=seed)
             game.build(world)
             if frames_every and frames_every > 0:
                 rec = _run_episode_with_frames(game, world, actions, max_ticks,
@@ -129,6 +131,7 @@ class PyExecutor:
                 "checkpoints": dict(rec.get("checkpoints", {})),
                 "final_snapshot": rec.get("snapshot", {}),
                 "actions": rec.get("actions", actions[:rec["ticks"]]),
+                "world_size": list(getattr(world, "size", (800, 600))),
                 "error": rec.get("error"),
             }
             if "frames" in rec:
@@ -335,12 +338,17 @@ def render_js_replay(game_source, out_path, *, actions, seed: int = 0, label=Non
                 "error": ep.get("error")}
 
     frames_data = ep.get("frames", [])
-    world_size = (800, 600)
+    world_size = tuple(ep.get("world_size") or (800, 600))
+    cam = render.FollowCamera(world_size)
     imgs = []
     for fr in frames_data:
-        fw = _FrameWorld(fr.get("entities", {}), world_size)
+        ents = fr.get("entities", {})
+        target = next((tuple(q["pos"]) for q in ents.values()
+                       if q.get("controlled")), None)
+        fw = _FrameWorld(ents, world_size)
         imgs.append(render._render_frame(fw, fr.get("tick", 0), label or "",
-                                         scale, world_size))
+                                         scale, world_size,
+                                         camera=cam.update(target)))
     if not imgs:
         return {"ticks": ep.get("ticks", 0), "result": ep.get("result"),
                 "frames": 0, "error": "no frames emitted"}
