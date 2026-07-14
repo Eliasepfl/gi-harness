@@ -168,3 +168,10 @@ cluster→site return format per the ORCD plan); revisit later.
 1. Spec v2 build wave (raycast sensors first) + bank→`.tscn` templates.
 2. Tier-1 LLM attackers live (bulletproof grade).
 3. Day-3 site page when the calendar day warrants it.
+4. **Import `godot_rl_agents_examples` as the RL smoke-bench** (pinned
+   d659636; smoke PPO per env, then the method-grid bench on ORCD) — full
+   plan: `notes/engines/GODOT_RL_BENCH_AND_PIPELINE.md` §A.
+5. **Close the full prompt→verified-game pipeline on the Godot lane** (godot
+   prompt sections + gamegen spec emission + G4 confirm + runner.gd serve
+   mode for G3' + one live acceptance run with the complete pass table) —
+   same note §B; demo rung (ONNX in-engine videos à la godot_rl_agents) §C.
