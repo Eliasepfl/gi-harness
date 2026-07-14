@@ -277,6 +277,43 @@ def cmd_game_replay(args) -> int:
     return 0 if result.get("result") in ("success", "failure", "timeout") else 1
 
 
+def cmd_game_attack(args) -> int:
+    """Run the adversarial G4 suite on a certified game (g4.attack_game)."""
+    try:
+        from harness.verify.g4 import attack_game
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("g4", exc, args.json)
+
+    tiers = (0,) if args.tier == 0 else (0, 1)
+    try:
+        report = attack_game(args.game_path, tiers=tiers)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game attack", exc, args.json)
+
+    if args.json:
+        _emit_json(report)
+        return 0 if report.get("passed") else 1
+
+    print(f"{str(report.get('grade')).upper()}  {args.game_path}")
+    if report.get("error"):
+        print(f"  error    : {report['error']}")
+        if report.get("funnel_hint"):
+            print(f"  hint     : {report['funnel_hint']}")
+        return 0 if report.get("passed") else 1
+    findings = report.get("findings", [])
+    n_hard = len(report.get("hard_findings", []))
+    print(f"  tiers    : {report.get('tiers_run')}   witness : {report.get('witness_ticks')}")
+    print(f"  findings : {len(findings)} ({n_hard} hard)")
+    for f in findings[:10]:
+        tag = "HARD" if f.get("hard") else "soft"
+        print(f"    [{tag}] {f.get('outcome')} ({f.get('family')}): {f.get('detail')}")
+    t1 = report.get("tier1") or {}
+    if t1.get("status"):
+        extra = f" - {t1.get('reason')}" if t1.get("reason") else ""
+        print(f"  tier1    : {t1['status']}{extra}")
+    return 0 if report.get("passed") else 1
+
+
 def cmd_game_watch(args) -> int:
     """Watch a game play live in a pygame window (real-time witness replay)."""
     as_json = getattr(args, "json", False)
@@ -569,6 +606,15 @@ def build_parser() -> argparse.ArgumentParser:
     gr.add_argument("--seed", type=int, default=0)
     gr.add_argument("--json", action="store_true")
     gr.set_defaults(func=cmd_game_replay)
+
+    ga = gmsub.add_parser(
+        "attack", help="adversarial G4 suite on a certified game (tier 0/1)")
+    ga.add_argument("game_path")
+    ga.add_argument("--tier", type=int, default=0, choices=[0, 1],
+                    help="max tier: 0 (mechanical fuzz, no LLM) or 1 (adds the "
+                         "cheap-LLM attacker lane; needs an OpenRouter key)")
+    ga.add_argument("--json", action="store_true")
+    ga.set_defaults(func=cmd_game_attack)
 
     gw = gmsub.add_parser("watch", help="watch a game play live in a pygame window")
     gw.add_argument("game_path")
