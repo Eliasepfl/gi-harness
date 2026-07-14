@@ -67,6 +67,13 @@ const ALLOWED_IDENTS := {
 }
 const ALLOWED_OPS := "+-*/%(),<>=!"
 
+# spec-v2 sensors: a FIXED whitelist mapping a spec `type` to a vendored, audited
+# sensor script (godotworld/addons/sensors/). The spec supplies DATA only (which
+# type + params); no spec string is ever executed. Unlisted types are ignored.
+const SENSOR_SCRIPTS := {
+	"raycast2d": "res://addons/sensors/RaycastSensor2D.gd",
+}
+
 # --------------------------------------------------------------------------- #
 # Parsed-spec state (set once by _load_spec)
 # --------------------------------------------------------------------------- #
@@ -77,6 +84,7 @@ var _spec_joints := []
 var _spec_contacts := []
 var _spec_act := {}
 var _spec_on_step := []
+var _spec_sensors := []             # spec-v2 sensor descriptors (DATA)
 var _spec_predicates := {}
 var _world_w := 800.0
 var _world_h := 600.0
@@ -98,6 +106,7 @@ var _steps := 0
 var _frozen := false
 var _nan := false
 var _tick_forces := []              # [[RigidBody2D, Vector2], ...] re-applied each sub-step
+var _sensors := []                  # [{node, n_rays}] in spec order -> obs tail
 
 var _query_ctx = null               # QueryCtx (Expression base instance)
 var _expr_cache := {}               # expr String -> Expression | null (parse/scan failed)
@@ -199,6 +208,7 @@ func _load_spec(source) -> String:
 	_spec_contacts = spec.get("on_contact", []) if typeof(spec.get("on_contact", [])) == TYPE_ARRAY else []
 	_spec_act = spec.get("act", {}) if typeof(spec.get("act", {})) == TYPE_DICTIONARY else {}
 	_spec_on_step = spec.get("on_step", []) if typeof(spec.get("on_step", [])) == TYPE_ARRAY else []
+	_spec_sensors = spec.get("sensors", []) if typeof(spec.get("sensors", [])) == TYPE_ARRAY else []
 	_spec_predicates = spec.get("predicates", {}) if typeof(spec.get("predicates", {})) == TYPE_DICTIONARY else {}
 
 	var ws = _spec_meta.get("world_size", null)
@@ -236,6 +246,7 @@ func _build_scene() -> String:
 	_frozen = false
 	_nan = false
 	_tick_forces = []
+	_sensors = []
 
 	for spec_body in _spec_bodies:
 		var err := _add_body(spec_body)
@@ -261,6 +272,11 @@ func _build_scene() -> String:
 	for beh in _spec_on_step:
 		if typeof(beh) == TYPE_DICTIONARY and str(beh.get("kind", "")) == "rising_level":
 			_flags[str(beh.get("flag", ""))] = float(beh.get("start", 0.0))
+
+	# spec-v2 sensors: instantiate each vendored sensor under its named body (DATA
+	# only -- no spec code runs). Added after all bodies exist so `attach_to` resolves.
+	for s in _spec_sensors:
+		_add_sensor(s)
 
 	return ""
 
@@ -409,6 +425,35 @@ func _add_joint(j) -> void:
 		_container.add_child(pin)
 
 
+func _add_sensor(s) -> void:
+	# spec-v2: attach a vendored obs sensor under a named body. `type` selects a
+	# FIXED whitelisted script; every param is DATA. Params are set BEFORE add_child
+	# so the sensor's `_ready` spawns its rays with the spec values (its setters do
+	# not re-spawn at runtime -- the editor-only path was stripped when vendored).
+	if typeof(s) != TYPE_DICTIONARY:
+		return
+	var stype := str(s.get("type", ""))
+	if not SENSOR_SCRIPTS.has(stype):
+		return
+	var rec = _bodies.get(str(s.get("attach_to", "")), null)
+	if rec == null or rec.removed:
+		return
+	var script = load(SENSOR_SCRIPTS[stype])
+	if script == null:
+		return
+	var node = script.new()
+	if s.has("n_rays"):
+		node.n_rays = float(s.get("n_rays"))
+	if s.has("ray_length"):
+		node.ray_length = float(s.get("ray_length"))
+	if s.has("cone_width_deg"):
+		node.cone_width = float(s.get("cone_width_deg"))
+	if s.has("collision_mask"):
+		node.collision_mask = int(s.get("collision_mask"))
+	rec.node.add_child(node)
+	_sensors.append({"node": node, "n_rays": int(node.n_rays)})
+
+
 func _teardown_scene() -> void:
 	if _container != null:
 		_container.queue_free()
@@ -416,6 +461,7 @@ func _teardown_scene() -> void:
 	_bodies = {}
 	_order = []
 	_node_ids = {}
+	_sensors = []
 
 
 # =========================================================================== #
@@ -434,6 +480,13 @@ func _run_episode(ep: Dictionary, max_ticks: int, frames_every: int,
 		_teardown_scene()
 		await process_frame
 		return _err_line("build failed: " + build_err)
+
+	# Sensor guard (#95359): a RayCast2D added this frame does not register with the
+	# physics space until one physics step elapses, so `force_raycast_update` would
+	# read empty on the first tick. Settle ONE frame here (sensor specs only, so
+	# sensor-free specs stay byte-for-byte unchanged). Not counted in `_steps`.
+	if not _sensors.is_empty():
+		await physics_frame
 
 	if frames_every > 0:
 		frames.append(_frame_json(0))
@@ -471,12 +524,19 @@ func _run_episode(ep: Dictionary, max_ticks: int, frames_every: int,
 	var oob_json := ""
 	if has_margin:
 		oob_json = _oob_json(margin)
+	# Read the sensor obs tail at the final settled state (before teardown frees them).
+	var has_obs := not _sensors.is_empty()
+	var obs_json := ""
+	if has_obs:
+		obs_json = _obs_json()
 
-	_teardown_scene()
+	_teardown_scene()  # clears _sensors -> capture has_obs above, not after
 	await process_frame  # flush the deferred free before the next build
 
 	var line := '{"result":"%s","ticks":%d,"checkpoints":%s,"final_snapshot":%s,"world_size":[%s,%s]' % [
 		result, applied, _checkpoints_json(latches), snap, _num(_world_w), _num(_world_h)]
+	if has_obs:
+		line += ',"obs":[%s]' % obs_json
 	if frames_every > 0:
 		line += ',"frames":[%s]' % ",".join(frames)
 	if has_margin:
@@ -893,10 +953,34 @@ func _query_json(rec) -> String:
 		rec.shape, _b(rec.static), _b(rec.sensor), _b(rec.controlled)]
 
 
+func _read_obs() -> Array:
+	# Concatenate every attached sensor's get_observation() in spec order -> the
+	# flat obs tail (floats). A sensor whose host body was removed reads as skipped.
+	var obs := []
+	for s in _sensors:
+		var node = s.node
+		if node == null or not is_instance_valid(node):
+			continue
+		var vals = node.get_observation()
+		if typeof(vals) == TYPE_ARRAY:
+			for v in vals:
+				obs.append(float(v))
+	return obs
+
+
+func _obs_json() -> String:
+	var parts := PackedStringArray()
+	for v in _read_obs():
+		parts.append(_f(float(v)))
+	return ",".join(parts)
+
+
 func _frame_json(tick: int) -> String:
 	var parts := PackedStringArray()
 	for name in _order:
 		parts.append('"%s":%s' % [_esc(name), _query_json(_bodies[name])])
+	if not _sensors.is_empty():
+		return '{"tick":%d,"entities":{%s},"obs":[%s]}' % [tick, ",".join(parts), _obs_json()]
 	return '{"tick":%d,"entities":{%s}}' % [tick, ",".join(parts)]
 
 
