@@ -58,7 +58,7 @@ import random
 
 # The executor seam + the §2 runner helpers. We only READ gameverify (never edit
 # it): its loader, engine detector and default World factory are stable handles.
-from harness.verify.executors import JsExecutor, PyExecutor, VerifyError
+from harness.verify.executors import GodotExecutor, JsExecutor, PyExecutor, VerifyError
 from harness.verify.gameverify import (
     _default_world_factory, detect_engine, load_game,
 )
@@ -313,6 +313,11 @@ def classify(ep, engine, *, avoidance, witness_ticks, controlled, initial_snapsh
 def _make_executor(engine, world_factory):
     if engine == "js":
         return JsExecutor()
+    if engine == "godot":
+        # Declarative-spec games attack through the SAME seam as py/js — the batch
+        # executor is the only physics contact. Without this branch a .spec.json
+        # would fall through to PyExecutor and mis-execute the spec as pymunk code.
+        return GodotExecutor()
     return PyExecutor(world_factory=world_factory or _default_world_factory)
 
 

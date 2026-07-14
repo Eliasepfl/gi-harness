@@ -1277,3 +1277,91 @@ def test_parse_parts_used_js_matches_bank_names_among_add():
 def test_parse_parts_used_empty_when_no_bank_calls():
     assert GG._parse_parts_used(GG._DRIFT, "py", {"puck", "goal_zone"}) == []
     assert GG._parse_parts_used("", "py", {"puck"}) == []
+
+
+def test_parse_parts_used_godot_matches_body_names():
+    # godot: the spec's body NAMES carry part identity (skinned by name, like js).
+    bank_names = {"marble", "tree", "bush", "wall"}
+    used = GG._parse_parts_used(GG._TRAVERSE_GODOT, "godot", bank_names)
+    assert used == ["wall", "tree", "bush", "marble"]   # in spec order, deduped
+
+
+# --- Godot engine wiring (declarative JSON spec) ------------------------------
+
+from harness.verify.executors import find_godot_exe  # noqa: E402
+
+GODOT_EXE = find_godot_exe()
+requires_godot = pytest.mark.skipif(
+    GODOT_EXE is None, reason="Godot binary not present")
+
+
+def test_engine_helpers_route_godot():
+    assert GG._resolve_engine("godot") == "godot"
+    assert GG._game_ext("godot") == ".spec.json"
+    assert GG._engine_lang("godot") == ("JSON", "json")
+
+
+def test_system_prompt_godot_is_compose():
+    from harness.gen import prompts as P
+    assert GG._system_prompt("godot") == P.compose("godot")
+
+
+def test_first_user_msg_godot_asks_for_a_json_spec():
+    msg = GG._first_user_msg("bounce a ball", "godot")
+    assert "```json" in msg
+    assert "spec (one JSON object)" in msg
+    assert "```python" not in msg
+
+
+def test_extract_spec_roundtrip_from_padded_reply():
+    spec = json.loads(GG._TRAVERSE_GODOT)
+    # A realistic model reply: DESIGN block, a ```json fence, and trailing prose.
+    reply = ("DESIGN\nTheme: climb\nMilestones: a -> b\n\n```json\n"
+             + GG._TRAVERSE_GODOT + "```\nThat is my spec.\n")
+    got = GG._extract_code(reply, "godot")
+    assert json.loads(got) == spec              # clean round-trip through verify's parser
+
+
+def test_extract_spec_tolerates_keepalive_padding_and_no_fence():
+    # Leading keep-alive padding + NO code fence at all (first '{' .. last '}').
+    reply = "\n\n: OPENROUTER PROCESSING\n" + '{"meta": {"title": "x"}, "bodies": []}'
+    got = GG._extract_spec(reply)
+    assert json.loads(got) == {"meta": {"title": "x"}, "bodies": []}
+
+
+def test_extract_spec_falls_back_when_no_braces():
+    assert GG._extract_spec("no object here") == "no object here"
+
+
+def test_ledger_records_engine(tmp_path):
+    from harness.core import telemetry
+    ledger = tmp_path / "ledger.jsonl"
+    result = {"backend": "template", "engine": "godot", "verdict": "COMPLETED",
+              "attempts": [{"report": {"passed": True}}]}
+    entry = telemetry.record_run(result, "climb the shelves", "template", 1.0,
+                                 path=str(ledger))
+    assert entry["engine"] == "godot"
+    line = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert line["engine"] == "godot"
+
+
+@requires_godot
+def test_generate_game_godot_template_roundtrip(tmp_path):
+    """The acceptance round-trip: a template-backend prompt -> .spec.json ->
+    the FULL G0-G3 godot funnel, all green, engine recorded end to end."""
+    res = GG.generate_game("climb the quarry shelves to the beacon",
+                           out_dir=str(tmp_path), backend="template",
+                           engine="godot", max_repairs=1, use_bank=False)
+    assert res["engine"] == "godot"
+    assert res["backend"] == "template"
+    assert res["verdict"] == "COMPLETED", res.get("attempts")
+    path = res["game_path"]
+    assert path and path.endswith(".spec.json")
+    # The promoted artifact is a real, re-verifiable spec.
+    from harness.verify.gameverify import detect_engine
+    assert detect_engine(path) == "godot"
+    spec = json.loads(open(path, "r", encoding="utf-8").read())
+    assert spec["meta"]["actions"] and any(b.get("control") for b in spec["bodies"])
+    # The certified report carries the engine + a witness the funnel found.
+    final = res["attempts"][-1]["report"]
+    assert final["engine"] == "godot" and final["passed"]

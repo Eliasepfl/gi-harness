@@ -10,6 +10,12 @@ prompts, pour mieux les changer separement"):
                          the runner drives a game. Uses {lang}-style placeholders.
     api_py.md/api_js.md - the concrete per-engine World API reference + the
                          module-format signatures + a structure-only stub.
+    api_godot.md       - the Godot lane's SELF-CONTAINED engine section: the
+                         declarative game-spec contract + the body/joint/act/
+                         on_step tables + the predicate DSL + a worked example.
+                         The Godot artifact is DATA (a JSON spec interpreted by a
+                         frozen runner), not code, so it carries its own contract
+                         framing instead of reusing the code-centric contract.md.
     rules.md           - the hard constraints (our accumulating lessons, incl.
                          the no-dead-action rule).
     orientation.md     - composition idioms ("invent a mechanic", proven patterns).
@@ -36,14 +42,15 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 CONTRACT = "contract.md"
 API_PY = "api_py.md"
 API_JS = "api_js.md"
+API_GODOT = "api_godot.md"
 RULES = "rules.md"
 ORIENTATION = "orientation.md"
 DESIGN_BLOCK = "design_block.md"
 BANK_MENU_TMPL = "bank_menu.md.tmpl"
 
 # Every section a composed prompt draws from (used by tests to assert coverage).
-SECTIONS = (CONTRACT, API_PY, API_JS, RULES, ORIENTATION, DESIGN_BLOCK,
-            BANK_MENU_TMPL)
+SECTIONS = (CONTRACT, API_PY, API_JS, API_GODOT, RULES, ORIENTATION,
+            DESIGN_BLOCK, BANK_MENU_TMPL)
 
 # Per-engine substitutions applied to the placeholder-bearing sections. Keys are
 # braced tokens ({lang}, ...) so they never collide with real code braces
@@ -52,6 +59,7 @@ _SUBS = {
     "py": {
         "{lang}": "Python",
         "{fence}": "python",
+        "{artifact}": "module",
         "{substrate}": "pymunk underneath",
         "{dict_word}": "a dict",
         "{false}": "False",
@@ -61,6 +69,7 @@ _SUBS = {
     "js": {
         "{lang}": "JavaScript",
         "{fence}": "javascript",
+        "{artifact}": "module",
         "{substrate}": "Planck.js / Box2D underneath",
         "{dict_word}": "a plain object",
         "{false}": "false",
@@ -69,11 +78,32 @@ _SUBS = {
                           "(and Math)."),
         "{rng_forbid}": "fake it with constants",
     },
+    # The Godot lane emits DATA, not code: the engine-neutral rules.md / design_block.md
+    # sections still render for it, so provide spec-flavoured values for their
+    # placeholders. api_godot.md is the self-contained engine section (its own
+    # contract); contract.md (the code-module contract) is NOT composed for godot.
+    "godot": {
+        "{lang}": "JSON",
+        "{fence}": "json",
+        "{artifact}": "JSON spec",
+        "{substrate}": "stock Godot Physics 2D",
+        "{dict_word}": "a JSON object",
+        "{false}": "false",
+        "{import_rule}": ("No code at all: you emit ONE JSON object that the frozen "
+                          "runner interprets. The only expressions allowed are the "
+                          "whitelisted predicate DSL."),
+        "{rng_forbid}": "hard-code the layout to fake it",
+    },
 }
 
 
 def _engine_key(engine) -> str:
-    return "js" if str(engine).lower() == "js" else "py"
+    e = str(engine).lower()
+    if e == "js":
+        return "js"
+    if e == "godot":
+        return "godot"
+    return "py"
 
 
 def _read(name: str) -> str:
@@ -101,12 +131,21 @@ def compose(engine="py", menu_text=None) -> str:
     [Tier-1b parts menu] -> DESIGN output format. `menu_text` is the already
     rendered menu (harness.gen.retrieval.build_menu); when None the prompt is the
     legend-only/no-bank baseline. Deterministic: same inputs -> identical bytes.
+
+    The Godot lane emits DATA, not code, so it swaps the code-module contract.md +
+    api_*.md pair for the SELF-CONTAINED api_godot.md (its own spec contract); the
+    rest of the pipeline (rules, orientation, menu, DESIGN block) is shared.
     """
     key = _engine_key(engine)
-    api = API_JS if key == "js" else API_PY
-    parts = [
-        _render(_read(CONTRACT), key),
-        _render(_read(api), key),
+    if key == "godot":
+        parts = [_render(_read(API_GODOT), key)]
+    else:
+        api = API_JS if key == "js" else API_PY
+        parts = [
+            _render(_read(CONTRACT), key),
+            _render(_read(api), key),
+        ]
+    parts += [
         _render(_read(RULES), key),
         _render(_read(ORIENTATION), key),
     ]

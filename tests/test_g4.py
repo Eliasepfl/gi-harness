@@ -473,5 +473,42 @@ def test_to_repair_report_shape():
     assert rr["hint"] and rr["g4_reproducer"] == {"engine": "py"}
 
 
+# ---------------------------------------------------------------------------
+# B3 smoke — attack a certified Godot spec end to end (skipped without Godot).
+# This exercises the SAME wiring the py/js lanes use: detect_engine routes the
+# .spec.json to the godot lane, attack_game verifies then hammers it, and the
+# router must hand tier 0 a GodotExecutor (not fall through to PyExecutor). The
+# fuzz sizing is deliberately tiny to keep the in-image Godot spawns fast.
+# ---------------------------------------------------------------------------
+from harness.verify.executors import find_godot_exe  # noqa: E402
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TRAVERSE_SPEC = os.path.join(_ROOT, "godotworld", "examples", "traverse.spec.json")
+requires_godot = pytest.mark.skipif(
+    find_godot_exe() is None, reason="Godot binary not present")
+
+
+def test_make_executor_routes_godot_to_godot_executor():
+    # Pure-python guard on the router fix (no Godot needed): a godot engine must
+    # get a GodotExecutor, never the pymunk default.
+    from harness.verify.executors import GodotExecutor, PyExecutor
+    assert isinstance(g4._make_executor("godot", None), GodotExecutor)
+    assert isinstance(g4._make_executor("py", None), PyExecutor)
+
+
+@requires_godot
+def test_attack_game_routes_and_hardens_a_godot_spec():
+    out = g4.attack_game(_TRAVERSE_SPEC, tiers=(0,), sandboxed=False, seed=0,
+                         horizon=40, fuzz_random=6, fuzz_long=3, noop_heavy=3,
+                         alt_periods=(1, 2), anti_variants=1)
+    # Routed to the godot lane (not "uncertified"/"error") and actually attacked.
+    assert out["engine"] == "godot", out
+    assert "error" not in out, out
+    assert out.get("grade") in ("bulletproof", "hardened", "open"), out
+    # ACTIONS were recovered from the G1 efficacy report (the js/godot path).
+    assert out["actions"] == ["run_left", "run_right", "hop"]
+    assert out["tier0"]["episodes"] > 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
