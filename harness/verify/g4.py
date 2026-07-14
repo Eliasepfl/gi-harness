@@ -880,6 +880,13 @@ def _actions_from_report(report):
     try:
         return list(report["actions"])
     except (KeyError, TypeError):
+        pass
+    # The G1 efficacy check holds the declared move set as its `effect` keys —
+    # present in every certified report, both engines.
+    try:
+        eff = report["layers"]["G1_rollout"]["checks"]["efficacy"]["effect"]
+        return list(eff.keys()) or None
+    except (KeyError, TypeError):
         return None
 
 
