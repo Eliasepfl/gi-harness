@@ -11,7 +11,7 @@
       "description": "Optional engine marker. When present must be \"godot\"; the harness also routes any *.spec.json path to this lane.",
       "const": "godot"
     },
-    "spec_version": {"type": "integer", "enum": [1]},
+    "spec_version": {"type": "integer", "enum": [1, 2]},
     "meta": {
       "type": "object",
       "required": ["title", "prompt", "actions"],
@@ -47,6 +47,11 @@
     "on_contact": {
       "type": "array",
       "items": {"$ref": "#/definitions/contact_rule"}
+    },
+    "sensors": {
+      "type": "array",
+      "description": "spec-v2: optional raycast obs sensors attached under a named body; each get_observation() is appended to the runner's per-tick obs tail. See SPEC.md.",
+      "items": {"$ref": "#/definitions/sensor"}
     },
     "act": {
       "type": "object",
@@ -121,6 +126,20 @@
         "rest_length": {"type": "number", "description": "spring only"},
         "stiffness": {"type": "number", "description": "spring only"},
         "damping": {"type": "number", "description": "spring only"}
+      }
+    },
+    "sensor": {
+      "type": "object",
+      "description": "spec-v2 raycast obs sensor. A fan of n_rays RayCast2D over cone_width_deg, attached under `attach_to`; each ray returns a normalized proximity in [0,1] (0 = no hit, ->1 as the hit nears).",
+      "required": ["type", "attach_to"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"enum": ["raycast2d"]},
+        "attach_to": {"type": "string", "minLength": 1, "description": "name of the body the sensor rides on"},
+        "n_rays": {"type": "integer", "minimum": 1, "maximum": 64, "description": "ray count (obs length); default 16"},
+        "ray_length": {"type": "number", "exclusiveMinimum": 0, "description": "max ray reach in px; default 200"},
+        "cone_width_deg": {"type": "number", "exclusiveMinimum": 0, "maximum": 360, "description": "fan spread in degrees; default 360"},
+        "collision_mask": {"type": "integer", "minimum": 0, "description": "2D physics layers the rays hit; default 1"}
       }
     },
     "contact_rule": {

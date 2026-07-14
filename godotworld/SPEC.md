@@ -30,6 +30,7 @@ latch checkpoints, check failure then success), the same y-UP px world with grav
   "on_contact": [ ... ],             // optional: latch a flag when two bodies touch
   "act":    { "<action>": [ verbs ] },
   "on_step":[ ... ],                 // optional: fixed behavior library
+  "sensors":[ ... ],                 // optional (spec-v2): raycast obs fans -> obs tail
   "predicates": { "success": "...", "failure"?: "...", "checkpoints": { ... } }
 }
 ```
@@ -109,6 +110,40 @@ order. `kind` selects the behavior:
 
 These four suffice for the shipped archetypes; new behaviors are a follow-up
 (`GODOT_LANE.md`).
+
+## 7b. `sensors` — raycast observation fans (spec-v2, optional)
+
+> Not to be confused with a body's `sensor: true` flag (§3), which makes that body a
+> non-colliding Area2D overlap zone. `sensors` here is a **top-level list of RL-style
+> observation probes** — audited nodes vendored from `godot_rl_agents` (MIT,
+> `godotworld/addons/sensors/`), attached under a named body and read as an **obs tail**.
+
+Each entry describes a proximity fan riding on one body:
+
+```jsonc
+{ "type": "raycast2d",     // the only sensor type in spec-v2
+  "attach_to": "<body>",   // name of the body the fan rides on (required)
+  "n_rays": 16,            // ray count = obs length; 1..64 (default 16)
+  "ray_length": 200,       // max reach in px (default 200)
+  "cone_width_deg": 360,   // fan spread in degrees (default 360)
+  "collision_mask": 1 }    // 2D physics layers the rays hit (default 1)
+```
+
+`n_rays` `RayCast2D` are fanned evenly over `cone_width_deg` (centered on the body's
+local +x). Each ray reports a **normalized proximity** `(ray_length − hit_dist)/ray_length`
+∈ `[0, 1]` — **`0` = no hit; larger = the hit point is nearer** (the vendored convention;
+a ray never sees its own host body). The runner concatenates every sensor's
+`get_observation()` (in spec order) into a flat float array and appends it as an `"obs"`
+tail on **each per-tick frame** and on the **episode record** (the final settled read).
+Specs with no `sensors` block emit no `"obs"` key at all — the frozen runner's existing
+output is byte-for-byte unchanged.
+
+Sensors are pure **DATA** (a fixed `type` selects a fixed vendored script — no spec string
+is ever executed), so they add no ambient authority. Determinism holds: identical jobs
+yield byte-identical obs. One subtlety (Godot issue #95359): a `RayCast2D` added at build
+time does not register with the physics space until a step elapses, so for sensor specs the
+runner settles **one** physics frame after build (uncounted in `steps`) before the first
+read — sensor-free specs skip this and are unaffected.
 
 ## 8. `predicates` — the whitelisted expression DSL
 
