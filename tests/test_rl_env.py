@@ -305,3 +305,103 @@ def test_smoke_train_improves_and_witness_replays(corridor):
     assert cert["learnable"] is True
     assert cert["rl_witness"] is not None
     assert cert["bridge_ok"] is True  # replayed to success via JsExecutor
+
+
+# ======================================================================== #
+# 4. Gymnasium adapter over PlanckEnv (the SB3 lane — skipif gymnasium absent)
+# ======================================================================== #
+# gymnasium ships WITH stable-baselines3 (requirements.txt, the [LF] migration);
+# it is absent from the current certifier image, so these SKIP here and the
+# orchestrator re-runs them in the sb3 image.
+@requires_serve
+def test_gym_adapter_spaces_mirror_planckenv(corridor):
+    gym = pytest.importorskip("gymnasium")
+    from harness.rl.env import make_gym_env
+
+    genv = make_gym_env(corridor)
+    try:
+        # Spaces are gymnasium spaces sized from the env's own obs_dim / n_actions.
+        assert isinstance(genv.observation_space, gym.spaces.Box)
+        assert isinstance(genv.action_space, gym.spaces.Discrete)
+        assert genv.action_space.n == 2
+        n_bodies = len(genv._env._body_order)
+        assert genv.observation_space.shape == (n_bodies * rlenv.PER_BODY + 2 + 1,)
+        assert genv.observation_space.dtype == np.float32
+        obs, info = genv.reset(seed=0)
+        assert obs.dtype == np.float32
+        assert genv.observation_space.contains(obs)
+    finally:
+        genv.close()
+
+
+@requires_serve
+def test_gym_adapter_seed_flows_into_planckenv_reset(corridor):
+    """reset(seed=) must forward the EXACT int into PlanckEnv's seeded reset, and a
+    following reset(seed=None) (SB3's autoreset form) must REUSE the latched seed —
+    the vendored VecEnv contract (fixed per-env seed, reused) the witness needs."""
+    pytest.importorskip("gymnasium")
+    from harness.rl.env import make_gym_env
+
+    genv = make_gym_env(corridor)
+    try:
+        seen: list[int] = []
+        planck = genv._env
+        orig = planck.reset
+
+        def spy(seed=0):
+            seen.append(int(seed))
+            return orig(seed=seed)
+
+        planck.reset = spy
+        genv.reset(seed=13)     # explicit -> latched
+        genv.reset()            # None -> reuse 13
+        genv.reset(seed=4)      # new explicit -> latched
+        genv.reset()            # None -> reuse 4
+        assert seen == [13, 13, 4, 4]
+    finally:
+        genv.close()
+
+
+@requires_serve
+def test_gym_adapter_obs_matches_raw_planckenv(corridor):
+    """The adapter returns PlanckEnv's obs UNCHANGED (same seed -> same vector)."""
+    pytest.importorskip("gymnasium")
+    from harness.rl.env import make_gym_env
+
+    genv = make_gym_env(corridor)
+    raw = rlenv.PlanckEnv(corridor)
+    try:
+        a_obs, _ = genv.reset(seed=5)
+        r_obs, _ = raw.reset(seed=5)
+        assert np.array_equal(a_obs, r_obs)
+    finally:
+        genv.close()
+        raw.close()
+
+
+# ======================================================================== #
+# 5. Trainer-switch regression guard — the vendored path is provably unchanged
+# ======================================================================== #
+# NB: no sb3 needed here — this RUNS in the current image. `default` and
+# `vendored` are two INDEPENDENT g3_prime invocations at the same seed; their
+# byte-identity proves BOTH that the default trainer is still the vendored PPO AND
+# that the vendored path is deterministic run-to-run (the refactor perturbs
+# nothing). Only wall-clock keys are excused.
+_TIMING_KEYS = ("wall_clock_s", "throughput_sps")
+
+
+def _stable(result: dict) -> dict:
+    return {k: v for k, v in result.items() if k not in _TIMING_KEYS}
+
+
+@requires_serve
+def test_vendored_trainer_default_and_byte_identical(corridor):
+    from harness.rl.certify import g3_prime
+
+    kw = dict(budget_steps=6000, seed=0, n_eval=4,
+              num_envs=4, num_steps=64, patience=999)
+    default = g3_prime(corridor, **kw)                       # trainer defaults here
+    vendored = g3_prime(corridor, trainer="vendored", **kw)
+
+    assert default["trainer"] == "vendored"                 # default IS vendored
+    assert _stable(default) == _stable(vendored)            # + deterministic, unchanged

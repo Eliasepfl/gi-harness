@@ -298,3 +298,80 @@ class PlanckEnv:
             self.close()
         except Exception:
             pass
+
+
+# --- Gymnasium adapter (OPTIONAL dep — the SB3 trainer lane only) -------------
+# `gymnasium` is not needed on the vendored PPO lane (ppo.py drives PlanckEnv's
+# gym-compatible surface directly with the Box/Discrete duck-types above), so it
+# is an optional dependency that arrives only with stable-baselines3
+# (GODOT_RL_AGENTS_CAPABILITIES.md §6.7, the [LF] migration). To keep env.py
+# importable WITHOUT gymnasium, the real gymnasium.Env subclass is built on first
+# use rather than at module import.
+_GYM_ENV_CLS = None
+
+
+def _gym_env_cls():
+    """Lazily define (and cache) the gymnasium.Env adapter subclass over PlanckEnv."""
+    global _GYM_ENV_CLS
+    if _GYM_ENV_CLS is not None:
+        return _GYM_ENV_CLS
+
+    import gymnasium as gym
+    from gymnasium import spaces
+
+    class GymPlanckEnv(gym.Env):
+        """A thin gymnasium.Env WRAPPER over one live PlanckEnv (wrap, don't
+        rewrite — PlanckEnv already mirrors the Gym API). Its only jobs are to
+        re-export PlanckEnv's frozen spaces as gymnasium ``spaces`` (sized from
+        the env's own ``obs_dim``/``n_actions``) and to thread gymnasium's
+        keyword-only ``reset(*, seed=...)`` contract into PlanckEnv's
+        deterministic per-episode seeding.
+
+        The seed is LATCHED: a ``reset(seed=None)`` — the form SB3's VecEnv uses
+        on autoreset — reuses the last explicit seed, so every episode of a given
+        env replays the SAME deterministic world. That exactly reproduces the
+        vendored VecEnv contract (base_seed+i, reused on autoreset) the RL witness
+        depends on, which is why the seed plumbing is witness-relevant.
+        """
+
+        metadata = {"render_modes": []}
+
+        def __init__(self, planck_env: "PlanckEnv"):
+            super().__init__()
+            self._env = planck_env
+            self._seed = 0                         # latched seed (see class docstring)
+            obs_dim = int(planck_env.observation_space.shape[0])
+            self.observation_space = spaces.Box(
+                low=-OBS_CLIP, high=OBS_CLIP, shape=(obs_dim,), dtype=np.float32)
+            self.action_space = spaces.Discrete(planck_env.action_space.n)
+            # Convenience passthroughs the eval rollouts read (action strings, horizon).
+            self.actions = planck_env.actions
+            self.horizon = planck_env.horizon
+
+        def reset(self, *, seed=None, options=None):
+            if seed is not None:
+                self._seed = int(seed)            # remember it for autoreset
+            obs, info = self._env.reset(seed=self._seed)
+            return obs, info
+
+        def step(self, action):
+            return self._env.step(int(action))
+
+        def close(self):
+            self._env.close()
+
+    _GYM_ENV_CLS = GymPlanckEnv
+    return _GYM_ENV_CLS
+
+
+def wrap_gym(planck_env: "PlanckEnv"):
+    """Wrap a live PlanckEnv in the gymnasium.Env adapter (see ``_gym_env_cls``)."""
+    return _gym_env_cls()(planck_env)
+
+
+def make_gym_env(game_path: str, **kwargs):
+    """Construct a PlanckEnv for ``game_path`` and return it wrapped as a
+    gymnasium.Env. Factory form so SB3's ``make_vec_env``/``DummyVecEnv`` thunks
+    (`lambda: make_gym_env(path)`) work, while env.py stays importable when
+    gymnasium is absent (the vendored lane never calls this)."""
+    return wrap_gym(PlanckEnv(game_path, **kwargs))
