@@ -298,6 +298,60 @@ def _py_line(entry: dict) -> str:
             f'{tail} | bodies: {len(entry.get("assembly", []))}')
 
 
+# --- v2 menu (name | volume | role - objective | overrides) ------------------
+# Role -> one-line objective phrase, mirroring ASSET_BANK_V2.md §3's role table.
+# Local (not imported from the offline bank_tools grower) so the gen loop stays
+# decoupled from the bank-authoring code.
+_ROLE_OBJECTIVE = {
+    "obstacle": "blocks the body",
+    "platform": "static foothold to stand on",
+    "hazard": "latches the failure flag on contact",
+    "collectible": "collects (runner auto-wires on_contact + remove)",
+    "goal": "reach-flag read by the success predicate",
+    "gate": "static posts + a sensor span (checkpoint)",
+    "mover": "behaviour-driven moving part",
+    "movable": "pushable dynamic body",
+    "vehicle": "natural controlled body (you still declare control)",
+    "decor": "cosmetic only",
+}
+
+_V2_USAGE = (
+    "Each line is an advisory VOLUME + ROLE: a certified footprint (shape and "
+    "size in px) and the objective the runner instantiates for that role. Treat "
+    "them as vocabulary for placing objects by objective and position - not a "
+    "catalog to exhaust, and never a constraint on your design. Build bodies "
+    "yourself; the bank only supplies shapes already proven correct.")
+
+
+def _volume_str(entry: dict) -> str:
+    """Compact one-line rendering of an entry's volume.footprint_2d."""
+    fp = (entry.get("volume") or {}).get("footprint_2d") or {}
+    shape = fp.get("shape")
+    if shape == "box":
+        w, h = fp.get("size", [0, 0])
+        return f"box {_num(w)}x{_num(h)}"
+    if shape == "circle":
+        return f"circle r={_num(fp.get('radius', 0))}"
+    if shape == "segment":
+        (ax, ay), (bx, by) = fp.get("a", [0, 0]), fp.get("b", [0, 0])
+        return f"segment {_num(abs(bx - ax))}x{_num(abs(by - ay))}"
+    if shape == "poly":
+        verts = fp.get("vertices", [])
+        xs = [v[0] for v in verts] or [0]
+        ys = [v[1] for v in verts] or [0]
+        return f"poly {len(verts)}v {_num(max(xs) - min(xs))}x{_num(max(ys) - min(ys))}"
+    return "n/a"
+
+
+def _v2_line(entry: dict) -> str:
+    role = entry.get("role", "?")
+    objective = _ROLE_OBJECTIVE.get(role, "")
+    over = _overrides_summary(entry)
+    tail = f" | overrides: {over}" if over else ""
+    return (f'  {entry["name"]} | volume: {_volume_str(entry)} '
+            f'| role: {role} - {objective}{tail}')
+
+
 def _js_line(entry: dict) -> str:
     n_bodies = len(entry.get("assembly", []))
     note = "" if n_bodies == 1 else f"  (+ {n_bodies - 1} more body/joint - see world.pin/pivot/spring)"
@@ -317,12 +371,25 @@ def build_menu(names, engine="py", *, bank=None) -> str:
     godot : same as js — the declarative spec has no ``world.part()``; its body
          NAMES drive sprite skinning exactly like js, so it reuses the js menu.
 
+    v2 catalog (``bank.is_v2``): one engine-agnostic ``name | volume: shape WxH |
+    role: <role> - <objective> | overrides`` line — the advisory volume+role
+    vocabulary of ASSET_BANK_V2.md §5.5 (no sprite-naming rule; there are no
+    sprites in v2). The ``engine`` argument is ignored for a v2 bank.
+
     Returns ``""`` when ``names`` is empty (caller uses the legend-only prompt).
     """
     names = list(names or [])
     if not names:
         return ""
     b = bank if bank is not None else _bank.load_bank("v1")
+
+    # v2 catalog: one advisory name | volume | role line, engine-agnostic
+    # (ASSET_BANK_V2.md §5.5). The bank is ADVISORY vocabulary here; the designer
+    # reads it and writes bodies itself (DECISIONS §1).
+    if getattr(b, "is_v2", False):
+        lines = [_v2_line(b.parts[n]) for n in names if n in b.parts]
+        return _prompts.render_bank_menu("\n".join(lines), _V2_USAGE)
+
     key = "js" if str(engine).lower() in ("js", "godot") else "py"
 
     if key == "js":

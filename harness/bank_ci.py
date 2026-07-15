@@ -18,8 +18,20 @@ and the World's NaN sentinel) rather than reimplementing sanity:
     mobile           joint(s) present; settles without NaN; bounded motion/spin
     trigger          primary is a sensor (never blocks a body)
 
-CLI: ``python -m harness.bank_ci [--version v1] [--json]`` prints a table and exits
-non-zero if any entry fails (naming the offending entry + checks).
+For a v2 catalog (ASSET_BANK_V2.md) the per-``physics_class`` FLOOR above is joined
+by two added families keyed on the entry's ``volume`` + ``role_contract``:
+
+    volume           realized AABB matches the declared footprint within tol,
+                     bounded across the override-grid extremes
+    role_contract    each machine-checkable promise re-asserted on live bodies
+                     (obstacle => static+non-sensor; collectible => sensor+removable;
+                     goal => sensor+non-lethal; gate => posts static + span sensor)
+
+The floor is keyed identically for both schemas (``physics_class`` is v1's
+``category`` renamed), so one certifier admits v1 and v2 alike.
+
+CLI: ``python -m harness.bank_ci [--version v1|v2] [--json]`` prints a table and
+exits non-zero if any entry fails (naming the offending entry + checks).
 """
 
 from __future__ import annotations
@@ -29,7 +41,7 @@ import json
 import math
 import sys
 
-from harness.core.bank import load_bank
+from harness.core.bank import load_bank, resolve_part
 from harness.verify.gameverify import ESCAPE_MARGIN, NAN_EVENT_TYPES, PEN_INIT_TOL
 from harness.core.world import World
 
@@ -41,7 +53,82 @@ SPEED_LIMIT = 1000.0        # px/s: bounded linear speed for mobile parts [eng.]
 REST_PEN_TOL = 2.5          # px: tolerated resting interpenetration after settle [eng.]
 GROUND_TOP = 20.0           # test-ground top edge (box at (400,10), size (_,20))
 PROP_SPAWN = (400.0, 140.0)  # default spawn for parts with no cert.pos [eng.]
+VOLUME_TOL_PX = 2.0         # px: absolute slack on the realized-vs-declared AABB [eng.]
+VOLUME_TOL_FRAC = 0.03      # +fraction of the declared extent (scale-robust) [eng.]
 _GROUND_NAME = "__ground"
+
+
+# --- v2 volume + role_contract helpers (ASSET_BANK_V2.md §5.4) ----------- #
+def _footprint_extent(fp: dict) -> tuple:
+    """(width, height) of a declared volume.footprint_2d block."""
+    shape = fp.get("shape")
+    if shape == "box":
+        return float(fp["size"][0]), float(fp["size"][1])
+    if shape == "circle":
+        d = 2.0 * float(fp["radius"])
+        return d, d
+    if shape == "segment":
+        (ax, ay), (bx, by) = fp["a"], fp["b"]
+        return abs(bx - ax), abs(by - ay)
+    xs = [v[0] for v in fp["vertices"]]
+    ys = [v[1] for v in fp["vertices"]]
+    return max(xs) - min(xs), max(ys) - min(ys)
+
+
+def _realized_extent(world, names: list) -> tuple:
+    """(width, height) of the union AABB of ``names`` in the live world."""
+    boxes = [world.query(n)["bbox"] for n in names]
+    x0 = min(b[0] for b in boxes)
+    y0 = min(b[1] for b in boxes)
+    x1 = max(b[2] for b in boxes)
+    y1 = max(b[3] for b in boxes)
+    return x1 - x0, y1 - y0
+
+
+def _volume_ok(world, names: list, entry: dict, overrides: dict) -> bool:
+    """Realized AABB matches the declared footprint (scaled), within tolerance."""
+    ew, eh = _footprint_extent(entry["volume"]["footprint_2d"])
+    scale = float(overrides.get("scale", 1.0))
+    ew, eh = ew * scale, eh * scale
+    rw, rh = _realized_extent(world, names)
+    tw = VOLUME_TOL_PX + VOLUME_TOL_FRAC * ew
+    th = VOLUME_TOL_PX + VOLUME_TOL_FRAC * eh
+    return abs(rw - ew) <= tw and abs(rh - eh) <= th
+
+
+def _q(world, name: str):
+    return world.query(name)
+
+
+def _rc_posts_static(w, e, p, rm) -> bool:
+    posts = [nm for r, nm in rm.items() if str(r).startswith("post")]
+    return bool(posts) and all(_q(w, nm)["static"] and not _q(w, nm)["sensor"]
+                               for nm in posts)
+
+
+def _rc_span_sensor(w, e, p, rm) -> bool:
+    nm = rm.get("span")
+    return nm is not None and _q(w, nm)["sensor"]
+
+
+# token -> live predicate (world, entry, primary_name, roles_map) -> bool. Asserts
+# the physically-observable subset of a role_contract on the settled bodies.
+_RC_LIVE = {
+    "primary_static": lambda w, e, p, rm: _q(w, p)["static"],
+    "primary_non_sensor": lambda w, e, p, rm: not _q(w, p)["sensor"],
+    "primary_dynamic": lambda w, e, p, rm: not _q(w, p)["static"],
+    "primary_sensor": lambda w, e, p, rm: _q(w, p)["sensor"],
+    "pushable": lambda w, e, p, rm: not _q(w, p)["static"] and not _q(w, p)["sensor"],
+    "controllable": lambda w, e, p, rm: not _q(w, p)["static"],
+    "removable": lambda w, e, p, rm: _q(w, p)["sensor"],
+    "pairs_with_got_flag": lambda w, e, p, rm: _q(w, p)["sensor"],
+    "non_lethal": lambda w, e, p, rm: _q(w, p)["sensor"],
+    "joint_present": lambda w, e, p, rm: len(e.get("joints", [])) >= 1,
+    "walkable_slope": lambda w, e, p, rm: _q(w, p)["static"] and not _q(w, p)["sensor"],
+    "posts_static": _rc_posts_static,
+    "span_sensor": _rc_span_sensor,
+    "span_reach_flag": _rc_span_sensor,
+}
 
 
 def _grid(entry: dict) -> list[tuple[str, dict]]:
@@ -89,9 +176,19 @@ def _penetrations(world, names: list[str], tol: float) -> list:
     return offenders
 
 
+def _entry_class(entry: dict) -> str:
+    """The physics_class (v2) or its v1 ``category`` synonym — the CI floor key."""
+    return entry.get("physics_class", entry.get("category"))
+
+
 def certify_instance(entry: dict, overrides: dict) -> dict:
-    """Certify one instantiation. Returns {"ok": bool, "failed": [labels]}."""
-    cat = entry["category"]
+    """Certify one instantiation. Returns {"ok": bool, "failed": [labels]}.
+
+    Instantiates the entry directly via ``resolve_part`` (not ``World.part``, whose
+    name-lookup is pinned to v1) so v1 AND v2 entries — including parametric names
+    absent from v1 — certify through the same live settle-grid.
+    """
+    cat = _entry_class(entry)
     cert = entry.get("cert", {})
     ground = cert.get("ground", cat == "prop")
 
@@ -102,7 +199,13 @@ def certify_instance(entry: dict, overrides: dict) -> dict:
     pos = list(cert.get("pos") or PROP_SPAWN)
 
     try:
-        primary = world.part("cert", entry["name"], pos=pos, **overrides)
+        resolved = resolve_part(entry, "cert", pos, overrides)
+        for body in resolved.bodies:
+            world.add(body["name"], body["shape"], **body["kwargs"])
+        for joint in resolved.joints:
+            getattr(world, joint["verb"])(*joint["args"], **joint["kwargs"])
+        primary = resolved.primary
+        roles_map = resolved.roles
     except Exception as exc:  # noqa: BLE001 - instantiation failure is a hard fail
         return {"ok": False, "failed": [f"instantiate:{exc}"]}
 
@@ -118,6 +221,12 @@ def certify_instance(entry: dict, overrides: dict) -> dict:
     # --- initial self-penetration (mobile subassemblies must abut, not overlap) ---
     need(not _penetrations(world, sub, PEN_INIT_TOL), "self_penetration")
 
+    # --- v2 VOLUME: realized AABB matches the declared footprint, at INIT (before
+    #     a dynamic body settles) and bounded across the override grid extremes. ---
+    volume_ok = True
+    if "volume" in entry:
+        volume_ok = _volume_ok(world, sub, entry, overrides)
+
     # --- settle ---
     world.step(SETTLE_STEPS)
 
@@ -129,7 +238,7 @@ def certify_instance(entry: dict, overrides: dict) -> dict:
     rest_names = sub + ([_GROUND_NAME] if ground else [])
     need(not _penetrations(world, rest_names, REST_PEN_TOL), "rest_penetration")
 
-    # --- per-category invariant ---
+    # --- per-class FLOOR invariant (physics_class == v1 category) ---
     if cat == "terrain":
         need(all(world.query(n)["static"] for n in sub), "not_all_static")
         moved = max(
@@ -150,6 +259,13 @@ def certify_instance(entry: dict, overrides: dict) -> dict:
         speed = max((_speed(world, n) for n in dyn), default=0.0)
         need(speed < SPEED_LIMIT, "unbounded_speed")
 
+    # --- v2 VOLUME + ROLE (semantic ceiling above the floor) ---
+    need(volume_ok, "volume")
+    for tok in entry.get("role_contract", []):
+        check = _RC_LIVE.get(tok)
+        if check is not None:
+            need(check(world, entry, primary, roles_map), f"contract:{tok}")
+
     return {"ok": not failed, "failed": failed}
 
 
@@ -158,7 +274,7 @@ def certify_entry(entry: dict) -> dict:
     results = [(label, certify_instance(entry, ov)) for label, ov in _grid(entry)]
     ok = all(r["ok"] for _, r in results)
     failed = sorted({f"{label}:{f}" for label, r in results for f in r["failed"]})
-    return {"name": entry["name"], "category": entry["category"],
+    return {"name": entry["name"], "category": _entry_class(entry),
             "grid": len(results), "ok": ok, "failed": failed}
 
 

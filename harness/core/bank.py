@@ -41,7 +41,29 @@ CATEGORY_INVARIANTS = {
     "decor": (),
 }
 
+# --- v2 vocabulary (ASSET_BANK_V2.md §3) --------------------------------- #
+# ``physics_class`` is the v1 ``category`` renamed: the CI FLOOR, keyed exactly
+# like CATEGORY_INVARIANTS (static/dynamic/sensor/jointed). ``role`` is the added
+# first-class objective the runner instantiates. The two split the one v1 axis.
+PHYSICS_CLASSES = CATEGORIES
+ROLES = frozenset({
+    "obstacle", "platform", "hazard", "collectible", "goal", "gate",
+    "mover", "movable", "vehicle", "decor",
+})
+FOOTPRINT_SHAPES = SHAPES
+
+# Machine-checkable role_contract promises (the semantic CEILING above the
+# physics_class floor). Each token has a DATA-level cross-check here (in
+# ``_validate_role_contract``) and a live re-assertion in ``harness.bank_ci``.
+ROLE_CONTRACT_TOKENS = frozenset({
+    "primary_static", "primary_non_sensor", "primary_dynamic", "primary_sensor",
+    "pushable", "removable", "pairs_with_got_flag", "non_lethal", "controllable",
+    "walkable_slope", "joint_present", "posts_static", "span_sensor",
+    "span_reach_flag",
+})
+
 _SCHEMA_VERSION = "1.0"
+_SCHEMA_VERSION_V2 = "2.0"
 _LOCK_NAME = "bank.lock"
 _CATALOG_NAME = "parts.json"
 
@@ -178,8 +200,23 @@ def _validate_overridable(part_name: str, over: dict, roles: set) -> None:
 
 
 def validate_bank(data: dict) -> None:
-    """Validate a parsed catalog; raise BankValidationError on any problem."""
+    """Validate a parsed catalog; raise BankValidationError on any problem.
+
+    Dispatches on ``schema_version``: ``"1.0"`` -> the v1 shape (``category`` +
+    ``sprite:null``); ``"2.0"`` -> the v2 shape (``physics_class`` + ``role`` +
+    ``volume`` + ``role_contract`` + ``render_binding``). The two share the
+    assembly/joints/overridable machinery verbatim (ASSET_BANK_V2.md §3).
+    """
     _require(isinstance(data, dict), "catalog root must be an object")
+    sv = data.get("schema_version")
+    if sv == _SCHEMA_VERSION_V2:
+        _validate_bank_v2(data)
+        return
+    _validate_bank_v1(data)
+
+
+def _validate_bank_v1(data: dict) -> None:
+    """Validate a parsed v1 catalog; raise BankValidationError on any problem."""
     _require(data.get("schema_version") == _SCHEMA_VERSION,
              f"schema_version must be {_SCHEMA_VERSION!r}")
     _require(isinstance(data.get("bank_version"), str) and data["bank_version"],
@@ -240,6 +277,214 @@ def validate_bank(data: dict) -> None:
                      f"{cat} part {name!r}: primary body must be a sensor")
         elif cat == "mobile":
             _require(len(joints) >= 1, f"mobile part {name!r}: needs at least one joint")
+
+
+# ======================================================================== #
+# v2 validation (ASSET_BANK_V2.md §3) — superset of v1, forward-compatible.
+# ======================================================================== #
+def _footprint_extent(fp: dict) -> tuple:
+    """(width, height) of a footprint_2d block (its axis-aligned bounding box)."""
+    shape = fp.get("shape")
+    if shape == "box":
+        w, h = fp["size"]
+        return float(w), float(h)
+    if shape == "circle":
+        d = 2.0 * float(fp["radius"])
+        return d, d
+    if shape == "segment":
+        (ax, ay), (bx, by) = fp["a"], fp["b"]
+        return abs(bx - ax), abs(by - ay)
+    if shape == "poly":
+        xs = [v[0] for v in fp["vertices"]]
+        ys = [v[1] for v in fp["vertices"]]
+        return max(xs) - min(xs), max(ys) - min(ys)
+    return 0.0, 0.0
+
+
+def _validate_footprint(name: str, fp: dict) -> None:
+    where = f"part {name!r} volume.footprint_2d"
+    _require(isinstance(fp, dict), f"{where}: must be an object")
+    shape = fp.get("shape")
+    _require(shape in FOOTPRINT_SHAPES,
+             f"{where}: shape {shape!r} not in {sorted(FOOTPRINT_SHAPES)}")
+    if shape == "box":
+        sz = fp.get("size")
+        _require(_is_vec2(sz) and sz[0] > 0 and sz[1] > 0,
+                 f"{where}: box needs size=[w>0, h>0]")
+    elif shape == "circle":
+        r = fp.get("radius")
+        _require(_is_num(r) and r > 0, f"{where}: circle needs radius>0")
+    elif shape == "segment":
+        _require(_is_vec2(fp.get("a")) and _is_vec2(fp.get("b")),
+                 f"{where}: segment needs a=[x,y] and b=[x,y]")
+    elif shape == "poly":
+        verts = fp.get("vertices")
+        _require(isinstance(verts, list) and len(verts) >= 3
+                 and all(_is_vec2(v) for v in verts),
+                 f"{where}: poly needs >=3 [x,y] vertices")
+    # Volume sanity: a footprint must enclose positive area on both axes.
+    w, h = _footprint_extent(fp)
+    _require(w > 0 and h > 0, f"{where}: degenerate footprint (extent {w}x{h})")
+
+
+def _validate_volume(name: str, vol: dict) -> None:
+    where = f"part {name!r} volume"
+    _require(isinstance(vol, dict), f"{where}: must be an object")
+    _require("footprint_2d" in vol, f"{where}: missing 'footprint_2d'")
+    _validate_footprint(name, vol["footprint_2d"])
+    # The 3D slot is reserved but MUST stay null in v2 (Path B deferred, §4).
+    _require(vol.get("glb", None) is None,
+             f"{where}: glb must be null (flat-3D Path B is deferred)")
+
+
+def _validate_render_binding(name: str, rb: dict) -> None:
+    where = f"part {name!r} render_binding"
+    _require(isinstance(rb, dict), f"{where}: must be an object")
+    prim = rb.get("primitive_2d")
+    _require(isinstance(prim, dict), f"{where}: primitive_2d must be an object")
+    _require(isinstance(prim.get("shape"), str) and prim["shape"],
+             f"{where}: primitive_2d.shape must be a non-empty string")
+    _require(isinstance(prim.get("color_by"), str) and prim["color_by"],
+             f"{where}: primitive_2d.color_by must be a non-empty string")
+    # Style-neutral: the reserved .tscn slot stays null in v2 (Path B deferred).
+    _require(rb.get("tscn", None) is None,
+             f"{where}: tscn must be null (flat-3D Path B is deferred)")
+
+
+def _validate_role_contract(name: str, contract, by_role: dict,
+                            primary_body: dict, n_joints: int) -> None:
+    """Cross-check each role_contract token against the STATIC entry shape.
+
+    bank_ci re-asserts the physically-observable subset on live, settled bodies;
+    this rejects a mis-declared promise at load time (ASSET_BANK_V2.md §5.4).
+    """
+    where = f"part {name!r} role_contract"
+    _require(isinstance(contract, list)
+             and all(isinstance(t, str) for t in contract),
+             f"{where}: must be a list of strings")
+    for tok in contract:
+        _require(tok in ROLE_CONTRACT_TOKENS,
+                 f"{where}: unknown token {tok!r}; "
+                 f"allowed: {sorted(ROLE_CONTRACT_TOKENS)}")
+    p = primary_body
+    static = bool(p.get("static", False))
+    sensor = bool(p.get("sensor", False))
+    c = set(contract)
+    if "primary_static" in c:
+        _require(static, f"{where}: primary_static but primary is dynamic")
+    if "primary_non_sensor" in c:
+        _require(not sensor, f"{where}: primary_non_sensor but primary is a sensor")
+    if "primary_dynamic" in c:
+        _require(not static, f"{where}: primary_dynamic but primary is static")
+    if "primary_sensor" in c:
+        _require(sensor, f"{where}: primary_sensor but primary is not a sensor")
+    if "pushable" in c:
+        _require(not static and not sensor,
+                 f"{where}: pushable needs a dynamic, non-sensor primary")
+    if "controllable" in c:
+        _require(not static, f"{where}: controllable needs a dynamic primary")
+    if "removable" in c:
+        _require(sensor, f"{where}: removable needs a sensor primary")
+    if "pairs_with_got_flag" in c:
+        _require(sensor, f"{where}: pairs_with_got_flag needs a sensor primary")
+    if "non_lethal" in c:
+        _require(sensor, f"{where}: non_lethal needs a sensor primary (no impulse)")
+    if "joint_present" in c:
+        _require(n_joints >= 1, f"{where}: joint_present but no joints declared")
+    if "walkable_slope" in c:
+        _require(p.get("shape") == "poly",
+                 f"{where}: walkable_slope needs a poly primary")
+        ys = [v[1] for v in p.get("vertices", [])]
+        _require(len(set(ys)) > 1,
+                 f"{where}: walkable_slope needs a sloped (non-flat) footprint")
+    if "posts_static" in c:
+        posts = [b for r, b in by_role.items() if str(r).startswith("post")]
+        _require(posts and all(b.get("static") and not b.get("sensor")
+                               for b in posts),
+                 f"{where}: posts_static needs >=1 static, non-sensor post body")
+    if "span_sensor" in c or "span_reach_flag" in c:
+        span = by_role.get("span")
+        _require(span is not None and span.get("sensor"),
+                 f"{where}: span must be a sensor body")
+
+
+def _validate_bank_v2(data: dict) -> None:
+    """Validate a parsed v2 catalog; raise BankValidationError on any problem."""
+    _require(data.get("schema_version") == _SCHEMA_VERSION_V2,
+             f"schema_version must be {_SCHEMA_VERSION_V2!r}")
+    _require(isinstance(data.get("bank_version"), str) and data["bank_version"],
+             "bank_version must be a non-empty string")
+    parts = data.get("parts")
+    _require(isinstance(parts, list) and parts, "'parts' must be a non-empty list")
+
+    seen: set = set()
+    for part in parts:
+        _require(isinstance(part, dict), "each part must be an object")
+        name = part.get("name")
+        _require(isinstance(name, str) and name, "part missing 'name'")
+        _require(name not in seen, f"duplicate part name {name!r}")
+        seen.add(name)
+
+        pc = part.get("physics_class")
+        _require(pc in PHYSICS_CLASSES,
+                 f"part {name!r}: physics_class {pc!r} not in {sorted(PHYSICS_CLASSES)}")
+        role = part.get("role")
+        _require(role in ROLES,
+                 f"part {name!r}: role {role!r} not in {sorted(ROLES)}")
+        # v2 drops the v1 sprite:null hard-require in favour of render_binding.
+        _require("sprite" not in part,
+                 f"part {name!r}: v2 has no 'sprite' (use render_binding)")
+        _require(isinstance(part.get("summary"), str) and part["summary"],
+                 f"part {name!r}: missing 'summary'")
+        _require(isinstance(part.get("tags"), list)
+                 and all(isinstance(t, str) for t in part["tags"]),
+                 f"part {name!r}: tags must be a list of strings")
+
+        _require("volume" in part, f"part {name!r}: missing 'volume'")
+        _validate_volume(name, part["volume"])
+        _require("render_binding" in part, f"part {name!r}: missing 'render_binding'")
+        _validate_render_binding(name, part["render_binding"])
+
+        prov = part.get("provenance")
+        _require(isinstance(prov, dict)
+                 and all(k in prov for k in ("author", "license", "source")),
+                 f"part {name!r}: provenance needs author/license/source")
+
+        assembly = part.get("assembly")
+        _require(isinstance(assembly, list) and assembly,
+                 f"part {name!r}: assembly must be a non-empty list")
+        roles: set = set()
+        for body in assembly:
+            _validate_body(name, body, roles)
+
+        primary = part.get("primary")
+        _require(primary in roles, f"part {name!r}: primary {primary!r} is not a body role")
+
+        joints = part.get("joints", [])
+        _require(isinstance(joints, list), f"part {name!r}: joints must be a list")
+        for joint in joints:
+            _validate_joint(name, joint, roles)
+
+        _validate_overridable(name, part.get("overridable", {}), roles)
+
+        # physics_class FLOOR at the DATA level (bank_ci re-checks on live bodies).
+        by_role = {b["role"]: b for b in assembly}
+        if pc == "terrain":
+            _require(all(b.get("static") for b in assembly),
+                     f"terrain part {name!r}: every body must be static")
+        elif pc == "prop":
+            _require(not by_role[primary].get("static", False),
+                     f"prop part {name!r}: primary body must be dynamic")
+        elif pc in ("hazard", "trigger"):
+            _require(by_role[primary].get("sensor", False),
+                     f"{pc} part {name!r}: primary body must be a sensor")
+        elif pc == "mobile":
+            _require(len(joints) >= 1, f"mobile part {name!r}: needs at least one joint")
+
+        # role_contract SEMANTIC ceiling.
+        _require("role_contract" in part, f"part {name!r}: missing 'role_contract'")
+        _validate_role_contract(name, part["role_contract"], by_role,
+                                by_role[primary], len(joints))
 
 
 def _is_num(x) -> bool:
@@ -410,11 +655,26 @@ class Bank:
         self.content_hash = digest
         self.lock = lock
 
+    @property
+    def schema_version(self) -> str:
+        return self.data.get("schema_version", _SCHEMA_VERSION)
+
+    @property
+    def is_v2(self) -> bool:
+        return self.schema_version == _SCHEMA_VERSION_V2
+
     def names(self) -> list[str]:
         return list(self.parts)
 
     def by_category(self, category: str) -> list[str]:
-        return [n for n, p in self.parts.items() if p["category"] == category]
+        return [n for n, p in self.parts.items() if p.get("category") == category]
+
+    def by_physics_class(self, physics_class: str) -> list[str]:
+        return [n for n, p in self.parts.items()
+                if p.get("physics_class") == physics_class]
+
+    def by_role(self, role: str) -> list[str]:
+        return [n for n, p in self.parts.items() if p.get("role") == role]
 
     def get(self, name: str) -> dict:
         if name not in self.parts:
@@ -480,7 +740,7 @@ def write_lock(version: str = "v1") -> dict:
     writes ``bank.lock``. Not called on the hot path.
     """
     bank = load_bank(version, use_cache=False)
-    lock = {"schema_version": _SCHEMA_VERSION,
+    lock = {"schema_version": bank.schema_version,
             "bank_version": bank.bank_version,
             "content_hash": bank.content_hash,
             "n_parts": len(bank.parts)}
