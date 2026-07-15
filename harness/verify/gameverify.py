@@ -54,6 +54,12 @@ NOOP_TICKS = 100            # 600 physics steps of noop rollout (600 / K_STEPS) 
 ESCAPE_MARGIN = 200.0       # px: a dynamic body beyond world+margin has escaped [eng.]
 EFFICACY_TICKS = 15         # hold each action from t0 for 15 ticks (90 steps) [eng.]
 EFFICACY_EPS = 1e-3         # px/rad: min snapshot divergence for a "live" action [eng.]
+CONTEXT_BURST_TICKS = 8     # ticks of each OTHER action used to build a dynamic
+                            # context before re-probing an action that looked dead
+                            # at t=0 — so a brake is tested on a MOVING body, a drop
+                            # while holding, etc. Small: this is a G1 gate, not a
+                            # solver (cost stays at the old t=0 pass unless something
+                            # is dead at rest) [eng.]
 DETERMINISM_EPS = 1e-6      # px/rad: two identical seeded runs must match within this [eng.]
 NAN_EVENT_TYPES = {"nan_detected", "nan", "explosion"}
 
@@ -442,22 +448,73 @@ def run_g1(executor, game_source, actions):
     delta = _snapshot_delta(r1["final_snapshot"], r2["final_snapshot"])
     checks["determinism"] = check(delta <= DETERMINISM_EPS, delta=_round_inf(delta))
 
-    # --- Action efficacy: each declared action must move the world ---
-    eff_specs = [{"seed": WORLD_SEED, "actions": [None] * EFFICACY_TICKS}]
-    eff_specs += [{"seed": WORLD_SEED, "actions": [a] * EFFICACY_TICKS} for a in actions]
-    eff = executor.run_batch(game_source, eff_specs, EFFICACY_TICKS)
-    baseline = eff[0]["final_snapshot"]
-    dead = []
-    effect = {}
-    for action, rec in zip(actions, eff[1:]):
-        d = _snapshot_delta(rec["final_snapshot"], baseline)
-        effect[action] = _round_inf(d)
-        if d <= EFFICACY_EPS:
-            dead.append(action)
-    checks["efficacy"] = check(not dead, dead=dead, effect=effect)
+    # --- Action efficacy: each declared action must move the world from SOME
+    # context (not only t=0). Context-dependent actions — brake on a moving body,
+    # drop/release/un-grab — are inert at rest but live once another action sets up
+    # the dynamic state, so they are re-probed from a short burst of each OTHER
+    # action before being called dead (2026-07-15 parking-game false positive). ---
+    dead, effect, n_contexts = _action_efficacy(executor, game_source, actions)
+    checks["efficacy"] = check(not dead, dead=dead, effect=effect,
+                               contexts=n_contexts)
 
     layer["passed"] = all(c["pass"] for c in checks.values())
     return layer
+
+
+def _action_efficacy(executor, game_source, actions):
+    """Per-action efficacy over a small, deterministic set of contexts.
+
+    An action is LIVE if, held for ``EFFICACY_TICKS``, it diverges the world from
+    the otherwise-identical noop continuation of SOME probed context; dead only if
+    it diverges in NONE. Contexts, in fixed order:
+
+      (0) the initial state (t=0), and — only for actions that look dead there —
+      (1..) the state left by a ``CONTEXT_BURST_TICKS`` burst of each OTHER action.
+
+    The t=0 pass alone reproduces the pre-fix check, so a game whose actions are all
+    live from rest pays exactly the old cost (no burst batch is run). Everything is
+    seeded (``WORLD_SEED``) and iterated in declared order, so it is reproducible.
+
+    Returns ``(dead, effect, n_contexts)``: ``effect`` maps EVERY declared action to
+    its BEST (max) divergence across the probed contexts (``None`` for an infinite /
+    body-set-changing divergence, as before), preserving the shape g4 reads;
+    ``n_contexts`` is how many contexts a dead action was probed from (``1`` when the
+    t=0 pass already cleared everything, else ``1 + #other actions``)."""
+    actions = list(actions)
+
+    # (0) t=0 pass: baseline noop + each action held from rest.
+    t0_specs = [{"seed": WORLD_SEED, "actions": [None] * EFFICACY_TICKS}]
+    t0_specs += [{"seed": WORLD_SEED, "actions": [a] * EFFICACY_TICKS} for a in actions]
+    t0 = executor.run_batch(game_source, t0_specs, EFFICACY_TICKS)
+    base0 = t0[0]["final_snapshot"]
+    best = {a: _snapshot_delta(rec["final_snapshot"], base0)
+            for a, rec in zip(actions, t0[1:])}
+
+    dead0 = [a for a in actions if best[a] <= EFFICACY_EPS]
+    if not dead0:
+        return [], {a: _round_inf(best[a]) for a in actions}, 1
+
+    # (1..) burst pass: re-probe each t=0-dead action from the state left by a short
+    # burst of every OTHER action. One shared baseline per burst context (burst then
+    # noop); each candidate is that same burst then the probed action held. Run as a
+    # single batch (one subprocess for the out-of-process lanes).
+    horizon = CONTEXT_BURST_TICKS + EFFICACY_TICKS
+    base_specs = [{"seed": WORLD_SEED,
+                   "actions": [b] * CONTEXT_BURST_TICKS + [None] * EFFICACY_TICKS}
+                  for b in actions]
+    cand_index = [(b, a) for b in actions for a in dead0 if a != b]
+    cand_specs = [{"seed": WORLD_SEED,
+                   "actions": [b] * CONTEXT_BURST_TICKS + [a] * EFFICACY_TICKS}
+                  for (b, a) in cand_index]
+    recs = executor.run_batch(game_source, base_specs + cand_specs, horizon)
+    base_snaps = {b: recs[i]["final_snapshot"] for i, b in enumerate(actions)}
+    for (b, a), rec in zip(cand_index, recs[len(actions):]):
+        d = _snapshot_delta(rec["final_snapshot"], base_snaps[b])
+        best[a] = max(best[a], d)
+
+    n_contexts = 1 + max(0, len(actions) - 1)   # t=0 + one per OTHER action
+    dead = [a for a in actions if best[a] <= EFFICACY_EPS]
+    return dead, {a: _round_inf(best[a]) for a in actions}, n_contexts
 
 
 def _repeat(value, n):
@@ -859,7 +916,10 @@ def _hint_g1(checks: dict) -> str:
         return (f"non-deterministic simulation: two identical seeded rollouts diverged "
                 f"(delta={checks['determinism'].get('delta')})")
     if not checks.get("efficacy", {}).get("pass", True):
-        return f"dead action(s) with no effect on the world: {', '.join(checks['efficacy']['dead'])}"
+        eff = checks["efficacy"]
+        n = eff.get("contexts", 1)
+        return (f"dead action(s) with no effect on the world from any of {n} "
+                f"probed context(s): {', '.join(eff['dead'])}")
     return "rollout failure (G1)"
 
 
