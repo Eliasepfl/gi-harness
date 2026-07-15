@@ -17,6 +17,16 @@ config/name="godotworld-spike"
 config/features=PackedStringArray("4.7")
 run/disable_stdout=false
 
+[threading]
+
+; Cap the general-purpose WorkerThreadPool. Headless Godot otherwise sizes it to
+; the HOST's online CPU count (448 on the ORCD nodes, ignoring our 4-core taskset),
+; spawning ~450 threads PER process -- which blows the shared `ulimit -u` and lets
+; only one Godot run at a time. Physics is on the main thread (2d/run_on_separate_
+; thread=false), so this does not touch stepping/determinism; the batch runner stays
+; byte-identical. A small pool is ample for our asset-free, headless workload.
+worker_pool/max_threads=3
+
 [physics]
 
 common/physics_ticks_per_second=60

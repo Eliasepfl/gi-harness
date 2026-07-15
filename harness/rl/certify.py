@@ -69,6 +69,22 @@ def _bridge_replay(game_source: str, witness: dict) -> dict:
     return recs[0]
 
 
+def _bridge_replay_godot(game_source: str, witness: dict) -> dict:
+    """Godot twin of :func:`_bridge_replay`: replay the RL witness through the
+    NORMAL batch executor (``GodotExecutor.run_batch``, which already exists) and
+    return its record. Same certificate-bridge contract — a serve-recorded (seed,
+    actions) pair MUST win through the frozen ``runner.gd``'s batch mode. The witness
+    ORACLE (:func:`_pick_witness`) and the js/py :func:`_bridge_replay` are untouched;
+    only the executor differs by engine."""
+    from harness.verify.executors import GodotExecutor
+    ex = GodotExecutor()
+    recs = ex.run_batch(
+        game_source,
+        [{"seed": witness["seed"], "actions": list(witness["actions"])}],
+        max_ticks=len(witness["actions"]))
+    return recs[0]
+
+
 def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              n_eval: int = N_EVAL, seed: int = 0, log=None,
              wall_clock_budget_s=None, trainer: str = "sb3",
@@ -89,17 +105,37 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     t0 = time.time()
     trainer_mod = _resolve_trainer(trainer)
 
+    # Engine-neutral seam: godot ('.spec.json') games run over GodotServeEnv (the
+    # serve/TCP sibling of PlanckEnv); js/py stay on PlanckEnv. Both expose the same
+    # obs/action + seeded-reset surface, so the trainer, eval, witness extraction and
+    # the bridge assert below are engine-agnostic — only the env class and the batch
+    # executor used for the bridge differ.
+    from harness.verify.gameverify import detect_engine
+    with open(game_path, "r", encoding="utf-8") as fh:
+        game_source = fh.read()
+    engine = detect_engine(game_path, game_source)
+
+    if engine == "godot":
+        import itertools
+        from harness.rl.godot_env import GodotServeEnv
+        # Each concurrent env needs a disjoint loopback port; hand out increasing
+        # offsets off GIP_PORT_BASE (§6.2 — one Slurm task's base, its vec slots).
+        _port_seq = itertools.count()
+
+        def make_env():
+            return GodotServeEnv(game_path, port_offset=next(_port_seq))
+    else:
+        def make_env():
+            return PlanckEnv(game_path)
+
     # Probe the game once to size the policy (spaces are frozen at construction).
-    probe = PlanckEnv(game_path)
+    probe = make_env()
     obs_dim = probe.observation_space.shape[0]
     n_actions = probe.action_space.n
     title = probe.title
     n_bodies = len(probe._body_order)
     cp_keys = list(probe._cp_keys)
     probe.close()
-
-    def make_env():
-        return PlanckEnv(game_path)
 
     # --- Train ---
     train_res = trainer_mod.train(make_env, obs_dim, n_actions,
@@ -114,7 +150,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # binary (0 or 1). The graded learnability signal therefore comes from the
     # STOCHASTIC (sampled) rollouts; greedy is reported too (it is the witness's
     # preferred form and the determinism-first certificate).
-    eval_env = PlanckEnv(game_path)
+    eval_env = make_env()
     greedy_eps = [trainer_mod.greedy_episode(eval_env, agent, seed=s)
                   for s in range(n_eval)]
     sampled_eps = [trainer_mod.sample_episode(eval_env, agent, seed=s,
@@ -131,15 +167,18 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     bridge_ok = None
     bridge_result = None
     if witness is not None:
-        with open(game_path, "r", encoding="utf-8") as fh:
-            game_source = fh.read()
-        rec = _bridge_replay(game_source, witness)
+        # Replay through the matching batch executor (js/py -> JsExecutor, godot ->
+        # GodotExecutor); the witness ORACLE / bridge machinery is unchanged.
+        if engine == "godot":
+            rec = _bridge_replay_godot(game_source, witness)
+        else:
+            rec = _bridge_replay(game_source, witness)
         bridge_result = rec.get("result")
         bridge_ok = bridge_result == "success"
         # The bridge is the whole point: a greedy witness recorded in serve mode
         # MUST win through the batch executor (identical semantics). Fail loud.
         assert bridge_ok, (
-            f"RL witness failed to replay to success via JsExecutor "
+            f"RL witness failed to replay to success via the batch executor "
             f"(got {bridge_result!r}) — serve/batch determinism broken")
 
     # Learnability is judged on the GRADED (stochastic) success rate — robust to
