@@ -1,12 +1,37 @@
 """g3_prime — the RL-learnability certifier (LLM_RL_SYSTEMS §4.2, Phase 0).
 
-`g3_prime(game_path, budget_steps)` trains a fresh PPO policy on the game via
-PlanckEnv, evaluates it greedily over a fixed set of seeds, and emits a
-learnability verdict plus the deterministic RL witness. The witness — a greedy,
-fixed-seed argmax rollout reduced to an action-string sequence — MUST replay to
-success through the NORMAL executor path (`JsExecutor.run_batch`); g3_prime
-asserts that, which is the certificate bridge: RL slots into the determinism-first
-harness with zero change to the replay/witness machinery (§4.1, risk #2).
+`g3_prime(game_path, budget_steps)` trains a fresh PPO policy on the game,
+evaluates it greedily over a fixed set of seeds, and emits a learnability verdict
+plus the deterministic RL witness. The witness — a greedy, fixed-seed argmax
+rollout reduced to an action-string sequence — MUST replay to success through the
+NORMAL batch executor path; g3_prime asserts that, which is the certificate bridge:
+RL slots into the determinism-first harness with zero change to the replay/witness
+machinery (§4.1, risk #2).
+
+ENGINE-NEUTRAL. The training env and the bridge executor are chosen by
+`detect_engine(game_path)` — everything between (trainer, greedy/sampled eval,
+witness ORACLE) is engine-agnostic:
+
+    engine     train env         bridge executor
+    -------     ---------         ---------------
+    js / py     PlanckEnv         JsExecutor.run_batch
+    godot       GodotServeEnv     GodotExecutor.run_batch   (.spec.json / runner.gd)
+    gdscript    GodotServeEnv     GdExecutor.run_batch      (.gd GameAPI / serve_game.gd)
+
+The two Godot dialects share ONE env class (`GodotServeEnv`, which auto-routes its
+serve host) and one witness contract; only the batch executor used for the bridge
+assert differs. This is what lets an RL policy PROVE a steering/vehicle `.gd` game
+the G3 tree solver cannot: a learned greedy rollout reduces to a deterministic
+{seed, argmax-actions} witness that wins through the frozen batch host (moat intact).
+
+PARALLEL / farming. g3_prime is ONE game; a fleet runs one game per Slurm-array task
+(`~/orcd/scratch/gi/g3p_farm.sbatch`). The gdscript manifest is
+``find scenes/games -name '*.gd'`` (the godot manifest is the tracked ``*.spec.json``
+set); task *t* reads line *t*. Each task MUST own a disjoint loopback port band —
+``export GIP_PORT_BASE=$(( 47000 + SLURM_ARRAY_TASK_ID * 64 ))`` — because every
+GodotServeEnv binds ``GIP_PORT_BASE + port_offset`` and g3_prime hands its vec/eval
+slots increasing offsets (see the make_env port_seq below). Within a task, sb3's
+DummyVecEnv gives the real-budget parallelism (num_envs slots, disjoint offsets).
 
 `learnable` is TRUE when the greedy success rate over the eval seeds clears
 LEARNABLE_SUCCESS_RATE. A negative (no success within budget, flat curve) is a
@@ -85,6 +110,23 @@ def _bridge_replay_godot(game_source: str, witness: dict) -> dict:
     return recs[0]
 
 
+def _bridge_replay_gdscript(game_source: str, witness: dict) -> dict:
+    """GDScript twin of :func:`_bridge_replay`: replay the RL witness through the
+    NORMAL gdscript batch executor (``GdExecutor.run_batch`` — the serve-contract
+    executor that compiles + drives a `.gd` GameAPI game via ``serve_game.gd``) and
+    return its record. Same certificate-bridge contract as the js/godot twins — a
+    serve-recorded (seed, actions) pair MUST win through the batch host, which shares
+    the serve host's per-tick semantics byte for byte; only the executor differs by
+    engine, so :func:`_pick_witness` and the sibling bridges stay untouched."""
+    from harness.verify.gd_exec import GdExecutor
+    ex = GdExecutor()
+    recs = ex.run_batch(
+        game_source,
+        [{"seed": witness["seed"], "actions": list(witness["actions"])}],
+        max_ticks=len(witness["actions"]))
+    return recs[0]
+
+
 def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              n_eval: int = N_EVAL, seed: int = 0, log=None,
              wall_clock_budget_s=None, trainer: str = "sb3",
@@ -119,17 +161,18 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     t0 = time.time()
     trainer_mod = _resolve_trainer(trainer)
 
-    # Engine-neutral seam: godot ('.spec.json') games run over GodotServeEnv (the
-    # serve/TCP sibling of PlanckEnv); js/py stay on PlanckEnv. Both expose the same
-    # obs/action + seeded-reset surface, so the trainer, eval, witness extraction and
-    # the bridge assert below are engine-agnostic — only the env class and the batch
-    # executor used for the bridge differ.
+    # Engine-neutral seam: both Godot dialects — godot ('.spec.json', via runner.gd)
+    # and gdscript ('.gd' GameAPI game, via serve_game.gd) — run over GodotServeEnv (the
+    # serve/TCP sibling of PlanckEnv, which auto-routes the host by detect_engine); js/py
+    # stay on PlanckEnv. All expose the same obs/action + seeded-reset surface, so the
+    # trainer, eval, witness extraction and the bridge assert below are engine-agnostic —
+    # only the env class and the batch executor used for the bridge differ.
     from harness.verify.gameverify import detect_engine
     with open(game_path, "r", encoding="utf-8") as fh:
         game_source = fh.read()
     engine = detect_engine(game_path, game_source)
 
-    if engine == "godot":
+    if engine in ("godot", "gdscript"):
         import itertools
         from harness.rl.godot_env import GodotServeEnv
         # Each concurrent env needs a disjoint loopback port; hand out increasing
@@ -185,9 +228,12 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     bridge_result = None
     if witness is not None:
         # Replay through the matching batch executor (js/py -> JsExecutor, godot ->
-        # GodotExecutor); the witness ORACLE / bridge machinery is unchanged.
+        # GodotExecutor, gdscript -> GdExecutor); the witness ORACLE / bridge machinery
+        # is unchanged.
         if engine == "godot":
             rec = _bridge_replay_godot(game_source, witness)
+        elif engine == "gdscript":
+            rec = _bridge_replay_gdscript(game_source, witness)
         else:
             rec = _bridge_replay(game_source, witness)
         bridge_result = rec.get("result")

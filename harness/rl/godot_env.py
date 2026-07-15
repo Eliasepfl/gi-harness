@@ -3,14 +3,26 @@
 
 Same obs/action CONTRACT as PlanckEnv (flat per-body float vector + discrete
 actions, seeded reset semantics) — it reuses ``build_obs_vector`` and the reward
-constants verbatim — but the world lives in a headless Godot process interpreting
-a declarative ``.spec.json`` through the FROZEN ``godotworld/runner.gd``. One env
-owns ONE long-lived Godot process in serve mode: ``reset`` reseeds + rebuilds the
-world, each ``step`` advances exactly ONE decision tick (act + K=6 physics steps +
-latch + terminal checks — byte-identical to ``runner.gd``'s ``_run_episode``).
-Because the serve stepping mirrors the batch runner, a greedy action sequence
-recorded here replays to success through ``GodotExecutor.run_batch`` — the
-certificate bridge in :mod:`harness.rl.certify`.
+constants verbatim — but the world lives in a headless Godot process. TWO game
+dialects share the identical framed serve protocol (init/reset/act/close), and the
+env auto-routes by :func:`harness.verify.gameverify.detect_engine` on the game path:
+
+* ``engine == "godot"``    — a declarative ``.spec.json`` interpreted by the FROZEN
+  ``godotworld/runner.gd`` (init key ``spec``; data, so the parent env is inherited).
+* ``engine == "gdscript"`` — a generated ``.gd`` GameAPI game (a plain Node
+  implementing build/act/state/checkpoints/is_success/is_failure/actions — see
+  ``godotworld/GAME_API.md``) compiled + driven by ``godotworld/serve_game.gd``
+  (init key ``source``). Because that host runs UNTRUSTED generated code, the child
+  process is spawned under the SCRUBBED env (``godot_exec.scrubbed_env`` — no
+  credential reaches it), exactly as :class:`harness.verify.gd_exec.GdExecutor` does.
+
+One env owns ONE long-lived Godot process in serve mode: ``reset`` reseeds + rebuilds
+the world, each ``step`` advances exactly ONE decision tick (act + K=6 physics steps +
+latch + terminal checks — byte-identical to the host's episode loop). Because the
+serve stepping mirrors the batch runner, a greedy action sequence recorded here
+replays to success through the MATCHING batch executor — ``GodotExecutor.run_batch``
+(godot) or ``GdExecutor.run_batch`` (gdscript) — the certificate bridge in
+:mod:`harness.rl.certify`.
 
 WIRE (INNER dual-dialect, GODOT_RL_AGENTS_CAPABILITIES.md §3): 4-byte
 BIG-ENDIAN length prefix + UTF-8 JSON. Python **binds/listens** on loopback;
@@ -76,9 +88,9 @@ _MAX_FRAME = 16 * 1024 * 1024  # 16 MiB frame cap (matches runner.gd SERVE_MAX_F
 
 class GodotServeError(RuntimeError):
     """A typed serve-lane failure. ``kind`` is one of ``port_in_use``,
-    ``godot_missing``, ``stale``, ``closed``, ``protocol``, ``init_failed``,
-    ``dead``, ``write_failed``, ``bad_speedup`` — so callers (and the STALE deadline
-    path) can branch without string-matching."""
+    ``godot_missing``, ``host_missing``, ``stale``, ``closed``, ``protocol``,
+    ``init_failed``, ``dead``, ``write_failed``, ``bad_speedup`` — so callers (and the
+    STALE deadline path) can branch without string-matching."""
 
     def __init__(self, kind: str, message: str):
         self.kind = kind
@@ -164,6 +176,22 @@ class GodotServeEnv:
         with open(game_path, "r", encoding="utf-8") as fh:
             self._source = fh.read()
 
+        # Engine dialect decides the serve HOST script, the init frame's source key,
+        # and whether the child runs under a scrubbed env. 'gdscript' (.gd GameAPI game)
+        # -> serve_game.gd, key "source", SCRUBBED (untrusted generated code, mirrors
+        # GdExecutor); anything else keeps the original 'godot' spec behaviour byte for
+        # byte -> runner.gd, key "spec", inherited env (declarative data, not code).
+        from harness.verify.gameverify import detect_engine
+        self.engine = detect_engine(game_path, self._source)
+        if self.engine == "gdscript":
+            self._host_rel = "res://serve_game.gd"
+            self._init_key = "source"
+            self._scrub = True
+        else:
+            self._host_rel = "res://runner.gd"
+            self._init_key = "spec"
+            self._scrub = False
+
         if port_base is None:
             port_base = int(os.environ.get("GIP_PORT_BASE", DEFAULT_PORT_BASE))
         self.port_base = int(port_base)
@@ -193,14 +221,24 @@ class GodotServeEnv:
                 "godot_missing",
                 f"Godot binary not found (set HARNESS_GODOT_EXE): {self._exe!r}")
         self._project = project or default_godot_project()
+        # The chosen serve host must actually be present in the project (a fresh checkout
+        # ships both runner.gd and serve_game.gd) — fail with a clear typed error rather
+        # than a confusing spawn-timeout STALE if it is missing.
+        self._host_path = os.path.join(self._project, os.path.basename(self._host_rel))
+        if not os.path.isfile(self._host_path):
+            self.close()
+            raise GodotServeError(
+                "host_missing",
+                f"serve host {os.path.basename(self._host_rel)} not found at {self._host_path}")
         self._ensure_provisioned()
 
         # 3) Spawn the runner and accept its outbound connection (bounded -> STALE,
         #    never a hang; transient startup crashes are respawned).
         self._conn = self._spawn_and_accept(connect_timeout_s)
 
-        # 4) init: load the spec + seeded build at seed 0; freeze the obs layout.
-        ready = self._exchange({"op": "init", "spec": self._source, "seed": 0,
+        # 4) init: load the game (spec/source per dialect) + seeded build at seed 0;
+        #    freeze the obs layout from the priming frame.
+        ready = self._exchange({"op": "init", self._init_key: self._source, "seed": 0,
                                 "horizon": self.horizon})
         if not ready.get("ok", False) or ready.get("error"):
             self.close()
@@ -253,15 +291,21 @@ class GodotServeEnv:
         # of real-time 60 Hz — the difference between ~10 and hundreds of steps/s. Route
         # through the shared builder so the flag is GUARANTEED on the serve seam too
         # (GODOT_DOCS_MINING.md section 3: enforce, don't trust the caller).
-        from harness.verify.godot_exec import stepping_argv, speedup_user_args
-        argv = stepping_argv(self._exe, self._project, "res://runner.gd",
+        from harness.verify.godot_exec import (
+            scrubbed_env, stepping_argv, speedup_user_args,
+        )
+        argv = stepping_argv(self._exe, self._project, self._host_rel,
                              ["--serve", "--port=%d" % self.port,
                               *speedup_user_args(self.speedup)])
+        # The gdscript host runs UNTRUSTED generated code -> spawn under the scrubbed,
+        # allow-listed env (no credential reachable), exactly as GdExecutor does. The
+        # godot/spec host interprets data only, so it inherits the parent env (env=None).
+        child_env = scrubbed_env() if self._scrub else None
         last_log = ""
         for attempt in range(SPAWN_RETRIES):
             self._log = tempfile.TemporaryFile(mode="w+b")
             self._proc = subprocess.Popen(argv, stdout=self._log, stderr=self._log,
-                                          stdin=subprocess.DEVNULL)
+                                          stdin=subprocess.DEVNULL, env=child_env)
             conn = self._accept_with_liveness(connect_timeout_s)
             if conn is not None:
                 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
