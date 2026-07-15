@@ -52,15 +52,21 @@ _COMPILE_CAP = 5  # max attempts for env/compile errors (G0 load/build) -> disca
 
 # OpenRouter backend ([eng.] = engineering choices)
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-_OPENROUTER_MAX_TOKENS = 16000
-_OPENROUTER_TIMEOUT = 300          # seconds, per request [eng.]
+# Output ceiling: measured 2026-07-15 on the real gdscript payload, glm-5.2
+# organically spends ~14.5k reasoning + ~3k content tokens (~17.6k total); the
+# old 16000 ceiling cut generation off BEFORE the code, yielding content=null
+# on every provider that ignores the reasoning cap. 32000 leaves full room for
+# an unbinded think plus the module.
+_OPENROUTER_MAX_TOKENS = 32000
+_OPENROUTER_TIMEOUT = 600          # seconds, per request; real payloads run minutes [eng.]
 _OPENROUTER_MAX_RETRIES = 3        # extra attempts on 429/5xx before giving up [eng.]
 _OPENROUTER_BACKOFF = 1.0          # initial backoff seconds, doubled each retry [eng.]
-# Reasoning-token cap: without one, free reasoning models (e.g. hy3) burn the
-# whole max_tokens budget thinking and return content=null. Override via the
-# OPENROUTER_REASONING_MAX_TOKENS secret; "0" removes the field entirely
-# (for non-reasoning models). [eng.]
-_OPENROUTER_REASONING_DEFAULT = 4000
+# Reasoning-token cap: a guardrail, not a muzzle — some providers ignore it
+# entirely (the content=null incident), and compliant ones should still leave
+# the model its natural ~14.5k design budget. Must stay < max_tokens. Override
+# via the OPENROUTER_REASONING_MAX_TOKENS secret; "0" removes the field
+# entirely (for non-reasoning models). [eng.]
+_OPENROUTER_REASONING_DEFAULT = 24000
 
 # Telemetry ledger (harness.telemetry) — one JSON line appended per run.
 _LEDGER_PATH = "runs/ledger.jsonl"
