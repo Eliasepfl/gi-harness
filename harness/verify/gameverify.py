@@ -40,7 +40,9 @@ from harness.verify.executors import (
 
 # --- Constants ([eng.] = engineering choice to calibrate) ---------------- #
 K_STEPS = 6                 # physics steps per decision tick (CONTRACTS §2)
-GAMEVERIFY_TIMEOUT_S = 180  # sandbox subprocess budget for a full G0-G3 run [eng.]
+GAMEVERIFY_TIMEOUT_S = 480  # sandbox subprocess budget for a full G0-G3 run [eng.]
+                            # (raised with TICK_BUDGET 21k->63k, 2026-07-15 - an
+                            # UNSOLVED search now legitimately runs ~3x longer)
 
 # G0
 MIN_ACTIONS, MAX_ACTIONS = 2, 8         # declared action-set size

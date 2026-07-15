@@ -60,7 +60,10 @@ from harness.verify import gameverify as gv
 
 # --- Constants ([eng.] = engineering choice to calibrate) ---------------- #
 MACRO_SEP = "*"            # macro-edge name = "<base_action>*<hold_ticks>"
-TICK_BUDGET = 21000        # total simulated ticks, ~= legacy (40+30)*300 [eng.]
+TICK_BUDGET = 63000        # total simulated ticks; 3x the legacy calibration [eng.]
+                           # (raised 2026-07-15, Elias: steering archetypes advance
+                           # gate-by-gate and were dying one leg short at 21k -
+                           # the old budget was tuned on pre-pivot hop games)
 BATCH_SIZE = 24            # rollouts replayed per batched (Js) node process; also the
                            # per-leaf commitment (like the guided pass's 30 continuations) [eng.]
 EPSILON = 0.2              # fraction of rollouts started from a uniform-random leaf [eng.]
