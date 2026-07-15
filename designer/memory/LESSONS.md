@@ -7,3 +7,10 @@
   on 3/5 attempts of the cone-slalom pilot (plus one stuck-between-gates).
   Steering exploration is far harder for the tree solver than hop/impulse
   play. Surface applied: rules_godot.md (deepseek) + this memory (agent).
+
+- [2026-07-15, pilot iter-2, ledger: ~/orcd/scratch/gi/pilot/ledger.jsonl]
+  steer-archetype: chain LENGTH is the certification killer — every attempt
+  now advances gate-by-gate but stalls one leg short (best: gate4/4 with
+  60/96 episodes, failing only the park). Cap steering chains at 2-3 gates;
+  final leg = short straight glide into the zone. Signature: UNSOLVED
+  "stuck between <gateN> and <gateN+1>/success" on 5/5 attempts.
