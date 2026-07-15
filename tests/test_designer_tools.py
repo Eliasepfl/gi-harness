@@ -17,8 +17,9 @@ from harness.designer import tools as T
 # --------------------------------------------------------------------------- #
 # Registry / schemas
 # --------------------------------------------------------------------------- #
-def test_registry_is_the_three_frozen_tools():
-    assert T.tool_names() == ["design", "certify", "retrieve_parts"]
+def test_registry_is_the_frozen_tools():
+    # The three oracle-spine tools plus the engine-free static-analysis tool.
+    assert T.tool_names() == ["design", "certify", "retrieve_parts", "inspect_world"]
     for entry in T.REGISTRY:
         assert entry["type"] == "function"
         fn = entry["function"]

@@ -1,7 +1,7 @@
 """The FROZEN tool layer v0 — the designer's read/oracle spine (§3 P1).
 
-Three tools, human-authored and frozen (the agent may only PROPOSE changes to
-this decomposition, never edit it):
+Three oracle-spine tools, human-authored and frozen (the agent may only PROPOSE
+changes to this decomposition, never edit it):
 
 * ``design(prompt_or_source, directive?, engine?, backend?)`` — wraps
   ``gamegen.generate_game`` (from scratch) / ``gamegen.revise_game`` (when a
@@ -14,6 +14,18 @@ this decomposition, never edit it):
 * ``retrieve_parts(prompt, engine)`` — wraps ``retrieval.retrieve_menu``, a pure
   function of ``(prompt, bank_version)``. Free, deterministic.
 
+Plus one FROZEN read-only STATIC-analysis tool (a fourth entry in the
+``DESIGNER_AGENT_PLAN.md`` §3 tool table — noted here, the plan itself is untouched):
+
+* ``inspect_world(spec_or_fragment)`` — engine-free placement feedback (v1): parse a
+  (partial) Godot ``.spec.json`` — a full spec dict OR a bodies-only fragment the
+  designer holds mid-composition — and return per-entity AABBs + bank roles + a
+  placement-warning taxonomy (solid-static overlaps, out-of-bounds bodies, isolated
+  sensors, floating statics, duplicate names). Geometry is computed analytically from
+  the spec fields alone (``godotworld/SPEC.md`` shapes, mirroring ``runner.gd``
+  ``_bbox``); NO Godot process spawns. Free, deterministic. An engine-backed v2
+  (live ``GodotServeEnv`` state) is a FOLLOWUP, not built here.
+
 Each tool has a JSON-schema'd input, a compact typed-dict output (the shapes from
 the plan's §3 table) plus a verbose handle to the full underlying report, and is
 exported in ``REGISTRY`` for OpenAI native function-calling. ``dispatch(name,
@@ -22,6 +34,8 @@ is read/oracle-only (``designer_write`` is the sole write path, §4).
 """
 from __future__ import annotations
 
+import json as _json
+import math as _math
 from typing import Any, Callable
 
 # --------------------------------------------------------------------------- #
@@ -172,6 +186,316 @@ def retrieve_parts(prompt: str, engine: str = "py") -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# inspect_world — static placement feedback (engine-free)
+# --------------------------------------------------------------------------- #
+# Heuristic tolerances (px). Static analysis only; the designer verifies. [eng.]
+_OVERLAP_EPS = 0.5      # ignore sub-pixel solid-static overlaps (float noise)
+_BOUNDS_EPS = 0.5       # ignore sub-pixel out-of-bounds excursions
+_SUPPORT_TOL = 4.0      # a static is "supported" if resting within this of a surface
+_REACH_TOL = 40.0       # a sensor is "reachable" if a body is within this of it
+
+
+def _is_num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _is_vec2(x: Any) -> bool:
+    return isinstance(x, (list, tuple)) and len(x) == 2 and all(_is_num(v) for v in x)
+
+
+def _local_verts(body: dict, shape: str) -> list[tuple[float, float]] | None:
+    """Local (unrotated, centered-at-pos) vertices for a non-circle shape, mirroring
+    ``runner.gd``'s per-shape ``verts`` (box corners / segment endpoints / poly)."""
+    if shape == "box":
+        size = body.get("size")
+        if not _is_vec2(size):
+            return None
+        w, h = float(size[0]), float(size[1])
+        return [(-w * 0.5, -h * 0.5), (w * 0.5, -h * 0.5),
+                (w * 0.5, h * 0.5), (-w * 0.5, h * 0.5)]
+    if shape == "segment":
+        a, b = body.get("a"), body.get("b")
+        if not (_is_vec2(a) and _is_vec2(b)):
+            return None
+        return [(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))]
+    if shape == "poly":
+        vs = body.get("vertices")
+        if not isinstance(vs, list) or len(vs) < 3 or not all(_is_vec2(v) for v in vs):
+            return None
+        return [(float(v[0]), float(v[1])) for v in vs]
+    return None
+
+
+def _shape_aabb(body: dict) -> list[float] | None:
+    """Analytic axis-aligned bounding box ``[left, bottom, right, top]`` (y UP), the
+    SAME box the frozen ``runner.gd`` ``_bbox`` computes for the G0 init check and
+    ``contained()`` (SPEC.md §8): circle → center ± r; box/segment/poly → the extents
+    of the ROTATED local vertices. Returns None for a shape with missing geometry."""
+    pos = body.get("pos")
+    if not _is_vec2(pos):
+        return None
+    px, py = float(pos[0]), float(pos[1])
+    shape = body.get("shape")
+    if shape == "circle":
+        r = body.get("radius")
+        if not _is_num(r):
+            return None
+        r = float(r)
+        return [px - r, py - r, px + r, py + r]
+    verts = _local_verts(body, shape)
+    if not verts:
+        return None
+    ang = float(body.get("angle", 0.0) or 0.0)
+    ca, sa = _math.cos(ang), _math.sin(ang)
+    left = bottom = _math.inf
+    right = top = -_math.inf
+    for vx, vy in verts:
+        wx = px + ca * vx - sa * vy
+        wy = py + sa * vx + ca * vy
+        left, right = min(left, wx), max(right, wx)
+        bottom, top = min(bottom, wy), max(top, wy)
+    return [left, bottom, right, top]
+
+
+def _aabb_penetration(a: list[float], b: list[float]) -> float:
+    """Min-axis overlap depth of two AABBs (0 if separated); mirrors runner.gd."""
+    ox = min(a[2], b[2]) - max(a[0], b[0])
+    oy = min(a[3], b[3]) - max(a[1], b[1])
+    if ox <= 0.0 or oy <= 0.0:
+        return 0.0
+    return min(ox, oy)
+
+
+def _aabb_gap(a: list[float], b: list[float]) -> float:
+    """Axis-max separation between two AABBs (0 if they overlap/touch)."""
+    dx = max(0.0, a[0] - b[2], b[0] - a[2])
+    dy = max(0.0, a[1] - b[3], b[1] - a[3])
+    return max(dx, dy)
+
+
+def _base_name(name: str) -> str:
+    """Strip a trailing ``_<digits>`` instance suffix (``wall_2`` -> ``wall``)."""
+    i = name.rfind("_")
+    if i > 0 and name[i + 1:].isdigit():
+        return name[:i]
+    return name
+
+
+def _kind_of(body: dict) -> str:
+    if body.get("sensor"):
+        return "sensor"
+    if body.get("static"):
+        return "static"
+    return "dynamic"
+
+
+def _round(x: float) -> float:
+    return round(float(x), 6)
+
+
+def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
+                  bank_version: str = "v1") -> dict:
+    """Static, engine-free placement feedback for a Godot spec (or bodies fragment).
+
+    Accepts a full spec dict, a bodies-only fragment (``{"bodies": [...]}`` or a bare
+    list of bodies), or a JSON string of either — so the designer can call it
+    mid-composition. Geometry is derived analytically from the spec fields alone (no
+    Godot process); ``use_bank``/``bank_version`` are harness-side knobs, not part of
+    the model-facing frozen schema.
+
+    -> {"entities": [{"name", "role_if_bank_matched", "position", "aabb", "shape",
+            "kind": static|dynamic|sensor}],
+        "warnings": [{"kind", "bodies", ...}],  # overlap_solid_statics | out_of_bounds
+            | isolated_sensor | floating_static | duplicate_name
+        "summary": {"counts", "by_shape", "world_size", "world_bbox", "is_fragment",
+            "n_entities", "n_warnings"}}
+    """
+    if isinstance(spec_or_fragment, str):
+        try:
+            spec_or_fragment = _json.loads(spec_or_fragment)
+        except ValueError as exc:
+            raise ValueError(f"inspect_world: input is not valid JSON: {exc}") from exc
+
+    if isinstance(spec_or_fragment, list):
+        spec: dict = {"bodies": spec_or_fragment}
+    elif isinstance(spec_or_fragment, dict):
+        spec = spec_or_fragment
+    else:
+        raise TypeError("inspect_world: expected a spec dict, bodies list, or JSON string")
+
+    raw_bodies = spec.get("bodies")
+    bodies = [b for b in raw_bodies if isinstance(b, dict)] if isinstance(raw_bodies, list) else []
+
+    # A full spec carries the whole contract (SPEC.md §1); anything less is a fragment
+    # the designer is still assembling.
+    is_fragment = not all(k in spec for k in ("meta", "act", "predicates"))
+    meta = spec.get("meta") if isinstance(spec.get("meta"), dict) else {}
+    ws = meta.get("world_size")
+    world_size = list(ws) if _is_vec2(ws) else (None if is_fragment else [800, 600])
+
+    roles = _bank_roles([b.get("name") for b in bodies], use_bank, bank_version)
+
+    # -- entities ----------------------------------------------------------
+    entities: list[dict] = []
+    recs: list[dict] = []  # parallel geometry records for the warning passes
+    for body in bodies:
+        name = body.get("name")
+        aabb = _shape_aabb(body)
+        pos = body.get("pos")
+        kind = _kind_of(body)
+        entities.append({
+            "name": name,
+            "role_if_bank_matched": roles.get(name) if isinstance(name, str) else None,
+            "position": [_round(pos[0]), _round(pos[1])] if _is_vec2(pos) else None,
+            "aabb": [_round(v) for v in aabb] if aabb is not None else None,
+            "shape": body.get("shape"),
+            "kind": kind,
+        })
+        recs.append({"name": name, "aabb": aabb, "kind": kind})
+
+    warnings = _collect_warnings(recs, world_size)
+
+    # -- summary -----------------------------------------------------------
+    counts = {"static": 0, "dynamic": 0, "sensor": 0, "total": len(entities)}
+    by_shape: dict[str, int] = {}
+    for e in entities:
+        counts[e["kind"]] += 1
+        by_shape[str(e["shape"])] = by_shape.get(str(e["shape"]), 0) + 1
+
+    boxes = [r["aabb"] for r in recs if r["aabb"] is not None]
+    world_bbox = None
+    if boxes:
+        world_bbox = [_round(min(b[0] for b in boxes)), _round(min(b[1] for b in boxes)),
+                      _round(max(b[2] for b in boxes)), _round(max(b[3] for b in boxes))]
+
+    return {
+        "entities": entities,
+        "warnings": warnings,
+        "summary": {
+            "counts": counts,
+            "by_shape": by_shape,
+            "world_size": world_size,
+            "world_bbox": world_bbox,
+            "is_fragment": is_fragment,
+            "n_entities": len(entities),
+            "n_warnings": len(warnings),
+        },
+    }
+
+
+def _bank_roles(names: list, use_bank: bool, bank_version: str) -> dict[str, str]:
+    """Map each body name to its bank part CATEGORY (the semantic role), matching by
+    exact name then base name (``wall_2`` -> ``wall``). Empty when the bank is off or
+    unavailable — a static analyzer must never fail because the bank is missing."""
+    if not use_bank:
+        return {}
+    try:
+        from harness.core import bank as _bank
+        catalog = _bank.load_bank(bank_version)
+    except Exception:  # noqa: BLE001 — bank is optional context, never fatal here
+        return {}
+    parts = catalog.parts
+    out: dict[str, str] = {}
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        part = parts.get(name) or parts.get(_base_name(name))
+        if part is not None:
+            out[name] = part.get("category")
+    return out
+
+
+def _collect_warnings(recs: list[dict], world_size: list | None) -> list[dict]:
+    """The warning taxonomy: overlapping solid statics, out-of-bounds bodies, isolated
+    sensors, floating statics, duplicate names — deterministic, in declaration order."""
+    warnings: list[dict] = []
+    solids = [r for r in recs if r["kind"] != "sensor" and r["aabb"] is not None]
+    statics = [r for r in recs if r["kind"] == "static" and r["aabb"] is not None]
+
+    # duplicate names (across ALL bodies, geometry or not).
+    seen: dict[Any, int] = {}
+    for r in recs:
+        seen[r["name"]] = seen.get(r["name"], 0) + 1
+    for name, n in seen.items():
+        if n > 1 and name is not None:
+            warnings.append({"kind": "duplicate_name", "bodies": [name], "count": n,
+                             "detail": f"{n} bodies share the name {name!r}"})
+
+    # overlapping solid statics (non-sensor statics with real AABB penetration).
+    solid_statics = [r for r in statics if r["kind"] == "static"]
+    for i in range(len(solid_statics)):
+        for j in range(i + 1, len(solid_statics)):
+            pen = _aabb_penetration(solid_statics[i]["aabb"], solid_statics[j]["aabb"])
+            if pen > _OVERLAP_EPS:
+                warnings.append({
+                    "kind": "overlap_solid_statics",
+                    "bodies": [solid_statics[i]["name"], solid_statics[j]["name"]],
+                    "penetration": _round(pen),
+                    "detail": "two solid static bodies overlap by "
+                              f"{pen:.1f}px (AABB)",
+                })
+
+    # bodies out of world bounds (only when bounds are known).
+    if _is_vec2(world_size):
+        wx, wy = float(world_size[0]), float(world_size[1])
+        for r in recs:
+            bb = r["aabb"]
+            if bb is None:
+                continue
+            if (bb[0] < -_BOUNDS_EPS or bb[1] < -_BOUNDS_EPS
+                    or bb[2] > wx + _BOUNDS_EPS or bb[3] > wy + _BOUNDS_EPS):
+                warnings.append({
+                    "kind": "out_of_bounds", "bodies": [r["name"]],
+                    "aabb": [_round(v) for v in bb],
+                    "detail": f"AABB extends outside the [0,0,{wx:g},{wy:g}] world",
+                })
+
+    # floating statics (no support: not near the world floor, not resting on / touching
+    # another solid). A heuristic — free-floating platforms are often intentional.
+    for r in statics:
+        bb = r["aabb"]
+        if bb[1] <= _SUPPORT_TOL:  # bottom near world floor (y=0)
+            continue
+        supported = False
+        for other in solids:
+            if other is r:
+                continue
+            ob = other["aabb"]
+            if _aabb_penetration(bb, ob) > 0.0:  # touching / connected to structure
+                supported = True
+                break
+            x_over = min(bb[2], ob[2]) - max(bb[0], ob[0])
+            if x_over > 0.0 and 0.0 <= bb[1] - ob[3] <= _SUPPORT_TOL:  # resting on top
+                supported = True
+                break
+        if not supported:
+            warnings.append({
+                "kind": "floating_static", "bodies": [r["name"]],
+                "detail": "static body has no support below it (floating heuristic)",
+            })
+
+    # sensors overlapping nothing reachable (no body within reach of the zone).
+    for r in recs:
+        if r["kind"] != "sensor" or r["aabb"] is None:
+            continue
+        reachable = False
+        for other in recs:
+            if other is r or other["aabb"] is None:
+                continue
+            if _aabb_gap(r["aabb"], other["aabb"]) <= _REACH_TOL:
+                reachable = True
+                break
+        if not reachable:
+            warnings.append({
+                "kind": "isolated_sensor", "bodies": [r["name"]],
+                "detail": "sensor zone overlaps nothing reachable (no body within "
+                          f"{_REACH_TOL:g}px)",
+            })
+
+    return warnings
+
+
+# --------------------------------------------------------------------------- #
 # Frozen JSON schemas + registry (OpenAI native function-calling shape)
 # --------------------------------------------------------------------------- #
 DESIGN_SCHEMA = {
@@ -266,14 +590,42 @@ RETRIEVE_PARTS_SCHEMA = {
     },
 }
 
-# The frozen tool spine, in OpenAI `tools=[...]` order.
-REGISTRY: list[dict] = [DESIGN_SCHEMA, CERTIFY_SCHEMA, RETRIEVE_PARTS_SCHEMA]
+INSPECT_WORLD_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "inspect_world",
+        "description": ("Statically inspect a Godot game-spec (or a bodies-only "
+                        "fragment mid-composition) WITHOUT running the engine: returns "
+                        "each entity's AABB, bank role, and kind (static/dynamic/"
+                        "sensor), plus placement warnings (solid-static overlaps, "
+                        "out-of-bounds bodies, isolated sensors, floating statics, "
+                        "duplicate names). Free and deterministic."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "spec_or_fragment": {
+                    "type": "object",
+                    "description": ("A full Godot spec dict (meta/bodies/act/predicates) "
+                                    "OR a bodies-only fragment ({\"bodies\": [...]}). "
+                                    "Analyzed from spec fields alone; no engine runs."),
+                },
+            },
+            "required": ["spec_or_fragment"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# The frozen tool spine + the static-analysis tool, in OpenAI `tools=[...]` order.
+REGISTRY: list[dict] = [DESIGN_SCHEMA, CERTIFY_SCHEMA, RETRIEVE_PARTS_SCHEMA,
+                        INSPECT_WORLD_SCHEMA]
 
 # name -> callable, for dispatching a native function call.
 _DISPATCH: dict[str, Callable[..., dict]] = {
     "design": design,
     "certify": certify,
     "retrieve_parts": retrieve_parts,
+    "inspect_world": inspect_world,
 }
 
 
