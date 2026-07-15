@@ -333,7 +333,8 @@ def _llm_route(prompt: str, index: list, k: int) -> list:
     return picked
 
 
-def select_skills(prompt: str, k: int = 3, *, root: str | None = None) -> list:
+def select_skills(prompt: str, k: int = 3, *, root: str | None = None,
+                  use_llm: bool = True) -> list:
     """The top-``k`` skills for ``prompt`` (``[]`` when the library is absent).
 
     Routing is LLM-FIRST (``_llm_route``: a model reads the name+description
@@ -358,7 +359,7 @@ def select_skills(prompt: str, k: int = 3, *, root: str | None = None) -> list:
     by_name = {e["name"]: e for e in index}
 
     # LLM-first routing; fall back to BM25 when it returns nothing.
-    llm_names = _llm_route(prompt, index, k)
+    llm_names = _llm_route(prompt, index, k) if use_llm else []
     if llm_names:
         out = []
         for name in llm_names[:k]:
@@ -433,7 +434,7 @@ def _orchestrator_block(root: str) -> str:
 
 def render_skill_context(prompt: str, k: int = 3, max_tokens: int = 4000,
                          *, root: str | None = None,
-                         orchestrator: bool = True) -> str:
+                         orchestrator: bool = True, use_llm: bool = True) -> str:
     """An attributed, budget-bounded reference block for ``prompt``.
 
     Layout: attribution header, then (when ``orchestrator``) the godot-master
@@ -445,7 +446,7 @@ def render_skill_context(prompt: str, k: int = 3, max_tokens: int = 4000,
     """
     d = library_root(root)
     master = _orchestrator_block(d) if (orchestrator and d) else ""
-    skills = [s for s in select_skills(prompt, k=k, root=root)
+    skills = [s for s in select_skills(prompt, k=k, root=root, use_llm=use_llm)
               if s.name != _MASTER_SKILL]  # the orchestrator is not a domain skill
     if not skills and not master:
         return ""

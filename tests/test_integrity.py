@@ -99,7 +99,7 @@ def test_snapshot_of_real_repo_includes_gamegen_and_contracts():
     """Sanity check against the real repo layout."""
     root = INT.__file__.rsplit("harness", 1)[0].rstrip("\\/")
     snap = INT.snapshot(root)
-    assert "harness/gamegen.py" in snap
-    assert "harness/integrity.py" in snap
+    assert "harness/gen/gamegen.py" in snap
+    assert "harness/core/integrity.py" in snap
     assert "CONTRACTS.md" in snap
     assert "env.py" not in snap

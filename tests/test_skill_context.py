@@ -46,21 +46,21 @@ def test_absent_library_is_none():
 # Selection: determinism
 # --------------------------------------------------------------------------- #
 def test_selection_is_deterministic():
-    a = SC.select_skills("platformer jump physics", k=3, root=_FIX)
-    b = SC.select_skills("platformer jump physics", k=3, root=_FIX)
+    a = SC.select_skills("platformer jump physics", k=3, root=_FIX, use_llm=False)
+    b = SC.select_skills("platformer jump physics", k=3, root=_FIX, use_llm=False)
     assert [s.name for s in a] == [s.name for s in b]
     # Same objects field-for-field (names, descriptions, bodies all reproduce).
     assert a == b
     # And the rendered block is byte-identical across calls.
-    assert (SC.render_skill_context("platformer jump physics", k=3, root=_FIX)
-            == SC.render_skill_context("platformer jump physics", k=3, root=_FIX))
+    assert (SC.render_skill_context("platformer jump physics", k=3, root=_FIX, use_llm=False)
+            == SC.render_skill_context("platformer jump physics", k=3, root=_FIX, use_llm=False))
 
 
 # --------------------------------------------------------------------------- #
 # Selection: relevance
 # --------------------------------------------------------------------------- #
 def test_platformer_prompt_ranks_relevant_skill_above_unrelated():
-    names = [s.name for s in SC.select_skills("platformer jump physics", k=2, root=_FIX)]
+    names = [s.name for s in SC.select_skills("platformer jump physics", k=2, root=_FIX, use_llm=False)]
     # The platformer/physics skills are selected; the unrelated audio skill is not.
     assert "godot-genre-platformer" in names
     assert "godot-2d-physics" in names
@@ -70,13 +70,13 @@ def test_platformer_prompt_ranks_relevant_skill_above_unrelated():
 
 
 def test_single_pick_is_the_best_match():
-    got = SC.select_skills("platformer jump physics", k=1, root=_FIX)
+    got = SC.select_skills("platformer jump physics", k=1, root=_FIX, use_llm=False)
     assert [s.name for s in got] == ["godot-genre-platformer"]
 
 
 def test_genre_and_physics_are_preferred_together():
     # Even a pure-physics prompt keeps a physics/architecture skill in the mix.
-    names = [s.name for s in SC.select_skills("collision rigidbody raycast", k=2, root=_FIX)]
+    names = [s.name for s in SC.select_skills("collision rigidbody raycast", k=2, root=_FIX, use_llm=False)]
     assert "godot-2d-physics" in names
 
 
@@ -84,7 +84,7 @@ def test_genre_and_physics_are_preferred_together():
 # Rendering: attribution + graceful absence
 # --------------------------------------------------------------------------- #
 def test_render_carries_attribution_and_bodies():
-    block = SC.render_skill_context("platformer jump physics", k=2, root=_FIX)
+    block = SC.render_skill_context("platformer jump physics", k=2, root=_FIX, use_llm=False)
     assert block
     assert "gd-agentic-skills" in block
     assert "LGPLv3" in block
@@ -101,8 +101,8 @@ def test_absent_library_renders_empty_and_selects_nothing():
 
 def test_no_match_renders_empty():
     # A prompt sharing no lexical signal with any fixture skill -> no injection.
-    assert SC.select_skills("xyzzy quux frobnicate", k=3, root=_FIX) == []
-    assert SC.render_skill_context("xyzzy quux frobnicate", k=3, root=_FIX) == ""
+    assert SC.select_skills("xyzzy quux frobnicate", k=3, root=_FIX, use_llm=False) == []
+    assert SC.render_skill_context("xyzzy quux frobnicate", k=3, root=_FIX, use_llm=False) == ""
 
 
 # --------------------------------------------------------------------------- #
@@ -110,7 +110,7 @@ def test_no_match_renders_empty():
 # --------------------------------------------------------------------------- #
 def test_token_budget_respected_and_oversized_skill_truncated():
     budget = 60
-    block = SC.render_skill_context("megamechanic", k=1, max_tokens=budget, root=_FIX)
+    block = SC.render_skill_context("megamechanic", k=1, max_tokens=budget, root=_FIX, use_llm=False)
     assert block
     # The oversized fixture body is far bigger than the budget, so it is truncated.
     assert "[truncated]" in block
@@ -120,8 +120,8 @@ def test_token_budget_respected_and_oversized_skill_truncated():
 
 
 def test_larger_budget_keeps_more_of_the_body():
-    small = SC.render_skill_context("megamechanic", k=1, max_tokens=60, root=_FIX)
-    large = SC.render_skill_context("megamechanic", k=1, max_tokens=400, root=_FIX)
+    small = SC.render_skill_context("megamechanic", k=1, max_tokens=60, root=_FIX, use_llm=False)
+    large = SC.render_skill_context("megamechanic", k=1, max_tokens=400, root=_FIX, use_llm=False)
     assert len(large) > len(small)
 
 
@@ -130,8 +130,8 @@ def test_larger_budget_keeps_more_of_the_body():
 # --------------------------------------------------------------------------- #
 def test_gdscript_contract_is_minimal_and_contract_only():
     contract = P.gdscript_contract()
-    assert "GameAPI" in contract
-    assert "reset(seed" in contract
+    assert "build(" in contract and "def act" in contract or "act(" in contract  # method convention, not a base class
+    assert "state(" in contract and "checkpoints(" in contract  # the typed-state read methods
     # Contract only: it must NOT carry the advisory-knowledge framing itself.
     assert "Reference knowledge (advisory)" not in contract
 
@@ -204,7 +204,7 @@ def test_generate_gdscript_injects_skills_and_records_them(tmp_path, monkeypatch
     # The composed system prompt carried the CONTRACT + the attributed advisory
     # knowledge section (injection actually reached the model).
     sysp = seen["systems"][0]
-    assert "GameAPI" in sysp
+    assert "build(" in sysp and ("act(" in sysp or "def act" in sysp)  # contract method convention
     assert "## Reference knowledge (advisory)" in sysp
     assert "gd-agentic-skills, LGPLv3, pinned e9e20ff" in sysp
     assert "godot-genre-platformer" in sysp

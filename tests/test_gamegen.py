@@ -1408,7 +1408,8 @@ def test_openrouter_gdscript_uses_compose_and_writes_gd(tmp_path, monkeypatch):
     assert res["game_path"].endswith(".gd")
     # The request carried the gdscript system prompt (menu-free; use_bank=False).
     sys_msg = fake.calls[0]["json"]["messages"][0]
-    assert sys_msg["role"] == "system" and sys_msg["content"] == P.compose("gdscript")
+    assert sys_msg["role"] == "system"
+    assert P.gdscript_contract() in sys_msg["content"]  # contract present; skills may follow
     assert "extends Node2D" in open(res["game_path"], encoding="utf-8").read()
 
 
