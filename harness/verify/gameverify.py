@@ -69,6 +69,7 @@ WORLD_SEED = 0              # physics seed shared by every fresh world [eng.]
 WORLD_W_BOUNDS = (800, 2400)   # declared WORLD_SIZE width bounds (px) [eng.]
 WORLD_H_BOUNDS = (600, 1600)   # declared WORLD_SIZE height bounds (px) [eng.]
 TRIVIAL_TICKS = 20          # a witness shorter than this marks a degenerate goal (~2s of decisions; v2.3 raised from 5) [eng.]
+SINGLE_ACTION_HORIZON = PROBE_HORIZON  # hold each action this long for the single-action probe [eng.]
 SOLIDITY_FRAC = 0.5         # witness replay: max solid-pair overlap depth as a fraction of the thinner body's smaller bbox dimension [eng.]
 SOLIDITY_TICKS = 2          # consecutive sampled ticks the overlap must persist to fail (transient impact slop is physics) [eng.]
 GUIDED_EPISODES = 30        # checkpoint-guided second-pass episodes (longer horizons need more) [eng.]
@@ -1463,6 +1464,17 @@ def _verify_gdscript(source: str, report: dict) -> dict:
             report["hint"] = _hint_g2(g2["checks"])
             return report
 
+        # --- G0.5: geometric reachability pre-filter (cheap, BEFORE the G3 solve) ---
+        # A checkpoint/goal geometrically walled off from spawn is definitely unsolvable;
+        # reject fast so G3 never burns its budget on it (Elias directive 1). Passing is
+        # necessary-not-sufficient (dynamic solvability stays G3).
+        g05 = _run_reachability(facts)
+        report["layers"]["G0_5_reach"] = g05
+        if not g05["passed"]:
+            report["failure_class"] = "GOAL_ERROR"
+            report["hint"] = g05.get("hint") or "a checkpoint/goal region is walled off"
+            return report
+
         # --- G3 ---
         try:
             g3 = _run_g3(executor, source, actions, declared)
@@ -1470,7 +1482,15 @@ def _verify_gdscript(source: str, report: dict) -> dict:
             raise
         except Exception:
             g3 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
-        return _finish_g3(report, g3)
+        report = _finish_g3(report, g3)
+
+        # --- G3.5: single-action anti-triviality (Elias directive 3) ---
+        # A cheap probe run as part of the gdscript verify feedback: a game winnable by
+        # spamming ONE action is BROKEN -> flip to GOAL_ERROR with the repair hint the
+        # generation loop consumes. Only worth running on an otherwise-certified game.
+        if report.get("passed"):
+            report = _single_action_gate(executor, source, actions, report)
+        return report
     except VerifyError as exc:
         # Godot missing / spawn stale / crash / unparseable -> VERIFY_ERROR shape.
         return exc.as_report()
@@ -1504,4 +1524,87 @@ def _finish_g3(report: dict, g3: dict) -> dict:
     report["failure_class"] = None
     report["hint"] = (f"valid game: static sane, deterministic rollout with live actions, "
                       f"well-formed goal, solved in {report['witness']['ticks']} decision ticks.")
+    return report
+
+
+# ======================================================================== #
+# Single-action anti-triviality probe (Elias directive 3)
+# ======================================================================== #
+# A game winnable by SPAMMING one action is a BROKEN game — success needs no varied
+# play. G3's TRIVIAL_TICKS bar catches fast wins but not a slow one-action grind, so
+# this cheap probe holds EACH declared action for the full horizon (one batch of
+# len(actions) episodes) and rejects a certified game if any single action wins. It
+# rides the SAME executor seam as G1/G3, so it is engine-agnostic; the gdscript funnel
+# wires it after G3 so the generation repair loop gets an actionable hint.
+
+def single_action_probe(executor, game_source, actions, horizon=SINGLE_ACTION_HORIZON):
+    """Probe whether the game is winnable by repeating ONE action. Holds each declared
+    action for `horizon` decision ticks (one batch) and returns the [(action, ticks),
+    ...] that reach success — empty means no single action alone wins. Deterministic
+    (WORLD_SEED); engine-agnostic (py/js/gdscript via the executor)."""
+    actions = list(actions or [])
+    if not actions:
+        return []
+    specs = [{"seed": WORLD_SEED, "actions": [a] * int(horizon)} for a in actions]
+    recs = executor.run_batch(game_source, specs, int(horizon))
+    wins = []
+    for a, rec in zip(actions, recs):
+        if rec.get("result") == "success":
+            wins.append((a, int(rec.get("ticks", 0))))
+    return wins
+
+
+def _run_reachability(facts) -> dict:
+    """G0.5 — geometric checkpoint/goal reachability pre-filter (Elias directive 1).
+
+    A CHEAP static flood-fill run between the G0/G1/G2 gates and the expensive G3 tree
+    solve. Reads the serve host's t=0 geometry facts, splits them into spawn / target
+    regions / static occupancy, and asks whether a collision-free corridor plausibly
+    exists from spawn to every target. NECESSARY-not-SUFFICIENT: a walled-off target is
+    a fast, definite reject (GOAL_ERROR); PASSING does NOT prove dynamic solvability —
+    that stays G3. If there is no occupancy geometry, no targets, or no spawn, there is
+    nothing to prove walling-off with, so the layer passes and defers to G3."""
+    from harness.verify.reachability import check_reachability, targets_and_occupancy
+    layer = {"passed": True, "checks": {}, "hint": ""}
+    bodies = facts.get("geometry") or []
+    ws = (facts.get("world_size") or {}).get("declared") or [800, 600]
+    spawn, clearance, targets, occ = targets_and_occupancy(bodies)
+    if spawn is None or not occ or not targets:
+        layer["checks"]["reachable"] = check(
+            True, reason="no static occupancy / target regions / spawn to check")
+        return layer
+    res = check_reachability(spawn, targets, occ, ws, clearance=clearance)
+    layer["checks"]["reachable"] = check(
+        res["reachable"], unreachable=res["unreachable"], targets=res["targets"],
+        dims=res["dims"], cells=list(res["cells"]) if res["cells"] else None)
+    layer["passed"] = res["reachable"]
+    layer["hint"] = res["detail"]
+    return layer
+
+
+def _single_action_hint(action, ticks) -> str:
+    return ("BROKEN: your game is winnable by repeating a single action "
+            f"({action!r} alone wins in {ticks} decision ticks) — add a real "
+            "obstacle/choice so success needs varied play")
+
+
+def _single_action_gate(executor, game_source, actions, report):
+    """Run the single-action probe as part of the verify feedback and, on a win, flip
+    the certified report to a GOAL_ERROR carrying the BROKEN repair hint (Elias
+    directive 3). A clean probe records a passing G3 sub-check and leaves the
+    certification intact. Engine trouble leaves the verdict untouched."""
+    try:
+        wins = single_action_probe(executor, game_source, actions, SINGLE_ACTION_HORIZON)
+    except VerifyError:
+        return report
+    layer = report.setdefault("layers", {}).setdefault(
+        "G3_solve", {"passed": True, "checks": {}})
+    layer.setdefault("checks", {})["single_action"] = check(
+        not wins, wins=[{"action": a, "ticks": t} for a, t in wins])
+    if wins:
+        a, t = wins[0]
+        layer["passed"] = False
+        report["passed"] = False
+        report["failure_class"] = "GOAL_ERROR"
+        report["hint"] = _single_action_hint(a, t)
     return report

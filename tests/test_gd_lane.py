@@ -27,6 +27,9 @@ from harness.verify.gd_exec import GdExecutor  # noqa: E402
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
 _MINI_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect_3d.gd")
+_SINGLE_ACTION = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "single_action_win.gd")
+_WALLED = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "walled_goal.gd")
+_FLYOFF = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "flyoff.gd")
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -76,6 +79,64 @@ def test_mini_collect_g0_contract_probe_facts():
 
 
 # ====================================================================== #
+# 1a. Single-action anti-triviality gate (Elias directive 3)
+# ====================================================================== #
+@requires_godot
+def test_single_action_win_rejected_with_broken_hint():
+    """A game winnable by SPAMMING one action ("right") certifies G0-G3 on its own
+    terms but is rejected by the single-action gate: GOAL_ERROR + the BROKEN repair
+    hint the generation loop consumes."""
+    rep = verify_game(_SINGLE_ACTION, sandboxed=False)
+    assert rep["engine"] == "gdscript"
+    assert rep["passed"] is False, rep
+    assert rep["failure_class"] == "GOAL_ERROR", rep
+    assert "BROKEN" in rep["hint"] and "single action" in rep["hint"], rep["hint"]
+    sa = rep["layers"]["G3_solve"]["checks"]["single_action"]
+    assert sa["pass"] is False
+    assert any(w["action"] == "right" for w in sa["wins"]), sa
+
+
+@requires_godot
+def test_mini_collect_passes_single_action_gate():
+    """mini_collect needs two DIFFERENT gems -> no single action wins; the gate's
+    check passes and the game still certifies."""
+    rep = verify_game(_MINI, sandboxed=False)
+    assert rep["passed"] is True, rep
+    sa = rep["layers"]["G3_solve"]["checks"].get("single_action")
+    assert sa is not None and sa["pass"] is True, sa
+
+
+# ====================================================================== #
+# 1c. G0.5 geometric reachability pre-filter (Elias directive 1)
+# ====================================================================== #
+@requires_godot
+def test_walled_goal_rejected_by_reachability_prefilter():
+    """A gem SEALED inside a box of walls is geometrically unreachable: the cheap G0.5
+    pre-filter rejects it (GOAL_ERROR + 'walled off' hint) BEFORE the G3 solve runs, so
+    G3_solve never even executes on this game."""
+    rep = verify_game(_WALLED, sandboxed=False)
+    assert rep["engine"] == "gdscript"
+    assert rep["passed"] is False, rep
+    assert rep["failure_class"] == "GOAL_ERROR", rep
+    g05 = rep["layers"]["G0_5_reach"]
+    assert g05["passed"] is False
+    assert "gem" in g05["checks"]["reachable"]["unreachable"], g05
+    assert "walled off" in rep["hint"] or "unreachable" in rep["hint"], rep["hint"]
+    # The pre-filter short-circuited BEFORE G3 (its layer stays unrun/empty).
+    assert not rep["layers"]["G3_solve"].get("checks"), rep["layers"]["G3_solve"]
+
+
+@requires_godot
+def test_reachable_fixtures_pass_reachability_prefilter():
+    """The reachable fixtures (mini_collect 2D + 3D) clear G0.5 and still certify — the
+    pre-filter is necessary-not-sufficient, never a false reject on a solvable game."""
+    for path in (_MINI, _MINI_3D):
+        rep = verify_game(path, sandboxed=False)
+        assert rep["passed"] is True, (path, rep)
+        assert rep["layers"]["G0_5_reach"]["passed"] is True, (path, rep)
+
+
+# ====================================================================== #
 # 1b. The 3D fixture certifies through the SAME funnel (3D-through-pipeline)
 # ====================================================================== #
 @requires_godot
@@ -116,6 +177,51 @@ def test_gd_serve_emits_three_component_vectors_for_3d():
     # The z axis is locked at 0; x moved left under the impulses.
     assert abs(puck["pos"][2]) < 1e-6, puck
     assert puck["pos"][0] < 400.0, puck
+
+
+# ====================================================================== #
+# 1d. Play-bounds termination (Elias directive 2)
+# ====================================================================== #
+@requires_godot
+def test_flyoff_controlled_body_truncates_not_escapes():
+    """A "fly" tick hurls the controlled player out of the play area: the episode
+    TRUNCATES cleanly (done_trunc, result not error) at the tick it leaves — and the
+    controlled body is NOT reported as an escape. The NON-controlled "debris" body,
+    which also leaves, IS still reported in oob (a required-containment escape)."""
+    with open(_FLYOFF, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        rec = ex.run_batch(src, [{"seed": 0, "actions": ["fly"] * 10}], 10,
+                           escape_margin=200.0)[0]
+    finally:
+        ex.close()
+    assert rec["done_trunc"] is True, rec           # runaway -> truncation
+    assert rec["result"] != "error", rec            # a clean end, not a break
+    assert rec["ticks"] < 10, rec                    # stepping stopped at the fly-off
+    assert "player" not in rec["oob"], rec           # controlled leaving is NOT an escape
+    assert rec["oob"] == ["debris"], rec             # non-controlled containment escape stands
+
+
+@requires_godot
+def test_mini_collect_no_trunc_and_byte_identical_when_in_bounds():
+    """An in-bounds plan never truncates (done_trunc False) and two independent serve
+    sessions stay byte-identical — the play-bounds change is inert where nothing leaves."""
+    with open(_MINI, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    plan = ["up"] * 12 + ["right"] * 20
+    snaps = []
+    for _ in range(2):
+        ex = GdExecutor(port_base=_free_port())
+        try:
+            rec = ex.run_batch(src, [{"seed": 0, "actions": plan}], len(plan),
+                               escape_margin=200.0)[0]
+            snaps.append(rec["final_snapshot"])
+            assert rec["done_trunc"] is False, rec
+            assert rec["oob"] == [], rec
+        finally:
+            ex.close()
+    assert snaps[0] == snaps[1]
 
 
 # ====================================================================== #
