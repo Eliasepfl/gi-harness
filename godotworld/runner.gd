@@ -36,6 +36,11 @@ const K_STEPS := 6
 const VMAX := 1.0e5
 const DEFAULT_WORLD := Vector2(800.0, 600.0)
 
+# Serve mode (INNER dual-dialect; GODOT_RL_AGENTS_CAPABILITIES.md section 3).
+const SERVE_MAX_FRAME := 16777216      # 16 MiB frame cap (protocol sanity guard)
+const SERVE_DEFAULT_HORIZON := 300     # decision-tick truncation budget (== PlanckEnv HORIZON)
+const SERVE_IDLE_TIMEOUT_MS := 120000  # self-quit after this long with no bytes (orphan guard)
+
 # The spike's fixed 3-body scene, expressed as a spec -- used when a job omits
 # "source" so godotworld/bench.py (the spike gate harness) keeps reproducing.
 const DEFAULT_SPEC := {
@@ -108,6 +113,15 @@ var _nan := false
 var _tick_forces := []              # [[RigidBody2D, Vector2], ...] re-applied each sub-step
 var _sensors := []                  # [{node, n_rays}] in spec order -> obs tail
 
+# Serve-mode episode state (INNER dialect; persists across `act`s, reset on `reset`).
+var _serve_latches := {}            # checkpoint name -> latch tick | null (mirrors _run_episode)
+var _serve_applied := 0             # decision ticks applied since the last reseed/reset
+var _serve_result := ""             # "" (running) | success | failure | error
+var _serve_done_term := false       # terminal (success/failure/nan) reached
+var _serve_done_trunc := false      # truncated (hit the horizon budget)
+var _serve_horizon := SERVE_DEFAULT_HORIZON
+var _serve_build_err := ""          # non-empty if the last seeded rebuild failed
+
 var _query_ctx = null               # QueryCtx (Expression base instance)
 var _expr_cache := {}               # expr String -> Expression | null (parse/scan failed)
 var _lines: PackedStringArray = []
@@ -145,6 +159,13 @@ func _initialize() -> void:
 
 
 func _main() -> void:
+	# Serve mode is additive: `-- --serve --port=<N>` connects OUT to a Python TCP
+	# listener and steps interactively. The batch/check paths below stay untouched.
+	var serve_port := _serve_port()
+	if serve_port >= 0:
+		await _serve_main(serve_port)
+		return
+
 	var job := _load_job()
 	if job.is_empty():
 		_emit_line(_err_line("no job / bad job JSON"))
@@ -187,6 +208,266 @@ func _finish() -> void:
 	payload += "__JSONL_END__\n"
 	printraw(payload)
 	quit()
+
+
+# =========================================================================== #
+# SERVE MODE -- INNER dual-dialect (GODOT_RL_AGENTS_CAPABILITIES.md section 3).
+#
+# ADDITIVE to batch/check (which stay byte-identical). Launched with
+# `-- --serve --port=<N>`, the runner CONNECTS OUT to a Python TCP listener on
+# 127.0.0.1:<N> (Python binds/listens, Godot connects -- the section-3 inversion of
+# the stdio sketch, so stdout log spam never corrupts the wire) and speaks 4-byte
+# BIG-ENDIAN length-prefixed UTF-8 JSON frames.
+#
+# Verbs (determinism-first; NO script/eval verb, NO `call` name-dispatch):
+#   init  {spec, seed, horizon} -> handshake + first frame (seeded FULL rebuild)
+#   reset {seed}                -> reseed-on-reset, seeded FULL world rebuild
+#   act   {actions, n_ticks}    -> run <= n_ticks decision ticks SYNCHRONOUSLY inside
+#                                  the handler (each tick MIRRORS _run_episode's body:
+#                                  apply action + K=6 physics steps + latch + failure
+#                                  + success), split term/trunc, terminal echo
+#   close                       -> ack + quit
+#
+# Reply frame: {obs_state:{name:<query dict>}, checkpoints:{name:tick|null}, tick,
+# result, done_term, done_trunc, world_size, error}. Because the per-tick stepping is
+# byte-for-byte _run_episode's, a serve-recorded (seed, actions) pair replays
+# identically through GodotExecutor.run_batch -- the RL certificate bridge.
+# =========================================================================== #
+func _serve_port() -> int:
+	var has_serve := false
+	var port := -1
+	for a in OS.get_cmdline_user_args():
+		if a == "--serve":
+			has_serve = true
+		elif a.begins_with("--port="):
+			port = a.substr(7).to_int()
+	return port if has_serve else -1
+
+
+func _serve_main(port: int) -> void:
+	var peer := StreamPeerTCP.new()
+	if peer.connect_to_host("127.0.0.1", port) != OK:
+		quit(1)
+		return
+	# Complete the outbound TCP handshake against the listening Python socket. The
+	# Python side's accept/read timeouts are the real STALE guard; this bounded loop
+	# only prevents a spin if the listener vanished before connect.
+	var guard := 0
+	while true:
+		peer.poll()
+		var st := peer.get_status()
+		if st == StreamPeerTCP.STATUS_CONNECTED:
+			break
+		if st == StreamPeerTCP.STATUS_ERROR or st == StreamPeerTCP.STATUS_NONE:
+			quit(1)
+			return
+		guard += 1
+		if guard > 1000000:
+			quit(1)
+			return
+		await process_frame
+	peer.set_no_delay(true)
+
+	while true:
+		var msg = await _read_frame(peer)
+		if msg == null:
+			break
+		var op := str(msg.get("op", ""))
+		if op == "close":
+			_write_frame(peer, '{"ok":true,"error":null}')
+			break
+		var reply := ""
+		match op:
+			"init":
+				reply = await _serve_init(msg)
+			"reset":
+				reply = await _serve_reset(msg)
+			"act":
+				reply = await _serve_act(msg)
+			_:
+				reply = '{"ok":false,"error":"unknown op: %s"}' % _esc(op)
+		_write_frame(peer, reply)
+	peer.disconnect_from_host()
+	quit()
+
+
+func _read_frame(peer: StreamPeerTCP):
+	# 4-byte BE length prefix, then that many UTF-8 JSON bytes. Returns the parsed
+	# Dictionary, or null on a short read / closed peer / non-object body.
+	var header := await _read_n(peer, 4)
+	if header.size() < 4:
+		return null
+	var length := (int(header[0]) << 24) | (int(header[1]) << 16) | (int(header[2]) << 8) | int(header[3])
+	if length <= 0 or length > SERVE_MAX_FRAME:
+		return null
+	var body := await _read_n(peer, length)
+	if body.size() < length:
+		return null
+	var parsed = JSON.parse_string(body.get_string_from_utf8())
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return null
+	return parsed
+
+
+func _read_n(peer: StreamPeerTCP, n: int) -> PackedByteArray:
+	# Read exactly n bytes by BUSY-WAITING on the socket -- deliberately NOT awaiting a
+	# frame. Yielding (await process/physics_frame) would let the SceneTree keep
+	# integrating physics during the between-op wait, whose duration is wall-clock
+	# dependent -> non-determinism AND a mismatch with the continuous batch runner.
+	# By spinning (poll + 1 ms OS sleep, no yield) the world is FROZEN between ops with
+	# bodies staying LIVE in the physics space, so `act`'s N*K `await physics_frame`
+	# burst is the ONLY physics that runs -- byte-for-byte the batch loop. A short
+	# return (buf.size() < n) signals a closed/errored/idle peer -> the caller quits
+	# (self-terminating orphan guard when Python vanishes without a clean FIN).
+	var buf := PackedByteArray()
+	var idle_start := Time.get_ticks_msec()
+	while buf.size() < n:
+		peer.poll()
+		var avail := peer.get_available_bytes()
+		if avail > 0:
+			var got = peer.get_partial_data(mini(avail, n - buf.size()))
+			if got[0] != OK:
+				return buf
+			buf.append_array(got[1])
+			idle_start = Time.get_ticks_msec()      # progress -> reset the idle clock
+		elif peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
+			return buf
+		elif Time.get_ticks_msec() - idle_start > SERVE_IDLE_TIMEOUT_MS:
+			return buf                               # idle too long -> treat as dead
+		else:
+			OS.delay_msec(1)                         # spin without stepping physics
+	return buf
+
+
+func _write_frame(peer: StreamPeerTCP, text: String) -> void:
+	var body := text.to_utf8_buffer()
+	var n := body.size()
+	var header := PackedByteArray()
+	header.append((n >> 24) & 0xFF)
+	header.append((n >> 16) & 0xFF)
+	header.append((n >> 8) & 0xFF)
+	header.append(n & 0xFF)
+	peer.put_data(header)
+	peer.put_data(body)
+
+
+func _serve_init(msg: Dictionary) -> String:
+	_serve_horizon = int(msg.get("horizon", SERVE_DEFAULT_HORIZON))
+	var load_err := _load_spec(msg.get("spec", ""))
+	if load_err != "" or _spec == null:
+		return '{"ok":false,"error":"%s"}' % _esc("spec load failed: " + load_err)
+	await _serve_build(int(msg.get("seed", 0)))
+	if _serve_build_err != "":
+		return '{"ok":false,"error":"%s"}' % _esc("build failed: " + _serve_build_err)
+	return _serve_frame_json(true)
+
+
+func _serve_reset(msg: Dictionary) -> String:
+	if _spec == null:
+		return '{"ok":false,"error":"no spec loaded"}'
+	await _serve_build(int(msg.get("seed", 0)))
+	if _serve_build_err != "":
+		return '{"ok":false,"error":"%s"}' % _esc("build failed: " + _serve_build_err)
+	return _serve_frame_json(false)
+
+
+func _serve_act(msg: Dictionary) -> String:
+	var actions_list = msg.get("actions", [])
+	if typeof(actions_list) != TYPE_ARRAY:
+		actions_list = []
+	var n_ticks := int(msg.get("n_ticks", actions_list.size()))
+	await _serve_do_ticks(actions_list, n_ticks)
+	return _serve_frame_json(false)
+
+
+func _serve_build(world_seed: int) -> void:
+	# Reseed-on-reset with a seeded FULL world rebuild (section-3 INNER contract).
+	# The world build is deterministic and rng-free, so `seed()` is a provenance/
+	# contract honouring no-op; the FULL rebuild is what guarantees a fresh episode.
+	_serve_build_err = ""
+	_teardown_scene()
+	await process_frame                 # flush the previous deferred free before rebuild
+	seed(world_seed)
+	var err := _build_scene()
+	_serve_latches = {}
+	_serve_applied = 0
+	_serve_result = ""
+	_serve_done_term = false
+	_serve_done_trunc = false
+	if err != "":
+		_serve_build_err = err
+		return
+	# Sensor settle guard (#95359), mirrors _run_episode (sensor-free specs unchanged).
+	if not _sensors.is_empty():
+		await physics_frame
+
+
+func _serve_do_ticks(actions_list: Array, n_ticks: int) -> void:
+	# Already terminal/truncated -> echo the frame, never re-step (terminal latch).
+	if _serve_done_term or _serve_done_trunc:
+		return
+	for i in range(n_ticks):
+		var action = null
+		if actions_list.size() > 0:
+			action = actions_list[i] if i < actions_list.size() else actions_list[actions_list.size() - 1]
+		# --- one decision tick: byte-for-byte _run_episode's per-tick body ---
+		_apply_action(action)
+		_serve_applied += 1
+		for k in range(K_STEPS):
+			_apply_tick_forces()
+			await physics_frame
+			_steps += 1
+			_update_contacts()
+			_run_on_step()
+			if not _sane():
+				_frozen = true
+				_nan = true
+				break
+		_latch(_serve_latches, _serve_applied)
+		if _frozen:
+			_serve_result = "error"
+			_serve_done_term = true
+			break
+		if _failure_expr != null and _eval_bool(_failure_expr):
+			_serve_result = "failure"
+			_serve_done_term = true
+			break
+		if _eval_bool(_success_expr):
+			_serve_result = "success"
+			_serve_done_term = true
+			break
+		if _serve_applied >= _serve_horizon:
+			_serve_done_trunc = true
+			break
+
+
+func _actions_json() -> String:
+	var acts = _spec_meta.get("actions", [])
+	var parts := PackedStringArray()
+	if typeof(acts) == TYPE_ARRAY:
+		for a in acts:
+			parts.append('"%s"' % _esc(str(a)))
+	return "[%s]" % ",".join(parts)
+
+
+func _serve_frame_json(with_handshake: bool) -> String:
+	# obs_state reuses _query_json (superset of what PlanckEnv's obs builder reads),
+	# emitted at full %.17f precision so two serve sessions are byte-deterministic.
+	var parts := PackedStringArray()
+	for name in _order:
+		parts.append('"%s":%s' % [_esc(name), _query_json(_bodies[name])])
+	var obs := "{%s}" % ",".join(parts)
+	var res_str := "null"
+	if _serve_result != "":
+		res_str = '"%s"' % _serve_result
+	var head := ""
+	if with_handshake:
+		head = '"ok":true,"title":"%s","actions":%s,' % [
+			_esc(str(_spec_meta.get("title", ""))), _actions_json()]
+	return ('{%s"obs_state":%s,"checkpoints":%s,"tick":%d,"result":%s,'
+		+ '"done_term":%s,"done_trunc":%s,"world_size":[%s,%s],"error":null}') % [
+		head, obs, _checkpoints_json(_serve_latches), _serve_applied, res_str,
+		_b(_serve_done_term), _b(_serve_done_trunc), _num(_world_w), _num(_world_h)]
 
 
 # =========================================================================== #
