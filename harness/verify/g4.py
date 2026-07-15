@@ -341,6 +341,14 @@ def _make_executor(engine, world_factory):
         # executor is the only physics contact. Without this branch a .spec.json
         # would fall through to PyExecutor and mis-execute the spec as pymunk code.
         return GodotExecutor()
+    if engine == "gdscript":
+        # Generated .gd games drive through the serve host (serve_game.gd) — the
+        # SAME run_batch(seed, actions) seam the funnel used, so the whole G4
+        # machinery (fuzz families, referee, stale oracle) is engine-agnostic.
+        # Without this branch a .gd would fall to PyExecutor and error out trying
+        # to parse GDScript as pymunk Python ("game attack failed: invalid syntax").
+        from harness.verify.gd_exec import GdExecutor
+        return GdExecutor()
     return PyExecutor(world_factory=world_factory or _default_world_factory)
 
 
@@ -1141,43 +1149,51 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
         return out
 
     executor = _make_executor(engine, world_factory)
-    controlled = _derive_controlled(report, game_source, engine, world_factory)
-    initial = _initial_snapshot(executor, game_source)
-
+    # An out-of-process executor with a persistent handle (the gdscript serve host)
+    # must be torn down when the suite ends; per-batch spawners (js/godot) and the
+    # in-process py executor have no close() and are skipped by the guard below.
     try:
-        tier0 = _run_tier0(executor, game_source, engine, actions, report,
-                           seed=seed, horizon=horizon, fuzz_random=fuzz_random,
-                           fuzz_long=fuzz_long, noop_heavy=noop_heavy,
-                           alt_periods=alt_periods, anti_variants=anti_variants,
-                           controlled=controlled, initial=initial)
-    except VerifyError as exc:
-        out.update({"grade": "error", "passed": False,
-                    "error": f"engine failure during tier 0: {exc}", "findings": []})
+        controlled = _derive_controlled(report, game_source, engine, world_factory)
+        initial = _initial_snapshot(executor, game_source)
+
+        try:
+            tier0 = _run_tier0(executor, game_source, engine, actions, report,
+                               seed=seed, horizon=horizon, fuzz_random=fuzz_random,
+                               fuzz_long=fuzz_long, noop_heavy=noop_heavy,
+                               alt_periods=alt_periods, anti_variants=anti_variants,
+                               controlled=controlled, initial=initial)
+        except VerifyError as exc:
+            out.update({"grade": "error", "passed": False,
+                        "error": f"engine failure during tier 0: {exc}", "findings": []})
+            return out
+
+        tier1 = _run_tier1(executor, game_source, engine, actions, report,
+                           k=k, models=models, controlled=controlled, initial=initial,
+                           horizon=horizon, requested=1 in tiers)
+
+        stale_block = _run_stale(executor, game_source, engine, actions, report,
+                                 controlled=controlled, initial=initial, horizon=horizon,
+                                 seed=seed, requested=bool(stale), stale_H=stale_H,
+                                 stale_budget=stale_budget,
+                                 stale_cand_budget=stale_cand_budget, top_m=top_m)
+
+        findings = (list(tier0["findings"]) + list(tier1["findings"])
+                    + list(stale_block["findings"]))
+        grade = _grade(findings, tier1, tiers)
+        out.update({
+            "grade": grade,
+            "passed": grade != "open",
+            "tier0": tier0,
+            "tier1": tier1,
+            "stale": stale_block,
+            "findings": findings,
+            "hard_findings": [f for f in findings if f["hard"]],
+        })
         return out
-
-    tier1 = _run_tier1(executor, game_source, engine, actions, report,
-                       k=k, models=models, controlled=controlled, initial=initial,
-                       horizon=horizon, requested=1 in tiers)
-
-    stale_block = _run_stale(executor, game_source, engine, actions, report,
-                             controlled=controlled, initial=initial, horizon=horizon,
-                             seed=seed, requested=bool(stale), stale_H=stale_H,
-                             stale_budget=stale_budget,
-                             stale_cand_budget=stale_cand_budget, top_m=top_m)
-
-    findings = (list(tier0["findings"]) + list(tier1["findings"])
-                + list(stale_block["findings"]))
-    grade = _grade(findings, tier1, tiers)
-    out.update({
-        "grade": grade,
-        "passed": grade != "open",
-        "tier0": tier0,
-        "tier1": tier1,
-        "stale": stale_block,
-        "findings": findings,
-        "hard_findings": [f for f in findings if f["hard"]],
-    })
-    return out
+    finally:
+        close = getattr(executor, "close", None)
+        if callable(close):
+            close()
 
 
 def _actions_from_report(report):

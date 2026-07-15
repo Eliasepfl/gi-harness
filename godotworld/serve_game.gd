@@ -334,13 +334,27 @@ func _op_act(msg: Dictionary) -> String:
 		actions_list = []
 	var n_ticks := int(msg.get("n_ticks", actions_list.size()))
 	var margin := float(msg.get("escape_margin", 0.0))
-	await _do_ticks(actions_list, n_ticks)
-	return _frame_json(false, margin)
+	# frames_every>0 -> capture a per-tick {tick, entities:{...}} frame every N
+	# decision ticks (plus t=0 and the terminal tick), mirroring the js/py
+	# frame doc so the replay/render lanes read it unchanged. 0 (default) keeps
+	# batch mode byte-identical: no frames captured, no "frames" key emitted.
+	var frames_every := int(msg.get("frames_every", 0))
+	var frames_out := PackedStringArray()
+	await _do_ticks(actions_list, n_ticks, frames_every, frames_out)
+	var frames_json := ""
+	if frames_every > 0:
+		frames_json = "[%s]" % ",".join(frames_out)
+	return _frame_json(false, margin, frames_json)
 
 
-func _do_ticks(actions_list: Array, n_ticks: int) -> void:
+func _do_ticks(actions_list: Array, n_ticks: int, frames_every: int,
+		frames_out: PackedStringArray) -> void:
 	if _done_term or _done_trunc:
 		return
+	var last_frame := -1
+	if frames_every > 0:
+		frames_out.append(_tick_frame_json(_applied))       # t=0 (post-reset) frame
+		last_frame = _applied
 	for i in range(n_ticks):
 		var action = null
 		if actions_list.size() > 0:
@@ -356,9 +370,14 @@ func _do_ticks(actions_list: Array, n_ticks: int) -> void:
 				break
 		_latch()
 		if _frozen:
+			# Broken physics: stop WITHOUT capturing the NaN frame (mirrors the
+			# py executor's error path, which returns frames captured so far).
 			_result = "error"
 			_done_term = true
 			break
+		if frames_every > 0 and (_applied % frames_every) == 0:
+			frames_out.append(_tick_frame_json(_applied))
+			last_frame = _applied
 		if _truthy(_game.is_failure()):
 			_result = "failure"
 			_done_term = true
@@ -370,6 +389,9 @@ func _do_ticks(actions_list: Array, n_ticks: int) -> void:
 		if _applied >= _horizon:
 			_done_trunc = true
 			break
+	# Ensure the terminal tick is represented (a period-N sampling can miss it).
+	if frames_every > 0 and not _frozen and last_frame != _applied:
+		frames_out.append(_tick_frame_json(_applied))
 
 
 func _latch() -> void:
@@ -442,7 +464,32 @@ func _op_reset(msg: Dictionary) -> String:
 # Frame JSON (obs_state at full %.17f precision so two serve sessions match byte
 # for byte; checkpoints/nan/oob mirror runner.gd's serve frame).
 # =========================================================================== #
-func _frame_json(with_handshake: bool, margin: float) -> String:
+func _frame_json(with_handshake: bool, margin: float, frames_json := "") -> String:
+	var obs := _entities_json()
+	var res_str := "null"
+	if _result != "":
+		res_str = '"%s"' % _result
+	var head := ""
+	if with_handshake:
+		head = '"ok":true,"actions":%s,' % _actions_json()
+	var oob := _oob_json(margin)
+	# frames_json is "" for every batch/init/reset/check call (byte-identical to
+	# the pre-frames wire) and ',"frames":[...]' only when act captured per-tick
+	# frames. It rides after "oob" so the leading keys never shift.
+	var frames_part := ""
+	if frames_json != "":
+		frames_part = ',"frames":%s' % frames_json
+	return ('{%s"obs_state":%s,"checkpoints":%s,"tick":%d,"result":%s,'
+		+ '"done_term":%s,"done_trunc":%s,"world_size":[%s,%s],'
+		+ '"nan":%s,"oob":[%s]%s,"error":null}') % [
+		head, obs, _checkpoints_json(), _applied, res_str,
+		_b(_done_term), _b(_done_trunc), _num(_world_w), _num(_world_h),
+		_b(_nan), oob, frames_part]
+
+
+func _entities_json() -> String:
+	# The '{name: body_obs}' map shared by the final obs_state and every per-tick
+	# frame (byte-identical to the obs the pre-frames _frame_json built inline).
 	var st = _safe_state()
 	var bodies = st.get("bodies", [])
 	var parts := PackedStringArray()
@@ -451,20 +498,13 @@ func _frame_json(with_handshake: bool, margin: float) -> String:
 			if typeof(b) != TYPE_DICTIONARY:
 				continue
 			parts.append('"%s":%s' % [_esc(str(b.get("name", ""))), _body_obs_json(b)])
-	var obs := "{%s}" % ",".join(parts)
-	var res_str := "null"
-	if _result != "":
-		res_str = '"%s"' % _result
-	var head := ""
-	if with_handshake:
-		head = '"ok":true,"actions":%s,' % _actions_json()
-	var oob := _oob_json(margin)
-	return ('{%s"obs_state":%s,"checkpoints":%s,"tick":%d,"result":%s,'
-		+ '"done_term":%s,"done_trunc":%s,"world_size":[%s,%s],'
-		+ '"nan":%s,"oob":[%s],"error":null}') % [
-		head, obs, _checkpoints_json(), _applied, res_str,
-		_b(_done_term), _b(_done_trunc), _num(_world_w), _num(_world_h),
-		_b(_nan), oob]
+	return "{%s}" % ",".join(parts)
+
+
+func _tick_frame_json(tick_no: int) -> String:
+	# One replay frame: {tick, entities:{name:{pos,vel,angle,controlled,static}}} --
+	# the js/py frame doc shape (harness/verify/executors.py::replay_frames_doc).
+	return '{"tick":%d,"entities":%s}' % [tick_no, _entities_json()]
 
 
 func _body_obs_json(b: Dictionary) -> String:

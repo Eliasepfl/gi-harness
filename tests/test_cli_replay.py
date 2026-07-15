@@ -36,8 +36,10 @@ requires_world = pytest.mark.skipif(not _HAVE_WORLD, reason="pymunk unavailable"
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
-_GODOT_SPEC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "tests", "fixtures", "godot_specs", "traverse.spec.json")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_GODOT_SPEC = os.path.join(_ROOT, "tests", "fixtures", "godot_specs", "traverse.spec.json")
+_GD_MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
+_GD_MINI_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect_3d.gd")
 
 
 def _args(**kw):
@@ -146,6 +148,46 @@ def test_replay_godot_frames_and_gif_e2e(tmp_path, capsys):
     assert set(doc["meta"]) == {"title", "prompt", "world_size", "engine", "witness"}
     assert doc["meta"]["engine"] == "godot"
     assert doc["meta"]["world_size"] == [1400, 700]          # meta has world size
+    frames = doc["frames"]
+    assert frames[0]["tick"] == 0
+    assert frames[-1]["tick"] == max(fr["tick"] for fr in frames)   # monotone
+    for fr in frames:
+        assert set(fr) == {"tick", "entities"}
+        assert fr["entities"]                                # non-empty scene
+
+    # --- GIF smoke: a real multi-frame file ---
+    assert "gif" in out and gif.exists() and gif.stat().st_size > 0
+    with Image.open(str(gif)) as im:
+        assert im.n_frames > 0
+
+
+# ====================================================================== #
+# GDScript lane e2e: `game replay foo.gd` drives the serve host — --frames +
+# --gif both work end-to-end (positional recording proving the .gd plays).
+# ====================================================================== #
+@requires_godot
+@pytest.mark.parametrize("path", [_GD_MINI, _GD_MINI_3D],
+                         ids=["mini_collect_2d", "mini_collect_3d"])
+def test_replay_gdscript_frames_and_gif_e2e(tmp_path, capsys, path):
+    """A `.gd` routes to the gdscript lane: the witness is re-derived via verify,
+    the frames substrate validates against the shared {meta, frames} schema (tick
+    monotone, entities non-empty), and the GIF renders to a real multi-frame file.
+
+    One cmd call so the (slow) witness search runs ONCE for both outputs."""
+    from PIL import Image
+    gif = tmp_path / "mini.gif"
+    fj = tmp_path / "mini.frames.json"
+    rc, out = _run(capsys, game_path=path, gif=str(gif), frames=str(fj))
+    assert rc == 0
+    assert out["engine"] == "gdscript"
+
+    # --- frames substrate: same schema the js/py/godot lanes emit ---
+    assert out["frames"]["n_frames"] > 0
+    assert out["frames"]["gzip_bytes"] < out["frames"]["raw_bytes"]
+    doc = json.loads(fj.read_text(encoding="utf-8"))
+    assert set(doc) == {"meta", "frames"}                    # exactly the contract
+    assert set(doc["meta"]) == {"title", "prompt", "world_size", "engine", "witness"}
+    assert doc["meta"]["engine"] == "gdscript"
     frames = doc["frames"]
     assert frames[0]["tick"] == 0
     assert frames[-1]["tick"] == max(fr["tick"] for fr in frames)   # monotone

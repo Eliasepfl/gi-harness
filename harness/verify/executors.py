@@ -392,6 +392,53 @@ def render_godot_replay(game_source, out_path, *, actions, seed: int = 0, label=
     return _episode_frames_to_gif(recs[0], out_path, label=label, scale=scale)
 
 
+# A marker half-extent (world units) for the bbox synthesised below.
+_GD_MARKER_R = 12.0
+
+
+def _synthesize_gd_bboxes(rec: dict) -> dict:
+    """The GameAPI (.gd) serve frames carry pos/vel/angle/controlled/static but NO
+    shape geometry (``godotworld/GAME_API.md`` — no bbox/verts). render.py draws
+    only entities with a ``bbox`` (skipping the rest), so for the GIF we synthesise
+    a small axis-aligned marker box around each entity's position — enough to show
+    the bodies MOVING (Elias: "any recording proving the game works"). Mutates rec
+    in place; the frames-JSON substrate keeps the geometry-free shape."""
+    for fr in rec.get("frames", []) or []:
+        for q in (fr.get("entities") or {}).values():
+            if q.get("bbox"):
+                continue
+            pos = q.get("pos")
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                continue
+            x, y = float(pos[0]), float(pos[1])
+            q["bbox"] = [x - _GD_MARKER_R, y - _GD_MARKER_R,
+                         x + _GD_MARKER_R, y + _GD_MARKER_R]
+            q.setdefault("shape", "circle")
+    return rec
+
+
+def render_gdscript_replay(game_source, out_path, *, actions, seed: int = 0, label=None,
+                           max_ticks: int = 400, scale: float = 0.6, every: int = 2,
+                           timeout_s: float = 120.0) -> dict:
+    """Render a generated .gd (GameAPI) game to a GIF — the gdscript twin of
+    ``render_godot_replay``.
+
+    The serve host computes the physics headlessly and emits positional frames; the
+    GameAPI lane exposes no shape geometry, so ``_synthesize_gd_bboxes`` fabricates
+    a per-entity marker box before drawing (render.py stays untouched). The result
+    is a positional recording proving the game plays — not a faithful skin."""
+    from harness.verify.gd_exec import GdExecutor
+    ex = GdExecutor(timeout_s=timeout_s)
+    every = max(1, int(every))
+    try:
+        recs = ex.run_batch(game_source, [{"seed": int(seed), "actions": list(actions)}],
+                            max_ticks, frames_every=every)
+    finally:
+        ex.close()
+    return _episode_frames_to_gif(_synthesize_gd_bboxes(recs[0]), out_path,
+                                  label=label, scale=scale)
+
+
 # ---------------------------------------------------------------------------
 # Frames substrate — persist a scrubbable replay for the web canvas player
 # ---------------------------------------------------------------------------
@@ -451,18 +498,31 @@ def replay_frames_doc(game_source, *, engine, actions, witness=None, seed: int =
     fresh verify) supplies ticks + checkpoints for the meta. Floats are rounded to
     ``round_dp`` decimals. Returns the document plus ``result`` / ``error`` keys
     describing the replay's terminal classification."""
+    gd_ex = None
     if engine == "js":
         ex = JsExecutor(node=node, runner_path=runner_path, timeout_s=timeout_s)
     elif engine == "godot":
         ex = GodotExecutor(timeout_s=timeout_s)
+    elif engine == "gdscript":
+        from harness.verify.gd_exec import GdExecutor
+        ex = gd_ex = GdExecutor(timeout_s=timeout_s)
     else:
         ex = PyExecutor()
-    recs = ex.run_batch(game_source, [{"seed": int(seed), "actions": list(actions)}],
-                        int(max_ticks), frames_every=1)
+    try:
+        recs = ex.run_batch(game_source, [{"seed": int(seed), "actions": list(actions)}],
+                            int(max_ticks), frames_every=1)
+    finally:
+        if gd_ex is not None:  # the serve host is a persistent process — tear it down
+            gd_ex.close()
     rec = recs[0]
 
     if engine == "godot":
         title, prompt, frames_raw = normalize_godot_record(rec, game_source)
+    elif engine == "gdscript":
+        # The .gd serve frames already carry the shared {tick, entities:{query}}
+        # shape; title/prompt are not part of the GameAPI contract -> blank meta.
+        title = prompt = None
+        frames_raw = rec.get("frames", [])
     else:
         title = rec.get("title")
         prompt = rec.get("prompt")
