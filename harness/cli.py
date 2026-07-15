@@ -370,6 +370,60 @@ def cmd_game_replay(args) -> int:
     return 0 if verdicts & {"success", "failure", "timeout"} else 1
 
 
+def cmd_game_capture(args) -> int:
+    """Render a REAL in-engine GIF of a certified game's witness replay.
+
+    Resolves the witness (a supplied ``--actions`` JSON, else a fresh verify), then drives
+    ``godotworld/capture_host.gd`` through the software-GL capture lane (dressed by the
+    zero-contact overlay) and assembles the PNG sequence into a GIF with PIL. Untouched by
+    certification -- what it draws is provably the certified witness."""
+    try:
+        from harness.verify.capture import capture_gif, CaptureError
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("capture", exc, args.json)
+
+    if args.actions:
+        try:
+            w = json.loads(Path(args.actions).read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return _call_error("game capture (--actions)", exc, args.json)
+        actions, seed = w.get("actions", []), int(w.get("seed", args.seed))
+    else:
+        try:
+            w = _game_witness(args.game_path)
+        except Exception as exc:  # noqa: BLE001
+            return _call_error("game capture (verify)", exc, args.json)
+        actions, seed = w.get("actions", []), int(w.get("seed", args.seed))
+        if not actions:
+            msg = "no witness found (game does not certify?) -- nothing to capture"
+            if args.json:
+                _emit_json({"error": msg})
+            else:
+                print(msg, file=sys.stderr)
+            return 1
+
+    out_gif = args.out or str(Path(args.game_path).with_suffix(".gif"))
+    try:
+        res = capture_gif(args.game_path, out_gif, actions=actions, seed=seed,
+                          follow=args.follow, width=args.width, height=args.height,
+                          fps=args.fps, max_frames=getattr(args, "max_frames", 300),
+                          frames_dir=getattr(args, "frames_dir", None))
+    except CaptureError as exc:
+        return _call_error("game capture", exc, args.json)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game capture", exc, args.json)
+
+    if args.json:
+        _emit_json(res)
+    else:
+        print(f"{str(res.get('result')).upper()}  {args.game_path}")
+        print(f"  ticks : {res.get('ticks')}   frames : {res.get('n_frames')}")
+        print(f"  gif   : {res.get('out_path')}")
+        if res.get("frames_dir"):
+            print(f"  pngs  : {res.get('frames_dir')}")
+    return 0 if res.get("result") in ("success", "failure", "exhausted") else 1
+
+
 def cmd_game_attack(args) -> int:
     """Run the adversarial G4 suite on a certified game (g4.attack_game)."""
     try:
@@ -897,6 +951,27 @@ def build_parser() -> argparse.ArgumentParser:
     gr.add_argument("--seed", type=int, default=0)
     gr.add_argument("--json", action="store_true")
     gr.set_defaults(func=cmd_game_replay)
+
+    gc = gmsub.add_parser(
+        "capture",
+        help="render a REAL in-engine GIF of a certified game's witness replay "
+             "(software-GL, dressed via the zero-contact overlay)")
+    gc.add_argument("game_path")
+    gc.add_argument("--out", default=None, help="output GIF path (default: <game>.gif)")
+    gc.add_argument("--follow", action="store_true",
+                    help="follow-cam on the controlled body (default: fit-to-scene overview)")
+    gc.add_argument("--actions", default=None,
+                    help="witness JSON ({seed,actions}) to replay; default: a fresh verify")
+    gc.add_argument("--frames-dir", default=None,
+                    help="also keep the raw PNG frame sequence in this directory")
+    gc.add_argument("--width", type=int, default=960)
+    gc.add_argument("--height", type=int, default=540)
+    gc.add_argument("--fps", type=int, default=20, help="GIF playback fps")
+    gc.add_argument("--max-frames", type=int, default=300,
+                    help="cap captured frames (longer witnesses are subsampled evenly)")
+    gc.add_argument("--seed", type=int, default=0)
+    gc.add_argument("--json", action="store_true")
+    gc.set_defaults(func=cmd_game_capture)
 
     ga = gmsub.add_parser(
         "attack", help="adversarial G4 suite on a certified game (tier 0/1)")

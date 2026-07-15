@@ -1,0 +1,47 @@
+# gi-capture.def -- OPTIONAL portable capture image (a delta over gi-certifier.sif).
+#
+# WHEN YOU NEED THIS: only for portability. On the ORCD nodes the demo-capture lane needs
+# NO rebuild -- scripts/capture_demo.sh supplies the X display (host Xvfb) and the x11
+# client libs (staged from the host's /usr/lib64) to the stock gi-certifier.sif at runtime,
+# and Godot renders with Mesa llvmpipe software GL (already in the base image). Empirically
+# verified in-image on 2026-07-15 (notes/engines/DEMO_CAPTURE_LANE.md).
+#
+# Build this ONLY to run capture where the host lacks Xvfb / the x11 libs (a different
+# cluster, a laptop, CI). It bakes xvfb + the x11 client libs INTO the image so the harness
+# is fully self-contained: set HARNESS_CAPTURE_XVFB=1 and `harness game capture` starts its
+# own Xvfb. The base gi-certifier.sif stays lean + pixel-free; this is a separate artifact.
+#
+# The base already ships Mesa software GL (swrast/llvmpipe DRI + libGL); this adds ONLY the
+# X server + the x11 client libraries Godot's x11 display driver dlopens at runtime. ffmpeg
+# is intentionally NOT added -- PIL assembles the PNG sequence into the GIF.
+#
+# Build (needs fakeroot or root + network; do it on a build-capable node, never blind):
+#   apptainer build --fakeroot gi-capture.sif scripts/gi-capture.def
+# Measure first: confirm the runtime path (scripts/capture_demo.sh) does NOT already work
+# on your target before spending a multi-minute apt build.
+
+Bootstrap: localimage
+From: /home/enaha/gi/gi-certifier.sif    # ADJUST to your gi-certifier.sif path
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    # The virtual X display + the x11 client libs Godot's x11/opengl3 driver dlopens.
+    apt-get install -y --no-install-recommends \
+        xvfb \
+        libxkbcommon0 libxkbcommon-x11-0 \
+        libx11-6 libxcb1 libxau6 libxdmcp6 \
+        libxcursor1 libxi6 libxrandr2 libxinerama1 libxext6 libxrender1 libxfixes3
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    # Software GL by default so no physical GPU is required.
+    export LIBGL_ALWAYS_SOFTWARE=1
+    # Opt the capture executor into managing its own Xvfb (harness/verify/capture.py).
+    export HARNESS_CAPTURE_XVFB=1
+
+%labels
+    role gi-capture
+    base gi-certifier.sif
+    adds xvfb + x11-client-libs (software GL already in base)
