@@ -179,6 +179,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     best_success = 0.0
     updates_since_best = 0
     stopped_early = False
+    plateau_stopped = False   # True IFF the patience plateau tripped (== converged)
 
     for update in range(1, num_updates + 1):
         if hp["anneal_lr"]:
@@ -292,9 +293,13 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
                 f"succ {succ_rate:.2f} sps {sps} plateau {updates_since_best}/{hp['patience']}")
 
         if updates_since_best >= hp["patience"]:
+            # Converged: no new smoothed-return best in `patience` updates. The only
+            # stop that means the curve was NOT still improving (see still_improving).
             stopped_early = True
+            plateau_stopped = True
             break
         if wall_clock_budget_s is not None and (time.time() - start) > wall_clock_budget_s:
+            # Wall-clock BUDGET cut — not convergence; curve may still be climbing.
             stopped_early = True
             break
 
@@ -308,6 +313,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
         "global_steps": global_step,
         "updates": update,
         "stopped_early": stopped_early,
+        "plateau_stopped": plateau_stopped,
         "best_success_rate_train": round(best_success, 3),
         "train_wall_s": round(time.time() - start, 1),
         "hp": hp,

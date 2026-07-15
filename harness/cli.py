@@ -703,6 +703,43 @@ def cmd_game_curriculum(args) -> int:
     return 0
 
 
+# ---- game harden -----------------------------------------------------------
+def cmd_game_harden(args) -> int:
+    """The FEEDBACK COMPILER as a CLI: run the oracles on a game (G4 always; G3'
+    with --g3), compile the post-cert outcomes into personalized repair directives,
+    apply the guarded revise-from-current-source loop, and report the outcome. A
+    revise attempt writes only into the sandbox; the last certified version is never
+    overwritten by a fix that fails to re-certify. Emits one JSON record."""
+    try:
+        from harness.gen.harden import harden_game
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("harden", exc, args.json)
+
+    try:
+        report = harden_game(
+            args.game_path, out_dir=args.out_dir, backend=args.backend,
+            tiers=(0,) if args.tier == 0 else (0, 1), stale=not args.no_stale,
+            run_g3=args.g3, budget_steps=args.budget, max_rounds=args.rounds)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game harden", exc, args.json)
+
+    if args.json:
+        _emit_json(report)
+        return 0 if report.get("final_verdict") in ("HARDENED", "BULLETPROOF") else 1
+
+    print(f"{str(report.get('final_verdict'))}  {args.game_path}")
+    print(f"  directives : {report.get('directives_issued')} issued over "
+          f"{report.get('rounds')} round(s)")
+    for rec in report.get("round_records", []):
+        print(f"  round {rec.get('round')} : verdict {rec.get('verdict')}")
+        for d in rec.get("directives", []):
+            print(f"    [{d.get('source')}] {d.get('fingerprint')}: "
+                  f"{str(d.get('text'))[:100]}")
+    print(f"  final game : {report.get('final_game_path')}")
+    print(f"  original untouched : {report.get('original_untouched')}")
+    return 0 if report.get("final_verdict") in ("HARDENED", "BULLETPROOF") else 1
+
+
 # ---- bank (parts bank list / certify) ----------------------------------------
 def _volume_brief(fp: dict) -> str:
     """One-token volume rendering for the ``bank list`` table."""
@@ -1028,6 +1065,32 @@ def build_parser() -> argparse.ArgumentParser:
                     help="where next-version games are written")
     gc.add_argument("--json", action="store_true")
     gc.set_defaults(func=cmd_game_curriculum)
+
+    gh = gmsub.add_parser(
+        "harden",
+        help="feedback compiler: oracles (G4 [+G3']) -> repair directives -> "
+             "guarded revise-from-current-source loop")
+    gh.add_argument("game_path")
+    gh.add_argument("--tier", type=int, default=0, choices=[0, 1],
+                    help="max G4 tier: 0 (mechanical fuzz) or 1 (adds the cheap-LLM "
+                         "attacker lane; needs an OpenRouter key)")
+    gh.add_argument("--no-stale", action="store_true",
+                    help="skip the G4 stale-state (softlock) tier")
+    gh.add_argument("--g3", action="store_true",
+                    help="also run the G3' RL learnability oracle (progress-gated); "
+                         "only on a game that certifies G0-G3")
+    gh.add_argument("--budget", type=int, default=1_000_000,
+                    help="G3' RL budget in env-steps (default 1M; the plateau-patience "
+                         "early-stop is the real limiter)")
+    gh.add_argument("--rounds", type=int, default=3,
+                    help="max repair rounds (convergence guard; default 3)")
+    gh.add_argument("--backend", default="auto",
+                    choices=["auto", "anthropic", "openrouter", "template"])
+    gh.add_argument("--out-dir", default="scenes/games/harden",
+                    help="run sandbox for revise attempts (the certified source is "
+                         "never overwritten)")
+    gh.add_argument("--json", action="store_true")
+    gh.set_defaults(func=cmd_game_harden)
 
     # ---- rl group ----
     rl = sub.add_parser("rl", help="RL-learnability tools (the G3' probe)")

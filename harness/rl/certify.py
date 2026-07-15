@@ -52,6 +52,73 @@ LEARNABLE_SUCCESS_RATE = 0.5     # greedy success rate to call a game learnable 
 TRAINERS = ("vendored", "sb3")   # RL trainer backends (sb3 default post-parity R1; vendored kept until one live curriculum round confirms)
 
 
+def still_improving_from_curve(curve_return, *, patience: int, window: int,
+                               min_delta: float) -> bool:
+    """Reconstruct the plateau early-stop bookkeeping over a return curve and report
+    whether the curve was STILL IMPROVING when it ended (patience never exhausted).
+
+    PURE and deterministic — the offline counterpart of the trainer callback's live
+    plateau logic (sb3_trainer/ppo: smoothed rolling mean over `window` updates, a new
+    best requires `> best + min_delta`, stop after `patience` updates with no new best).
+    A monotonically-climbing curve never plateaus (True); a curve flat for >= patience
+    updates has converged (False). Used only as a FALLBACK when a trainer result does
+    not carry the authoritative ``plateau_stopped`` flag."""
+    curve = [float(c) for c in (curve_return or [])]
+    if not curve:
+        return False
+    best = -1e9
+    since = 0
+    for i in range(len(curve)):
+        smoothed = sum(curve[max(0, i - window + 1):i + 1]) / float(
+            min(i + 1, window))
+        if smoothed > best + min_delta:
+            best = smoothed
+            since = 0
+        else:
+            since += 1
+    return since < patience
+
+
+def _still_improving(train_res: dict) -> bool:
+    """Was the learning curve still improving when the budget ended?
+
+    Prefer the trainer's authoritative ``plateau_stopped`` flag (set ONLY by the
+    patience-plateau branch — a wall-clock or budget-exhaustion stop leaves it False,
+    since neither means convergence). Fall back to reconstructing the plateau from the
+    return curve when a trainer does not surface the flag."""
+    plateau_stopped = train_res.get("plateau_stopped")
+    if plateau_stopped is not None:
+        return not bool(plateau_stopped)
+    if not train_res.get("stopped_early", False):
+        return True                       # ran to the full budget -> still climbing
+    hp = train_res.get("hp") or {}
+    return still_improving_from_curve(
+        train_res.get("curve_return") or [],
+        patience=int(hp.get("patience", 40)),
+        window=int(hp.get("plateau_window", 10)),
+        min_delta=float(hp.get("min_delta", 0.05)))
+
+
+def _per_checkpoint_latch_rate(eval_eps: list[dict], cp_keys: list[str]) -> dict:
+    """Fraction of eval episodes in which each declared checkpoint latched.
+
+    The per-CHECKPOINT companion to `checkpoints_curve` (which is only the per-update
+    MEAN latch COUNT during training). Each eval episode carries a `latched` dict
+    (checkpoint -> tick when reached, None/absent otherwise); a checkpoint counts as
+    latched for an episode when its value is not None. Over BOTH the greedy and sampled
+    eval pools so the rate is robust on fully-deterministic games (where greedy is a
+    single trajectory). Enables the feedback compiler's checkpoint-pair directive."""
+    eps = list(eval_eps or [])
+    n = len(eps)
+    if not n or not cp_keys:
+        return {k: 0.0 for k in (cp_keys or [])}
+    rates = {}
+    for k in cp_keys:
+        hits = sum(1 for e in eps if (e.get("latched") or {}).get(k) is not None)
+        rates[k] = round(hits / float(n), 3)
+    return rates
+
+
 def _resolve_trainer(trainer: str):
     """Return the trainer module exposing ``train`` / ``greedy_episode`` /
     ``sample_episode``. ``vendored`` is the CleanRL-mirror PPO (`harness.rl.ppo`,
@@ -147,7 +214,10 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     Returns (task-required keys + provenance extras):
         learnable, steps_to_first_success, checkpoints_curve (per-update mean
         latches), final_success_rate (over n_eval greedy episodes),
-        rl_witness ({seed, actions, ticks} | None), wall_clock_s.
+        rl_witness ({seed, actions, ticks} | None), wall_clock_s,
+        still_improving (curve improving when the budget ended -> the compiler emits
+        `continue_training`), per_checkpoint_latch_rate ({checkpoint: fraction of eval
+        episodes that latched it} -> the compiler's checkpoint-pair localiser).
     """
     # The algo registry lives on the SB3 lane only; the vendored CleanRL-mirror PPO
     # exposes no `method` seam, so reject a non-default method up front (before any
@@ -240,6 +310,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     final_success_rate = round(n_greedy / float(n_eval), 3)     # greedy (task key)
     stochastic_success_rate = round(n_sampled / float(n_eval), 3)  # graded signal
 
+    # Per-checkpoint latch rate over ALL eval episodes (greedy + sampled) — WHICH
+    # declared milestones the trained policy actually reaches. The feedback compiler
+    # reads this to name the last-reliably-latched / first-never-latched checkpoint
+    # pair (a stalled agent) or to detect that NOTHING ever latched (unsolvable).
+    per_checkpoint_latch_rate = _per_checkpoint_latch_rate(
+        greedy_eps + sampled_eps, cp_keys)
+
     # --- RL witness + the certificate bridge (assert it replays via JsExecutor) ---
     witness = _pick_witness(greedy_eps, sampled_eps)
     bridge_ok = None
@@ -275,6 +352,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "final_success_rate": final_success_rate,             # greedy (deterministic)
         "rl_witness": witness,
         "wall_clock_s": round(time.time() - t0, 1),
+        # Progress-gated budget signal: True IFF the curve was still improving when the
+        # budget ended (patience plateau never tripped) — the compiler emits
+        # `continue_training` instead of a repair directive (LLM_RL_SYSTEMS / feedback
+        # loop). False means the run CONVERGED (or was budget/wall-clock limited).
+        "still_improving": _still_improving(train_res),
+        # WHICH milestones the policy reaches over the eval episodes (see helper).
+        "per_checkpoint_latch_rate": per_checkpoint_latch_rate,
         # --- provenance / diagnostics ---
         "title": title,
         "game_path": game_path,
@@ -285,6 +369,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "trained_steps": train_res["global_steps"],
         "updates": train_res["updates"],
         "stopped_early": train_res["stopped_early"],
+        "plateau_stopped": train_res.get("plateau_stopped"),
         "curve_return": train_res["curve_return"],
         "curve_success": train_res["curve_success"],
         "greedy_success_count": n_greedy,
