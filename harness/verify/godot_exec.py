@@ -86,6 +86,39 @@ def speedup_user_args(speedup: int) -> list[str]:
     return [] if int(speedup) == SPEEDUP_MIN else ["--speedup=%d" % int(speedup)]
 
 
+# --- Env scrub (GDSCRIPT_LANE.md security) --------------------------------- #
+# The GDScript lane compiles + runs generated code inside the serve host process, so
+# that process must NEVER see a credential. The G0 scanner already bans
+# OS.get_environment, but defense-in-depth: the Python spawner hands the child a
+# MINIMAL, allow-listed env — the handful of vars headless Godot legitimately needs
+# (paths, locale, its own HARNESS_GODOT_* knobs) and NOTHING that looks like a secret
+# (no OPENROUTER_*/ANTHROPIC_*/*_API_KEY). Default-deny: an unlisted var is dropped.
+_ENV_ALLOW_EXACT = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+    "TMPDIR", "TMP", "TEMP",
+    "DISPLAY", "WAYLAND_DISPLAY",
+    "LD_LIBRARY_PATH", "LD_PRELOAD",   # headless Godot's bundled shared libs
+    "HARNESS_GODOT_EXE", "HARNESS_GODOT_SPEEDUP",
+})
+_ENV_ALLOW_PREFIX = ("LC_", "XDG_")   # locale + user-dir vars Godot uses for its cache
+
+
+def scrubbed_env(base: dict | None = None, *, allow_extra=()) -> dict:
+    """A MINIMAL child env for spawning the GDScript serve host: the allow-listed
+    subset of ``base`` (default ``os.environ``) only. Default-deny — anything not
+    explicitly allowed (every ``*_API_KEY``, ``OPENROUTER_*``, ``ANTHROPIC_*``, …) is
+    dropped, so the untrusted game process can never read a credential even if the
+    scanner missed an env-read. ``allow_extra`` adds test-visible keys."""
+    src = os.environ if base is None else base
+    allow_exact = _ENV_ALLOW_EXACT | frozenset(allow_extra)
+    out: dict[str, str] = {}
+    for key, val in src.items():
+        if key in allow_exact or any(key.startswith(p) for p in _ENV_ALLOW_PREFIX):
+            out[key] = val
+    return out
+
+
 def stepping_argv(exe: str, project: str, runner_rel: str,
                   user_args: list[str] | tuple[str, ...] = ()) -> list[str]:
     """Build the argv for a physics-STEPPING headless runner invocation, GUARANTEEING

@@ -1018,6 +1018,96 @@ def run_g0_js(facts: dict) -> dict:
     return layer
 
 
+# ======================================================================== #
+# GDScript engine: G0 static layer over the serve host's "check" facts
+# ======================================================================== #
+# The GDScript lane (engine=gdscript) is the NEW static species (GDSCRIPT_LANE.md):
+# generated CODE, not data. Its G0 fuses the three code gates —
+#   (b) the python-side banned-API scan  (harness/verify/gd_gate.scan_gd_source),
+#   (a) the parse gate                    (facts["load"], serve_game.gd's compile),
+#   (c) the contract probe                (facts["contract"].methods, has_method) —
+# with the SAME structural checks the data lanes use (actions 2..8, one controlled
+# dynamic body, >=2 bodies, in bounds). The check keys mirror run_g0_js so
+# `_hint_g0` renders identical hints across engines.
+
+def run_g0_gd(facts: dict, violations) -> dict:
+    """G0 static layer for a GDScript (GameAPI) game.
+
+    ``violations`` is the python banned-API scan result (list of strings); ``facts``
+    is the serve host's ``check`` payload (parse gate + contract probe + t=0 facts).
+    Stops at the first failing gate, so the code never runs if the scan or parse
+    gate rejects it."""
+    from harness.verify.gd_gate import GD_REQUIRED_METHODS
+    layer = {"passed": False, "checks": {}}
+    checks = layer["checks"]
+
+    # (b) banned-API scan (a hard fail; the code was NOT compiled/run).
+    violations = list(violations or [])
+    checks["sandbox_scan"] = check(not violations, violations=violations)
+    if violations:
+        return layer
+
+    # (a) parse gate: the headless in-memory compile-check.
+    load = facts.get("load") or {}
+    if not load.get("ok"):
+        checks["loads"] = check(False, error=load.get("error", "parse/compile failed"))
+        return layer
+    checks["loads"] = check(True)
+
+    # (c) contract probe: every required GameAPI method is present.
+    methods = (facts.get("contract") or {}).get("methods") or {}
+    missing = [m for m in GD_REQUIRED_METHODS if not methods.get(m)]
+    checks["symbols"] = check(not missing, missing=missing, not_callable=[])
+    if missing:
+        return layer
+
+    # actions() is a list[str] of size 2..8.
+    actions = facts.get("actions") or {}
+    n = actions.get("length")
+    actions_ok = (bool(actions.get("is_list")) and isinstance(n, int) and n
+                  and bool(actions.get("all_str"))
+                  and MIN_ACTIONS <= n <= MAX_ACTIONS)
+    checks["actions"] = check(bool(actions_ok),
+                              n=n if actions.get("is_list") else None)
+    if not actions_ok:
+        return layer
+
+    ws = facts.get("world_size") or {}
+    ws_ok, ws_detail = _world_size_check(ws.get("declared"))
+    checks["world_size"] = check(ws_ok, **ws_detail)
+    if not ws_ok:
+        return layer
+
+    build = facts.get("build") or {}
+    if not build.get("ok"):
+        checks["builds"] = check(False, error=build.get("error", "build failed"))
+        return layer
+    checks["builds"] = check(True)
+
+    entities = list(facts.get("entities", []) or [])
+    queries = facts.get("queries") or {}
+
+    controlled = [name for name in entities if queries.get(name, {}).get("controlled")]
+    one_controlled = (len(controlled) == 1
+                      and not queries.get(controlled[0], {}).get("static", False))
+    checks["controlled"] = check(one_controlled, controlled=controlled)
+
+    checks["counts"] = check(len(entities) >= MIN_ENTITIES, n=len(entities))
+
+    offenders = [[a, b, round(float(d), 3)]
+                 for a, b, d in (facts.get("penetration") or [])
+                 if float(d) > PEN_INIT_TOL]
+    checks["no_penetration"] = check(not offenders, offenders=offenders)
+
+    oob = [name for name in entities
+           if not queries.get(name, {}).get("static", False)
+           and not queries.get(name, {}).get("in_bounds", True)]
+    checks["in_bounds"] = check(not oob, offenders=oob)
+
+    layer["passed"] = all(c["pass"] for c in checks.values())
+    return layer
+
+
 def run_g2_js(g2: dict) -> dict:
     """G2 goal layer for a JS game, from the runner's check facts."""
     layer = {"passed": False, "checks": {}}
@@ -1085,13 +1175,18 @@ _JS_MARKER = re.compile(r"(?m)^\s*(?:#|//)\s*engine\s*:\s*js\b")
 # The Godot lane's artifact is a declarative JSON spec (godotworld/SPEC.md): a
 # `.spec.json` path, or JSON carrying a top-level `"engine": "godot"` marker.
 _GODOT_MARKER = re.compile(r'"engine"\s*:\s*"godot"')
+# The GDScript lane's artifact is a `.gd` game extending GameAPI (godotworld/
+# GAME_API.md): a `.gd` path, or an `# engine: gdscript` marker.
+_GD_MARKER = re.compile(r"(?m)^\s*#\s*engine\s*:\s*gdscript\b")
 
 
 def detect_engine(game_path: str, source: str = "") -> str:
-    """Game engine: 'godot' for a `.spec.json` path or an `"engine":"godot"` JSON
-    marker; 'js' for a `.js` path or an `# engine: js` / `// engine: js` marker;
-    otherwise 'py' (default)."""
+    """Game engine: 'gdscript' for a `.gd` path or an `# engine: gdscript` marker;
+    'godot' for a `.spec.json` path or an `"engine":"godot"` JSON marker; 'js' for a
+    `.js` path or an `# engine: js` / `// engine: js` marker; otherwise 'py'."""
     path = str(game_path).lower()
+    if path.endswith(".gd") or _GD_MARKER.search(source or ""):
+        return "gdscript"
     if path.endswith(".spec.json") or _GODOT_MARKER.search(source or ""):
         return "godot"
     if path.endswith(".js"):
@@ -1133,6 +1228,8 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
     # Godot (declarative-spec) paths run the SAME funnel over their executor + the
     # runner's check facts.
     engine = detect_engine(game_path, source)
+    if engine == "gdscript":
+        return _verify_gdscript(source, report)
     if engine == "godot":
         return _verify_godot(source, report)
     if engine == "js":
@@ -1294,6 +1391,77 @@ def _verify_godot(source: str, report: dict) -> dict:
         # Godot binary missing / crash / timeout / unparseable output -> VERIFY_ERROR
         # shape (no funnel layers), exactly like sandbox.run_sandboxed trouble.
         return exc.as_report()
+
+
+def _verify_gdscript(source: str, report: dict) -> dict:
+    """The GDScript (GameAPI) funnel: G0 fuses the python banned-API scan + the serve
+    host's parse gate + contract probe (``run_g0_gd``); G1/G3 batch through a
+    ``GdExecutor`` over ``serve_game.gd``; G2 reuses ``run_g2_js`` on the host's t=0
+    goal facts (is_success/is_failure/checkpoints share the JS check shape). The code
+    is NEVER compiled or run until the static scan passes. Adds ``"engine": "gdscript"``."""
+    from harness.verify.gd_exec import GdExecutor
+    from harness.verify.gd_gate import scan_violations
+    report["engine"] = "gdscript"
+
+    # (b) banned-API scan FIRST — a hard fail short-circuits BEFORE any Godot spawn,
+    # so unscanned code is never compiled or executed.
+    violations = scan_violations(source)
+    if violations:
+        g0 = run_g0_gd({}, violations)
+        report["layers"]["G0_static"] = g0
+        report["failure_class"] = "ENV_ERROR"
+        report["hint"] = _hint_g0(g0["checks"])
+        return report
+
+    executor = GdExecutor()
+    try:
+        # G0 (parse gate + contract probe + structural) + G2 facts: ONE check op.
+        facts = executor.run_check(source)
+
+        g0 = run_g0_gd(facts, [])
+        report["layers"]["G0_static"] = g0
+        if not g0["passed"]:
+            report["failure_class"] = "ENV_ERROR"
+            report["hint"] = _hint_g0(g0["checks"])
+            return report
+
+        actions = (facts.get("actions") or {}).get("values") or []
+        declared = list(((facts.get("g2") or {}).get("checkpoints") or {}).get("keys", []))
+
+        # --- G1 ---
+        try:
+            g1 = run_g1(executor, source, actions)
+        except VerifyError:
+            raise
+        except Exception:
+            g1 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
+        report["layers"]["G1_rollout"] = g1
+        if not g1["passed"]:
+            report["failure_class"] = "ENV_ERROR"
+            report["hint"] = _hint_g1(g1["checks"])
+            return report
+
+        # --- G2 ---
+        g2 = run_g2_js((facts.get("g2") or {}))
+        report["layers"]["G2_goal"] = g2
+        if not g2["passed"]:
+            report["failure_class"] = "GOAL_ERROR"
+            report["hint"] = _hint_g2(g2["checks"])
+            return report
+
+        # --- G3 ---
+        try:
+            g3 = _run_g3(executor, source, actions, declared)
+        except VerifyError:
+            raise
+        except Exception:
+            g3 = {"passed": False, "checks": {"crash": check(False, error=traceback.format_exc(limit=3))}}
+        return _finish_g3(report, g3)
+    except VerifyError as exc:
+        # Godot missing / spawn stale / crash / unparseable -> VERIFY_ERROR shape.
+        return exc.as_report()
+    finally:
+        executor.close()
 
 
 def _finish_g3(report: dict, g3: dict) -> dict:
