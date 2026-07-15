@@ -1,5 +1,14 @@
 # VERSIONS — module map (which code belongs to which version, active vs frozen)
 
+> **[2026-07-15] PARTIALLY HISTORICAL.** The ACTIVE lane is v3: agent-written
+> GDScript (`harness/gen` gamegen+feedback+harden, `harness/verify` gd lane +
+> G0.5 + G4 + capture, `harness/rl` serve/batched-vec/SB3, `godotworld/` serve
+> + capture + dresser + asset loader, `assets/` bank). The v1 py lane and the
+> v2 planck/godot-spec lanes described below are FROZEN regression floors —
+> still tested, no longer defaults. Retired subsystems referenced below
+> (parts bank menus, sprite bank, prompt sections beyond `api_gdscript.md`)
+> no longer exist on main. Current truth: `README.md` + `STATE.md`.
+
 Maintained henceforth. One page. Companion to `OBJECTIVES.md` (roadmap) and
 `CONTRACTS.md` (normative interfaces). The repository is organised by version:
 

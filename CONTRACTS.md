@@ -1,5 +1,17 @@
 # CONTRACTS — module interfaces (v2: generated games)
 
+> **[2026-07-15] HISTORICAL for the py/planck/spec lanes.** The ACTIVE (v3)
+> normative surfaces are: the GDScript GameAPI contract
+> (`harness/gen/prompts/api_gdscript.md` — duck-typed `build/act/state/
+> checkpoints/is_success/is_failure/actions`, self-seeded RNG), the serve wire
+> protocol (`godotworld/serve_game.gd` — 4-byte-BE length-prefixed JSON,
+> init/reset/act/close, batched `n_instances`), the verify funnel
+> (G0/G0.5/G1/G2/G3/G4/G3′ in `harness/verify` + `harness/rl`), and the
+> feedback-loop taxonomy (`notes/engines/FEEDBACK_LOOP.md`). The pymunk
+> world conventions below (800×600, gravity -900) bind ONLY the frozen v1/v2
+> lanes — generated GDScript games choose their own dimensions (anti-anchoring).
+> Current truth: `README.md` + `STATE.md`.
+
 > Normative document for parallel implementation. Each module is built by a different
 > agent: **only touch your assigned files** (§8), code against these exact signatures.
 > Python 3.12, pymunk 7.3.0 (installed — verify the real API empirically, don't code from memory).

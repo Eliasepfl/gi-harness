@@ -1,177 +1,130 @@
 # STATE — project snapshot & restart guide
 
-> Updated 2026-07-14 (very) late. Companion to `OBJECTIVES.md` (roadmap),
+> Updated 2026-07-15 (day 3, evening). Companion to `OBJECTIVES.md` (roadmap),
 > `VERSIONS.md` (module map), `CONTRACTS.md` (normative interfaces).
-> Everything below is committed and pushed to `Eliasepfl/gi-harness` (main).
+> Everything below is committed and pushed to `Eliasepfl/gi-harness` (main)
+> unless marked in-flight.
 
 ## What this is
 
 An agent harness for the General Intuition challenge: **text prompt → playable
-2D game → certified entirely in code** (no VLM, no pixels in verification).
-Site: https://eliasepfl.github.io/ (password in `gi-site/_secret/password.txt`,
-never committed).
+game → certified entirely in code** (no VLM, no pixels in verification).
+Runs on MIT ORCD ("Engaging"), apptainer image `gi-certifier.sif` as the
+canonical certifier. Site: https://eliasepfl.github.io/.
 
-## The pipeline as it stands (v2.4, 439 tests green)
+## The lane (two pivots, both final)
+
+1. **Godot-only** (2026-07-14): pymunk/planck lanes frozen as regression floor.
+2. **Agent-written GDScript** (2026-07-15): the declarative JSON-spec lane is
+   PARKED at generation (kills variety); the designer writes a single `.gd`
+   GameAPI file (duck-typed: `build/act/state/checkpoints/is_success/
+   is_failure/actions`), verified through the serve contract
+   (`godotworld/serve_game.gd`). Contract = signatures + hard rules ONLY
+   (anti-anchoring: no examples, no dimensions, no magic values).
+   Skills: gd-agentic-skills, godot-master orchestrator leads (~24k tokens),
+   domain skills LLM-routed. Same principle everywhere: **no hardcoded
+   taxonomies on LLM-facing surfaces — light LLM routing over a menu**
+   (skills, asset matching, directives).
+
+## Designer model
+
+`z-ai/glm-5.2` (OpenRouter, key in gitignored `env.py`). Hard-won reasoning-model
+config (all measured 2026-07-15): output ceiling 32k (GLM thinks 14.5–24k tokens
+on real payloads; providers ignore reasoning caps), null-content salvage = one
+retry with thinking disabled (49s/$0.04, reliable), `OPENROUTER_REASONING_MAX_TOKENS=off`
+switch available (5× cheaper, quality A/B open). An explicitly requested backend
+that fails surfaces `ENV_ERROR` — **never** a silent template fallback (the
+"GLM 4/4" fake-result incident), and anthropic SDK errors fall through the
+auto chain correctly.
+
+## The pipeline (all live on main)
 
 ```
-prompt ──> designer LLM ──> game (js code | godot JSON spec | py code)
-              │  bank MENU (BM25 over 60 certified parts)
-              v
-        G0 static ─ G1 rollout ─ G2 goal ─ G3 solve (Go-Explore TREE, default)
-              │  solidity oracle · WORLD_SIZE≤2400x1600 · duration bar (≥20t)
-              v
-        G4 adversarial (avoidance / single-action / breaker fuzz) → open|hardened|bulletproof
-              v
-        G3' RL learnability (PPO CPU, checkpoint-latch reward) → difficulty grade
-              v
-        curriculum: profile → "harden/ease at <milestone>" directive → next version
-              v
-        demos: witness GIF · web canvas replayer (~17 KB gzip vs 1.3 MB GIF)
+prompt ─ skills(godot-master + routed) ─> GLM writes game.gd
+   v
+G0 parse/contract/banned-APIs ─ G0.5 reachability flood ─ G1 determinism+live-actions(context-aware)
+   ─ G2 goal ─ G3 tree solve → witness ─┬─ certified
+                                        v
+              G4 attack (escape/single-action/shortcut→broken-gating/softlock)
+              G3' RL (SB3; in-scene batched vec env: N instances/1 proc/1 socket, ~9x)
+                                        v
+              harden: oracle outcomes → PERSONALIZED DIRECTIVES → revise from
+              CURRENT source (orchestrator kept, routed on directive text) →
+              re-certify; guard: max rounds, REPAIR_STALLED, never overwrite certified
+                                        v
+              capture: zero-contact dresser + software-GL in-engine frames → GIF
+              (2D stays 2D — no fake-3D; 3D games get assets from the bank)
 ```
 
-Three engines behind one executor seam: **PyExecutor** (pymunk), **JsExecutor**
-(Planck.js — the 6 showcase games), **GodotExecutor** (Godot 4.7 headless +
-frozen `runner.gd` interpreting declarative JSON specs — 3 example games
-certified; spec v1 = 4/7 archetypes full, gaps: ordered switches, joints,
-per-step movers → `notes/engines/GODOT_RL_EXAMPLES_AUDIT.md` has the priority
-order: raycast sensors → move/spin_body → ordered_flag → path_follow → joints).
+Key invariants: witness replays bit-identically (lockstep serve stepping,
+`HARNESS_GODOT_SPEEDUP=8` tick-paired); dressed-vs-undressed state trails
+byte-identical (tested); play-bounds exit = truncation, not a break;
+single-action-win = broken-game repair feedback; game processes env-scrubbed.
 
-## The numbers that matter
+## Day-3 numbers (honest)
 
-- **Day-2 batch**: 6 Opus-authored Planck games, worlds 900–2000 px,
-  witnesses 97–261 ticks, **6/6 G4-hardened** (0 escapes / 0 NaN / 0
-  single-action wins over ~3,300 adversarial episodes). 5 published on
-  day2/ (flood_tower held back — too close to day-1 volcano).
-- **Difficulty map @500k steps** (`notes/rl_agent/DIFFICULTY_MAP_R1.md`):
-  boulder_run *easy* 1.0 · demolition *easy* 0.97 · gem_cavern **target**
-  0.656 · meteor *hard* 0.06 · vault *hard* 0.0 (stalls at `cleared_gap1`) ·
-  flood_tower *not_learnable*. Key insight: **G4 robustness and RL difficulty
-  are different axes** — the certified set spreads across five grades.
-- **Live curriculum rounds 1-2**: round 1 (from-scratch regen) — hy3:free
-  failed 5/5 under the v2.3+ bar; bookkeeping bug found+fixed (`26b3fc4`).
-  Round 2 (**revise mode**, merged, 443 tests): hy3 produced a COMPLETED
-  minimal edit **first attempt, zero repairs** — 3 edits all on `cleared_gap1`
-  (shelf widened, spike narrowed), PROMPT byte-identical, later stages
-  untouched, re-certifies independently. Grade stayed *hard* but moved right:
-  sr 0→0.125, gap1 mastery 0.155→0.485. Lesson: **hy3 can edit, not
-  blank-page**; remaining gap to target = budget-limited (2M and/or a second
-  ease round). Caveat noted: successive revise rounds overwrite the same slug
-  dir (versioned per-round subdirs = follow-up). Model routing: easy→hy3
-  variants, target→ship, hard→hy3 revise first then Opus, not_learnable→ease.
+- **Certified games: 5** — cross-road, knock-puck, push-ball (deepseek era) +
+  fly-rings (GLM, 2 attempts), drive-cart-lap (GLM, 5 attempts; deepseek failed
+  it 5/5 — RL confirmed its version genuinely unsolvable, 0 checkpoints).
+- **All 2D** (model defaults to 2D even on 3D-evoking prompts — open item; the
+  full funnel is 3D-proven via the `mini_collect_3d` fixture).
+- **Batched RL throughput**: 2048 sps vs 233 sequential at N=4 (8.8×);
+  farm runs at 1922–3029 sps. Budget default 1M, progress-gated.
+- **Parking prompt**: still failing after 5 real attempts — but with 5
+  *distinct, correctly diagnosed* flaws (parse → out-of-bounds cones →
+  pre-satisfied checkpoint → dead milestones → single-action win). Prime
+  first customer for the harden loop.
+- **First harden wave**: fly-rings → `HARDENED` (no hard findings);
+  knock-puck → `OPEN_UNMAPPED` (soft findings only, honestly no directive);
+  cross/push/drive rerunning after the anthropic-auth fall-through fix.
+- **Demos**: real in-engine renders live (`demos/day3/*_RENDERED.gif`);
+  dot-GIFs retired as demo artifacts (verification-only).
 
-## Restarting a work session (local)
+## In flight (worktree agents; merge on landing)
 
-1. Read `OBJECTIVES.md`, this file, then the notes index below as needed.
-2. Prereqs already on this machine: anaconda base python (pymunk, PIL,
-   pytest, torch-cpu), node + `nodeworld/node_modules`, Godot 4.7 console exe
-   + rapier in `godotworld/tools/` (gitignored), OpenRouter key in `env.py`
-   (gitignored — NEVER commit).
-3. Sanity: `python -m pytest tests/ -q` (439 expected) ·
-   `python -m harness game verify godotworld/examples/escape.spec.json --json` ·
-   `python -m harness game replay <game.js> --frames out.json`.
-4. Key CLI verbs: `game new|verify|replay|attack|curriculum`, `game stats`.
-5. Conventions that MUST survive: base code frozen during generation runs
-   (integrity manifest); demos generated from machine-readable results; days
-   on the site = real calendar days, new batches = new rows; count every
-   failure (ledger); notes-per-task in `notes/` (context is reused).
+- **Inverse-value G4 attacker** (Elias's design, literature-validated:
+  anti-policy search + winning-trajectory prefix seeding + freeze-detect +
+  tree-refutation confirm → certified softlock witnesses; A/B vs random fuzz
+  required) — `notes/adversarial/INVERSE_VALUE_G4.md`.
+- **3D asset dressing** (bank assets on 3D proxies only; 2.5D mode was CUT —
+  "if the game is 2D, keep it 2D").
 
-## ORCD phase — how to start (the runbook is written)
+## Queued next (decision-complete)
 
-**THE document: `notes/compute/ORCD_GODOT_RL_PLAN.md`** — copy-paste runbook.
-Condensed path:
+1. Swarm ADOPT items (`notes/engines/MCP_FEEDBACK_TOOLS.md` — godot-mcp itself
+   rejected, mechanics extracted): runtime stderr delta-capture in the 3
+   spawners → new directive class; `--check-only` analyzer-errors parse fix;
+   engine-truth geometry in the check op; later a headless GDScript LSP sidecar.
+2. 3D generation nudge (prompts that evoke 3D should yield 3D games).
+3. GPU RL option: conda env `godot-rl` (torch+cu128, editable pinned clone)
+   ready for `gdrl` runs on GPU nodes; needs exported env binaries.
 
-1. Open an Engaging session (login node). Run the **day-1 checklist** (§plan):
-   module load miniforge → clone → mamba env (py3.12, pymunk, torch-cpu,
-   nodejs) → `npm install` in nodeworld/ → **egress probe** (`srun ... curl
-   openrouter` — compute-node internet is NOT promised; if absent: generate
-   locally, verify/train remotely) → smoke `pytest` on `mit_quicktest`.
+## Restarting a work session (cluster)
 
-   **Cloning (the repo is PRIVATE — you need auth on the cluster):**
-   ```bash
-   git config --global core.autocrlf input        # BEFORE cloning (CRLF kills node/bash)
-   git clone https://github.com/Eliasepfl/gi-harness.git   # HTTPS + a GitHub PAT,
-   # or add an SSH key on the cluster and use git@github.com:Eliasepfl/gi-harness.git
-   ```
+1. Read this file, then `OBJECTIVES.md`, then notes as needed
+   (`notes/engines/GDSCRIPT_LANE.md`, `notes/engines/FEEDBACK_LOOP.md`,
+   `notes/adversarial/INVERSE_VALUE_G4.md`, `notes/engines/DEMO_CAPTURE_LANE.md`).
+2. Everything runs in-image: `module load apptainer/1.4.2`,
+   `apptainer exec -B /orcd ~/gi/gi-certifier.sif ...` (`~/gi` symlinks the repo).
+   Godot NEVER bare on login nodes (448-core thread thrash).
+3. Slurm: `mit_preemptable` (CPUs fastest), ≤200 array tasks, `--requeue`,
+   `GIP_PORT_BASE=$((47000 + TASK_ID*64))`, per-task `HARNESS_LEDGER` shards →
+   `harness ledger merge`.
+4. Sanity: scoped pytest in-image (full suite is slow; gate the files you touch).
+5. Conventions that MUST survive: tree FROZEN during generation runs (integrity
+   manifest); count every failure (ledger); notes-per-task in `notes/`;
+   secrets only in `env.py`/env vars, never committed.
 
-   **What does NOT travel with the clone (gitignored) — restore each:**
-   | Missing | Why | Restore on the cluster |
-   |---|---|---|
-   | `env.py` (OpenRouter key) | secret | recreate by hand, or `export OPENROUTER_API_KEY=...` (env vars override) — only needed if compute/login nodes generate |
-   | `nodeworld/node_modules/` | deps | `npm install` in `nodeworld/` (or baked into the `.sif`) |
-   | `godotworld/tools/` (Godot exe + rapier) | binaries, Windows-only anyway | download the LINUX artifacts per the runbook (`Godot_v4.7-stable_linux.x86_64` + the same rapier zip, which ships the linux `.so`), then the one-time `--headless --import` |
-   | `scenes/games/` (the 6 showcase games, curriculum artifacts) | generated artifacts | `rsync -av "scenes/games/" orcd-login.mit.edu:~/gi-harness/scenes/games/` from this machine — git does NOT carry them |
-   | `runs/` (ledger) | telemetry | start fresh on the cluster (per-task shards + merge, per the runbook); rsync the local ledger only if continuity matters |
-   | `banks/sprites/raw/` (Kenney atlases) | cosmetic only | skip — cluster demos return `frames.json`, not GIFs |
-2. Build the **canonical certifier image** from the verbatim `.sif` definition
-   in the plan (ubuntu22.04 + miniforge + node + **Linux Godot 4.7 single
-   binary** + rapier `.so` from the same zip we already use + the mandatory
-   one-time `--headless --import`). The three Linux-Godot unknowns are marked
-   as day-1 GATES in the plan — measure, don't assume.
-3. Fire the three Slurm arrays (templates verbatim in the plan):
-   **certify farm** (verify+attack, bank-bound, minutes) → **G3' probe farm**
-   (200k-screen everything ≈ 2-3 min/game/core; 2M only on the
-   learnable-but-not-sharp band) → **curriculum batch rounds**
-   (local↔cluster ping-pong: cluster grades N games, local LLM revises the
-   non-targets, resubmit).
-4. Results flow: scratch shards → `rsync` back → ledger merge
-   (dedupe on `(game_id, seed, verdict_hash)`) → `frames.json` feeds the site
-   replayer (never GIFs). Witness replay on the certifier image = the
-   certificate, wherever training ran.
-5. Named follow-up before scale: a `harness rl probe` CLI verb (the plan's
-   probe farm currently uses a 6-line inline driver).
-
-## Notes index (the reusable context)
+## Notes index (the load-bearing ones)
 
 | Area | File |
 |---|---|
-| Curriculum loop + grades | `notes/rl_agent/CURRICULUM_LOOP.md` |
-| Difficulty map r1 | `notes/rl_agent/DIFFICULTY_MAP_R1.md` |
-| RL architecture survey | `notes/rl_agent/LLM_RL_SYSTEMS.md` |
-| G3' spike results | `notes/rl_agent/G3_PRIME_SPIKE.md` |
-| Tree solver wiring | `notes/adversarial/G3_TREE_WIRING.md` |
-| G4 design | `notes/adversarial/G4_DESIGN.md` |
-| ORCD runbook (THE one) | `notes/compute/ORCD_GODOT_RL_PLAN.md` |
-| ORCD cluster map | `notes/compute/ORCD_DEPLOYMENT.md` |
-| Web replayer contract | `notes/compute/WEB_REPLAYER.md` |
-| Demos audit | `notes/compute/WATCHABLE_DEMOS.md` |
-| Godot lane | `notes/engines/GODOT_LANE.md` + `godotworld/SPEC.md` |
-| Godot feasibility/spike | `notes/engines/GODOT_MIGRATION.md`, `godotworld/SPIKE_REPORT.md` |
-| Godot+RL merge design | `notes/engines/GODOT_RL_MERGE.md` |
-| Examples-bank audit | `notes/engines/GODOT_RL_EXAMPLES_AUDIT.md` |
-| Skills/plugins surveys | `notes/engines/CLAUDE_GAMEGEN_SKILLS.md`, `GODOT_SKILLS_WORLDGEN.md`, `CLAUDE_GODOT_YOUTUBE.md` |
-| Paper: LLM-as-a-Verifier | `notes/papers/LLM_AS_A_VERIFIER.md` |
-| Parts bank | `notes/PARTS_BANK.md` + `banks/` |
-
-## Model config (current)
-
-- `OPENROUTER_MODEL = deepseek/deepseek-v4-flash` (Elias, 14 juil. — id
-  verified against the OpenRouter models endpoint; smoke generation COMPLETED
-  in 2 attempts using bank parts). Previous volume model: tencent/hy3:free.
-- **DECIDED (Elias, 14 juil.): deepseek-v4-flash is the designer for BOTH
-  autonomous runs AND curriculum revisions / hard games** — one OpenRouter
-  key, no ANTHROPIC_API_KEY, no Opus-designer lane for now. Escalate to a
-  stronger designer only if deepseek's revise/generation failure data says so
-  (the ledger decides, per the telemetry directive).
-- The three Godot example specs were enriched from plumbing fixtures to real
-  demo levels (80d4e0b) and published as day-2's "third engine" row
-  (demos 15-17, rendered from real Godot engine state).
-
-## Demos format
-
-**DECIDED (Elias, 14 juil.): the gallery stays on GIFs** — no replayer
-switch for now. The canvas replayer remains a live beta pilot at
-`day2/replayer_demo.html` (and the frames-JSON substrate remains the
-cluster→site return format per the ORCD plan); revisit later.
-
-## Open decisions (Elias's calls)
-
-1. Spec v2 build wave (raycast sensors first) + bank→`.tscn` templates.
-2. Tier-1 LLM attackers live (bulletproof grade).
-3. Day-3 site page when the calendar day warrants it.
-4. **Import `godot_rl_agents_examples` as the RL smoke-bench** (pinned
-   d659636; smoke PPO per env, then the method-grid bench on ORCD) — full
-   plan: `notes/engines/GODOT_RL_BENCH_AND_PIPELINE.md` §A.
-5. **Close the full prompt→verified-game pipeline on the Godot lane** (godot
-   prompt sections + gamegen spec emission + G4 confirm + runner.gd serve
-   mode for G3' + one live acceptance run with the complete pass table) —
-   same note §B; demo rung (ONNX in-engine videos à la godot_rl_agents) §C.
+| THE pivot | `notes/engines/GDSCRIPT_LANE.md` |
+| Feedback loop spec (Elias) | `notes/engines/FEEDBACK_LOOP.md` |
+| Inverse-value G4 (Elias) | `notes/adversarial/INVERSE_VALUE_G4.md` + `FEASIBILITY_LITERATURE.md` |
+| MCP research verdict | `notes/engines/MCP_FEEDBACK_TOOLS.md` |
+| Capture lane (what worked) | `notes/engines/DEMO_CAPTURE_LANE.md` |
+| Asset bank | `notes/engines/ASSET_BANK.md` |
+| Why demo≠designer gap | `notes/engines/ASYMMETRY_ANALYSIS.md` |
+| ORCD runbook | `notes/compute/ORCD_GODOT_RL_PLAN.md` + `ORCD_DAY1_LOG.md` |
+| RL library capabilities | `notes/engines/GODOT_RL_AGENTS_CAPABILITIES.md` |
