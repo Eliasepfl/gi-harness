@@ -14,3 +14,7 @@ godotworld/tools/
 .claude/
 /gi-certifier.sif
 designer/workspace/
+
+# demo asset bank: binary meshes are rebuildable; manifest+README are tracked
+assets/models/
+assets/aabb.json
