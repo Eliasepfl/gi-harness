@@ -135,6 +135,26 @@ def test_port_base_and_offset_compose():
         occupier.close()
 
 
+@pytest.mark.parametrize("bad", ["0", "17", "abc", "3.5"])
+def test_serve_invalid_speedup_rejected(monkeypatch, bad):
+    # An invalid HARNESS_GODOT_SPEEDUP is rejected as a TYPED error BEFORE any port bind
+    # or Godot spawn (so this needs no binary): speedup resolves first in __init__.
+    monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", bad)
+    with pytest.raises(GodotServeError) as ei:
+        GodotServeEnv(TRAVERSE, port_base=_free_port())
+    assert ei.value.kind == "bad_speedup"
+
+
+def test_serve_speedup_argv_omits_default_appends_when_set():
+    # The serve seam threads --speedup=N through the SAME shared builder as the batch
+    # executor; the N==1 default omits it, keeping the invocation byte-identical.
+    from harness.verify.godot_exec import speedup_user_args, stepping_argv
+    argv = stepping_argv("/opt/godot", "/proj", "res://runner.gd",
+                         ["--serve", "--port=47000", *speedup_user_args(8)])
+    assert argv[argv.index("--") + 1:] == ["--serve", "--port=47000", "--speedup=8"]
+    assert speedup_user_args(1) == []
+
+
 # ====================================================================== #
 # 2. Serve round-trip + determinism (skipped without the Godot binary)
 # ====================================================================== #
@@ -188,6 +208,61 @@ def test_serve_same_seed_determinism_across_sessions():
             env.close()
     assert len(seqs[0]) == len(seqs[1])
     assert all(np.array_equal(a, b) for a, b in zip(*seqs)), "serve must be deterministic"
+
+
+def _serve_obs_trace(monkeypatch, speedup, action="run_right", n=15):
+    """Reset seed 0 then step `action` n times at the given speedup, returning the obs
+    vectors. Sets HARNESS_GODOT_SPEEDUP so the runner scales the physics/time pair."""
+    if speedup == 1:
+        monkeypatch.delenv("HARNESS_GODOT_SPEEDUP", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", str(speedup))
+    env = GodotServeEnv(TRAVERSE, port_base=_free_port())
+    try:
+        assert env.speedup == speedup
+        env.reset(seed=0)
+        ai = env.actions.index(action)
+        vecs = []
+        for _ in range(n):
+            o, _r, term, trunc, _i = env.step(ai)
+            vecs.append(o.copy())
+            if term or trunc:
+                break
+        return vecs
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_serve_roundtrip_at_speedup_8(monkeypatch):
+    """A full init/reset/act round-trip works at speedup 8 (obs shape stable)."""
+    monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", "8")
+    env = GodotServeEnv(TRAVERSE, port_base=_free_port())
+    try:
+        assert env.speedup == 8
+        obs_dim = env.observation_space.shape[0]
+        obs, info = env.reset(seed=0)
+        assert obs.shape == (obs_dim,)
+        ri = env.actions.index("run_right")
+        for _ in range(5):
+            o, r, term, trunc, i = env.step(ri)
+            assert o.shape == (obs_dim,)
+            assert isinstance(r, float)
+            if term or trunc:
+                break
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_serve_speedup_is_tick_identical(monkeypatch):
+    """Serve stepping is tick-identical across speedups: the SAME seed+actions at
+    speedup 1 vs 8 yield IDENTICAL obs vectors every step (paired scaling keeps dt at
+    1/60), so a witness recorded at any speedup replays anywhere."""
+    slow = _serve_obs_trace(monkeypatch, 1)
+    fast = _serve_obs_trace(monkeypatch, 8)
+    assert len(slow) == len(fast) == 15
+    assert all(np.array_equal(a, b) for a, b in zip(slow, fast)), "speedup perturbed obs"
 
 
 @requires_godot

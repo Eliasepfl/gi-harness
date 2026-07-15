@@ -46,6 +46,45 @@ _DEFAULT_EXE_NAME = "Godot_v4.7-stable_win64_console.exe"
 # callers to pass it.
 FIXED_FPS = "60"
 
+# The game-tick SPEEDUP lever (GODOT_RL_AGENTS_CAPABILITIES.md "Fixed-delta under
+# speedup"). Farms opt in via ``HARNESS_GODOT_SPEEDUP``; runner.gd scales
+# physics_ticks_per_second AND time_scale together by this factor so the per-tick delta
+# stays exactly 1/60 -- trajectories are tick-identical, only wall-clock shrinks. The
+# default is 1 (byte-for-byte the shipped behaviour) until a soak comparison on a full
+# verify corpus confirms it. Validated to an integer in [SPEEDUP_MIN, SPEEDUP_MAX].
+SPEEDUP_ENV = "HARNESS_GODOT_SPEEDUP"
+SPEEDUP_MIN = 1
+SPEEDUP_MAX = 16
+
+
+def speedup_from_env(env: dict | None = None) -> int:
+    """Resolve the game-tick speedup from ``HARNESS_GODOT_SPEEDUP`` (default 1).
+
+    Validates an INTEGER in ``[SPEEDUP_MIN, SPEEDUP_MAX]`` and raises ``ValueError`` on
+    anything else (non-integer, out of range) so a fat-fingered farm env fails fast
+    instead of silently voiding replay. Both stepping seams (batch executor + serve env)
+    route through this so the validation is identical. An unset/empty var -> 1."""
+    raw = (env if env is not None else os.environ).get(SPEEDUP_ENV)
+    if raw is None or str(raw).strip() == "":
+        return SPEEDUP_MIN
+    text = str(raw).strip()
+    try:
+        val = int(text)
+    except ValueError:
+        raise ValueError(
+            f"{SPEEDUP_ENV} must be an integer in "
+            f"[{SPEEDUP_MIN},{SPEEDUP_MAX}], got {raw!r}")
+    if val < SPEEDUP_MIN or val > SPEEDUP_MAX:
+        raise ValueError(
+            f"{SPEEDUP_ENV}={val} out of range [{SPEEDUP_MIN},{SPEEDUP_MAX}]")
+    return val
+
+
+def speedup_user_args(speedup: int) -> list[str]:
+    """The ``--speedup=N`` cmdline tail runner.gd parses, or ``[]`` for the N==1 default
+    (so the default invocation stays byte-identical to the pre-speedup argv)."""
+    return [] if int(speedup) == SPEEDUP_MIN else ["--speedup=%d" % int(speedup)]
+
 
 def stepping_argv(exe: str, project: str, runner_rel: str,
                   user_args: list[str] | tuple[str, ...] = ()) -> list[str]:
@@ -160,6 +199,11 @@ class GodotExecutor:
         if not os.path.isfile(runner):
             raise VerifyError("godot_runner_missing",
                               f"runner.gd not found at {runner}")
+        # Validate the speedup env BEFORE provisioning/spawn so a bad value fails fast.
+        try:
+            speedup = speedup_from_env()
+        except ValueError as exc:
+            raise VerifyError("godot_bad_speedup", str(exc))
         self._ensure_provisioned()
 
         job_fd, job_path = tempfile.mkstemp(suffix=".json", prefix="godot_job_")
@@ -167,7 +211,7 @@ class GodotExecutor:
             with os.fdopen(job_fd, "w", encoding="utf-8") as fh:
                 json.dump(job, fh)
             argv = stepping_argv(self.exe, self.project, self.runner_rel,
-                                 ["--job=" + job_path])
+                                 ["--job=" + job_path, *speedup_user_args(speedup)])
             try:
                 proc = subprocess.run(argv, capture_output=True, text=True,
                                       encoding="utf-8", errors="replace",

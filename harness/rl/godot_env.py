@@ -77,8 +77,8 @@ _MAX_FRAME = 16 * 1024 * 1024  # 16 MiB frame cap (matches runner.gd SERVE_MAX_F
 class GodotServeError(RuntimeError):
     """A typed serve-lane failure. ``kind`` is one of ``port_in_use``,
     ``godot_missing``, ``stale``, ``closed``, ``protocol``, ``init_failed``,
-    ``dead``, ``write_failed`` — so callers (and the STALE deadline path) can
-    branch without string-matching."""
+    ``dead``, ``write_failed``, ``bad_speedup`` — so callers (and the STALE deadline
+    path) can branch without string-matching."""
 
     def __init__(self, kind: str, message: str):
         self.kind = kind
@@ -147,6 +147,16 @@ class GodotServeEnv:
         self._conn = None
         self._proc = None
         self._log = None
+
+        # Resolve the game-tick SPEEDUP first (HARNESS_GODOT_SPEEDUP, default 1) so an
+        # invalid value fails fast BEFORE binding a port or spawning Godot. The runner
+        # scales physics_ticks_per_second AND time_scale by this so per-tick delta stays
+        # 1/60 -- serve stepping stays byte-identical to the batch replay at any speedup.
+        from harness.verify.godot_exec import speedup_from_env
+        try:
+            self.speedup = speedup_from_env()
+        except ValueError as exc:
+            raise GodotServeError("bad_speedup", str(exc))
 
         self.game_path = game_path
         self.horizon = int(horizon)
@@ -243,9 +253,10 @@ class GodotServeEnv:
         # of real-time 60 Hz — the difference between ~10 and hundreds of steps/s. Route
         # through the shared builder so the flag is GUARANTEED on the serve seam too
         # (GODOT_DOCS_MINING.md section 3: enforce, don't trust the caller).
-        from harness.verify.godot_exec import stepping_argv
+        from harness.verify.godot_exec import stepping_argv, speedup_user_args
         argv = stepping_argv(self._exe, self._project, "res://runner.gd",
-                             ["--serve", "--port=%d" % self.port])
+                             ["--serve", "--port=%d" % self.port,
+                              *speedup_user_args(self.speedup)])
         last_log = ""
         for attempt in range(SPAWN_RETRIES):
             self._log = tempfile.TemporaryFile(mode="w+b")
