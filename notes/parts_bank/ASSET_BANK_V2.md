@@ -196,3 +196,24 @@ Recommendation: **shape for both, build only Path A now, let Elias price Path B.
    *inspiration for `render.py`*, not files to lift). Confirm palette owner.
 6. **Curation/admission gate** — the Roblox-Toolbox lesson (design.md A.1): certify every object
    before admission; ambiguous filenames (raceFuture, roadStraightSkew) reviewed by a human.
+
+---
+
+## DECISIONS (Elias, 2026-07-14 late-night addendum)
+
+1. **Binding: ADVISORY** — the designer just sees the menu ("easier to work
+   with"). Resolve-mode is dropped; the mis-wiring class stays covered by
+   verification instead. Follow-on accepted: a PLACEMENT-FEEDBACK harness —
+   the designer gets typed world-state feedback (asset names, positions,
+   AABBs, overlaps) after placing blocks; v1 = static spec analyzer tool in
+   the frozen tool layer, v2 = live engine state via the serve mode.
+2. **Validate 2D FIRST with all the new addons; ship the 3D rung by end of
+   week** — schema stays shaped-for-both (Path A build now, Path B insertion
+   points mapped in the pipeline schema).
+3. **Bank size must never direct the prompts.** The menu is advisory
+   vocabulary, not a catalog: prompts must not anchor on bank contents.
+   Growth mandate: (a) mass-extract ALL vendored CC0 kits (hundreds of
+   objects, not 15-20), (b) PARAMETRIC volume families (boxes/cylinders/
+   capsules/ramps/arcs across dimension ranges with roles — "just volumes is
+   fine" means the bank can grow to hundreds of certified entries with zero
+   external assets), (c) Poly Pizza as offline grower.
