@@ -14,3 +14,10 @@
   60/96 episodes, failing only the park). Cap steering chains at 2-3 gates;
   final leg = short straight glide into the zone. Signature: UNSOLVED
   "stuck between <gateN> and <gateN+1>/success" on 5/5 attempts.
+
+- [2026-07-15, CORRECTION on iter-2 lesson] Elias's challenge accepted: the
+  "short chains" lesson was never tested independently of the 3x budget
+  raise and is DEMOTED to hypothesis; reverted from rules_godot.md. Iter-3
+  = budget-only vs the iter-2 baseline to isolate the variable. Lesson 1
+  (near-straight first milestone) keeps its evidence: it was validated at
+  the OLD 21k budget (start-failures 3/5 -> 0/5 on prompt change alone).

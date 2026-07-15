@@ -18,8 +18,3 @@ These are the moat the verifier replays your winning run against (G0-G4). None i
   later gate one short curve from the previous one. Long or twisty first legs
   make the game unsolvable in search budget even when a human could drive it.
   [lesson: pilot-2026-07-15, 3/5 attempts died at the first milestone]
-- Steering chains must be SHORT: at most 2-3 gates between spawn and goal, and
-  the final approach into any parking/stop zone must be a short, near-straight
-  glide. Every extra gate multiplies the search cost; a 4-gate chain that a
-  human drives easily is beyond the certification search budget.
-  [lesson: pilot-2026-07-15 iter-2, 5/5 attempts stuck between consecutive gates]
