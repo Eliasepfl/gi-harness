@@ -1525,3 +1525,25 @@ def test_generate_game_gdscript_template_roundtrip(tmp_path):
     assert detect_engine(path) == "gdscript"
     final = res["attempts"][-1]["report"]
     assert final["engine"] == "gdscript" and final["passed"]
+
+
+def test_explicit_backend_never_falls_back_to_template(monkeypatch, tmp_path):
+    """An explicitly requested backend that is unavailable must surface
+    ENV_ERROR — never silently substitute the template games (they certify
+    trivially and poison model evaluations with fake COMPLETED verdicts)."""
+    from harness.gen import gamegen
+
+    def _unavailable(*a, **k):
+        raise gamegen._BackendUnavailable("nope")
+
+    monkeypatch.setitem(gamegen._LLM_RUNNERS, "openrouter", _unavailable)
+    res = gamegen._dispatch("a game", str(tmp_path), "openrouter", 1)
+    assert res["verdict"] == "ENV_ERROR"
+    assert res["backend"] == "openrouter"
+    assert res["game_path"] is None
+    assert "no template fallback" in res["note"]
+
+    # `auto` keeps the documented template fallback.
+    monkeypatch.setitem(gamegen._LLM_RUNNERS, "anthropic", _unavailable)
+    res_auto = gamegen._dispatch("a game", str(tmp_path), "auto", 1)
+    assert res_auto["backend"] == "template"

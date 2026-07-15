@@ -788,6 +788,13 @@ def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None,
                                       first_user)
         except _BackendUnavailable as e:
             notes.append(f"{name} unavailable ({e})")
+    if backend != "auto":
+        # An EXPLICITLY requested backend must hard-fail, never silently degrade
+        # to the template games: they certify trivially, so a fallback poisons
+        # any model evaluation with fake COMPLETED verdicts.
+        return {"game_path": None, "attempts": [], "verdict": "ENV_ERROR",
+                "backend": backend, "design": None,
+                "note": "; ".join(notes) + "; explicit backend requested -> no template fallback"}
     note = "; ".join(notes) + "; falling back to templates" if notes else None
     return _run_template(prompt, run_dir, max_repairs, note, engine)
 
