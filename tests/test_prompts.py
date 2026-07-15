@@ -204,12 +204,24 @@ def test_engine_key_maps_godot():
     assert "false" in rules and "{false}" not in rules
 
 
-def test_godot_bank_menu_reuses_the_js_renderer():
-    # "spec body NAMES drive sprite skinning exactly like js" — so the godot menu
-    # is byte-identical to the js menu (same naming-rule usage line + preset lines).
+def test_godot_bank_menu_is_advisory_vocabulary_not_a_catalog():
+    # The declarative godot lane emits DATA (no world.add / world.part), so its menu
+    # is ADVISORY name+physics vocabulary, NOT the js/py construction catalog (Elias:
+    # "the menu is advisory vocabulary, NEVER a catalog"). It therefore differs from
+    # BOTH the js and py menus and carries none of their code idioms / sprite-binding.
     names = ["wrecking_ball"]
-    assert R.build_menu(names, "godot") == R.build_menu(names, "js")
-    assert R.build_menu(names, "godot") != R.build_menu(names, "py")
+    godot = R.build_menu(names, "godot")
+    assert godot != R.build_menu(names, "js")
+    assert godot != R.build_menu(names, "py")
+    # No py/js construction idioms and no retired sprite-binding rule in the godot menu.
+    for banned in ("world.add", "world.part(", "renderer binds sprites by name",
+                   "EXACT part name"):
+        assert banned not in godot, banned
+    # The retrieved part is still surfaced as advisory vocabulary + the raw-body
+    # escape hatch stays visible.
+    assert "wrecking_ball" in godot
+    assert "advisory" in godot.lower()
+    assert "spec's body list" in godot
 
 
 # --- Track P: designer-prompt overhaul (variety + precision + mined physics) --
@@ -283,3 +295,95 @@ def test_godot_designer_sections_do_not_leak_into_js():
                    "meta.archetype", "Common failures - pass the loader",
                    "awesome-gamedev-agent-skills", "pick ONE mechanic archetype"):
         assert marker not in js, marker
+
+
+# --- Track PROMPTS: legacy PURGE + godot-coherent designer prompt -------------
+
+# Every pymunk/planck-era idiom the PIPELINE_MAP flagged as leaking onto the
+# default (godot) path, plus the retired sprite-binding menu rule. A composed
+# godot prompt is a declarative-spec brief and must contain NONE of them.
+_BANNED_GODOT_IDIOMS = (
+    "world.add", "world.rng", "world.control", "world.set_gravity",
+    "world.steps", "world.touching", "world.on_contact", "world.remove",
+    "world.query", "world.spring", "world.pivot", "world.part(",
+    "WORLD_SIZE", "renderer binds sprites by name", "EXACT part name",
+    "in act()",
+)
+
+
+def test_composed_godot_has_no_legacy_pyjs_idioms():
+    sp = P.compose("godot")
+    for tok in _BANNED_GODOT_IDIOMS:
+        assert tok not in sp, tok
+
+
+def test_composed_godot_with_menu_has_no_legacy_idioms():
+    # The menu (retrieval.build_menu) is spliced into the per-run godot prompt;
+    # it must be as clean as the section files — no world.add in the footer either.
+    menu = R.build_menu(["wrecking_ball"], "godot")
+    sp = P.compose("godot", menu)
+    for tok in _BANNED_GODOT_IDIOMS:
+        assert tok not in sp, tok
+
+
+def test_godot_uses_its_own_section_files_not_the_pyjs_ones():
+    # compose("godot") draws the godot-specific rules/orientation/design siblings,
+    # never the py/js code-module sections (which are actively wrong for the spec).
+    sp = P.compose("godot")
+    # godot rules_godot.md — the moat, engine-neutral (no world.control/rng idiom).
+    assert "Hard constraints" in sp
+    assert "EXACTLY one controlled body" in sp
+    assert "up to ~16 gameplay bodies" in sp          # relaxed body cap
+    # godot orientation_godot.md — objective archetypes + composition idioms.
+    assert "do NOT default to a platformer" in sp
+    assert "Composition idioms" in sp
+    # The py/js orientation's pymunk-only capability line must NOT be present.
+    assert "flipping gravity" not in sp
+    # godot design_block_godot.md — DESIGN format, json fence, no world.add.
+    assert "DESIGN" in sp and "Milestones:" in sp and "Parts used:" in sp
+
+
+def test_godot_sensors_raycast_documented():
+    # The raycast observation-fan sensor (spec-v2) is taught in the api tables.
+    sp = P.compose("godot")
+    assert "raycast2d" in sp
+    assert "attach_to" in sp
+    assert "n_rays" in sp
+    assert "cone_width_deg" in sp
+    # It is DATA that never touches the win / physics (off-by-default).
+    assert "never touches physics" in sp
+
+
+def test_godot_steer_archetype_and_relaxed_blocklist():
+    # The heading-control brick (thrust/torque + contained) landed, so a
+    # steer-to-pose archetype is now offered and the motion blocklist is relaxed.
+    sp = P.compose("godot")
+    assert "STEER-TO-POSE" in sp
+    assert "Heading control HAS landed" in sp
+    # The verbs/predicate the brick relies on are in the api tables.
+    assert '"verb": "thrust"' in sp or "thrust" in sp
+    assert "torque" in sp
+    assert "contained(" in sp
+    # Still-honest about what remains out of scope (no false promises).
+    assert "Still NOT yet expressible" in sp
+
+
+def test_godot_worked_examples_are_multiple_and_distinct():
+    # The single Ledge-Hop attractor is replaced by 2-3 structurally distinct ones.
+    sp = P.compose("godot")
+    assert "Ledge Hop" not in sp
+    assert "Worked mini-example" in sp
+    # Three distinct win-shapes appear, each a separate ```json spec.
+    assert sp.count("```json") >= 3
+    assert "Dock the Crate" in sp        # DELIVER (cargo pose)
+    assert "Park the Rover" in sp        # STEER-TO-POSE (contained finish)
+    assert "Beat the Flood" in sp        # RISING-HAZARD ESCAPE
+
+
+def test_godot_folds_in_examples_corpus_distillation():
+    # EXAMPLES_STRUCTURE_GUIDE §5 universals/differentiators, high-level only.
+    sp = P.compose("godot")
+    assert "Design universals" in sp
+    assert "COMPOUND latch" in sp                  # success is pose AND stillness AND state
+    assert "DIFFERENTIATOR family" in sp           # the anti-sameness lever
+    assert "anti-sameness" in sp
