@@ -647,6 +647,86 @@ def cmd_game_curriculum(args) -> int:
     return 0
 
 
+# ---- bank (parts bank list / certify) ----------------------------------------
+def _volume_brief(fp: dict) -> str:
+    """One-token volume rendering for the ``bank list`` table."""
+    if not fp:
+        return "-"
+    shape = fp.get("shape")
+    if shape == "box":
+        w, h = fp.get("size", [0, 0])
+        return f"box {w}x{h}"
+    if shape == "circle":
+        return f"circle r={fp.get('radius', 0)}"
+    if shape == "poly":
+        return f"poly {len(fp.get('vertices', []))}v"
+    if shape == "segment":
+        return "segment"
+    return str(shape or "-")
+
+
+def cmd_bank_list(args) -> int:
+    """List parts-bank entries (name, physics_class, role, volume, overrides)."""
+    try:
+        from harness.core.bank import load_bank
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("bank", exc, args.json)
+    try:
+        bank = load_bank(args.version, use_cache=False)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("bank list", exc, args.json)
+
+    rows = []
+    for name in bank.names():
+        p = bank.parts[name]
+        rows.append({
+            "name": name,
+            "physics_class": p.get("physics_class", p.get("category")),
+            "role": p.get("role"),
+            "volume": (p.get("volume") or {}).get("footprint_2d"),
+            "summary": p.get("summary"),
+            "overrides": sorted((p.get("overridable") or {}).keys()),
+        })
+
+    if args.json:
+        _emit_json({"version": args.version, "bank_version": bank.bank_version,
+                    "schema_version": bank.schema_version, "count": len(rows),
+                    "parts": rows})
+        return 0
+
+    print(f"=== BANK {args.version} ({bank.bank_version}, schema "
+          f"{bank.schema_version}): {len(rows)} parts ===")
+    width = max((len(r["name"]) for r in rows), default=4)
+    for r in rows:
+        role_s = r["role"] or "-"
+        print(f"  {r['name'].ljust(width)}  {str(r['physics_class']):8}  "
+              f"{role_s:11}  {_volume_brief(r['volume'])}")
+    return 0
+
+
+def cmd_bank_certify(args) -> int:
+    """Run the offline bank-CI certification pass over a bank version."""
+    try:
+        from harness.bank_ci import certify_bank, _print_table
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("bank_ci", exc, args.json)
+    try:
+        bank, rows = certify_bank(args.version)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("bank certify", exc, args.json)
+
+    n_pass = sum(r["ok"] for r in rows)
+    all_ok = n_pass == len(rows)
+    if args.json:
+        _emit_json({"version": args.version, "bank_version": bank.bank_version,
+                    "content_hash": bank.content_hash, "lock_ok": bank.hash_ok,
+                    "passed": n_pass, "total": len(rows), "all_ok": all_ok,
+                    "rows": rows})
+    else:
+        _print_table(bank, rows)
+    return 0 if all_ok else 1
+
+
 # ---- ledger merge ------------------------------------------------------------
 def cmd_ledger_merge(args) -> int:
     """Merge per-task cluster ledger shards into the canonical ledger."""
@@ -885,6 +965,22 @@ def build_parser() -> argparse.ArgumentParser:
                          "GODOT_RL_AGENTS_CAPABILITIES.md §6.7)")
     rp.add_argument("--json", action="store_true")
     rp.set_defaults(func=cmd_rl_probe)
+
+    # ---- bank group ----
+    bk = sub.add_parser("bank", help="parts-bank utilities (list / certify)")
+    bksub = bk.add_subparsers(dest="bank_command", required=True)
+    bl = bksub.add_parser(
+        "list", help="list bank entries (name, physics_class, role, volume)")
+    bl.add_argument("--version", default="v2", help="bank version (default v2)")
+    bl.add_argument("--json", action="store_true")
+    bl.set_defaults(func=cmd_bank_list)
+    bc = bksub.add_parser(
+        "certify",
+        help="run the offline bank-CI certification pass (volume + physics_class "
+             "floor + role_contract); exits non-zero if any entry fails")
+    bc.add_argument("--version", default="v2", help="bank version (default v2)")
+    bc.add_argument("--json", action="store_true")
+    bc.set_defaults(func=cmd_bank_certify)
 
     lg = sub.add_parser("ledger", help="run-ledger utilities (cluster shard merge)")
     lgsub = lg.add_subparsers(dest="ledger_command", required=True)
