@@ -47,6 +47,7 @@ CONTRACT = "contract.md"
 API_PY = "api_py.md"
 API_JS = "api_js.md"
 API_GODOT = "api_godot.md"
+API_GDSCRIPT = "api_gdscript.md"
 RULES = "rules.md"
 ORIENTATION = "orientation.md"
 DESIGN_BLOCK = "design_block.md"
@@ -61,10 +62,17 @@ RULES_GODOT = "rules_godot.md"
 ORIENTATION_GODOT = "orientation_godot.md"
 DESIGN_BLOCK_GODOT = "design_block_godot.md"
 
+# The GDScript lane emits CODE (a .gd game class), not the declarative JSON spec, so
+# it cannot reuse the spec-flavoured godot sections (predicate DSL, `on_step` kinds,
+# ```json fence). api_gdscript.md is the SELF-CONTAINED engine section (contract +
+# base-class services + the BANNED list + physics + failures); design_block_gdscript.md
+# carries only the DESIGN output format with a ```gdscript fence.
+DESIGN_BLOCK_GDSCRIPT = "design_block_gdscript.md"
+
 # Every section a composed prompt draws from (used by tests to assert coverage).
-SECTIONS = (CONTRACT, API_PY, API_JS, API_GODOT, RULES, ORIENTATION,
+SECTIONS = (CONTRACT, API_PY, API_JS, API_GODOT, API_GDSCRIPT, RULES, ORIENTATION,
             DESIGN_BLOCK, RULES_GODOT, ORIENTATION_GODOT, DESIGN_BLOCK_GODOT,
-            BANK_MENU_TMPL)
+            DESIGN_BLOCK_GDSCRIPT, BANK_MENU_TMPL)
 
 # Per-engine substitutions applied to the placeholder-bearing sections. Keys are
 # braced tokens ({lang}, ...) so they never collide with real code braces
@@ -108,6 +116,22 @@ _SUBS = {
                           "whitelisted predicate DSL."),
         "{rng_forbid}": "hard-code the layout to fake it",
     },
+    # The GDScript lane emits a .gd game CLASS: real code, but only game logic through
+    # the base-class services. api_gdscript.md / design_block_gdscript.md are written
+    # without {..} placeholders (they are engine-specific and fully concrete), so these
+    # values are a defensive fallback for any placeholder that might be added later.
+    "gdscript": {
+        "{lang}": "GDScript",
+        "{fence}": "gdscript",
+        "{artifact}": "GDScript game class",
+        "{substrate}": "stock Godot Physics 2D behind a frozen host",
+        "{dict_word}": "a Dictionary",
+        "{false}": "false",
+        "{import_rule}": ("No imports, no dynamic loads, no engine/OS/network/thread "
+                          "access: you write ordinary GDScript game logic that reaches "
+                          "the world ONLY through the base-class services."),
+        "{rng_forbid}": "use the host's seeded rng, never the global randi/randf",
+    },
 }
 
 
@@ -117,6 +141,8 @@ def _engine_key(engine) -> str:
         return "js"
     if e == "godot":
         return "godot"
+    if e == "gdscript":
+        return "gdscript"
     return "py"
 
 
@@ -151,9 +177,21 @@ def compose(engine="py", menu_text=None) -> str:
     the py/js rules/orientation/design sections for godot-specific siblings that
     speak the declarative-spec vocabulary (no world.add / world.control / rng
     idioms). The menu splice point is shared.
+
+    The GDScript lane emits CODE (a .gd game class implementing the GameAPI
+    contract) but of a shape neither the code-module contract.md nor the
+    spec-flavoured godot sections fit, so it composes the SELF-CONTAINED
+    api_gdscript.md (contract + base-class services + the BANNED list + physics +
+    failures) plus its own design_block_gdscript.md (```gdscript output format).
     """
     key = _engine_key(engine)
-    if key == "godot":
+    if key == "gdscript":
+        # The code lane's api_gdscript.md is SELF-CONTAINED (contract + services +
+        # BANNED list + physics + failures), so it composes only itself + its own
+        # DESIGN output format. The menu splice point is shared.
+        parts = [_render(_read(API_GDSCRIPT), key)]
+        design = DESIGN_BLOCK_GDSCRIPT
+    elif key == "godot":
         parts = [
             _render(_read(API_GODOT), key),
             _render(_read(RULES_GODOT), key),
@@ -183,6 +221,8 @@ ESCAPE_HATCH_CODE = ("The full construction API (world.add and the joints) remai
                      "fully available for anything the bank lacks.")
 ESCAPE_HATCH_GODOT = ("Invent any bodies your game needs directly in the spec's body "
                       "list - the menu never constrains the design.")
+ESCAPE_HATCH_GDSCRIPT = ("Invent any bodies your game needs directly with add_body / "
+                         "add_static in build_world - the menu never constrains the design.")
 
 
 def render_bank_menu(parts_block: str, usage_line: str,

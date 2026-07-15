@@ -1085,20 +1085,37 @@ _JS_MARKER = re.compile(r"(?m)^\s*(?:#|//)\s*engine\s*:\s*js\b")
 # The Godot lane's artifact is a declarative JSON spec (godotworld/SPEC.md): a
 # `.spec.json` path, or JSON carrying a top-level `"engine": "godot"` marker.
 _GODOT_MARKER = re.compile(r'"engine"\s*:\s*"godot"')
+# The GDScript lane's artifact is a real `.gd` game class (notes/engines/
+# GDSCRIPT_LANE.md): a `.gd` path, or a `# engine: gdscript` comment marker.
+_GDSCRIPT_MARKER = re.compile(r"(?m)^\s*#\s*engine\s*:\s*gdscript\b")
 
 
 def detect_engine(game_path: str, source: str = "") -> str:
     """Game engine: 'godot' for a `.spec.json` path or an `"engine":"godot"` JSON
-    marker; 'js' for a `.js` path or an `# engine: js` / `// engine: js` marker;
-    otherwise 'py' (default)."""
+    marker; 'gdscript' for a `.gd` path or a `# engine: gdscript` marker; 'js' for a
+    `.js` path or an `# engine: js` / `// engine: js` marker; otherwise 'py'."""
     path = str(game_path).lower()
     if path.endswith(".spec.json") or _GODOT_MARKER.search(source or ""):
         return "godot"
+    if path.endswith(".gd") or _GDSCRIPT_MARKER.search(source or ""):
+        return "gdscript"
     if path.endswith(".js"):
         return "js"
     if _JS_MARKER.search(source or ""):
         return "js"
     return "py"
+
+
+def gdscript_route_available() -> bool:
+    """Whether the GDScript verify route — the G0 code-gates + serve-contract
+    executor (TRACK C) — is importable in this build. The generator writes `.gd`
+    games regardless; this only tells callers/tests whether the FULL G0-G3 funnel
+    can run yet, so a template-backend e2e can skip gracefully until TRACK C merges."""
+    try:
+        import harness.verify.gdscript_verify  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 # ======================================================================== #
@@ -1135,6 +1152,8 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
     engine = detect_engine(game_path, source)
     if engine == "godot":
         return _verify_godot(source, report)
+    if engine == "gdscript":
+        return _verify_gdscript(source, report)
     if engine == "js":
         return _verify_js(source, report)
     return _verify_py(source, report, world_factory)
@@ -1294,6 +1313,33 @@ def _verify_godot(source: str, report: dict) -> dict:
         # Godot binary missing / crash / timeout / unparseable output -> VERIFY_ERROR
         # shape (no funnel layers), exactly like sandbox.run_sandboxed trouble.
         return exc.as_report()
+
+
+def _verify_gdscript(source: str, report: dict) -> dict:
+    """The GDScript-lane funnel: the NEW G0 code-gates (parse + banned-API scan +
+    contract probe) then G1-G3 through the serve contract. That executor + those
+    gates are TRACK C (notes/engines/GDSCRIPT_LANE.md). Until they merge this route
+    delegates to ``harness.verify.gdscript_verify.verify_gdscript``; if that module
+    is absent it returns a typed ``gdscript_route_absent`` report so the repair loop
+    degrades cleanly instead of misrouting a ``.gd`` into the pymunk path."""
+    report["engine"] = "gdscript"
+    try:
+        from harness.verify.gdscript_verify import verify_gdscript
+    except ImportError:
+        # No funnel layers + an `error` record == the VERIFY_ERROR shape the repair
+        # loop recognises (harness.gen.gamegen._is_verify_error): it stops after one
+        # retry instead of grinding blind on an empty hint.
+        report.pop("layers", None)
+        report["failure_class"] = "VERIFY_ERROR"
+        report["error"] = {
+            "type": "gdscript_route_absent",
+            "message": ("the gdscript verify route (G0 code-gates + serve-contract "
+                        "executor) is not merged in this build"),
+        }
+        report["hint"] = ("gdscript verification route not wired yet; the .gd was "
+                          "emitted but cannot be certified until TRACK C lands")
+        return report
+    return verify_gdscript(source, report)
 
 
 def _finish_g3(report: dict, g3: dict) -> dict:

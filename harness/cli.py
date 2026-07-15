@@ -867,10 +867,13 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("prompt", help="open-ended natural-language prompt")
     gn.add_argument("--backend", default="auto",
                     choices=["auto", "anthropic", "openrouter", "template"])
-    gn.add_argument("--engine", default=None, choices=["py", "js", "godot"],
-                    help="engine: godot (declarative .spec.json), js (Planck.js), "
-                         "or py (pymunk); default from HARNESS_ENGINE env, else "
-                         "godot (py/js are frozen legacy)")
+    gn.add_argument("--engine", default=None,
+                    choices=["py", "js", "godot", "gdscript"],
+                    help="engine: godot (declarative .spec.json), gdscript "
+                         "(agent-written .gd game class), js (Planck.js), or py "
+                         "(pymunk); default from HARNESS_ENGINE env, else godot "
+                         "(gdscript is selectable but not yet the default; py/js "
+                         "are frozen legacy)")
     gn.add_argument("--out-dir", default="scenes/games")
     gn.add_argument("--json", action="store_true")
     gn.set_defaults(func=cmd_game_new)

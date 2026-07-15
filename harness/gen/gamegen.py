@@ -142,12 +142,18 @@ def _engine_lang(engine):
     if engine == "godot":
         # The godot artifact is a declarative JSON spec, not code.
         return ("JSON", "json")
+    if engine == "gdscript":
+        # The gdscript artifact is a real .gd game class (CODE, not a spec).
+        return ("GDScript", "gdscript")
     return ("Python", "python")
 
 
 # The godot lane's per-run system prompt (menu-free shim, byte-identical to
 # compose("godot")); parallels _SYSTEM_PROMPT / SYSTEM_PROMPT_JS.
 _SYSTEM_PROMPT_GODOT = prompts.compose("godot")
+# The gdscript lane's per-run system prompt (menu-free shim, byte-identical to
+# compose("gdscript")); parallels the godot/js/py shims.
+_SYSTEM_PROMPT_GDSCRIPT = prompts.compose("gdscript")
 
 
 def _system_prompt(engine, menu_text=None):
@@ -163,6 +169,8 @@ def _system_prompt(engine, menu_text=None):
         return SYSTEM_PROMPT_JS
     if engine == "godot":
         return _SYSTEM_PROMPT_GODOT
+    if engine == "gdscript":
+        return _SYSTEM_PROMPT_GDSCRIPT
     return _SYSTEM_PROMPT
 
 
@@ -172,13 +180,22 @@ def _game_ext(engine):
     if engine == "godot":
         # The .spec.json extension is what detect_engine routes to the godot lane.
         return ".spec.json"
+    if engine == "gdscript":
+        # A plain .gd game class; detect_engine routes .gd to the gdscript lane.
+        return ".gd"
     return ".py"
 
 
 def _first_user_msg(prompt, engine="py"):
     _, fence = _engine_lang(engine)
-    # The godot artifact is one JSON object (the spec), not a code module.
-    artifact = "spec (one JSON object)" if engine == "godot" else "module"
+    # The godot artifact is one JSON object (the spec); the gdscript artifact is
+    # one .gd game class (code); py/js are a code module.
+    if engine == "godot":
+        artifact = "spec (one JSON object)"
+    elif engine == "gdscript":
+        artifact = "GDScript game class (one .gd file)"
+    else:
+        artifact = "module"
     return (f'User prompt: "{prompt}"\n'
             "Design an original 2D physics game for this prompt. Return the "
             f"DESIGN block, then exactly one ```{fence} {artifact} that follows the "
@@ -466,7 +483,14 @@ def _extract_code(text, engine="py"):
     """First fenced code block for the engine (fallback: any fenced block, raw text)."""
     if engine == "godot":
         return _extract_spec(text)
-    if engine == "js":
+    if engine == "gdscript":
+        # The gdscript artifact is real code -> the same fence-extraction machinery
+        # as py/js, keyed to a ```gdscript (or ```gd) fence.
+        for lang in ("gdscript", "gd"):
+            m = re.search(rf"```{lang}\s*\n(.*?)```", text, re.DOTALL)
+            if m:
+                return m.group(1)
+    elif engine == "js":
         for lang in ("javascript", "js"):
             m = re.search(rf"```{lang}\s*\n(.*?)```", text, re.DOTALL)
             if m:
@@ -595,7 +619,12 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
 
 def _run_template(prompt, run_dir, max_repairs, note, engine="py"):
     name = _select_template(prompt)
-    if engine == "godot":
+    if engine == "gdscript":
+        # One built-in .gd fixture (mirrors the js/godot single-template shape); the
+        # per-prompt keyword selection has no gdscript variants yet.
+        code = _TEMPLATE_GAMES_GDSCRIPT.get(name, _DRIFT_GDSCRIPT)
+        design = _DESIGNS_GDSCRIPT.get(name, _DESIGNS_GDSCRIPT["drift"])
+    elif engine == "godot":
         # One certified spec fixture (mirrors the js single-template shape); the
         # per-prompt keyword selection has no godot variants yet.
         code = _TEMPLATE_GAMES_GODOT.get(name, _TRAVERSE_GODOT)
@@ -712,10 +741,12 @@ def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None,
 def _resolve_engine(engine):
     """Target engine: explicit arg > HARNESS_ENGINE env > 'godot' default.
 
-    'godot' (declarative spec, the default post-pivot), 'js' (Planck) or 'py'
-    (pymunk). The py/js lanes are frozen legacy: still fully selectable (explicit
-    arg or HARNESS_ENGINE), but no longer the default target (see
-    notes/engines/GODOT_ONLY_PIVOT.md)."""
+    'godot' (declarative spec, the default post-pivot), 'gdscript' (an agent-written
+    .gd game class verified through the serve contract; see notes/engines/
+    GDSCRIPT_LANE.md), 'js' (Planck) or 'py' (pymunk). The py/js lanes are frozen
+    legacy: still fully selectable, but no longer the default. gdscript is selectable
+    now but does NOT change the default (the lane switch is a later call, after the
+    head-to-head)."""
     if engine is None:
         engine = os.environ.get("HARNESS_ENGINE", "godot")
     e = str(engine).lower()
@@ -723,6 +754,8 @@ def _resolve_engine(engine):
         return "js"
     if e == "py":
         return "py"
+    if e == "gdscript":
+        return "gdscript"
     return "godot"
 
 
@@ -758,6 +791,10 @@ _ADD_JS_RE = re.compile(r"""world\.add\(\s*["']([A-Za-z0-9_.]+)["']""")
 # godot: the spec's body NAMES carry the part identity (skinned by name, like js);
 # only bodies use a "name" key, so this reliably enumerates the declared entities.
 _NAME_GODOT_RE = re.compile(r'"name"\s*:\s*"([A-Za-z0-9_.]+)"')
+# gdscript: the .gd game names each body in its add_body/add_static/add_sensor call
+# (skinned by name, like godot/js); the first string arg is the body identity.
+_NAME_GDSCRIPT_RE = re.compile(
+    r"""add_(?:body|static|sensor)\(\s*["']([A-Za-z0-9_.]+)["']""")
 
 
 def _bank_names():
@@ -783,6 +820,11 @@ def _parse_parts_used(source, engine, bank_names):
     elif eng == "godot":
         # Spec body names matched against the bank (skinning parity with js).
         candidates = _NAME_GODOT_RE.findall(source)
+        want = bank_names
+    elif eng == "gdscript":
+        # add_body/add_static/add_sensor names matched against the bank (skinning
+        # parity with godot/js).
+        candidates = _NAME_GDSCRIPT_RE.findall(source)
         want = bank_names
     else:
         candidates = _PART_PY_RE.findall(source)
@@ -1202,4 +1244,82 @@ _DESIGNS_GODOT = {
                  "on_top_shelf -> at_beacon.\n"
                  "Win / Lose: win when the marble reaches the beacon zone; lose if "
                  "it touches either spike strip.\n"),
+}
+
+
+# --- Built-in v2 game, GDScript variant (a real .gd game class) ---------------
+# The gdscript lane's artifact is CODE: a class extending the frozen host's GameBase
+# and implementing the GameAPI contract (notes/engines/GDSCRIPT_LANE.md). This offline
+# fixture is a topdown "arm then dock" drift - touch the far switch to arm the pad, then
+# coast the puck home. A required reversal means no single held action wins. It exercises
+# the whole contract (set_gravity / add_static / add_sensor / add_body / control / impulse
+# / on_step clamp + flag latch / contacts / contained / checkpoints / success). Indented
+# with TABS, matching godotworld/runner.gd. Do NOT grow this into a genre library, and it
+# is deliberately NOT shown to the designer (the prompt is examples-free by design).
+_DRIFT_GDSCRIPT = '''extends GameBase
+# Topdown air-hockey: touch the switch on the left to arm the pad, then drift the
+# puck into the glowing pad on the right. Requires a reversal, so no single action wins.
+
+const MAX_SPEED := 230.0
+
+func game_meta() -> Dictionary:
+	return {
+		"title": "Arm and Dock",
+		"prompt": "arm the pad at the switch, then drift the puck home",
+		"actions": ["left", "right", "up", "down"],
+	}
+
+func build_world() -> void:
+	set_gravity(Vector2.ZERO)                       # topdown: no "down" to fall toward
+	add_static("wall_top", {"pos": Vector2(400, 588), "size": Vector2(800, 24)})
+	add_static("wall_bottom", {"pos": Vector2(400, 12), "size": Vector2(800, 24)})
+	add_static("wall_left", {"pos": Vector2(12, 300), "size": Vector2(24, 600)})
+	add_static("wall_right", {"pos": Vector2(788, 300), "size": Vector2(24, 600)})
+	add_sensor("switch", {"pos": Vector2(70, 300), "size": Vector2(60, 200)})
+	add_sensor("pad", {"pos": Vector2(620, 300), "size": Vector2(110, 110)})
+	add_body("puck", {"shape": "circle", "pos": Vector2(300, 300), "radius": 16.0,
+		"friction": 0.0, "elasticity": 0.4})
+	control("puck")
+
+func on_action(action: String) -> void:
+	match action:
+		"left": impulse("puck", Vector2(-55, 0))
+		"right": impulse("puck", Vector2(55, 0))
+		"up": impulse("puck", Vector2(0, 55))
+		"down": impulse("puck", Vector2(0, -55))
+
+func on_step() -> void:
+	if contacts("puck", "switch"):
+		set_flag("armed", true)
+	# Keep hostile impulse-spam under the tunnelling speed so containment holds.
+	set_velocity("puck", vel("puck").limit_length(MAX_SPEED))
+
+func checkpoints() -> Dictionary:
+	var p := pos("puck")
+	return {
+		"moved_off_start": p.distance_to(Vector2(300, 300)) > 40.0,
+		"reached_switch": flag("armed"),
+		"heading_home": flag("armed") and p.x > 400.0,
+		"docked": contained("puck", "pad"),
+	}
+
+func success() -> bool:
+	return flag("armed") and contained("puck", "pad")
+'''
+
+_TEMPLATE_GAMES_GDSCRIPT = {"drift": _DRIFT_GDSCRIPT}
+
+_DESIGNS_GDSCRIPT = {
+    "drift": ("DESIGN\n"
+              "Theme: a topdown air-hockey puck that must arm a switch before it "
+              "can dock.\n"
+              "Entities: one controlled puck, four perimeter walls, a left switch "
+              "sensor, a right pad sensor.\n"
+              "Mechanic twist: the pad is inert until the puck touches the far "
+              "switch - a required reversal, so no single held action wins.\n"
+              "Actions: left/right/up/down impulse the puck across frictionless ice.\n"
+              "Milestones: moved_off_start -> reached_switch -> heading_home -> "
+              "docked.\n"
+              "Win / Lose: win when the puck is armed AND fully inside the pad; no "
+              "lose condition.\n"),
 }
