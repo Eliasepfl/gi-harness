@@ -184,37 +184,21 @@ def compose(engine="py", menu_text=None) -> str:
     api_gdscript.md (contract + base-class services + the BANNED list + physics +
     failures) plus its own design_block_gdscript.md (```gdscript output format).
     """
-    # PURGED (Elias, 2026-07-15): the spec-lane prompt library is deleted -
-    # the project pivoted to agent-written GDScript verified through the
-    # GameAPI serve contract (notes/engines/GDSCRIPT_LANE.md). The two
-    # surviving prompt surfaces (the GameAPI contract reference and the
-    # derived attacker prompt) live with the gdscript lane, not here.
-    return ("[SPEC-LANE PARKED 2026-07-15] prompt library purged; the gdscript "
-            "lane owns the surviving prompt surfaces - notes/engines/GDSCRIPT_LANE.md")
-
+    # PARKED (Elias, 2026-07-15): the SPEC-lane prompt library (py / js / godot) is
+    # deleted — the project pivoted to agent-written GDScript verified through the
+    # GameAPI serve contract (notes/engines/GDSCRIPT_LANE.md). Those section .md files
+    # no longer exist, so every parked lane returns the sentinel. The GDScript lane is
+    # LIVE: its self-contained api_gdscript.md + design_block_gdscript.md still compose.
     key = _engine_key(engine)
-    if key == "gdscript":
-        # The code lane's api_gdscript.md is SELF-CONTAINED (contract + services +
-        # BANNED list + physics + failures), so it composes only itself + its own
-        # DESIGN output format. The menu splice point is shared.
-        parts = [_render(_read(API_GDSCRIPT), key)]
-        design = DESIGN_BLOCK_GDSCRIPT
-    elif key == "godot":
-        parts = [
-            _render(_read(API_GODOT), key),
-            _render(_read(RULES_GODOT), key),
-            _render(_read(ORIENTATION_GODOT), key),
-        ]
-        design = DESIGN_BLOCK_GODOT
-    else:
-        api = API_JS if key == "js" else API_PY
-        parts = [
-            _render(_read(CONTRACT), key),
-            _render(_read(api), key),
-            _render(_read(RULES), key),
-            _render(_read(ORIENTATION), key),
-        ]
-        design = DESIGN_BLOCK
+    if key != "gdscript":
+        return ("[SPEC-LANE PARKED 2026-07-15] prompt library purged; the gdscript "
+                "lane owns the surviving prompt surfaces - notes/engines/GDSCRIPT_LANE.md")
+
+    # The code lane's api_gdscript.md is SELF-CONTAINED (contract + services +
+    # BANNED list + physics + failures), so it composes only itself + its own
+    # DESIGN output format. The menu splice point is shared.
+    parts = [_render(_read(API_GDSCRIPT), key)]
+    design = DESIGN_BLOCK_GDSCRIPT
     if menu_text:
         parts.append(menu_text.replace("\r\n", "\n").replace("\r", "\n"))
     parts.append(_render(_read(design), key))

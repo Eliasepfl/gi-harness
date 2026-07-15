@@ -1,8 +1,9 @@
 """Prompt tests - GDScript lane only.
 
-The spec-lane prompt library was purged (Elias, 2026-07-15, commit 64e95b0);
-its tests died with it. What survives is the gdscript engine section:
-compose('gdscript') assembles the GameAPI contract prompt.
+The spec-lane prompt library was purged (Elias, 2026-07-15); its tests died with it.
+What survives is the gdscript engine section: compose('gdscript') assembles the
+duck-typed METHOD-CONVENTION prompt (a plain Node implementing build/act/state/...,
+NO base class -- godotworld/GAME_API.md), examples-free.
 """
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import re
 
 import pytest
 
+from harness.core import integrity as INT
 from harness.gen import prompts as P
 
 
@@ -23,51 +25,52 @@ def _gdscript_blocks(sp):
 def test_all_sections_present_in_composed_gdscript():
     sp = P.compose("gdscript")
     # api_gdscript.md — the self-contained code contract + tables.
-    assert "ONE GDScript file" in sp                # emit a .gd class, real code
-    assert "extends GameBase" in sp                 # the base class it extends
+    assert "ONE GDScript file" in sp                # emit a .gd node, real code
+    assert "NO BASE CLASS" in sp                    # a PLAIN node, nothing to resolve
     assert "DESIGN BEFORE YOU CODE" in sp           # design-before-code scaffold
     assert "DIVERSITY IS THE JOB" in sp             # the diversity mandate
-    # The GameAPI contract tables: required methods + base-class services.
-    for method in ("game_meta()", "build_world()", "on_action(action)",
-                   "checkpoints()", "success()"):
-        assert method in sp, method
-    for service in ("add_body(name, opts)", "add_static(name, opts)",
-                    "add_sensor(name, opts)", "control(name)", "set_gravity(vec)",
-                    "impulse(name, vec)", "force(name, vec)", "set_velocity(name, vec)",
-                    "torque(name, mag)", "thrust(name, mag)"):
-        assert service in sp, service
-    for query in ("grounded(name)", "contacts(a, b)", "contained(a, b)", "dist(a, b)"):
-        assert query in sp, query
-    assert "```gdscript" in sp                       # the placeholder-skeleton fence
-    # design_block_gdscript.md — DESIGN output format, gdscript fence.
+    # The seven method SIGNATURES the has_method contract probe checks (taught by name,
+    # not as a filled skeleton — reference, not a worked example).
+    for sig in ("func build(world_seed: int) -> void", "func act(action: String) -> void",
+                "func state() -> Dictionary", "func checkpoints() -> Dictionary",
+                "func is_success() -> bool", "func is_failure() -> bool",
+                "func actions() -> Array"):
+        assert sig in sp, sig
+    # The rng is self-seeded (a determinism RULE, not an anchoring node/value).
+    assert "RandomNumberGenerator" in sp
+    # The state() snapshot keys the funnel reads.
+    for key in ('"controlled"', '"static"', '"bodies"'):
+        assert key in sp, key
+    # design_block_gdscript.md — DESIGN output format.
     assert "DESIGN" in sp and "Milestones:" in sp and "Parts used:" in sp
     assert "# Output format" in sp
 
 
-def test_composed_gdscript_has_no_complete_game_examples():
-    # Elias rejected worked examples as attractors: the guide carries ONLY a
-    # placeholder FORM, never a copyable game. Grep-test that discipline.
+def test_composed_gdscript_is_reference_not_a_worked_game():
+    # Elias's discipline: the guide carries SIGNATURES + slot descriptions, never a
+    # filled skeleton or a copyable game — a worked example anchors the small model
+    # (and a filled skeleton hardcodes a dimension/shape it must not).
     sp = P.compose("gdscript")
-    blocks = _gdscript_blocks(sp)
-    assert blocks, "expected at least the skeleton block"
-    # The skeleton is a form, not a design: placeholder slots + pass bodies.
-    skeleton = max(blocks, key=lambda b: b.count("func "))
-    assert "<" in skeleton and "pass" in skeleton
-    assert "shape to fill, not a game to copy" in sp
-    # Every OTHER fenced gdscript block is a <=3-line syntax fragment.
-    for b in blocks:
-        if b is skeleton:
-            continue
-        nonblank = [ln for ln in b.splitlines() if ln.strip()]
-        assert len(nonblank) <= 3, nonblank
-    # No fenced block is a filled, copyable game (real construction + a concrete win).
-    for b in blocks:
-        filled_build = b.count("add_body(") + b.count("add_static(")
-        concrete_win = ("func success" in b and "return <" not in b
-                        and "return false" not in b)
-        assert not (filled_build >= 2 and concrete_win), "a worked game leaked in"
-    # The offline fixture's own game must never appear in the designer prompt.
+    assert "there is deliberately no skeleton" in sp
+    # NO fenced gdscript block is a complete, playable game body.
+    for b in _gdscript_blocks(sp):
+        builds = b.count("RigidBody") + b.count("StaticBody") + b.count("add_child(")
+        assert not (builds >= 2 and "func " in b), "a worked game leaked in"
+    # The offline template's own game never appears in the designer prompt.
     assert "Arm and Dock" not in sp
+    assert "air-hockey puck that must drift" not in sp
+    assert "_puck" not in sp and "_pads" not in sp
+
+
+def test_gdscript_grants_2d_and_3d_dimension_freedom():
+    # Elias: BOTH 2D and 3D are first-class; the fiction chooses, neither is the default.
+    sp = P.compose("gdscript")
+    assert "Node2D" in sp and "Node3D" in sp             # both dimension families named
+    assert "PhysicsServer3D.set_active(true)" in sp      # the one 3D quirk, taught
+    # The controlled body's shape/type is a design choice, never a forced circle.
+    assert "default to a circle" in sp
+    flat = " ".join(sp.lower().split())
+    assert "whatever the game is about" in flat
 
 
 def test_gdscript_banned_list_states_determinism_and_sandbox_reasons():
@@ -82,16 +85,32 @@ def test_gdscript_banned_list_states_determinism_and_sandbox_reasons():
     flat = " ".join(sp.lower().split())
     assert "sandbox escape" in flat
     assert "nondeterministic" in flat or "nondeterminism" in flat
-    assert "seeded" in flat            # use the host's seeded rng, not global randi
+    # The sanctioned randomness path: seed your own generator, not the global rng.
+    assert "seed it from world_seed" in flat or "seed your own" in flat
 
 
 def test_gdscript_gravity_is_the_games_own_choice():
-    # View guidance: gravity is set by the GAME in build_world, not chosen for it.
+    # View guidance: gravity/view is the GAME's to set (no hardcoded frame values).
     sp = P.compose("gdscript")
-    assert "set_gravity(Vector2(0, -900))" in sp       # side view anchor
-    assert "set_gravity(Vector2.ZERO)" in sp           # topdown anchor
     flat = " ".join(sp.lower().split())
-    assert "gravity is yours to set" in flat or "gravity choice you make" in flat
+    assert "yours to set" in flat                       # gravity/orientation is the game's
+    assert "topdown" in flat and "side" in flat         # both 2D frame anchors named, no values
+
+
+def test_gdscript_prompt_carries_no_anchoring_residue():
+    # Elias's anti-anchoring principle: the surface carries signatures + hard rules only,
+    # NOT hardcoded values, a world extent, prescribed (2D-only) node types, or a skeleton.
+    sp = P.compose("gdscript")
+    # No world-size field (pure spec-lane residue) and no hardcoded arena extent.
+    for residue in ("world_size", "[800", "800, 600", "WORLD_SIZE"):
+        assert residue not in sp, residue
+    # No prescribed 2D-only node types (the game picks bodies for its dimension).
+    for node2d in ("RigidBody2D", "StaticBody2D", "Area2D", "CollisionShape2D"):
+        assert node2d not in sp, node2d
+    # No filled skeleton / worked game.
+    assert "there is deliberately no skeleton" in sp
+    for b in _gdscript_blocks(sp):
+        assert "func " not in b, "a code skeleton leaked in"
 
 
 def test_compose_gdscript_deterministic_and_distinct():
@@ -111,7 +130,7 @@ def test_menu_splices_into_gdscript_before_design_block():
     sp = P.compose("gdscript", menu)
     assert "GD_MENU_MARKER" in sp
     # The menu comes AFTER the api contract and BEFORE the DESIGN output format.
-    assert sp.index("extends GameBase") < sp.index("GD_MENU_MARKER")
+    assert sp.index("func build(world_seed") < sp.index("GD_MENU_MARKER")
     assert sp.index("GD_MENU_MARKER") < sp.index("# Output format")
     assert "GD_MENU_MARKER" not in P.compose("gdscript")
 
@@ -122,24 +141,27 @@ def test_composed_gdscript_has_no_spec_or_pyjs_idioms_or_placeholders():
     for spec_tok in ('"verb": "impulse"', "predicate DSL", "```json",
                      "whitelisted predicate", "on_step\":"):
         assert spec_tok not in sp, spec_tok
-    # ...nor the py/js construction idioms.
-    for pyjs in ("world.add", "world.part(", "world.control", "pymunk", "Planck.js"):
-        assert pyjs not in sp, pyjs
+    # ...nor the py/js construction idioms, nor the retired GameBase service API.
+    for stale in ("world.add", "world.part(", "world.control", "pymunk", "Planck.js",
+                  "extends GameBase", "add_body(", "set_gravity("):
+        assert stale not in sp, stale
     # Every {..} placeholder the shared substitution carries is resolved.
     for token in ("{lang}", "{fence}", "{artifact}", "{substrate}", "{false}",
                   "{import_rule}", "{rng_forbid}", "{dict_word}"):
         assert token not in sp, token
 
 
-def test_gdscript_physics_and_failures_are_self_contained():
+def test_gdscript_common_failures_are_taught():
     sp = P.compose("gdscript")
-    # Physics guidance (derive sizes, do not memorize) + the code-gate failure table.
-    assert "Physics the host enforces" in sp
-    assert "TUNNELLING" in sp
-    assert "Common failures" in sp
+    # The per-gate failure reminders (hard rules), no hardcoded physics numbers.
+    assert "Common gate failures" in sp
     for row in ("G0 parse error", "G0 banned API", "G0 contract probe",
-                "G1 containment escape", "G1 dead action", "G3 grounded-gated jump"):
+                "G1 containment escape", "G1 dead action", "G1 single-action win",
+                "G2 predicate already true at t=0", "G3 goal never true"):
         assert row in sp, row
+    # The tunnelling principle is folded into the containment fix (a rule, not a value).
+    flat = " ".join(sp.lower().split())
+    assert "clamp the controlled body" in flat
 
 
 def test_gdscript_integrity_freezes_its_prompt_sections():

@@ -1,20 +1,26 @@
-# mini_collect.gd -- a GameAPI-compliant fixture game (GDScript lane).
+# mini_collect.gd -- a duck-typed GameAPI-convention fixture game (GDScript lane).
+#
+# A PLAIN Node2D that IMPLEMENTS the method convention -- NO base class, no
+# `class_name` dependency (godotworld/GAME_API.md): build/act/state/checkpoints/
+# is_success/is_failure/actions. It compiles STANDALONE (godot --headless
+# --check-only --script mini_collect.gd, no --path) and certifies G0-G3 through the
+# serve contract (godotworld/serve_game.gd + harness/verify/gd_exec.py).
 #
 # A top-down 3-body collect game: one controlled RigidBody2D player + two gem
 # markers. The player coasts under zero gravity + linear damping (the top-down
 # friction analog) and collects a gem by moving within COLLECT_R of it. Success =
 # both gems collected. Deterministic: no wall clock, no global RNG -- the ONLY
-# randomness is a tiny seed-stable jitter drawn from `self.rng` (which the harness
-# seeds before build), proving the base rng is wired.
+# randomness is a tiny seed-stable jitter drawn from an rng the game creates ITSELF
+# from build()'s seed (the banned-API scan forbids the unseeded global randi/randf/
+# randomize, so a self-seeded RandomNumberGenerator is the sanctioned path).
 #
-# Passes the GDScript lane funnel: G0 (banned-API scan + parse gate + contract
-# probe + one controlled dynamic body + >=2 bodies), G1 (deterministic two-run
-# drift + each of the 4 moves is live + no success under noop), G2 (both milestones
-# false at t=0, pure predicates), G3 (a budgeted solver collects both gems).
+# Passes the GDScript lane funnel: G0 (banned-API scan + standalone parse gate +
+# contract probe + one controlled dynamic body + >=2 bodies), G1 (deterministic
+# two-run drift + each of the 4 moves is live + no success under noop), G2 (both
+# milestones false at t=0, pure predicates), G3 (a budgeted solver collects both gems).
 
-extends GameAPI
+extends Node2D
 
-const WORLD := Vector2(800.0, 600.0)
 const COLLECT_R := 40.0
 const IMPULSE := 150.0
 const DAMP := 3.0
@@ -22,14 +28,19 @@ const MAX_V := 130.0        # px/s speed cap -> bounded, predictable per-tick tr
                             # (~13 px/tick) so the goal needs REAL play (non-trivial)
                             # while staying solvable within the budget
 
+var _rng := RandomNumberGenerator.new()   # seeded from build()'s seed -- the game owns
+                                           # its randomness; the host hands it none
 var _player: RigidBody2D = null
 var _gems := []            # [{name, node, pos, collected}]
 
 
 func build(world_seed: int) -> void:
-	# A tiny deterministic jitter (same for a given seed) -- exercises self.rng
-	# without perturbing solvability or determinism (both runs share seed 0).
-	var jitter := rng.randf_range(-5.0, 5.0)
+	# Seed OUR OWN generator from the world seed -> the same seed yields the same
+	# stream (two builds at the same seed match, which G1's drift gate checks).
+	_rng.seed = world_seed
+	# A tiny deterministic jitter (same for a given seed) -- exercises the rng without
+	# perturbing solvability or determinism (both runs share seed 0).
+	var jitter := _rng.randf_range(-5.0, 5.0)
 
 	_player = RigidBody2D.new()
 	_player.gravity_scale = 0.0                              # top-down: no floor to fall to
@@ -118,7 +129,6 @@ func state() -> Dictionary:
 		})
 	return {
 		"bodies": bodies,
-		"world_size": [WORLD.x, WORLD.y],
 		"flags": {"got_first": _count() >= 1, "got_both": _count() >= 2},
 	}
 

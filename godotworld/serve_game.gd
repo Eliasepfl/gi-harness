@@ -1,9 +1,11 @@
 # serve_game.gd -- FROZEN, audited serve host for the GDScript (GameAPI) lane.
 #
 # The code twin of runner.gd's serve mode: where runner.gd interprets a DATA spec,
-# this host loads a generated `.gd` game that `extends GameAPI` (godotworld/
-# GAME_API.md) and drives it through the SAME framed serve protocol so the Python
-# funnel (harness/verify/gd_exec.py -> the shared G0-G3 layers) is engine-agnostic.
+# this host loads a generated `.gd` game -- a PLAIN Node that IMPLEMENTS the method
+# convention (build/act/state/checkpoints/is_success/is_failure/actions; NO base
+# class -- godotworld/GAME_API.md) -- and drives it through the SAME framed serve
+# protocol so the Python funnel (harness/verify/gd_exec.py -> the shared G0-G3
+# layers) is engine-agnostic.
 #
 # Run (spawned by the Python side; NEVER hand-run against untrusted code outside
 # the container):
@@ -29,10 +31,11 @@
 # methods are called, so this process runs UNTRUSTED code -- it therefore runs ONLY
 # in-container, on a SCRUBBED environment (the Python spawner passes no keys), and
 # ONLY after the Python-side static banned-API scanner (harness/verify/gd_gate.py)
-# has passed. The base class hands the game rng + a physics-space handle and nothing
-# else; every escape hatch (OS/FileAccess/net/threads/reflection/wall-clock/unseeded
-# RNG) is a hard G0 scanner fail. This host itself uses NO such API on the game's
-# behalf.
+# has passed. The host hands the game NOTHING but tree membership (its RigidBody2D
+# children join the world's physics space) + build()'s seed; the game seeds its own
+# RandomNumberGenerator. Every escape hatch (OS/FileAccess/net/threads/reflection/
+# wall-clock/unseeded RNG) is a hard G0 scanner fail. This host itself uses NO such
+# API on the game's behalf.
 
 extends SceneTree
 
@@ -210,18 +213,19 @@ func _write_frame(peer: StreamPeerTCP, text: String) -> void:
 # Game compile + build (the in-memory parse gate + contract probe)
 # =========================================================================== #
 func _compile_source(src: String) -> Dictionary:
-	# Parse gate: compile the generated source in-memory. reload() returns non-OK on
-	# any parse/compile error -- the headless equivalent of validate_script.gd's
-	# ResourceLoader compile-check (GODOT_AI_TOOLING_AUDIT.md tugcan mine), without a
-	# file on disk. Returns {"ok", "error", "script"} (compile ONCE; instantiate per
-	# episode from the returned GDScript so reset never recompiles).
+	# In-memory compile so we can INSTANTIATE the game (compile ONCE; instantiate per
+	# episode from the returned GDScript so reset never recompiles). The AUTHORITATIVE
+	# parse gate is now the Python side's standalone `--check-only --script` (a duck-typed
+	# plain-Node game has no base class to resolve, so it compiles standalone); this
+	# reload() is the belt-and-braces twin that also yields the instantiable script.
+	# Returns {"ok", "error", "script"}.
 	var gd := GDScript.new()
 	gd.source_code = src
 	var err := gd.reload()
 	if err != OK:
 		return {"ok": false, "error": "parse/compile failed (Error %d)" % err, "script": null}
 	if not gd.can_instantiate():
-		return {"ok": false, "error": "script is not instantiable (does it extend GameAPI?)", "script": null}
+		return {"ok": false, "error": "script is not instantiable (must be a plain Node implementing the method convention)", "script": null}
 	return {"ok": true, "error": "", "script": gd}
 
 
@@ -230,7 +234,7 @@ func _instantiate(gd: GDScript) -> Dictionary:
 	if inst == null:
 		return {"ok": false, "error": "instantiation returned null", "instance": null}
 	if not (inst is Node):
-		return {"ok": false, "error": "game must extend a Node (GameAPI)", "instance": null}
+		return {"ok": false, "error": "game must be a Node (extends Node / Node2D / Node3D)", "instance": null}
 	return {"ok": true, "error": "", "instance": inst}
 
 
@@ -263,13 +267,12 @@ func _rebuild(world_seed: int) -> String:
 	if not missing.is_empty():
 		inst.free()                         # not in the tree yet
 		return "missing contract method(s): " + ", ".join(missing)
-	# Seed the harness rng BEFORE build so a game that draws from it is deterministic.
-	if "rng" in inst and inst.rng != null:
-		inst.rng.seed = world_seed
 	root.add_child(inst)
-	# Hand the game the physics-space handle (optional; most games ignore it).
-	if "_space_rid" in inst:
-		inst._space_rid = root.world_2d.space
+	# The game is a plain Node implementing the method convention (no base class): it
+	# seeds its OWN RandomNumberGenerator from build()'s seed -- the banned-API scan
+	# forbids the unseeded global randi/randf/randomize, so a self-seeded generator is
+	# the sanctioned path -- and its RigidBody2D children join the world's physics space
+	# by tree membership. The host hands it nothing but that membership + the seed.
 	# build() may raise inside generated code; a bad build surfaces as an error frame
 	# rather than crashing the host.
 	inst.build(world_seed)
@@ -387,15 +390,22 @@ func _sane() -> bool:
 	for b in bodies:
 		if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)):
 			continue
-		var p = b.get("pos", [0.0, 0.0])
-		var v = b.get("vel", [0.0, 0.0])
+		var p = b.get("pos", [])
+		var v = b.get("vel", [])
 		if typeof(p) != TYPE_ARRAY or typeof(v) != TYPE_ARRAY:
 			continue
-		var px := float(p[0]); var py := float(p[1])
-		var vx := float(v[0]); var vy := float(v[1])
-		if not (is_finite(px) and is_finite(py) and is_finite(vx) and is_finite(vy)):
-			return false
-		if sqrt(vx * vx + vy * vy) > VMAX:
+		# Every position component finite; full velocity magnitude under VMAX -- across
+		# 2 OR 3 components, so a 3D explosion (large vz) is caught like a 2D one.
+		for c in p:
+			if not is_finite(float(c)):
+				return false
+		var sq := 0.0
+		for c in v:
+			var cv := float(c)
+			if not is_finite(cv):
+				return false
+			sq += cv * cv
+		if sqrt(sq) > VMAX:
 			return false
 	return true
 
@@ -458,16 +468,22 @@ func _frame_json(with_handshake: bool, margin: float) -> String:
 
 
 func _body_obs_json(b: Dictionary) -> String:
-	var p = b.get("pos", [0.0, 0.0])
-	var v = b.get("vel", [0.0, 0.0])
-	var px := 0.0; var py := 0.0; var vx := 0.0; var vy := 0.0
-	if typeof(p) == TYPE_ARRAY and p.size() == 2:
-		px = float(p[0]); py = float(p[1])
-	if typeof(v) == TYPE_ARRAY and v.size() == 2:
-		vx = float(v[0]); vy = float(v[1])
-	return ('{"pos":[%s,%s],"vel":[%s,%s],"angle":%s,"controlled":%s,"static":%s}') % [
-		_f(px), _f(py), _f(vx), _f(vy), _f(float(b.get("angle", 0.0))),
+	return ('{"pos":%s,"vel":%s,"angle":%s,"controlled":%s,"static":%s}') % [
+		_vec_json(b.get("pos", [])), _vec_json(b.get("vel", [])),
+		_f(float(b.get("angle", 0.0))),
 		_b(bool(b.get("controlled", false))), _b(bool(b.get("static", false)))]
+
+
+func _vec_json(a) -> String:
+	# Emit a pos/vel vector at full %.17f precision, however many components the game
+	# reports -- 2D ([x,y]) OR 3D ([x,y,z]). The obs is thus dimension-agnostic; the
+	# Python-side snapshot deltas zip componentwise, so both lanes read it unchanged.
+	# Byte-identical to the old "[%s,%s]" for a 2-vector.
+	var parts := PackedStringArray()
+	if typeof(a) == TYPE_ARRAY:
+		for x in a:
+			parts.append(_f(float(x)))
+	return "[%s]" % ",".join(parts)
 
 
 func _actions_json() -> String:
@@ -495,7 +511,7 @@ func _oob_json(margin: float) -> String:
 			if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)):
 				continue
 			var p = b.get("pos", [0.0, 0.0])
-			if typeof(p) != TYPE_ARRAY or p.size() != 2:
+			if typeof(p) != TYPE_ARRAY or p.size() < 2:
 				continue
 			var px := float(p[0]); var py := float(p[1])
 			if px < -margin or py < -margin or px > _world_w + margin or py > _world_h + margin:
@@ -535,13 +551,10 @@ func _op_check(msg: Dictionary) -> String:
 		inst.free()
 		return JSON.stringify(out)
 
-	# 3. Build the scene (fresh, seed 0), then probe t=0.
+	# 3. Build the scene (fresh, seed 0), then probe t=0. The game self-seeds from
+	# build()'s seed; the host only grants tree membership.
 	await process_frame
-	if "rng" in inst and inst.rng != null:
-		inst.rng.seed = 0
 	root.add_child(inst)
-	if "_space_rid" in inst:
-		inst._space_rid = root.world_2d.space
 	inst.build(0)
 	_game = inst
 	out["build"] = {"ok": true, "error": null}
@@ -599,8 +612,11 @@ func _op_check(msg: Dictionary) -> String:
 
 
 func _center_in_bounds(b: Dictionary) -> bool:
+	# Bounds are the [0,w]x[0,h] plane of the FIRST TWO position components (x, y);
+	# a 3D game keeps that plane in bounds (extra components -- depth/height -- are not
+	# boxed here, only checked finite by _sane). Accept >= 2 components (2D or 3D).
 	var p = b.get("pos", [0.0, 0.0])
-	if typeof(p) != TYPE_ARRAY or p.size() != 2:
+	if typeof(p) != TYPE_ARRAY or p.size() < 2:
 		return false
 	var px := float(p[0]); var py := float(p[1])
 	return px >= 0.0 and py >= 0.0 and px <= _world_w and py <= _world_h

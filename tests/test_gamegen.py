@@ -1120,82 +1120,9 @@ def test_openrouter_json_returns_none_on_garbage():
 #  Tier-1b parts pipeline: retrieval injection, pinning, and ledger block
 # =============================================================================
 
-# A game that instantiates a bank part via world.part (so parts_used is non-empty).
-_PART_GAME_PY = '''TITLE = "wreck"
-PROMPT = "swing a wrecking ball"
-ACTIONS = ["push", "pull"]
-def build(world):
-    world.part("wrecker", "wrecking_ball", pos=(400, 230))
-    world.control("wrecker")
-def act(world, action):
-    world.impulse("wrecker", (60 if action == "push" else -60, 0))
-def success(world):
-    return world.query("wrecker")["pos"][0] > 600
-def checkpoints(world):
-    return {"swung": world.query("wrecker")["pos"][0] > 500}
-'''
-
-
-@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
-def test_bank_menu_injected_and_pinned_across_repairs(tmp_path, monkeypatch):
-    # The retrieved Tier-1b menu is spliced into the system prompt and PINNED:
-    # every repair attempt sees the identical system prompt (same menu).
-    systems = []
-
-    def fake_complete(client, system, messages):
-        systems.append(system)
-        return "DESIGN\nParts used: wrecking_ball as \"wrecker\"\n```python\n" + \
-            _PART_GAME_PY + "\n```"
-
-    verify_calls = {"n": 0}
-
-    def fake_verify(path):
-        verify_calls["n"] += 1
-        if verify_calls["n"] == 1:
-            return {"passed": False, "failure_class": "UNSOLVED",
-                    "hint": "0/40 episodes", "witness": None}
-        return {"passed": True, "failure_class": None, "hint": "", "witness": {}}
-
-    monkeypatch.setattr(GG, "_make_client", lambda: object())
-    monkeypatch.setattr(GG, "_llm_complete", fake_complete)
-    _install_gameverify(monkeypatch, fake_verify)
-
-    res = GG.generate_game("swing a wrecking ball to smash a tower",
-                           out_dir=str(tmp_path), backend="anthropic", max_repairs=4)
-
-    assert res["verdict"] == "COMPLETED"
-    assert len(systems) == 2                       # initial + one repair
-    # The menu was injected (the retrieved part shows up in the system prompt)...
-    assert "wrecking_ball (mobile)" in systems[0]
-    assert "world.part(" in systems[0]
-    # ...and it is PINNED — byte-identical system prompt across repair iterations.
-    assert systems[0] == systems[1]
-    # Pipeline telemetry reflects the pinned menu + the part the game used.
-    pipe = res["pipeline"]
-    assert pipe["menu_mode"] == "menu"
-    assert "wrecking_ball" in pipe["retrieved"]
-    assert pipe["parts_used"] == ["wrecking_ball"]
-
-
-def test_ledger_pipeline_block_written(tmp_path, monkeypatch):
-    ledger = tmp_path / "ledger.jsonl"
-    monkeypatch.setattr(GG, "_LEDGER_PATH", str(ledger))
-    monkeypatch.setattr(GG, "_make_client", lambda: object())
-    monkeypatch.setattr(
-        GG, "_llm_complete",
-        lambda client, system, messages: "DESIGN\nt\n```python\n" + _PART_GAME_PY + "\n```")
-    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
-                                                "hint": "", "witness": {}})
-
-    GG.generate_game("swing a wrecking ball to smash a tower",
-                     out_dir=str(tmp_path / "out"), backend="anthropic", max_repairs=2)
-
-    entry = json.loads(ledger.read_text(encoding="utf-8").strip().splitlines()[0])
-    assert "pipeline" in entry
-    pipe = entry["pipeline"]
-    assert pipe["menu_mode"] == "menu"
-    assert "wrecking_ball" in pipe["retrieved"]
-    assert pipe["parts_used"] == ["wrecking_ball"]
+# RETIRED (Elias, 2026-07-15): the Tier-1b bank-HIT tests (menu injection + the
+# pinned-menu ledger block) are deleted with banks/ — no bank data means no menu
+# hit to assert. The OFF / legend-only paths below still exercise the live pipeline.
 
 
 def test_pipeline_off_for_template_backend(tmp_path, monkeypatch):
@@ -1454,11 +1381,11 @@ def test_extract_gdscript_roundtrip_from_padded_reply():
 
 
 def test_extract_gdscript_tolerates_gd_fence_and_keepalive_padding():
-    reply = ("\n\n: OPENROUTER PROCESSING\n```gd\nextends GameBase\n"
-             "func success() -> bool:\n\treturn true\n```")
+    reply = ("\n\n: OPENROUTER PROCESSING\n```gd\nextends Node2D\n"
+             "func is_success() -> bool:\n\treturn true\n```")
     got = GG._extract_code(reply, "gdscript")
-    assert got.startswith("extends GameBase")
-    assert "func success" in got
+    assert got.startswith("extends Node2D")
+    assert "func is_success" in got
 
 
 def test_openrouter_gdscript_uses_compose_and_writes_gd(tmp_path, monkeypatch):
@@ -1482,43 +1409,44 @@ def test_openrouter_gdscript_uses_compose_and_writes_gd(tmp_path, monkeypatch):
     # The request carried the gdscript system prompt (menu-free; use_bank=False).
     sys_msg = fake.calls[0]["json"]["messages"][0]
     assert sys_msg["role"] == "system" and sys_msg["content"] == P.compose("gdscript")
-    assert "extends GameBase" in open(res["game_path"], encoding="utf-8").read()
+    assert "extends Node2D" in open(res["game_path"], encoding="utf-8").read()
 
 
 def test_builtin_gdscript_fixture_is_contract_shaped():
     src = GG._DRIFT_GDSCRIPT
-    assert src.startswith("extends GameBase")
-    # Every required + optional GameAPI method the host calls.
-    for method in ("func game_meta", "func build_world", "func on_action",
-                   "func on_step", "func checkpoints", "func success"):
+    assert src.startswith("extends Node2D")           # a plain node, no base class
+    # Every required method of the convention (exact names).
+    for method in ("func build(world_seed", "func act(action", "func state(",
+                   "func checkpoints(", "func is_success(", "func is_failure(",
+                   "func actions("):
         assert method in src, method
-    # Exactly one controlled body.
-    assert src.count("control(") == 1
+    # Exactly one controlled dynamic body in the state() snapshot.
+    assert src.count('"controlled": true') == 1
     # 2..8 declared actions.
-    actions = re.search(r'"actions":\s*\[([^\]]*)\]', src).group(1)
+    actions = re.search(r'func actions\(\).*?\[([^\]]*)\]', src, re.DOTALL).group(1)
     assert 2 <= len(re.findall(r'"[a-z_]+"', actions)) <= 8
-    # Tab-indented (matches godotworld/runner.gd), never space-indented bodies.
+    # Tab-indented (matches godotworld conventions), never space-indented bodies.
     indented = [ln for ln in src.splitlines() if ln[:1] in (" ", "\t")]
     assert indented and all(ln.startswith("\t") for ln in indented)
-    # Free of every BANNED family (it must pass the G0 code-gate when TRACK C lands).
+    # Self-seeds its rng from build()'s seed (the sanctioned randomness path).
+    assert "_rng.seed = world_seed" in src
+    # Free of every BANNED family (it passes the G0 code-gate).
     for banned in ("OS.", "FileAccess", "HTTPRequest", "Thread", "Time.",
                    "randi(", "randf(", "preload(", "load(", "set_script",
                    "get_tree(", "queue_free"):
         assert banned not in src, banned
 
 
-def test_parse_parts_used_gdscript_matches_body_names():
-    # gdscript: add_static/add_sensor/add_body names carry part identity (skinned by
-    # name, like godot/js) - in source order, deduped, filtered to the bank.
-    bank_names = {"puck", "switch", "pad", "wall_top", "wall_left"}
-    used = GG._parse_parts_used(GG._DRIFT_GDSCRIPT, "gdscript", bank_names)
-    assert used == ["wall_top", "wall_left", "switch", "pad", "puck"]
+# RETIRED (Elias, 2026-07-15): the gdscript parts-used test is deleted with banks/ —
+# a duck-typed plain-Node game builds real Godot nodes (RigidBody2D.new()), not the
+# retired add_body/add_static/add_sensor bank vocabulary, so there is no body-name
+# skinning to match against a catalog.
 
 
 def test_detect_engine_and_route_available_gdscript():
     from harness.verify.gameverify import detect_engine, gdscript_route_available as avail
     assert detect_engine("/games/foo.gd") == "gdscript"
-    assert detect_engine("/games/x.txt", "# engine: gdscript\nextends GameBase") == "gdscript"
+    assert detect_engine("/games/x.txt", "# engine: gdscript\nextends Node2D") == "gdscript"
     # Other lanes still win their own path/marker.
     assert detect_engine("/games/foo.spec.json") == "godot"
     assert detect_engine("/games/foo.js") == "js"
@@ -1554,7 +1482,7 @@ def test_generate_game_gdscript_emits_gd_with_mocked_verify(tmp_path, monkeypatc
     path = res["game_path"]
     assert path and path.endswith(".gd")
     src = open(path, encoding="utf-8").read()
-    assert "extends GameBase" in src and "func build_world" in src
+    assert "extends Node2D" in src and "func build(world_seed" in src
     # The written artifact is the clean .gd game, not the DESIGN prose.
     assert not src.lstrip().startswith("DESIGN")
 
@@ -1581,8 +1509,9 @@ def test_verify_game_gdscript_route_absent_is_typed(tmp_path):
 @requires_gdscript_route
 def test_generate_game_gdscript_template_roundtrip(tmp_path):
     """Acceptance: a template-backend prompt -> .gd -> the FULL G0-G3 funnel through
-    the serve contract, all green, engine recorded end to end. Skips until TRACK C
-    (the G0 code-gates + serve-contract executor) merges."""
+    the serve contract, all green, engine recorded end to end. The offline template is
+    a duck-typed plain-Node game (no base class), so it compiles standalone and
+    certifies. Runs when Godot + the gdscript verify route are present."""
     res = GG.generate_game("arm the pad then dock the puck", out_dir=str(tmp_path),
                            backend="template", engine="gdscript", max_repairs=1,
                            use_bank=False)

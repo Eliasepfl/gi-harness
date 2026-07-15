@@ -1256,70 +1256,115 @@ _DESIGNS_GODOT = {
 # / on_step clamp + flag latch / contacts / contained / checkpoints / success). Indented
 # with TABS, matching godotworld/runner.gd. Do NOT grow this into a genre library, and it
 # is deliberately NOT shown to the designer (the prompt is examples-free by design).
-_DRIFT_GDSCRIPT = '''extends GameBase
-# Topdown air-hockey: touch the switch on the left to arm the pad, then drift the
-# puck into the glowing pad on the right. Requires a reversal, so no single action wins.
+_DRIFT_GDSCRIPT = '''extends Node2D
+# A duck-typed plain-Node game (no base class, no class_name): a topdown air-hockey
+# puck that must drift onto BOTH glowing pads -- one to the LEFT, one to the RIGHT of
+# the start -- so a single held action never wins (a reversal is required). Docking is
+# a proximity latch read purely in the predicates. Deterministic: the only randomness
+# is a seed-stable jitter from an rng the game seeds itself from build()'s seed.
 
-const MAX_SPEED := 230.0
+const DOCK_R := 40.0
+const IMPULSE := 150.0
+const DAMP := 3.0
+const MAX_V := 130.0        # px/s cap -> ~13 px/tick, bounded travel (containment + non-trivial)
 
-func game_meta() -> Dictionary:
-	return {
-		"title": "Arm and Dock",
-		"prompt": "arm the pad at the switch, then drift the puck home",
-		"actions": ["left", "right", "up", "down"],
-	}
+var _rng := RandomNumberGenerator.new()
+var _puck: RigidBody2D = null
+var _pads := []             # [{name, pos, docked}]
 
-func build_world() -> void:
-	set_gravity(Vector2.ZERO)                       # topdown: no "down" to fall toward
-	add_static("wall_top", {"pos": Vector2(400, 588), "size": Vector2(800, 24)})
-	add_static("wall_bottom", {"pos": Vector2(400, 12), "size": Vector2(800, 24)})
-	add_static("wall_left", {"pos": Vector2(12, 300), "size": Vector2(24, 600)})
-	add_static("wall_right", {"pos": Vector2(788, 300), "size": Vector2(24, 600)})
-	add_sensor("switch", {"pos": Vector2(70, 300), "size": Vector2(60, 200)})
-	add_sensor("pad", {"pos": Vector2(620, 300), "size": Vector2(110, 110)})
-	add_body("puck", {"shape": "circle", "pos": Vector2(300, 300), "radius": 16.0,
-		"friction": 0.0, "elasticity": 0.4})
-	control("puck")
+func build(world_seed: int) -> void:
+	_rng.seed = world_seed
+	var jitter := _rng.randf_range(-5.0, 5.0)
+	_puck = RigidBody2D.new()
+	_puck.gravity_scale = 0.0                        # topdown: no "down" to fall toward
+	_puck.linear_damp_mode = RigidBody2D.DAMP_MODE_REPLACE
+	_puck.linear_damp = DAMP
+	_puck.lock_rotation = true
+	_puck.can_sleep = false
+	_puck.position = Vector2(400.0, 300.0 + jitter)
+	var col := CollisionShape2D.new()
+	var circ := CircleShape2D.new()
+	circ.radius = 16.0
+	col.shape = circ
+	_puck.add_child(col)
+	add_child(_puck)
+	_pads = []
+	_add_pad("pad_left", Vector2(200.0, 300.0))      # ~200 px left of start
+	_add_pad("pad_right", Vector2(620.0, 300.0))     # ~420 px right -> forces a reversal
 
-func on_action(action: String) -> void:
+func _add_pad(pad_name: String, pos: Vector2) -> void:
+	var marker := Node2D.new()
+	marker.name = pad_name
+	marker.position = pos
+	add_child(marker)
+	_pads.append({"name": pad_name, "pos": pos, "docked": false})
+
+func _physics_process(_delta: float) -> void:
+	if _puck == null:
+		return
+	if _puck.linear_velocity.length() > MAX_V:
+		_puck.linear_velocity = _puck.linear_velocity.limit_length(MAX_V)
+	for p in _pads:
+		if not p.docked and _puck.position.distance_to(p.pos) < DOCK_R:
+			p.docked = true
+
+func act(action: String) -> void:
+	if _puck == null:
+		return
+	var v := Vector2.ZERO
 	match action:
-		"left": impulse("puck", Vector2(-55, 0))
-		"right": impulse("puck", Vector2(55, 0))
-		"up": impulse("puck", Vector2(0, 55))
-		"down": impulse("puck", Vector2(0, -55))
+		"left": v = Vector2(-IMPULSE, 0.0)
+		"right": v = Vector2(IMPULSE, 0.0)
+		"up": v = Vector2(0.0, -IMPULSE)
+		"down": v = Vector2(0.0, IMPULSE)
+	_puck.apply_central_impulse(v)
 
-func on_step() -> void:
-	if contacts("puck", "switch"):
-		set_flag("armed", true)
-	# Keep hostile impulse-spam under the tunnelling speed so containment holds.
-	set_velocity("puck", vel("puck").limit_length(MAX_SPEED))
+func _count() -> int:
+	var n := 0
+	for p in _pads:
+		if p.docked:
+			n += 1
+	return n
+
+func state() -> Dictionary:
+	var bodies := [{
+		"name": "puck", "pos": [_puck.position.x, _puck.position.y],
+		"vel": [_puck.linear_velocity.x, _puck.linear_velocity.y],
+		"angle": _puck.rotation, "controlled": true, "static": false,
+	}]
+	for p in _pads:
+		bodies.append({
+			"name": p.name, "pos": [p.pos.x, p.pos.y], "vel": [0.0, 0.0],
+			"angle": 0.0, "controlled": false, "static": true,
+		})
+	return {"bodies": bodies,
+		"flags": {"one": _count() >= 1, "both": _count() >= 2}}
 
 func checkpoints() -> Dictionary:
-	var p := pos("puck")
-	return {
-		"moved_off_start": p.distance_to(Vector2(300, 300)) > 40.0,
-		"reached_switch": flag("armed"),
-		"heading_home": flag("armed") and p.x > 400.0,
-		"docked": contained("puck", "pad"),
-	}
+	return {"docked_first": _count() >= 1, "docked_both": _count() >= 2}
 
-func success() -> bool:
-	return flag("armed") and contained("puck", "pad")
+func is_success() -> bool:
+	return _count() >= 2
+
+func is_failure() -> bool:
+	return false
+
+func actions() -> Array:
+	return ["left", "right", "up", "down"]
 '''
 
 _TEMPLATE_GAMES_GDSCRIPT = {"drift": _DRIFT_GDSCRIPT}
 
 _DESIGNS_GDSCRIPT = {
     "drift": ("DESIGN\n"
-              "Theme: a topdown air-hockey puck that must arm a switch before it "
-              "can dock.\n"
-              "Entities: one controlled puck, four perimeter walls, a left switch "
-              "sensor, a right pad sensor.\n"
-              "Mechanic twist: the pad is inert until the puck touches the far "
-              "switch - a required reversal, so no single held action wins.\n"
+              "Theme: a topdown air-hockey puck that must drift onto two glowing "
+              "pads on opposite sides of the rink.\n"
+              "Entities: one controlled puck plus two static pad markers - one to "
+              "the left of the start, one to the right.\n"
+              "Mechanic twist: the pads straddle the start, so a single held action "
+              "reaches at most one - docking both forces a reversal.\n"
               "Actions: left/right/up/down impulse the puck across frictionless ice.\n"
-              "Milestones: moved_off_start -> reached_switch -> heading_home -> "
-              "docked.\n"
-              "Win / Lose: win when the puck is armed AND fully inside the pad; no "
-              "lose condition.\n"),
+              "Milestones: docked_first -> docked_both.\n"
+              "Win / Lose: win when the puck has docked both pads; no lose "
+              "condition.\n"),
 }

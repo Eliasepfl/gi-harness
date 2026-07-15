@@ -26,6 +26,7 @@ from harness.verify.gd_exec import GdExecutor  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
+_MINI_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect_3d.gd")
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -75,6 +76,49 @@ def test_mini_collect_g0_contract_probe_facts():
 
 
 # ====================================================================== #
+# 1b. The 3D fixture certifies through the SAME funnel (3D-through-pipeline)
+# ====================================================================== #
+@requires_godot
+def test_mini_collect_3d_certifies_g0_g3():
+    """A duck-typed plain-Node3D game (PhysicsServer3D.set_active + RigidBody3D/
+    StaticBody3D/Area3D + Vector3 state) certifies G0-G3 through the serve contract —
+    proving 3D works THROUGH the pipeline, not just as a standalone script, and guarding
+    the serve host / oracles against 2D-only assumptions (Vector2, xy-bounds, xy-sanity)."""
+    rep = verify_game(_MINI_3D, sandboxed=False)
+    assert rep["passed"] is True, rep
+    assert rep["failure_class"] is None
+    assert rep["engine"] == "gdscript"
+    for layer in ("G0_static", "G1_rollout", "G2_goal", "G3_solve"):
+        assert rep["layers"][layer]["passed"], (layer, rep["layers"][layer])
+    w = rep["witness"]
+    assert w is not None and w["ticks"] >= 20, w        # a real, non-trivial play
+    assert set(w["checkpoints"]) == {"reached_first", "reached_both"}
+    assert all(t is not None for t in w["checkpoints"].values()), w["checkpoints"]
+    # G0 sees one controlled body among the 4 (puck + two Area3D goals + the table).
+    checks = rep["layers"]["G0_static"]["checks"]
+    assert checks["controlled"]["controlled"] == ["puck"]
+    assert checks["counts"]["n"] == 4
+
+
+@requires_godot
+def test_gd_serve_emits_three_component_vectors_for_3d():
+    """The serve obs is dimension-agnostic: a 3D game's pos/vel come back as 3-vectors
+    ([x, y, z]) through the same seam a 2D game's 2-vectors do (the _vec_json fix)."""
+    with open(_MINI_3D, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        rec = ex.run_batch(src, [{"seed": 0, "actions": ["left"] * 6}], 6)[0]
+    finally:
+        ex.close()
+    puck = rec["final_snapshot"]["puck"]
+    assert len(puck["pos"]) == 3 and len(puck["vel"]) == 3, puck
+    # The z axis is locked at 0; x moved left under the impulses.
+    assert abs(puck["pos"][2]) < 1e-6, puck
+    assert puck["pos"][0] < 400.0, puck
+
+
+# ====================================================================== #
 # 2. Determinism — the G1 two-run drift gate, direct
 # ====================================================================== #
 @requires_godot
@@ -117,7 +161,7 @@ def test_gd_serve_collect_mechanic_latches():
 @requires_godot
 def test_parse_gate_rejects_syntax_error(tmp_path):
     p = tmp_path / "broken.gd"
-    p.write_text("extends GameAPI\nfunc build(world_seed):\n\tvar x = = =\n",
+    p.write_text("extends Node2D\nfunc build(world_seed):\n\tvar x = = =\n",
                  encoding="utf-8")
     rep = verify_game(str(p), sandboxed=False)
     assert rep["engine"] == "gdscript"
@@ -130,7 +174,7 @@ def test_contract_probe_rejects_missing_method(tmp_path):
     # A syntactically valid game that FORGETS state() -> the contract probe rejects it.
     p = tmp_path / "no_state.gd"
     p.write_text(
-        "extends GameAPI\n"
+        "extends Node2D\n"
         "func build(world_seed):\n"
         "\tvar b = RigidBody2D.new()\n"
         "\tadd_child(b)\n"

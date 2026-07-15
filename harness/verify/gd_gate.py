@@ -16,12 +16,13 @@ prose is not a false positive) over the escape hatches the GameAPI contract forb
 (``randi``/``randf``/``randomize`` — a game MUST draw from ``self.rng``), and
 ``get_tree().quit``. Any hit is a HARD G0 fail with a line number.
 
-The other two G0 gates run inside Godot (the ``check`` op of ``serve_game.gd``):
-(a) the parse gate — a headless in-memory compile-check (the ``validate_script``
-ResourceLoader pattern, ``notes/engines/GODOT_AI_TOOLING_AUDIT.md`` tugcan mine),
-surfaced as ``facts["load"]``; and (c) the contract probe — ``has_method`` over the
-required GameAPI methods, surfaced as ``facts["contract"]``. ``gameverify.run_g0_gd``
-folds all three into the shared G0 report shape.
+The other two G0 gates: (a) the parse gate — a STANDALONE ``godot --headless
+--check-only --script <file>`` compile-check (a duck-typed plain-Node game has no base
+class to resolve, so it compiles standalone; ``harness/verify/gd_exec.py``), surfaced
+as ``facts["load"]``; and (c) the contract probe — ``has_method`` over the required
+method-convention methods (run inside ``serve_game.gd``'s ``check`` op), surfaced as
+``facts["contract"]``. ``gameverify.run_g0_gd`` folds all three into the shared G0
+report shape.
 
 The scanner is defense-IN-DEPTH, not the sole boundary: generated code additionally
 runs ONLY in-container on compute nodes, in a process whose environment is scrubbed
@@ -87,7 +88,7 @@ _RULES: list[tuple[str, re.Pattern, str]] = [
     ("load", re.compile(r"(?<![\w.])load\s*\("),
      "load() is banned (only self's own scene; no dynamic resource loads)"),
     ("preload", re.compile(r"(?<![\w.])preload\s*\("),
-     "preload() is banned (only the GameAPI base is referenced, via extends)"),
+     "preload() is banned (the game is a self-contained node; no dynamic resource loads)"),
     ("time", re.compile(r"(?<![\w])Time\s*\."),
      "Time.* (wall clock) is banned (nondeterminism)"),
     ("randomize", re.compile(r"(?<![\w])randomize\s*\("),

@@ -68,7 +68,7 @@ _BANNED = [
 
 @pytest.mark.parametrize("rule,src", _BANNED, ids=[r for r, _ in _BANNED])
 def test_scanner_catches_each_banned_api(rule, src):
-    findings = scan_gd_source("extends GameAPI\n" + src)
+    findings = scan_gd_source("extends Node2D\n" + src)
     rules = {f["rule"] for f in findings}
     assert rule in rules, (rule, rules, src)
     # every finding carries a 1-based line and a token
@@ -80,31 +80,31 @@ def test_scanner_catches_global_randi_and_randf_range():
     for bad in ("var x = randi()", "var y = randi_range(0, 3)",
                 "var z = randf_range(0.0, 1.0)"):
         assert any(f["rule"] == "global_rng"
-                   for f in scan_gd_source("extends GameAPI\nfunc build(s): " + bad)), bad
+                   for f in scan_gd_source("extends Node2D\nfunc build(s): " + bad)), bad
 
 
 def test_scanner_allows_self_rng_methods():
     # A method call on the seeded self.rng is the SANCTIONED path -> not a finding.
     for good in ("var x = self.rng.randf()", "var y = rng.randi_range(0, 3)",
                  "var z = rng.randf_range(-5.0, 5.0)"):
-        assert scan_gd_source("extends GameAPI\nfunc build(s): " + good) == [], good
+        assert scan_gd_source("extends Node2D\nfunc build(s): " + good) == [], good
 
 
 def test_scanner_flags_rng_randomize_even_on_receiver():
     # randomize() reseeds from the wall clock -> banned even as rng.randomize().
     assert any(f["rule"] == "randomize"
-               for f in scan_gd_source("extends GameAPI\nfunc build(s): rng.randomize()"))
+               for f in scan_gd_source("extends Node2D\nfunc build(s): rng.randomize()"))
 
 
 def test_scanner_ignores_banned_token_in_comment_or_string():
-    src = ('extends GameAPI\n'
+    src = ('extends Node2D\n'
            '# this game never calls OS.execute or FileAccess\n'
            'func actions(): return ["OS.left", "right"]\n')
     assert scan_gd_source(src) == [], scan_gd_source(src)
 
 
 def test_scanner_reports_correct_line_number():
-    src = "extends GameAPI\nfunc build(s):\n\tpass\nfunc act(a):\n\tOS.alert(a)\n"
+    src = "extends Node2D\nfunc build(s):\n\tpass\nfunc act(a):\n\tOS.alert(a)\n"
     findings = [f for f in scan_gd_source(src) if f["rule"] == "os"]
     assert len(findings) == 1
     assert findings[0]["line"] == 5
@@ -122,11 +122,11 @@ def test_mini_collect_fixture_scans_clean():
 # ====================================================================== #
 def test_detect_engine_routes_gd():
     assert detect_engine("game.gd", "") == "gdscript"
-    assert detect_engine("/abs/path/mini_collect.gd", "extends GameAPI") == "gdscript"
+    assert detect_engine("/abs/path/mini_collect.gd", "extends Node2D") == "gdscript"
 
 
 def test_detect_engine_gdscript_marker():
-    assert detect_engine("g.txt", "# engine: gdscript\nextends GameAPI") == "gdscript"
+    assert detect_engine("g.txt", "# engine: gdscript\nextends Node2D") == "gdscript"
     # a .gd path still wins for js/godot-looking content
     assert detect_engine("x.gd", "// engine: js") == "gdscript"
 
@@ -143,7 +143,7 @@ def test_detect_engine_other_lanes_unchanged():
 def test_verify_game_banned_gd_fails_g0_without_godot(tmp_path):
     p = tmp_path / "evil.gd"
     p.write_text(
-        "extends GameAPI\n"
+        "extends Node2D\n"
         "func build(world_seed):\n"
         "\tOS.execute(\"rm\", [\"-rf\", \"/\"])\n",
         encoding="utf-8")
@@ -269,7 +269,8 @@ def test_gd_executor_spawns_with_scrubbed_env(monkeypatch, tmp_path):
     import harness.verify.gd_exec as gx
     from harness.verify.executors import VerifyError
 
-    # A fake, already-provisioned project so no --import subprocess is needed.
+    # A fake, already-provisioned project (``.godot`` present) so no --import subprocess
+    # is needed; the spawn path is what we are capturing.
     proj = tmp_path / "godotworld"
     proj.mkdir()
     (proj / ".godot").mkdir()

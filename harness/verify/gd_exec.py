@@ -33,6 +33,24 @@ import tempfile
 import time
 
 
+def _parse_error_line(check_only_output: str) -> str:
+    """The actionable line from a failed ``--check-only`` run. Godot prints
+    ``SCRIPT ERROR: Parse Error: <msg>`` (and/or ``Failed to load script ...``); return
+    the first such line so the G0 ``loads`` hint points the repair loop at the syntax
+    fault, falling back to a compact tail if the shape is unexpected."""
+    lines = [ln.strip() for ln in (check_only_output or "").splitlines() if ln.strip()]
+    for ln in lines:
+        low = ln.lower()
+        if "parse error" in low or "script error" in low:
+            return ln
+    for ln in lines:
+        if "error" in ln.lower():
+            return ln
+    tail = " ".join(lines[-3:])
+    return ("parse/compile failed (--check-only): " + tail) if tail \
+        else "parse/compile failed (--check-only)"
+
+
 class GdExecutor:
     """Out-of-process executor spawning one ``serve_game.gd`` per instance and
     reusing it across ``run_check`` + every ``run_batch`` of the funnel run."""
@@ -114,10 +132,13 @@ class GdExecutor:
                           f"serve_game.gd did not connect on port {self.port}\n{last_log}")
 
     def _provision(self) -> None:
-        """One-time ``--headless --import`` so ``res://.godot`` (and the global class
-        cache that registers ``GameAPI``) exists — a fresh checkout needs it for
-        ``extends GameAPI`` to resolve. Verified by the ARTIFACT, never the returncode
-        (GH #77508/#83449 lie), mirroring GodotExecutor."""
+        """One-time ``--headless --import`` so ``res://.godot`` exists — the SERVE host
+        (G1-G3) runs in the project and needs the import artifact on a fresh checkout.
+        The PARSE gate no longer needs it: a duck-typed plain-Node game (no base class,
+        no ``class_name`` to resolve) compiles STANDALONE via ``--check-only --script``
+        (see ``run_check``), so there is no global-class-cache dependency. Verified by
+        the ARTIFACT, never the returncode (GH #77508/#83449 lie), mirroring
+        GodotExecutor."""
         from harness.verify.godot_exec import _dotgodot_present
         if _dotgodot_present(self._project):
             return
@@ -186,12 +207,60 @@ class GdExecutor:
 
     # -- surface: run_check ------------------------------------------------
     def run_check(self, game_source) -> dict:
+        """G0/G2 facts: a STANDALONE parse gate then the serve host's contract probe.
+
+        The parse gate is a bare ``godot --headless --check-only --script <file>`` on the
+        source alone (no ``--path``, no project): a duck-typed plain-Node game has NO base
+        class to resolve, so the compile-check stands alone and ``rc == 0`` iff it parses
+        (the old ``extends GameAPI`` Error-43 wall is gone by construction). If it fails we
+        return the load failure WITHOUT ever spawning the serve host or running the code.
+        On success the serve ``check`` op supplies the contract probe (``has_method`` over
+        the required methods) + the t=0 facts; the standalone parse result is authoritative
+        for ``facts["load"]``."""
         from harness.verify.executors import VerifyError
+        load = self._check_only(game_source)
+        if not load.get("ok"):
+            return {"mode": "check", "scan": [], "load": load}
         self._ensure_connected()
         facts = self._exchange({"op": "check", "source": game_source})
         if facts.get("ok") is False and facts.get("error"):
             raise VerifyError("gd_check_fatal", str(facts["error"]))
+        facts["load"] = load
         return facts
+
+    def _check_only(self, game_source) -> dict:
+        """Standalone GDScript parse gate. Writes the source to a temp ``.gd`` and runs
+        ``godot --headless --check-only --script <abs path>`` under the SCRUBBED env
+        (untrusted code; ``--check-only`` parses without executing). ``rc == 0`` -> parses;
+        non-zero -> the Godot ``Parse Error`` line is surfaced as the load hint. Returns
+        ``{"ok": bool, "error": str|None}`` in the shape ``run_g0_gd`` consumes."""
+        from harness.verify.executors import VerifyError
+        from harness.verify.godot_exec import scrubbed_env
+        if not self._exe or not os.path.isfile(self._exe):
+            raise VerifyError("godot_missing",
+                              f"Godot binary not found (set HARNESS_GODOT_EXE): {self._exe!r}")
+        fd, path = tempfile.mkstemp(suffix=".gd", prefix="gdcheck_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(str(game_source))
+            try:
+                proc = subprocess.run(
+                    [self._exe, "--headless", "--check-only", "--script", path],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    env=scrubbed_env(), timeout=self.timeout_s)
+            except FileNotFoundError as exc:
+                raise VerifyError("godot_missing", str(exc))
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "error": "parse gate timed out (--check-only)"}
+            if proc.returncode == 0:
+                return {"ok": True, "error": None}
+            out = (proc.stdout or b"").decode("utf-8", "replace")
+            return {"ok": False, "error": _parse_error_line(out)}
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     # -- surface: run_batch ------------------------------------------------
     def run_batch(self, game_source, episodes, max_ticks, frames_every=0,
