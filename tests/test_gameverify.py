@@ -330,6 +330,36 @@ def checkpoints(world):
     return {"halfway": world.query("player")["pos"][0] > 200}
 '''
 
+# "brake" zeroes the car's velocity: INERT at t=0 (the car is parked, vel 0) but
+# LIVE the moment the car is moving. The pre-fix efficacy check probed only t=0 and
+# wrongly flagged it dead ("dead action ... brake") — the real parking-game false
+# positive from 2026-07-15. It must PASS G1 now (certified live from a dynamic
+# context reached by a short burst of another action).
+GAME_BRAKE = '''
+TITLE = "Parking"
+PROMPT = "drive the car right past the marker"
+ACTIONS = ["right", "left", "brake"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(400, 10), size=(2000, 20), static=True)
+    world.add("car", shape="box", pos=(100, 60), size=(20, 20))
+    world.control("car")
+
+def act(world, action):
+    if action == "right":
+        world.impulse("car", (60, 0))
+    elif action == "left":
+        world.impulse("car", (-60, 0))
+    elif action == "brake":
+        world.set_velocity("car", (0, 0))
+
+def success(world):
+    return world.query("car")["pos"][0] > 300
+
+def checkpoints(world):
+    return {"halfway": world.query("car")["pos"][0] > 200}
+'''
+
 # success is true at t=0 (steps == 0) but false after any step -> passes G1
 # agency, fails G2 (success_false_at_t0).
 GAME_SUCCESS_AT_T0 = '''
@@ -540,6 +570,25 @@ def test_missing_checkpoints_fails_g0(tmp_path):
     assert "checkpoints" in rep["hint"]
 
 
+def test_brake_like_action_passes_g1_efficacy(tmp_path, legacy_thresholds):
+    """A brake-like action (inert at t=0, live once the body moves) must PASS G1.
+
+    Pre-fix the efficacy check only probed t=0, so a stationary-car brake false-
+    failed with "dead action(s) ... brake" (the 2026-07-15 parking-game bug). The
+    context-aware probe re-tests it from the state left by a burst of another action
+    and certifies it live."""
+    path = _write(tmp_path, "brake.py", GAME_BRAKE)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    assert rep["layers"]["G0_static"]["passed"] is True
+    g1 = rep["layers"]["G1_rollout"]
+    assert g1["passed"] is True, rep.get("hint")
+    eff = g1["checks"]["efficacy"]
+    assert eff["pass"] is True
+    assert "brake" not in eff["dead"]
+    # The declared move set stays present as `effect` keys (g4 relies on this).
+    assert set(eff["effect"]) == {"right", "left", "brake"}
+
+
 def test_dead_action_fails_g1_efficacy(tmp_path):
     path = _write(tmp_path, "dead.py", GAME_DEAD_ACTION)
     rep = verify_game(path, sandboxed=False, world_factory=factory())
@@ -547,8 +596,11 @@ def test_dead_action_fails_g1_efficacy(tmp_path):
     assert rep["failure_class"] == "ENV_ERROR"
     eff = rep["layers"]["G1_rollout"]["checks"]["efficacy"]
     assert eff["pass"] is False
+    # A genuine no-op stays dead across EVERY probed context (t=0 + the bursts).
     assert "idle" in eff["dead"]
+    assert eff["contexts"] >= 2
     assert "idle" in rep["hint"]
+    assert "context" in rep["hint"]
 
 
 def test_success_true_at_t0_fails_g2(tmp_path):
