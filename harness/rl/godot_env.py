@@ -215,15 +215,22 @@ class GodotServeEnv:
     # -- provisioning -----------------------------------------------------
     def _ensure_provisioned(self) -> None:
         """One-time headless ``--import`` so a fresh checkout loads ``res://.godot``
-        (the same gotcha GodotExecutor handles). Idempotent; skipped once present."""
-        if os.path.isdir(os.path.join(self._project, ".godot")):
+        (the same gotcha GodotExecutor handles). Idempotent; skipped once present.
+
+        Confirms success by the EFFECT (``.godot`` appearing), never the import
+        returncode (GH #77508/#83449 lie); retries once if the first import quit early."""
+        from harness.verify.godot_exec import _dotgodot_present
+        if _dotgodot_present(self._project):
             return
-        try:
-            subprocess.run(
-                [self._exe, "--headless", "--import", "--path", self._project],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180.0)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass  # a real failure surfaces on the actual serve run below
+        for _ in range(2):
+            try:
+                subprocess.run(
+                    [self._exe, "--headless", "--import", "--path", self._project],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180.0)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                break  # a real failure surfaces on the actual serve run below
+            if _dotgodot_present(self._project):
+                break  # artifact present -> import truly took (effect, not returncode)
 
     # -- spawn / connect --------------------------------------------------
     def _spawn_and_accept(self, connect_timeout_s: float):
@@ -233,10 +240,12 @@ class GodotServeEnv:
         process that misses the deadline surfaces as ``stale``."""
         # `--fixed-fps 60` (as the batch executor uses) decouples the main loop from
         # wall-clock so `await physics_frame` steps as fast as the CPU allows instead
-        # of real-time 60 Hz — the difference between ~10 and hundreds of steps/s.
-        argv = [self._exe, "--headless", "--fixed-fps", "60",
-                "--path", self._project, "-s", "res://runner.gd", "--",
-                "--serve", "--port=%d" % self.port]
+        # of real-time 60 Hz — the difference between ~10 and hundreds of steps/s. Route
+        # through the shared builder so the flag is GUARANTEED on the serve seam too
+        # (GODOT_DOCS_MINING.md section 3: enforce, don't trust the caller).
+        from harness.verify.godot_exec import stepping_argv
+        argv = stepping_argv(self._exe, self._project, "res://runner.gd",
+                             ["--serve", "--port=%d" % self.port])
         last_log = ""
         for attempt in range(SPAWN_RETRIES):
             self._log = tempfile.TemporaryFile(mode="w+b")

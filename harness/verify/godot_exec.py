@@ -39,6 +39,38 @@ END = "__JSONL_END__"
 # Console build streams stdout cleanly to a pipe (SPIKE_REPORT.md gotcha #4).
 _DEFAULT_EXE_NAME = "Godot_v4.7-stable_win64_console.exe"
 
+# The physics step rate. `--fixed-fps 60` "disables real-time synchronization" so dt is
+# a fixed 1/60 instead of wall-clock dependent — MANDATORY on every stepping invocation
+# or byte-identical replay voids (GODOT_DOCS_MINING.md section 3). Nothing in
+# project.godot can enforce it (it is a CLI flag), so we pin it here and refuse to trust
+# callers to pass it.
+FIXED_FPS = "60"
+
+
+def stepping_argv(exe: str, project: str, runner_rel: str,
+                  user_args: list[str] | tuple[str, ...] = ()) -> list[str]:
+    """Build the argv for a physics-STEPPING headless runner invocation, GUARANTEEING
+    ``--fixed-fps 60`` regardless of the caller. Both seams that step physics — the
+    batch/check executor and the serve env — must route through this so determinism
+    can never regress by a dropped flag. Asserts the flag is present (belt-and-braces
+    against a future edit reordering the list)."""
+    assert FIXED_FPS.isdigit() and int(FIXED_FPS) > 0, \
+        "FIXED_FPS must be a positive integer string (the pinned physics rate)"
+    argv = [exe, "--headless", "--fixed-fps", FIXED_FPS,
+            "--path", project, "-s", runner_rel, "--", *user_args]
+    i = argv.index("--fixed-fps")
+    assert i >= 0 and argv[i + 1] == FIXED_FPS, \
+        "stepping invocation MUST pin --fixed-fps 60 (determinism pin)"
+    return argv
+
+
+def _dotgodot_present(project: str) -> bool:
+    """Whether the ``res://.godot`` import artifact exists — the EFFECT a one-time
+    ``--headless --import`` is supposed to produce. Import returncodes lie (GH #77508
+    quits early, #83449 returns 1 on success), so provisioning verifies THIS, never the
+    exit code (GODOT_DOCS_MINING.md section 3 CI gotchas)."""
+    return os.path.isdir(os.path.join(project, ".godot"))
+
 
 def _repo_root() -> str:
     """Repo root = grandparent of this module's package dir (harness/verify/)."""
@@ -96,18 +128,25 @@ class GodotExecutor:
     # -- provisioning ------------------------------------------------------
     def _ensure_provisioned(self) -> None:
         """Generate ``res://.godot`` once (one-time headless import) so the project
-        loads cleanly on a fresh checkout. Idempotent; skipped once ``.godot`` exists."""
+        loads cleanly on a fresh checkout. Idempotent; skipped once ``.godot`` exists.
+
+        The import returncode is NOT trusted (GH #77508/#83449): success is confirmed by
+        the EFFECT — the ``.godot`` artifact appearing — with one retry if the first
+        ``--import`` quit before finishing. A persistent absence is left for the actual
+        run below to surface as a load error."""
         if self._provisioned:
             return
-        dotgodot = os.path.join(self.project, ".godot")
-        if not os.path.isdir(dotgodot):
-            try:
-                subprocess.run(
-                    [self.exe, "--headless", "--import", "--path", self.project],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=max(self.timeout_s, 180.0))
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass  # a real failure surfaces on the actual run below
+        if not _dotgodot_present(self.project):
+            for _ in range(2):
+                try:
+                    subprocess.run(
+                        [self.exe, "--headless", "--import", "--path", self.project],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=max(self.timeout_s, 180.0))
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    break  # a real failure surfaces on the actual run below
+                if _dotgodot_present(self.project):
+                    break  # artifact present -> import truly took (effect, not returncode)
         self._provisioned = True
 
     # -- process plumbing --------------------------------------------------
@@ -127,9 +166,8 @@ class GodotExecutor:
         try:
             with os.fdopen(job_fd, "w", encoding="utf-8") as fh:
                 json.dump(job, fh)
-            argv = [self.exe, "--headless", "--fixed-fps", "60",
-                    "--path", self.project, "-s", self.runner_rel,
-                    "--", "--job=" + job_path]
+            argv = stepping_argv(self.exe, self.project, self.runner_rel,
+                                 ["--job=" + job_path])
             try:
                 proc = subprocess.run(argv, capture_output=True, text=True,
                                       encoding="utf-8", errors="replace",

@@ -16,6 +16,10 @@ config_version=5
 config/name="godotworld-spike"
 config/features=PackedStringArray("4.7")
 run/disable_stdout=false
+; --fixed-fps 60 (a CLI flag, enforced Python-side) drives dt; cap the frame rate at
+; unlimited so nothing throttles the fixed-step loop. Pinned to the engine default so
+; a point-release flip cannot silently change stepping cadence (GODOT_DOCS_MINING.md §3).
+run/max_fps=0
 
 [threading]
 
@@ -32,11 +36,17 @@ worker_pool/max_threads=3
 common/physics_ticks_per_second=60
 common/max_physics_steps_per_frame=8
 common/physics_jitter_fix=0.0
+; Render-only interpolation, but pin it (to the current default) so a 4.7 point-release
+; default flip cannot shift recorded transforms if rendering is ever added later.
+common/physics_interpolation=false
 2d/default_gravity=900.0
 2d/default_gravity_vector=Vector2(0, -1)
 2d/default_linear_damp=0.0
 2d/default_angular_damp=0.0
 2d/run_on_separate_thread=false
+; Pin the contact-solver iteration count (to the current default, 16) so contact
+; resolution cannot drift between engine releases and void byte-identical replay.
+2d/solver/solver_iterations=16
 
 [debug]
 

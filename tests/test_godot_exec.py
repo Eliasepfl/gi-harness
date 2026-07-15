@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.verify.executors import (  # noqa: E402
     GodotExecutor, VerifyError, default_godot_project, find_godot_exe,
+    stepping_argv, _dotgodot_present,
 )
 from harness.verify.gameverify import (  # noqa: E402
     detect_engine, run_g0_js, run_g2_js, verify_game,
@@ -214,6 +215,44 @@ def test_find_godot_exe_env_override(monkeypatch, tmp_path):
 def test_default_project_has_runner():
     # The lane's frozen interpreter ships in the repo (independent of the binary).
     assert os.path.isfile(os.path.join(default_godot_project(), "runner.gd"))
+
+
+# ====================================================================== #
+# Determinism pins (GODOT_DOCS_MINING.md section 3, pure python)
+# ====================================================================== #
+def test_stepping_argv_pins_fixed_fps():
+    # Every physics-stepping invocation is built through stepping_argv, which
+    # GUARANTEES --fixed-fps 60 regardless of the caller (else replay voids).
+    argv = stepping_argv("/opt/godot", "/proj", "res://runner.gd", ["--job=/tmp/j.json"])
+    i = argv.index("--fixed-fps")
+    assert argv[i + 1] == "60"
+    assert "--headless" in argv
+    assert argv[argv.index("-s") + 1] == "res://runner.gd"
+    # user args land after the -- separator, in order.
+    assert argv[argv.index("--") + 1:] == ["--job=/tmp/j.json"]
+
+
+def test_stepping_argv_rejects_a_dropped_flag():
+    # The builder asserts the flag survives a future edit; simulate the flag being
+    # stripped and confirm the guard trips.
+    import harness.verify.godot_exec as gx
+    orig = gx.FIXED_FPS
+    try:
+        gx.FIXED_FPS = ""  # a bad edit that drops the value
+        with pytest.raises(AssertionError):
+            gx.stepping_argv("/g", "/p", "res://runner.gd", [])
+    finally:
+        gx.FIXED_FPS = orig
+
+
+def test_dotgodot_present_verifies_import_effect(tmp_path):
+    # Provisioning trusts the .godot ARTIFACT, never the import returncode
+    # (GH #77508/#83449 lie): the effect check flips only when the dir appears.
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert _dotgodot_present(str(proj)) is False
+    (proj / ".godot").mkdir()
+    assert _dotgodot_present(str(proj)) is True
 
 
 # ====================================================================== #

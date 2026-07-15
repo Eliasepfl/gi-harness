@@ -32,6 +32,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EXAMPLES = os.path.join(_ROOT, "tests", "fixtures", "godot_specs")
 _SCHEMA = os.path.join(_ROOT, "godotworld", "spec.schema.json")
 _SENSORS_DIR = os.path.join(_ROOT, "godotworld", "addons", "sensors")
+_RUNNER = os.path.join(_ROOT, "godotworld", "runner.gd")
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -140,6 +141,19 @@ def test_vendored_raycast_is_decoupled_and_attributed():
     assert 'extends "res://addons/sensors/ISensor2D.gd"' in src
     # The proximity convention we assert in the e2e: (ray_length - distance)/ray_length.
     assert "(ray_length - distance) / ray_length" in src
+
+
+def test_runner_preloads_sensor_scripts():
+    # GODOT_DOCS_MINING.md section 2/3: the finite sensor whitelist is PRELOADED (a
+    # compile-time const table) so there is no load() hitch in the physics-sensitive
+    # rebuild path and a bad path fails fast at boot instead of silently dropping a sensor.
+    with open(_RUNNER, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    assert 'preload("res://addons/sensors/RaycastSensor2D.gd")' in src
+    # No runtime load()-by-string of the whitelist survives in the rebuild path.
+    assert "load(SENSOR_SCRIPTS" not in src
+    # _add_sensor resolves the preloaded Script from the const table.
+    assert "SENSOR_SCRIPTS.get(stype" in src
 
 
 # ====================================================================== #

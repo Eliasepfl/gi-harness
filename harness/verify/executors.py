@@ -500,4 +500,5 @@ def replay_frames_doc(game_source, *, engine, actions, witness=None, seed: int =
 # ---------------------------------------------------------------------------
 from harness.verify.godot_exec import (  # noqa: E402,F401
     GodotExecutor, find_godot_exe, default_godot_project,
+    stepping_argv, _dotgodot_present,
 )
