@@ -120,6 +120,81 @@ def _child_env() -> dict:
     return env
 
 
+# --------------------------------------------------------------------------- #
+# Bank-asset routing (cosmetic, 3D games): map bodies -> asset ids once per game.
+# The mapping only ever dresses the render overlay; physics/oracles are untouched.
+# --------------------------------------------------------------------------- #
+def _default_manifest() -> str:
+    """<repo>/assets/manifest.json (this file is harness/verify/, so up two to root)."""
+    p = Path(__file__).resolve().parents[2] / "assets" / "manifest.json"
+    return str(p) if p.is_file() else ""
+
+
+def _use_llm() -> bool:
+    """LLM routing unless HARNESS_OFFLINE, or no OpenRouter key is resolvable (offline)."""
+    if os.environ.get("HARNESS_OFFLINE", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    try:
+        from harness.gen.gamegen import _resolve_secret
+        return _resolve_secret("OPENROUTER_API_KEY") is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _game_context(game_path: str) -> str:
+    """A light semantic anchor for routing: the game's slug as spaced words."""
+    return Path(game_path).stem.replace("_", " ").strip()
+
+
+def _dump_bodies(exe: str, project: str, game_path: str, timeout_s: float = 90.0) -> list:
+    """Routing pre-pass: build the game HEADLESS (no dressing/render -> safe + cheap) and
+    return its t=0 state() body list ([{name, controlled}, ...]). [] on any failure."""
+    work = tempfile.mkdtemp(prefix="gidump_")
+    dump = os.path.join(work, "bodies.json")
+    argv = [exe, "--headless", "--path", project, "-s", "res://capture_host.gd", "--",
+            "--game-file=%s" % os.path.abspath(game_path),
+            "--dump-state=%s" % dump]
+    try:
+        log = tempfile.TemporaryFile(mode="w+b")
+        subprocess.run(argv, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                       env=_child_env(), timeout=timeout_s)
+        if os.path.isfile(dump):
+            data = json.loads(Path(dump).read_text(encoding="utf-8"))
+            bodies = data.get("bodies", [])
+            if isinstance(bodies, list):
+                return bodies
+    except Exception:  # noqa: BLE001 - routing is best-effort; primitives are the fallback
+        pass
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return []
+
+
+def _route_assets_for_game(exe: str, project: str, game_path: str,
+                           game_context: str | None, manifest_path: str) -> str:
+    """Route this game's bodies to bank assets and cache the mapping beside the game.
+    Returns the cache path (fed to the capture host via ``--assets-file``), or "" on any
+    failure -- in which case the dresser simply uses primitive proxies."""
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return ""
+    try:
+        from harness.demo.asset_bank import route_assets, load_manifest
+    except Exception:  # noqa: BLE001
+        return ""
+    bodies = _dump_bodies(exe, project, game_path)
+    names = [b.get("name") for b in bodies if isinstance(b, dict) and b.get("name")]
+    if not names:
+        return ""
+    cache = str(Path(game_path).with_suffix(".assets.json"))
+    ctx = game_context or _game_context(game_path)
+    try:
+        manifest = load_manifest(manifest_path)
+        route_assets(ctx, bodies, manifest, use_llm=_use_llm(), cache_path=cache)
+    except Exception:  # noqa: BLE001
+        return ""
+    return cache
+
+
 def _capture_argv(exe: str, project: str, user_args: list[str], width: int,
                   height: int) -> list[str]:
     """A physics-STEPPING but NON-headless invocation of the capture host. Pins
@@ -143,10 +218,17 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
                 height: int = DEFAULT_HEIGHT, fps: int = DEFAULT_FPS,
                 max_frames: int = DEFAULT_MAX_FRAMES, frames_dir: str | None = None,
                 downscale_to: int | None = 640, timeout_s: float = 300.0,
-                exe: str | None = None, project: str | None = None) -> dict:
+                exe: str | None = None, project: str | None = None,
+                dress_assets: bool = True, game_context: str | None = None,
+                assets_manifest: str | None = None) -> dict:
     """Render a certified ``.gd`` game's witness replay to a GIF. ``actions`` is the
     winning plan (from a fresh verify). Returns ``{result, ticks, n_frames, out_path,
-    frames_dir?}``. Raises ``CaptureError`` on an infra failure."""
+    frames_dir?}``. Raises ``CaptureError`` on an infra failure.
+
+    When ``dress_assets`` (default), route the game's bodies to render-only bank assets once
+    (``asset_bank.route_assets``, cached to ``<game>.assets.json``) and feed the mapping to
+    the capture host; only 3D games' proxies are actually dressed (2D games stay flat). Asset
+    dressing is purely cosmetic -- the certified physics/state trail is unaffected."""
     from harness.verify.godot_exec import default_godot_project, find_godot_exe
 
     exe = exe or find_godot_exe()
@@ -156,6 +238,12 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     host = os.path.join(project, "capture_host.gd")
     if not os.path.isfile(host):
         raise CaptureError(f"capture_host.gd not found at {host}")
+
+    # Route bank assets once per game (best-effort; primitives are the fallback).
+    manifest = assets_manifest or _default_manifest()
+    assets_file = ""
+    if dress_assets:
+        assets_file = _route_assets_for_game(exe, project, game_path, game_context, manifest)
 
     work = tempfile.mkdtemp(prefix="gicap_")
     frames_out = frames_dir or os.path.join(work, "frames")
@@ -176,6 +264,9 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     ]
     if follow:
         user_args.append("--follow")
+    if assets_file:
+        user_args.append("--assets-file=%s" % assets_file)
+        user_args.append("--assets-manifest=%s" % os.path.abspath(manifest))
 
     argv = _capture_argv(exe, project, user_args, int(width), int(height))
 

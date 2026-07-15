@@ -13,14 +13,23 @@
 #   only ever read, a DRESSED replay and an UNDRESSED replay produce byte-identical
 #   state() trails by construction -- proven by the capture-lane identity test.
 #
+# 3D games may additionally have their proxies dressed with REAL low-poly bank assets
+# (MISSION step 1): when route_assets mapped a body to an asset id, the primitive proxy
+# is replaced by an AssetLoader-loaded, render-only model scaled to the body's collision
+# AABB. The asset carries ZERO physics nodes (AssetLoader strips them) and lives in the
+# overlay subtree exactly like the primitive it replaces -- the zero-contact contract and
+# the state-trail identity are unchanged. A null asset load falls back to the primitive.
+# 2D games are ALWAYS presented flat (no 2.5D): a 2D game stays 2D.
+#
 # Reused by BOTH the headless capture host (capture_host.gd) and the desktop local
 # player (demo_player.gd). Pure engine nodes only -> works in headless-x11 software GL
-# and in a normal desktop Godot window alike. No external assets, no network.
+# and in a normal desktop Godot window alike. No external assets required (the bank
+# assets are an optional visual upgrade; the primitive path always renders).
 #
 # API:
 #   var stage := load("res://visual_dress.gd").new()
 #   parent.add_child(stage)                 # a SIBLING of the game, never a child of it
-#   stage.dress(game_root, {follow=false})  # discover bodies, build proxies + cam/light
+#   stage.dress(game_root, {follow=false, assets={...}, manifest_path="..."})
 #   ... each rendered frame ...
 #   stage.sync()                            # mirror transforms (read-only on the game)
 
@@ -37,6 +46,8 @@ const COL_GROUND_3D := Color(0.28, 0.32, 0.38)         # 3D floor
 const COL_OUTLINE := Color(0, 0, 0, 0.35)
 
 const CIRCLE_SEGMENTS := 24
+const ASSET_POS_TOL := 30.0         # t=0 body<->state position match tolerance (asset routing)
+const ELEV_3D := 38.0               # 3D overview elevation above the play plane (deg; not top-down)
 const WALL_LINE_WIDTH := 6.0
 const MARGIN_FRAC := 0.12           # fit-to-scene padding (fraction of extent)
 const SENSOR_ALPHA := 0.28
@@ -48,9 +59,14 @@ const Z_DYNAMIC := 10
 # ---- discovered state ----------------------------------------------------- #
 var _pairs: Array = []               # [{src: Node(shape), proxy: Node}]
 var _is_3d := false
+var _assets_norm: Dictionary = {}    # normalised-body-name -> bank asset id (from route_assets)
+var _manifest_path := ""             # abs/res:// path to assets/manifest.json (AssetLoader source)
+var _asset_by_body: Dictionary = {}  # body instance-id -> resolved asset id (t=0 matched)
 var _follow := false
 var _camera = null                   # Camera2D or Camera3D
 var _controlled_body = null          # the controlled body node (follow target)
+var _controlled_proxy = null         # its 3D proxy (the follow cam rides this, zero-contact)
+var _controlled_ext := Vector3.ONE   # its collision half-extents (chase-offset scale)
 var _stage2d: Node2D = null
 var _stage3d: Node3D = null
 # world-space bounds of the whole scene at t=0 (for fit-to-scene framing)
@@ -69,6 +85,10 @@ func dress(game_root: Node, opts := {}) -> void:
 	_view_w = float(opts.get("view_w", 960.0))
 	_view_h = float(opts.get("view_h", 540.0))
 	_is_3d = game_root is Node3D
+	# Optional bank-asset dressing for the 3D path (cosmetic; see MISSION step 1). A 2D game
+	# ignores these -- it is always presented flat.
+	_manifest_path = str(opts.get("manifest_path", ""))
+	_build_assets_norm(opts.get("assets", {}))
 
 	# 1. Discover every collision shape in the game tree (READ-ONLY walk).
 	var shapes: Array = []
@@ -77,6 +97,10 @@ func dress(game_root: Node, opts := {}) -> void:
 	# 2. Identify the controlled body by matching state()'s controlled entry to a body.
 	var ctrl_pos = _controlled_pos_from_state(game_root)
 	_assign_roles(shapes, ctrl_pos)
+
+	# 2b. Resolve each body's bank asset (3D only), matching nodes to state() names by t=0 pos.
+	if _is_3d:
+		_resolve_assets(game_root, shapes)
 
 	# 3. Build the overlay proxies + framing under a fresh stage subtree (a sibling).
 	if _is_3d:
@@ -91,23 +115,21 @@ func dress(game_root: Node, opts := {}) -> void:
 
 
 func sync() -> void:
-	# Mirror each body's current global transform onto its visual proxy. READ-ONLY on
-	# the game tree -- this is the whole zero-contact contract. Called once per captured
-	# frame by the host; never steps physics.
+	# Mirror each body's current global transform onto its visual proxy. READ-ONLY on the
+	# game tree -- this is the whole zero-contact contract. Called once per captured frame by
+	# the host; never steps physics. Asset proxies are wrapped in an orthonormal mount, so
+	# assigning the mount's global_transform preserves the asset's own fit-scale.
 	for p in _pairs:
 		var src = p["src"]
 		var proxy = p["proxy"]
 		if not (is_instance_valid(src) and is_instance_valid(proxy)):
 			continue
-		if _is_3d:
-			proxy.global_transform = src.global_transform
-		else:
-			proxy.global_transform = src.global_transform
+		proxy.global_transform = src.global_transform
 	if _follow and _camera != null and is_instance_valid(_camera) \
 			and _controlled_body != null and is_instance_valid(_controlled_body):
-		if _is_3d:
-			_follow_3d()
-		else:
+		# 3D follow tracks for free -- the camera is parented to the controlled proxy, which
+		# this loop already re-posed. Only the 2D overlay needs an explicit camera move.
+		if not _is_3d:
 			_camera.global_position = _controlled_body.global_position
 
 
@@ -429,6 +451,9 @@ func _build_3d(shapes: Array) -> void:
 		_stage3d.add_child(proxy)
 		_pairs.append({"src": rec["shape"], "proxy": proxy})
 		_expand_bounds_3d(rec)
+		if rec["role"] == "controlled" and _controlled_proxy == null:
+			_controlled_proxy = proxy
+			_controlled_ext = _shape_half_extent_3d(rec["shape"].shape)
 
 	if not _bounds_valid():
 		_min = Vector3(0, 0, 0)
@@ -459,6 +484,22 @@ func _build_3d(shapes: Array) -> void:
 
 func _make_3d_proxy(rec: Dictionary):
 	var role: String = rec["role"]
+	# 1. If this body routed to a bank asset, dress its PROXY with the render-only model
+	#    (scaled to the collision AABB, base-anchored so it grounds on the body's floor).
+	#    The asset lives under a mount whose transform is mirrored each frame; the mount stays
+	#    orthonormal so the asset's own fit-scale is preserved by sync()'s global_transform.
+	var aid := _asset_id_for_rec(rec)
+	if aid != "":
+		var ext := _shape_half_extent_3d(rec["shape"].shape)
+		var asset = _load_asset(aid, ext * 2.0, "base")
+		if asset != null:
+			var mount := Node3D.new()
+			mount.name = "AssetMount"
+			asset.position.y = -ext.y   # asset base at the shape's bottom (mount at centre)
+			mount.add_child(asset)
+			return mount
+
+	# 2. Fallback: the primitive proxy mirroring the collision shape.
 	var shape = rec["shape"].shape
 	var mesh: Mesh = null
 	if shape is BoxShape3D:
@@ -487,6 +528,12 @@ func _make_3d_proxy(rec: Dictionary):
 		mesh = fb
 	var mi := MeshInstance3D.new()
 	mi.mesh = mesh
+	mi.mesh.surface_set_material(0, _mesh_material(role))
+	return mi
+
+
+func _mesh_material(role: String) -> StandardMaterial3D:
+	# Role-differentiated PBR material for a primitive 3D proxy.
 	var mat := StandardMaterial3D.new()
 	var fill := _role_fill(role)
 	mat.albedo_color = fill
@@ -499,8 +546,7 @@ func _make_3d_proxy(rec: Dictionary):
 		mat.emission_enabled = true
 		mat.emission = fill
 		mat.emission_energy_multiplier = 0.35
-	mi.mesh.surface_set_material(0, mat)
-	return mi
+	return mat
 
 
 func _expand_bounds_3d(rec: Dictionary) -> void:
@@ -527,6 +573,112 @@ func _shape_half_extent_3d(shape) -> Vector3:
 		var rr: float = shape.radius
 		return Vector3(rr, shape.height * 0.5, rr)
 	return Vector3(10, 10, 10)
+
+
+# =========================================================================== #
+# Asset routing consumption (MISSION step 1) -- render-only, physics-free
+# =========================================================================== #
+func _build_assets_norm(assets) -> void:
+	# Index the route_assets mapping ({state-body-name: asset_id|null}) by a normalised name
+	# so it survives case/underscore differences between state() names and node names
+	# (e.g. state "puck" vs node "Puck", "goal_a" vs "GoalA").
+	_assets_norm.clear()
+	if typeof(assets) != TYPE_DICTIONARY:
+		return
+	for k in assets.keys():
+		var v = assets[k]
+		if typeof(v) == TYPE_STRING and String(v) != "":
+			_assets_norm[_norm_name(String(k))] = String(v)
+
+
+func _norm_name(name: String) -> String:
+	var out := ""
+	for ch in name.to_lower():
+		if (ch >= "a" and ch <= "z") or (ch >= "0" and ch <= "9"):
+			out += ch
+	return out
+
+
+func _resolve_assets(game_root: Node, shapes: Array) -> void:
+	# Build body-instance-id -> asset-id, once, before proxies. Bodies are matched to state()
+	# names by t=0 POSITION (node names need not equal state names -- e.g. an unnamed
+	# RigidBody3D whose state name is "puck"), with a node-name fallback.
+	_asset_by_body.clear()
+	if _assets_norm.is_empty() or _manifest_path == "":
+		return
+	var state_bodies := _state_bodies(game_root)
+	var seen := {}
+	for rec in shapes:
+		var body = rec["body"]
+		if body == null or not is_instance_valid(body):
+			continue
+		var bid: int = body.get_instance_id()
+		if seen.has(bid):
+			continue
+		seen[bid] = true
+		var aid: String = _asset_for_body(body, state_bodies)
+		if aid != "":
+			_asset_by_body[bid] = aid
+
+
+func _state_bodies(game_root: Node) -> Array:
+	# [{name: String, pos: Vector3}] from the game's own t=0 state() (a PURE query). Empty on
+	# any deviation -- routing then falls back to node-name matching.
+	var out := []
+	if not game_root.has_method("state"):
+		return out
+	var st = game_root.state()
+	if typeof(st) != TYPE_DICTIONARY:
+		return out
+	var bodies = st.get("bodies", [])
+	if typeof(bodies) != TYPE_ARRAY:
+		return out
+	for b in bodies:
+		if typeof(b) != TYPE_DICTIONARY:
+			continue
+		var v := Vector3.ZERO
+		var pos = b.get("pos", [])
+		if typeof(pos) == TYPE_ARRAY and pos.size() >= 2:
+			v.x = float(pos[0]); v.y = float(pos[1])
+			if pos.size() >= 3:
+				v.z = float(pos[2])
+		out.append({"name": String(b.get("name", "")), "pos": v})
+	return out
+
+
+func _asset_for_body(body: Node, state_bodies: Array) -> String:
+	# Prefer a t=0 position match to a state() body; fall back to the node's own name.
+	var bpos := _body_pos3(body)
+	var best_name := ""
+	var best_d := INF
+	for sb in state_bodies:
+		var d: float = (sb["pos"] as Vector3).distance_to(bpos)
+		if d < best_d:
+			best_d = d
+			best_name = String(sb["name"])
+	if best_name != "" and best_d <= ASSET_POS_TOL:
+		var aid := String(_assets_norm.get(_norm_name(best_name), ""))
+		if aid != "":
+			return aid
+	return String(_assets_norm.get(_norm_name(String(body.name)), ""))
+
+
+func _asset_id_for_rec(rec: Dictionary) -> String:
+	var body = rec["body"]
+	if body == null or not is_instance_valid(body):
+		return ""
+	return String(_asset_by_body.get(body.get_instance_id(), ""))
+
+
+func _load_asset(asset_id: String, target_size: Vector3, anchor: String):
+	# Render-only bank model via AssetLoader (physics provably stripped). Returns null on any
+	# failure -> the caller falls back to the primitive proxy, so the demo always renders.
+	if asset_id == "" or _manifest_path == "":
+		return null
+	var loader = load("res://asset_loader.gd")
+	if loader == null:
+		return null
+	return loader.load_asset(asset_id, _manifest_path, target_size, "fit", anchor)
 
 
 # =========================================================================== #
@@ -572,6 +724,18 @@ func _setup_camera_2d() -> void:
 
 
 func _setup_camera_3d() -> void:
+	# --follow rides a pivot on the controlled body's proxy (chase cam); default is an
+	# elevated, TILTED overview of the whole scene (godot_rl-examples arena look).
+	if _follow and _controlled_proxy != null and is_instance_valid(_controlled_proxy):
+		_setup_follow_cam_3d()
+	else:
+		_setup_overview_cam_3d()
+
+
+func _setup_overview_cam_3d() -> void:
+	# An elevated, tilted fit-to-scene overview (~ELEV_3D above the play plane, NOT straight
+	# top-down): the scene's large axes read as a ground plane with the bodies standing on it,
+	# like ScoreTheGoal's arena shots. All distances scale off the AABB (no absolute values).
 	var cam := Camera3D.new()
 	cam.name = "DemoCamera3D"
 	var center := (_min + _max) * 0.5
@@ -579,34 +743,44 @@ func _setup_camera_3d() -> void:
 	var radius: float = max(span.length() * 0.5, 1.0)
 	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
 	cam.fov = 50.0
-	var d := radius / tan(deg_to_rad(cam.fov * 0.5)) * (1.0 + MARGIN_FRAC)
-	# View roughly ALONG the scene's thinnest axis (its natural "depth"/normal) with a
-	# modest isometric tilt -- frames every body for a flat XY-plane layout (the common
-	# 3D case) AND reads as 3D for a volumetric scene. Derived from the AABB, so no
-	# game-specific "up" is assumed.
-	var depth := _thin_axis_dir(span)
-	var up := _up_for(depth)
-	var side := depth.cross(up).normalized()
-	var dir := (depth * 0.92 + up * 0.20 + side * 0.14).normalized()
-	# Extra pull-back so the whole AABB clears the frame despite the tilt.
-	d *= 1.25
-	cam.global_position = center + dir * d
-	cam.look_at(center, up)
+	# The thin axis is the scene's "up" (out of the play plane); pull back along an in-plane
+	# axis and rise by the elevation angle so we look DOWN onto the plane at a tilt.
+	var normal := _thin_axis_dir(span)
+	var back := _up_for(normal)
+	var el := deg_to_rad(ELEV_3D)
+	var dir := (back * cos(el) + normal * sin(el)).normalized()
+	var d := radius / tan(deg_to_rad(cam.fov * 0.5)) * (1.0 + MARGIN_FRAC) * 1.2
+	cam.near = 0.5
 	cam.far = d * 4.0 + 2000.0
-	cam.near = max(0.05, d * 0.005)
-	_stage3d.add_child(cam)
+	_stage3d.add_child(cam)                # in-tree BEFORE look_at (needs a global transform)
+	cam.global_position = center + dir * d
+	cam.look_at(center, normal)            # world-up = play-plane normal -> arena framing
 	cam.make_current()
 	_camera = cam
-	_cam_center = center
-	_cam_dist = d
-	_cam_dir = dir
-	_cam_up = up
 
 
-var _cam_center := Vector3.ZERO
-var _cam_dist := 100.0
-var _cam_dir := Vector3.ZERO
-var _cam_up := Vector3(0, -1, 0)
+func _setup_follow_cam_3d() -> void:
+	# A chase camera hung off a PIVOT parented to the controlled body's proxy (which already
+	# mirrors the body read-only -> tracking is free and the zero-contact contract is intact).
+	# Offset ~1 body-height up + ~3 body-lengths behind, pitched ~13 deg down (car.tscn rig).
+	var ext := _controlled_ext
+	var bh: float = max(ext.y * 2.0, 1.0)
+	var bl: float = max(max(ext.x, ext.z) * 2.0, 1.0)
+	var pivot := Node3D.new()
+	pivot.name = "CamPivot"
+	_controlled_proxy.add_child(pivot)
+	var cam := Camera3D.new()
+	cam.name = "DemoFollowCam3D"
+	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
+	cam.fov = 50.0
+	# Godot forward is -Z, so "behind" is +Z; rise by one body-height, look ~13 deg down.
+	cam.position = Vector3(0.0, bh * 1.0, bl * 3.2)
+	cam.rotation = Vector3(deg_to_rad(-13.0), 0.0, 0.0)
+	cam.near = 0.5
+	cam.far = (bl * 3.2 + bh) * 8.0 + 2000.0
+	pivot.add_child(cam)
+	cam.make_current()
+	_camera = cam
 
 
 func _thin_axis_dir(span: Vector3) -> Vector3:
@@ -622,19 +796,13 @@ func _thin_axis_dir(span: Vector3) -> Vector3:
 
 
 func _up_for(depth: Vector3) -> Vector3:
-	# A stable "up" perpendicular to the depth axis (-Y for a z-depth layout so the view
-	# matches the 2D y-down convention these games share).
+	# A stable in-plane axis perpendicular to the depth axis (-Y for a z-depth layout so the
+	# view matches the 2D y-down convention these games share).
 	if absf(depth.z) > 0.5:
 		return Vector3(0, -1, 0)
 	if absf(depth.y) > 0.5:
 		return Vector3(0, 0, -1)
 	return Vector3(0, -1, 0)
-
-
-func _follow_3d() -> void:
-	var t: Vector3 = _controlled_body.global_position
-	_camera.global_position = t + _cam_dir * (_cam_dist * 0.5)
-	_camera.look_at(t, _cam_up)
 
 
 # =========================================================================== #

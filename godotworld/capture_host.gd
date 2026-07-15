@@ -57,6 +57,9 @@ var _no_dress := false
 var _no_frames := false
 var _fp_path := ""
 var _fp_lines: PackedStringArray = PackedStringArray()
+var _assets_file := ""       # route_assets cache JSON ({body_name: asset_id|null}); 3D dressing
+var _assets_manifest := ""   # abs/res:// assets/manifest.json for AssetLoader
+var _dump_state := ""        # write t=0 state body list to this path + quit (routing pre-pass)
 
 
 func _initialize() -> void:
@@ -82,9 +85,18 @@ func _run() -> void:
 	_no_dress = _has_flag("--no-dress")     # identity-test lane (no overlay at all)
 	_no_frames = _has_flag("--no-frames")   # step + fingerprint only, write no PNGs
 	_fp_path = _str_arg("--fingerprint=", "")
+	_assets_file = _str_arg("--assets-file=", "")
+	_assets_manifest = _str_arg("--assets-manifest=", "")
+	_dump_state = _str_arg("--dump-state=", "")   # routing pre-pass: emit t=0 bodies + quit
 
-	if game_file == "" or _out_dir == "":
-		push_error("capture_host: --game-file and --out are required")
+	# The routing pre-pass and the render pass both need a game; --out is only required when
+	# actually writing frames.
+	if game_file == "":
+		push_error("capture_host: --game-file is required")
+		quit(2)
+		return
+	if _dump_state == "" and _out_dir == "":
+		push_error("capture_host: --out is required (unless --dump-state)")
 		quit(2)
 		return
 
@@ -134,6 +146,14 @@ func _run() -> void:
 	_game = inst
 	await physics_frame  # settle t=0
 
+	# ROUTING PRE-PASS: emit the t=0 state() body list (name + controlled) and quit. The Python
+	# capture driver reads this, calls asset_bank.route_assets, and feeds the cache back in via
+	# --assets-file for the real render pass. No dressing/rendering -> safe headless + cheap.
+	if _dump_state != "":
+		_write_dump_state()
+		quit(0)
+		return
+
 	# Dress: a ZERO-CONTACT overlay stage, SIBLING of the game (added to root, never to
 	# the game). It reads the game tree read-only; the game is never mutated. The
 	# identity test runs this host with --no-dress to prove the overlay is inert.
@@ -141,7 +161,13 @@ func _run() -> void:
 		var dress_script = load("res://visual_dress.gd")
 		_stage = dress_script.new()
 		root.add_child(_stage)
-		_stage.dress(_game, {"follow": _follow, "view_w": float(_width), "view_h": float(_height)})
+		_stage.dress(_game, {
+			"follow": _follow,
+			"view_w": float(_width),
+			"view_h": float(_height),
+			"assets": _load_assets_dict(_assets_file),
+			"manifest_path": _assets_manifest,
+		})
 
 	# Ensure the out dir exists.
 	DirAccess.make_dir_recursive_absolute(_out_dir)
@@ -281,6 +307,43 @@ func _sane() -> bool:
 		if sqrt(sq) > VMAX:
 			return false
 	return true
+
+
+func _load_assets_dict(path: String) -> Dictionary:
+	# Parse the route_assets cache ({body_name: asset_id|null}). {} on any failure -> the
+	# dresser simply uses primitive proxies (the demo always renders).
+	if path == "":
+		return {}
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return {}
+	var parsed = JSON.parse_string(f.get_as_text())
+	f.close()
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return {}
+	return parsed
+
+
+func _write_dump_state() -> void:
+	# The routing pre-pass output: the t=0 state() bodies as [{name, controlled}], for
+	# asset_bank.route_assets. Names come straight from the game's own state() (the mapping
+	# is keyed by these), so routing + the dresser's t=0-position match agree.
+	var bodies_out := []
+	var st = _game.state()
+	if typeof(st) == TYPE_DICTIONARY:
+		var bodies = st.get("bodies", [])
+		if typeof(bodies) == TYPE_ARRAY:
+			for b in bodies:
+				if typeof(b) != TYPE_DICTIONARY:
+					continue
+				bodies_out.append({
+					"name": str(b.get("name", "")),
+					"controlled": bool(b.get("controlled", false)),
+				})
+	var f := FileAccess.open(_dump_state, FileAccess.WRITE)
+	if f != null:
+		f.store_string(JSON.stringify({"bodies": bodies_out}))
+		f.flush()
 
 
 func _write_meta() -> void:

@@ -13,6 +13,7 @@ import os
 import pytest
 
 from harness.verify import capture
+from harness.demo import asset_bank
 
 
 def test_capture_argv_is_never_headless_and_pins_fixed_fps():
@@ -73,3 +74,63 @@ def test_assemble_gif_downscales_wide_frames(tmp_path):
     with Image.open(out) as im:
         assert im.size[0] == 640            # downscaled to the cap width
         assert im.size[1] == int(800 * 640 / 1200)
+
+
+# --------------------------------------------------------------------------- #
+# Bank-asset routing call-site (Godot-free plumbing; 3D games only get dressed)
+# --------------------------------------------------------------------------- #
+def test_use_llm_off_when_harness_offline(monkeypatch):
+    # HARNESS_OFFLINE forces the offline fallback regardless of any key present.
+    monkeypatch.setenv("HARNESS_OFFLINE", "1")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-present")
+    assert capture._use_llm() is False
+
+
+def test_use_llm_on_with_key_and_no_offline(monkeypatch):
+    monkeypatch.delenv("HARNESS_OFFLINE", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-present")
+    assert capture._use_llm() is True
+
+
+def test_game_context_is_slug_as_words():
+    assert capture._game_context("/x/y/drive_a_cart_one_lap.gd") == "drive a cart one lap"
+    assert capture._game_context("/x/mini_collect_3d.gd") == "mini collect 3d"
+
+
+def test_default_manifest_points_at_the_bank():
+    mf = capture._default_manifest()
+    assert mf and os.path.isfile(mf)
+    man = asset_bank.load_manifest(mf)
+    assert len(man["assets"]) >= 8
+
+
+def test_route_for_game_returns_empty_when_manifest_missing(tmp_path):
+    # A bad manifest short-circuits BEFORE any Godot pre-pass -> "" (dresser uses primitives).
+    out = capture._route_assets_for_game(
+        "/no/such/godot", "/no/such/project", str(tmp_path / "g.gd"),
+        game_context="g", manifest_path=str(tmp_path / "nope.json"))
+    assert out == ""
+
+
+def test_route_for_game_empty_when_dump_fails(tmp_path):
+    # A valid manifest but an unresolvable Godot exe -> the dump pre-pass yields no bodies,
+    # so routing declines gracefully (no crash, no cache written).
+    mf = capture._default_manifest()
+    out = capture._route_assets_for_game(
+        "/no/such/godot", "/no/such/project", str(tmp_path / "g.gd"),
+        game_context="g", manifest_path=mf)
+    assert out == ""
+
+
+def test_offline_route_consumes_3d_body_names():
+    # The call-site's offline contract: route_assets covers every t=0 body name with a valid
+    # bank id or None, and semantically-named goals do map to a real asset.
+    manifest = asset_bank.load_manifest(capture._default_manifest())
+    ids = {a["id"] for a in manifest["assets"]}
+    bodies = [{"name": "puck", "controlled": True}, {"name": "goal_left"},
+              {"name": "goal_right"}, {"name": "table"}]
+    mapping = asset_bank.route_assets("mini collect 3d", bodies, manifest, use_llm=False)
+    assert set(mapping) == {"puck", "goal_left", "goal_right", "table"}
+    for v in mapping.values():
+        assert v is None or v in ids
+    assert mapping["goal_left"] is not None and mapping["goal_left"] in ids
