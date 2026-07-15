@@ -66,3 +66,19 @@ on a CPU node); run SLURM-side, never on the login node.
 - OGV writer is editor-only; use AVI or PNG from the command line.
 - Determinism of the RENDER is not guaranteed (nor needed) — the WITNESS is the
   determinism anchor; capture just visualizes it.
+
+## Camera: FIT-TO-SCENE overview, not follow (Elias, 2026-07-15)
+
+To JUDGE a game you must see the WHOLE scene; a tight follow-cam on the agent
+shows only a window. Default demo camera = a static fit-to-scene overview
+computed from the AABB/bounding-sphere of all bodies at build time.
+
+- **2D:** `Camera2D.zoom` is a MULTIPLIER (<1 zooms OUT / shows more). Center on
+  the bodies' AABB centre; `zoom = min(vw/scene_w, vh/scene_h)` with ~10% margin;
+  `position_smoothing_enabled=false`; `anchor_mode=DRAG_CENTER`.
+- **3D:** `Camera3D.projection=PROJECTION_ORTHOGONAL`, `size=scene_extent+margin`,
+  placed above-and-back at an isometric angle, then `look_at(centre, Vector3.UP)`.
+  Perspective alt: distance `d = radius / tan(fov/2)`, `look_at(centre)`.
+- Follow-with-generous-margin only as a fallback for courses too large for one
+  frame; never the default. Docs (429'd this pass) to confirm the exact
+  Camera2D.zoom/limit + Camera3D.size semantics before implementing.
