@@ -337,14 +337,23 @@ def _llm_complete(client, system, messages):
 
     Adaptive thinking is set explicitly (off by default on this model). NO
     temperature/top_p/prefill - they 400 on claude-opus-4-8.
+
+    ANY SDK failure here (auth/credentials, connection, API error) converts to
+    _BackendUnavailable so the `auto` chain falls through to openrouter instead
+    of killing the run — observed 2026-07-15: a keyless environment raised
+    "Could not resolve authentication method" straight through `game harden`.
     """
-    resp = client.messages.create(
-        model=_MODEL,
-        max_tokens=_MAX_TOKENS,
-        thinking={"type": "adaptive"},
-        system=system,
-        messages=messages,
-    )
+    try:
+        resp = client.messages.create(
+            model=_MODEL,
+            max_tokens=_MAX_TOKENS,
+            thinking={"type": "adaptive"},
+            system=system,
+            messages=messages,
+        )
+    except Exception as exc:  # noqa: BLE001 - SDK auth/connection/API errors
+        raise _BackendUnavailable(
+            f"anthropic call failed: {type(exc).__name__}: {str(exc)[:140]}")
     parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
     return "\n".join(parts)
 
