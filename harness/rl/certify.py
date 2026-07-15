@@ -88,7 +88,7 @@ def _bridge_replay_godot(game_source: str, witness: dict) -> dict:
 def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              n_eval: int = N_EVAL, seed: int = 0, log=None,
              wall_clock_budget_s=None, trainer: str = "sb3",
-             **train_kwargs) -> dict:
+             method: str = "ppo", **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
     `trainer` selects the RL backend: ``"vendored"`` (default, the CleanRL-mirror
@@ -97,11 +97,25 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     the same greedy/sampled eval-episode emission, so the witness ORACLE below
     (`_pick_witness`/`_bridge_replay`) is identical regardless of trainer.
 
+    `method` selects the SB3 algorithm (``ppo`` default / ``a2c`` / ``dqn``) and is
+    a pass-through to the SB3 trainer ONLY — the algo registry is an sb3-lane seam,
+    so a non-default `method` on ``trainer="vendored"`` is rejected with a clear
+    error. It is recorded in the result dict (``method``) for the ledger.
+
     Returns (task-required keys + provenance extras):
         learnable, steps_to_first_success, checkpoints_curve (per-update mean
         latches), final_success_rate (over n_eval greedy episodes),
         rl_witness ({seed, actions, ticks} | None), wall_clock_s.
     """
+    # The algo registry lives on the SB3 lane only; the vendored CleanRL-mirror PPO
+    # exposes no `method` seam, so reject a non-default method up front (before any
+    # env/training work) with a message that points at the right lane.
+    if trainer == "vendored" and method != "ppo":
+        raise ValueError(
+            f"trainer='vendored' does not support method={method!r}: the algo "
+            f"registry (ppo|a2c|dqn) is exposed only by the SB3 trainer — use "
+            f"trainer='sb3', or keep method='ppo'")
+
     t0 = time.time()
     trainer_mod = _resolve_trainer(trainer)
 
@@ -138,10 +152,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     probe.close()
 
     # --- Train ---
+    # `method` is an SB3-only kwarg (the vendored ppo.train takes no such arg), so
+    # forward it only on the sb3 lane; the vendored lane was already gated above.
+    method_kw = {} if trainer == "vendored" else {"method": method}
     train_res = trainer_mod.train(make_env, obs_dim, n_actions,
                                   total_steps=budget_steps, seed=seed, log=log,
                                   wall_clock_budget_s=wall_clock_budget_s,
-                                  **train_kwargs)
+                                  **method_kw, **train_kwargs)
     agent = train_res["agent"]
 
     # --- Evaluation over fixed seeds ---
@@ -198,6 +215,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "title": title,
         "game_path": game_path,
         "trainer": trainer,
+        "method": method,                                     # algo (ledger key)
         "stochastic_success_rate": stochastic_success_rate,   # graded learnability
         "budget_steps": budget_steps,
         "trained_steps": train_res["global_steps"],

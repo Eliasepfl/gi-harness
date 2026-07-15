@@ -19,9 +19,18 @@ entropy/value coeffs, grad-norm. The smoothed plateau early-stop
 (patience/window/min_delta) is reproduced in a training callback — the "declare
 UNSOLVABLE-BY-RL and move on, never hang" rule.
 
+The learner is selected off a small ALGO registry (`method=`): ``ppo`` (default),
+``a2c`` and ``dqn`` — BASE stable_baselines3 only. ppo/a2c are on-policy and share
+the mirrored actor-critic net-arch + rollout knobs; dqn is off-policy and carries
+its OWN small-budget hyperparameters (`DQN_DEFAULTS`) — PPO's n_steps / minibatch /
+clip / gae knobs are never forced onto it. Every method emits the SAME eval/witness
+surface (greedy = predict(deterministic=True), sampled = deterministic=False), so
+`certify._pick_witness`/`_bridge_replay` stay untouched.
+
 stable-baselines3 is an OPTIONAL dependency (pinned `>=2.4,<3`, requirements.txt);
-it is imported lazily inside `train()` so this module (and the eval helpers) stay
-importable on the vendored lane, where SB3 is never installed.
+it is imported lazily inside `train()` (and the registry helpers) so this module
+(and the eval helpers) stay importable on the vendored lane, where SB3 is never
+installed.
 """
 
 from __future__ import annotations
@@ -33,6 +42,60 @@ import torch
 
 from harness.rl.env import wrap_gym
 from harness.rl.ppo import DEFAULTS
+
+
+# --- Algorithm registry ------------------------------------------------------
+# Method name (the CLI/ledger token) -> the BASE stable_baselines3 class. BASE
+# sb3 ONLY: sb3-contrib algos (RecurrentPPO, QRDQN, TRPO, ...) live in a separate
+# `sb3-contrib` package the certifier image does not yet carry, so wiring them up
+# is a FOLLOWUP that needs an image rebuild. Resolution is lazy (the import lives
+# inside `_algo_registry`) so this module stays importable on the vendored lane.
+ALGO_METHODS = ("ppo", "a2c", "dqn")
+DEFAULT_METHOD = "ppo"
+
+
+def _algo_registry() -> dict:
+    """Map method name -> SB3 algorithm class (imported lazily; base sb3 only)."""
+    from stable_baselines3 import A2C, DQN, PPO
+
+    return {"ppo": PPO, "a2c": A2C, "dqn": DQN}
+
+
+def _resolve_algo(method: str):
+    """Return the SB3 algorithm class for ``method`` (one of ``ALGO_METHODS``).
+
+    Raises ``ValueError`` on an unknown method — including sb3-contrib names such
+    as ``recurrentppo``, which are a followup gated on an image rebuild."""
+    reg = _algo_registry()
+    try:
+        return reg[method]
+    except KeyError:
+        raise ValueError(
+            f"unknown method {method!r} (expected one of {tuple(reg)}); "
+            f"sb3-contrib algos (e.g. RecurrentPPO) are a followup needing an "
+            f"image rebuild") from None
+
+
+# --- DQN small-budget hyperparameters ([eng.]) ------------------------------
+# DQN is OFF-policy: PPO's rollout knobs (num_steps, num_minibatches,
+# update_epochs, clip_coef, gae_lambda, ent_coef, vf_coef) DO NOT apply and are
+# never forwarded. Only the SHARED knobs (gamma, hidden, num_envs, the plateau
+# patience/window/min_delta) are read from `DEFAULTS`; everything below is DQN's
+# own, sized for the small screening budget — SB3's stock defaults assume a ~1e6
+# replay buffer / 1e4 target sync, both far too large for a 3-5k-step probe.
+DQN_DEFAULTS = dict(
+    learning_rate=1e-3,          # a touch above SB3's 1e-4 to move on tiny budgets
+    buffer_size=50_000,          # replay capacity (vs SB3's 1e6 — memory-frugal)
+    learning_starts=100,         # warm the buffer before the first gradient step
+    batch_size=64,               # replay minibatch
+    tau=1.0,                     # hard target update (DQN default)
+    train_freq=4,                # one gradient step per 4 env-steps
+    gradient_steps=1,
+    target_update_interval=250,  # sync target net (vs SB3's 1e4)
+    exploration_fraction=0.2,    # anneal epsilon over the first 20% of the budget
+    exploration_initial_eps=1.0,
+    exploration_final_eps=0.05,
+)
 
 
 def _build_callback_cls():
@@ -127,25 +190,106 @@ def _build_callback_cls():
     return _CurveCallback
 
 
+def _build_onpolicy(method: str, algo_cls, venv, hp: dict, seed: int):
+    """Construct an ON-policy SB3 model (PPO or A2C) mirroring the vendored loop's
+    knobs: the separate 2x64 tanh actor/critic net-arch (orthogonal init), the
+    learning rate (+ linear anneal), n_steps, gamma/lambda, entropy/value coeffs,
+    grad-norm. PPO keeps the full minibatch/epoch/clip machinery; A2C is the same
+    actor-critic net + rollout but a single full-batch update per rollout, so the
+    PPO-only knobs (num_minibatches/update_epochs/clip_coef) are simply NOT
+    forwarded — SB3's A2C has no such parameters."""
+    base_lr = hp["learning_rate"]
+    # anneal_lr -> SB3 linear schedule (progress_remaining runs 1.0 -> 0.0), the
+    # same shape as ppo.py's `frac = 1 - (update-1)/num_updates`.
+    lr = (lambda progress_remaining: progress_remaining * base_lr) \
+        if hp["anneal_lr"] else base_lr
+
+    policy_kwargs = dict(
+        net_arch=dict(pi=[hp["hidden"], hp["hidden"]],   # separate 2x64 actor/critic
+                      vf=[hp["hidden"], hp["hidden"]]),
+        activation_fn=torch.nn.Tanh,
+        ortho_init=True,
+    )
+    common = dict(
+        learning_rate=lr,
+        n_steps=hp["num_steps"],
+        gamma=hp["gamma"],
+        gae_lambda=hp["gae_lambda"],
+        ent_coef=hp["ent_coef"],
+        vf_coef=hp["vf_coef"],
+        max_grad_norm=hp["max_grad_norm"],
+        policy_kwargs=policy_kwargs,
+        seed=seed,
+        device="cpu",                 # CPU only — no GPU assumptions (== ppo.py)
+        verbose=0,
+    )
+    if method == "ppo":
+        batch_size = hp["num_envs"] * hp["num_steps"]
+        minibatch_size = max(1, batch_size // hp["num_minibatches"])
+        return algo_cls(
+            "MlpPolicy", venv,
+            batch_size=minibatch_size,
+            n_epochs=hp["update_epochs"],
+            clip_range=hp["clip_coef"],
+            **common)
+    return algo_cls("MlpPolicy", venv, **common)   # a2c
+
+
+def _build_dqn(algo_cls, venv, hp: dict, seed: int):
+    """Construct an OFF-policy DQN model from DQN's OWN small-budget knobs
+    (`DQN_DEFAULTS`). Discrete actions only — the PlanckEnv action space IS
+    Discrete, so DQN applies. NONE of PPO's rollout hyperparameters are forwarded;
+    epsilon-greedy exploration (not an LR anneal) drives exploration. A single Q
+    net-arch (no actor/critic split, no ortho_init — DQN's MlpPolicy has neither)."""
+    policy_kwargs = dict(
+        net_arch=[hp["hidden"], hp["hidden"]],   # one Q-net (no pi/vf split)
+        activation_fn=torch.nn.Tanh,
+    )
+    return algo_cls(
+        "MlpPolicy", venv,
+        learning_rate=hp["learning_rate"],
+        buffer_size=hp["buffer_size"],
+        learning_starts=hp["learning_starts"],
+        batch_size=hp["batch_size"],
+        tau=hp["tau"],
+        gamma=hp["gamma"],
+        train_freq=hp["train_freq"],
+        gradient_steps=hp["gradient_steps"],
+        target_update_interval=hp["target_update_interval"],
+        exploration_fraction=hp["exploration_fraction"],
+        exploration_initial_eps=hp["exploration_initial_eps"],
+        exploration_final_eps=hp["exploration_final_eps"],
+        policy_kwargs=policy_kwargs,
+        seed=seed,
+        device="cpu",                 # CPU only — no GPU assumptions (== ppo.py)
+        verbose=0,
+    )
+
+
 def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           seed: int = 0, device: str = "cpu", log=None, wall_clock_budget_s=None,
-          **overrides) -> dict:
-    """Train SB3 PPO on `make_env` (a 0-arg PlanckEnv factory) for ~`total_steps`
-    env-steps and return the same dict shape as `ppo.train` (agent + curves +
-    steps_to_first_success + bookkeeping). `obs_dim`/`n_actions` are accepted for
-    surface parity with the vendored trainer; SB3 sizes the policy from the env's
-    own spaces via the gymnasium adapter."""
-    from stable_baselines3 import PPO
+          method: str = DEFAULT_METHOD, **overrides) -> dict:
+    """Train an SB3 learner on `make_env` (a 0-arg PlanckEnv factory) for
+    ~`total_steps` env-steps and return the same dict shape as `ppo.train` (agent +
+    curves + steps_to_first_success + bookkeeping, plus the resolved `method`).
+    `obs_dim`/`n_actions` are accepted for surface parity with the vendored trainer;
+    SB3 sizes the policy from the env's own spaces via the gymnasium adapter.
+
+    `method` selects the algorithm off the registry (`ALGO_METHODS`: ``ppo``
+    default / ``a2c`` / ``dqn``). ppo/a2c share the mirrored on-policy net-arch and
+    rollout knobs; dqn is off-policy and gets its own `DQN_DEFAULTS` — the PPO
+    rollout knobs are never forced onto it. The callback (curves + plateau/wall-clock
+    early stop) and the greedy/sampled eval surface are identical for every method."""
+    algo_cls = _resolve_algo(method)   # validates method (+ lazily imports SB3)
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     hp = dict(DEFAULTS)
+    if method == "dqn":
+        hp.update(DQN_DEFAULTS)       # off-policy knobs (no PPO rollout params)
     hp.update(overrides)
 
     num_envs = hp["num_envs"]
-    num_steps = hp["num_steps"]
-    batch_size = num_envs * num_steps
-    minibatch_size = max(1, batch_size // hp["num_minibatches"])
 
     # One PlanckEnv per vec slot, wrapped as gymnasium.Env then Monitored so each
     # episode-end info carries r/l PLUS our success + n_latched (info_keywords) —
@@ -161,35 +305,8 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     # autoreset — the exact per-env fixed-seed scheme of the vendored VecEnv.
     venv.seed(seed)
 
-    base_lr = hp["learning_rate"]
-    # anneal_lr -> SB3 linear schedule (progress_remaining runs 1.0 -> 0.0), the
-    # same shape as ppo.py's `frac = 1 - (update-1)/num_updates`.
-    lr = (lambda progress_remaining: progress_remaining * base_lr) \
-        if hp["anneal_lr"] else base_lr
-
-    policy_kwargs = dict(
-        net_arch=dict(pi=[hp["hidden"], hp["hidden"]],   # separate 2x64 actor/critic
-                      vf=[hp["hidden"], hp["hidden"]]),
-        activation_fn=torch.nn.Tanh,
-        ortho_init=True,
-    )
-    model = PPO(
-        "MlpPolicy", venv,
-        learning_rate=lr,
-        n_steps=num_steps,
-        batch_size=minibatch_size,
-        n_epochs=hp["update_epochs"],
-        gamma=hp["gamma"],
-        gae_lambda=hp["gae_lambda"],
-        clip_range=hp["clip_coef"],
-        ent_coef=hp["ent_coef"],
-        vf_coef=hp["vf_coef"],
-        max_grad_norm=hp["max_grad_norm"],
-        policy_kwargs=policy_kwargs,
-        seed=seed,
-        device="cpu",                 # CPU only — no GPU assumptions (== ppo.py)
-        verbose=0,
-    )
+    model = (_build_dqn(algo_cls, venv, hp, seed) if method == "dqn"
+             else _build_onpolicy(method, algo_cls, venv, hp, seed))
 
     callback = _build_callback_cls()(hp, log=log,
                                      wall_clock_budget_s=wall_clock_budget_s)
@@ -200,6 +317,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
 
     return {
         "agent": model,
+        "method": method,
         "curve_return": callback.curve_return,
         "curve_latched": callback.curve_latched,
         "curve_success": callback.curve_success,
