@@ -67,7 +67,7 @@ def test_design_template_backend_passes_verify(tmp_path):
                    out_dir=str(tmp_path / "games"))
     assert res["verdict"] == "COMPLETED"
     assert res["backend"] == "template"
-    assert res["game_path"] and res["game_path"].endswith(".py")
+    assert res["game_path"] and res["game_path"].endswith(".spec.json")  # godot default post-pivot
     assert res["integrity"] == "ok"
 
 

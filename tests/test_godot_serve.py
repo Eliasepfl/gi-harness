@@ -33,7 +33,7 @@ from harness.rl.godot_env import (  # noqa: E402
 from harness.verify.executors import GodotExecutor, find_godot_exe  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_EXAMPLES = os.path.join(_ROOT, "godotworld", "examples")
+_EXAMPLES = os.path.join(_ROOT, "tests", "fixtures", "godot_specs")
 TRAVERSE = os.path.join(_EXAMPLES, "traverse.spec.json")
 
 GODOT_EXE = find_godot_exe()

@@ -116,7 +116,10 @@ def test_no_bank_dir_adds_no_bank_key(tmp_path):
 # Real repo sanity
 # --------------------------------------------------------------------------- #
 def test_real_repo_snapshot_has_bank_and_designer_seed():
+    # The wave-0 seed skills were deleted (they codified the pre-pivot
+    # perimeter, commit 09d94a4); the TRACKING mechanism is what matters —
+    # asserted against fixture trees above. The real repo must still pin the
+    # bank hash; designer skills reappear here once the reseed lands.
     root = INT.__file__.rsplit("harness", 1)[0].rstrip("\\/")
     snap = INT.snapshot(root)
     assert "bank:v1" in snap
-    assert any(k.startswith("designer/skills/") for k in snap)
