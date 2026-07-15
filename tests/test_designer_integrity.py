@@ -10,6 +10,8 @@ the base harness/**/*.py + CONTRACTS.md manifest unchanged.
 """
 from __future__ import annotations
 
+import pytest
+
 import json
 import os
 import re
@@ -153,6 +155,7 @@ def test_no_bank_dir_adds_no_bank_key(tmp_path):
 # --------------------------------------------------------------------------- #
 # Real repo sanity
 # --------------------------------------------------------------------------- #
+@pytest.mark.skip(reason="designer content purged with the GDScript pivot (Elias, 2026-07-15); mechanism tests above still guard the cage")
 def test_real_repo_snapshot_has_bank_and_designer_seed():
     # The wave-0 seed skills were deleted (they codified the pre-pivot perimeter,
     # commit 09d94a4); the reseed (TRACK RESEED, wave-1) has since landed, so the
@@ -171,6 +174,7 @@ def test_real_repo_snapshot_has_bank_and_designer_seed():
 # --------------------------------------------------------------------------- #
 # Reseeded skills library — HUB routing + frontmatter integrity (TRACK RESEED)
 # --------------------------------------------------------------------------- #
+@pytest.mark.skip(reason="designer content purged with the GDScript pivot (Elias, 2026-07-15); mechanism tests above still guard the cage")
 def test_reseeded_library_present_and_hub_exists():
     """The wave-1 reseed landed: HUB.md + a spread of routed skills exist."""
     files = _skill_files()
@@ -180,6 +184,7 @@ def test_reseeded_library_present_and_hub_exists():
     assert len(files) >= 8
 
 
+@pytest.mark.skip(reason="designer content purged with the GDScript pivot (Elias, 2026-07-15); mechanism tests above still guard the cage")
 def test_hub_routes_have_no_dangling_targets():
     """Every skill the HUB routes to must exist — no dangling routes."""
     hub = os.path.join(_SKILLS_DIR, "HUB.md")
@@ -193,6 +198,7 @@ def test_hub_routes_have_no_dangling_targets():
     assert not dangling, f"HUB routes to non-existent skills: {dangling}"
 
 
+@pytest.mark.skip(reason="designer content purged with the GDScript pivot (Elias, 2026-07-15); mechanism tests above still guard the cage")
 def test_every_skill_is_routed_by_hub_no_orphans():
     """No orphan skills: every non-HUB skill file is reachable from the HUB."""
     hub = os.path.join(_SKILLS_DIR, "HUB.md")
@@ -205,6 +211,7 @@ def test_every_skill_is_routed_by_hub_no_orphans():
     assert not orphans, f"skills exist but the HUB never routes to them: {orphans}"
 
 
+@pytest.mark.skip(reason="designer content purged with the GDScript pivot (Elias, 2026-07-15); mechanism tests above still guard the cage")
 def test_at_least_six_archetype_cards():
     """The library ships 6-10 archetype cards (the differentiator families)."""
     archetypes = []
@@ -216,6 +223,7 @@ def test_at_least_six_archetype_cards():
     assert 6 <= len(archetypes) <= 10, f"expected 6-10 archetype cards, got {archetypes}"
 
 
+@pytest.mark.skip(reason="designer content purged with the GDScript pivot (Elias, 2026-07-15); mechanism tests above still guard the cage")
 def test_every_skill_has_valid_frontmatter():
     """Frontmatter validation for ALL skill files (DESIGNER_AGENT_PLAN.md §4)."""
     for name in _skill_files():
@@ -235,6 +243,7 @@ def test_every_skill_has_valid_frontmatter():
         assert fm["provenance"], f"{name}: provenance must be non-empty"
 
 
+@pytest.mark.skip(reason="designer content purged with the GDScript pivot (Elias, 2026-07-15); mechanism tests above still guard the cage")
 def test_quarried_skills_attribute_the_lgpl_source():
     """No verbatim copying (LGPL): any skill mining the quarry must attribute it."""
     for name in _skill_files():
