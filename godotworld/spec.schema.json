@@ -12,6 +12,22 @@
       "const": "godot"
     },
     "spec_version": {"type": "integer", "enum": [1, 2]},
+    "world": {
+      "type": "object",
+      "description": "Optional world-level physics mode (SPEC.md §2b). Omitted -> side view (gravity (0,-900), zero damping; byte-identical back-compat).",
+      "additionalProperties": false,
+      "properties": {
+        "view": {
+          "enum": ["side", "topdown"],
+          "description": "side (default): gravity (0,-900), a platformer/tower/pit seen from the side. topdown: gravity (0,0), the x/y plane is the floor seen from above; bodies glide and linear_damp is the friction analog."
+        },
+        "linear_damp": {
+          "type": "number",
+          "minimum": 0,
+          "description": "topdown only: the per-body linear damping (top-down friction analog) applied to every dynamic body so a released body coasts to a stop. Omitted -> 1.5. Ignored in side view."
+        }
+      }
+    },
     "meta": {
       "type": "object",
       "required": ["title", "prompt", "actions"],

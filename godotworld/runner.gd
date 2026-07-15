@@ -24,7 +24,14 @@
 # DECISION-TICK SEMANTICS (CONTRACTS section 2, K=6): per tick, apply the action's
 # verb list, then step physics 6x (each `await physics_frame` == one physics step),
 # updating contacts + on_step behaviors after each step; then latch checkpoints,
-# check failure, then success. Fresh scene per episode; y-UP px; gravity (0,-900).
+# check failure, then success. Fresh scene per episode; y-UP px.
+#
+# VIEW MODE (SPEC.md section 2b): the optional top-level `world` block selects gravity.
+# `side` (default) keeps the historical (0,-900) and zero damping -- a spec with no
+# `world` block is byte-for-byte identical to before this field existed (no body property
+# is touched). `topdown` zeroes gravity (gravity_scale=0) so the x/y plane is the floor
+# seen from above, and applies `world.linear_damp` (default 1.5) to every dynamic body as
+# the friction analog so a released body coasts to a stop. Both serve and batch honour it.
 #
 # BYTE-DETERMINISM: episode floats are emitted with "%.17f" (full float64) -- JSON
 # rounding would MASK low-bit drift. Check-mode facts (never byte-compared) use the
@@ -35,6 +42,7 @@ extends SceneTree
 const K_STEPS := 6
 const VMAX := 1.0e5
 const DEFAULT_WORLD := Vector2(800.0, 600.0)
+const DEFAULT_TOPDOWN_DAMP := 1.5      # top-down friction analog when world.linear_damp is omitted
 
 # SPEEDUP lever (GODOT_RL_AGENTS_CAPABILITIES.md "Fixed-delta under speedup",
 # godot_rl_agents sync.gd:61-62). `--speedup=N` scales BOTH the physics rate and
@@ -109,6 +117,8 @@ var _spec_sensors := []             # spec-v2 sensor descriptors (DATA)
 var _spec_predicates := {}
 var _world_w := 800.0
 var _world_h := 600.0
+var _view := "side"                 # "side" (gravity (0,-900)) | "topdown" (gravity (0,0))
+var _world_linear_damp := 0.0       # top-down friction analog; 0 in side view (untouched)
 var _success_expr = null            # String or null
 var _failure_expr = null            # String or null
 var _checkpoint_keys := []          # ordered checkpoint names
@@ -537,6 +547,17 @@ func _load_spec(source) -> String:
 		_world_w = DEFAULT_WORLD.x
 		_world_h = DEFAULT_WORLD.y
 
+	# View mode (SPEC.md section 2b). Side (default) is byte-identical back-compat: no
+	# body property is touched. Top-down zeroes gravity + turns on the linear_damp friction
+	# analog (default 1.5). Applied per dynamic body in _add_body.
+	_view = "side"
+	_world_linear_damp = 0.0
+	var world_block = spec.get("world", {})
+	if typeof(world_block) == TYPE_DICTIONARY and str(world_block.get("view", "side")) == "topdown":
+		_view = "topdown"
+		var ld = world_block.get("linear_damp", null)
+		_world_linear_damp = float(ld) if (typeof(ld) == TYPE_FLOAT or typeof(ld) == TYPE_INT) else DEFAULT_TOPDOWN_DAMP
+
 	_success_expr = _spec_predicates.get("success", null)
 	_failure_expr = _spec_predicates.get("failure", null)
 	_checkpoint_keys = []
@@ -702,6 +723,14 @@ func _add_body(b) -> String:
 		rb.max_contacts_reported = 8
 		rb.mass = float(b.get("mass", 1.0))
 		rb.lock_rotation = bool(b.get("locked_rotation", false))
+		# TOP-DOWN view: zero gravity (the x/y plane is the floor seen from above) and
+		# turn on linear_damp as the friction analog so a released body coasts to a stop.
+		# SIDE view leaves the engine defaults (gravity_scale 1, linear_damp 0) UNTOUCHED
+		# so specs without a topdown `world` block stay byte-for-byte identical.
+		if _view == "topdown":
+			rb.gravity_scale = 0.0
+			rb.linear_damp_mode = RigidBody2D.DAMP_MODE_REPLACE
+			rb.linear_damp = _world_linear_damp
 		var vel = b.get("velocity", null)
 		if typeof(vel) == TYPE_ARRAY and vel.size() == 2:
 			rb.linear_velocity = Vector2(float(vel[0]), float(vel[1]))
@@ -1425,6 +1454,8 @@ func _run_check(source) -> String:
 	# 4. Declared world size (bounds validated Python-side).
 	var declared_ws = _spec_meta.get("world_size", null)
 	out["world_size"] = {"declared": declared_ws, "effective": [_world_w, _world_h]}
+	# View mode (SPEC.md section 2b): side (gravity (0,-900)) | topdown (gravity (0,0)).
+	out["world"] = {"view": _view, "linear_damp": _world_linear_damp}
 
 	# 5. Build the scene.
 	await process_frame

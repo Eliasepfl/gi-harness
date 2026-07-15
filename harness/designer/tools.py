@@ -199,6 +199,7 @@ _REACH_TOL = 40.0       # a sensor is "reachable" if a body is within this of it
 # reasons about EXACT engine semantics, not approximations (GODOT_DOCS_MINING.md §1).
 _DEFAULT_GRAVITY = 900.0            # project.godot 2d/default_gravity
 _DEFAULT_GRAVITY_VEC = (0.0, -1.0)  # 2d/default_gravity_vector — y-UP world, down = -Y
+_DEFAULT_TOPDOWN_DAMP = 1.5        # runner.gd DEFAULT_TOPDOWN_DAMP (world.linear_damp default)
 _TICK_DT = 1.0 / 60.0              # fixed physics dt (--fixed-fps 60); zero damping
 _CONTACT_CAP = 8                   # RigidBody2D.max_contacts_reported — silently drops >8
 _TUNNEL_THIN_PX = 6.0             # a static wall thinner than this can be tunnelled (CCD off)
@@ -333,7 +334,10 @@ def _gravity_of(meta: dict) -> list:
     """The world gravity vector ``[gx, gy]`` (px/s²), y-UP so default down = -Y (§1.1).
     Reads ``meta.gravity`` (magnitude) + ``meta.gravity_vector`` (direction) when a spec
     carries them, else the project.godot defaults ``(0,-1)·900 = (0,-900)`` — the exact
-    vector the runner's floating/OOB verdicts must reference or they invert sign."""
+    vector the runner's floating/OOB verdicts must reference or they invert sign.
+
+    NOTE: only the SIDE view has gravity; ``inspect_world`` overrides this to ``[0, 0]``
+    in a top-down world (see ``_view_of`` / SPEC.md §2b)."""
     mag = _DEFAULT_GRAVITY
     vx, vy = _DEFAULT_GRAVITY_VEC
     if isinstance(meta, dict):
@@ -346,6 +350,33 @@ def _gravity_of(meta: dict) -> list:
             if length > 0:
                 vx, vy = float(gv[0]) / length, float(gv[1]) / length
     return [vx * mag, vy * mag]
+
+
+def _world_block(spec: Any) -> dict:
+    """The optional top-level ``world`` block (SPEC.md §2b), or ``{}`` when absent."""
+    if isinstance(spec, dict):
+        wb = spec.get("world")
+        if isinstance(wb, dict):
+            return wb
+    return {}
+
+
+def _view_of(spec: Any) -> str:
+    """The world view mode: ``"topdown"`` when the ``world`` block selects it, else the
+    default ``"side"``. Top-down zeroes gravity (SPEC.md §2b), which flips several
+    placement oracles (floating statics / ballistic forecasts become meaningless; a
+    ``linear_damp`` makes a park-at-rest goal satisfiable)."""
+    return "topdown" if _world_block(spec).get("view") == "topdown" else "side"
+
+
+def _topdown_linear_damp(spec: Any) -> float:
+    """The top-down friction analog (``world.linear_damp``, default 1.5) — the per-body
+    damping the runner applies to every dynamic body in a top-down world. ``0.0`` in the
+    side view (where linear_damp is ignored and bodies coast forever)."""
+    if _view_of(spec) != "topdown":
+        return 0.0
+    ld = _world_block(spec).get("linear_damp")
+    return float(ld) if _is_num(ld) else _DEFAULT_TOPDOWN_DAMP
 
 
 def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
@@ -387,7 +418,10 @@ def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
     meta = spec.get("meta") if isinstance(spec.get("meta"), dict) else {}
     ws = meta.get("world_size")
     world_size = list(ws) if _is_vec2(ws) else (None if is_fragment else [800, 600])
-    gravity = _gravity_of(meta)  # [gx, gy]; default [0, -900] (y-UP world, down = -Y)
+    # View mode (SPEC.md §2b): a top-down world has ZERO gravity, so its gravity-dependent
+    # oracles (floating statics, ballistic forecast, park-at-rest) are branched below.
+    view = _view_of(spec)
+    gravity = [0.0, 0.0] if view == "topdown" else _gravity_of(meta)
 
     roles = _bank_roles([b.get("name") for b in bodies], use_bank, bank_version)
 
@@ -433,8 +467,10 @@ def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
             "by_shape": by_shape,
             "world_size": world_size,
             "world_bbox": world_bbox,
+            "view": view,
             "gravity": [_round(gravity[0]), _round(gravity[1])],
-            "ballistic": _ballistic_summary(recs, spec, gravity),
+            # A jump/ballistic forecast is meaningless with no gravity (top-down).
+            "ballistic": None if view == "topdown" else _ballistic_summary(recs, spec, gravity),
             "is_fragment": is_fragment,
             "n_entities": len(entities),
             "n_warnings": len(warnings),
@@ -477,6 +513,7 @@ def _collect_warnings(recs: list[dict], world_size: list | None,
     statics = [r for r in recs if r["kind"] == "static" and r["aabb"] is not None]
     dynamics = [r for r in recs if r["kind"] == "dynamic" and r["aabb"] is not None]
     known_bodies = {r["name"] for r in recs if isinstance(r["name"], str)}
+    topdown = _view_of(spec) == "topdown"  # zero gravity flips the gravity-dependent passes
 
     # duplicate names (across ALL bodies, geometry or not).
     seen: dict[Any, int] = {}
@@ -524,8 +561,9 @@ def _collect_warnings(recs: list[dict], world_size: list | None,
 
     # floating statics (no support: not near the world floor, not resting on / touching
     # another solid). A heuristic — free-floating platforms are often intentional. The
-    # "floor" is the low-Y edge because gravity points -Y (§1.1).
-    for r in statics:
+    # "floor" is the low-Y edge because gravity points -Y (§1.1). MEANINGLESS in a
+    # top-down world (no gravity, so nothing "falls" or needs support) — suppressed.
+    for r in ([] if topdown else statics):
         bb = r["aabb"]
         if bb[1] <= _SUPPORT_TOL:  # bottom near world floor (y=0)
             continue
@@ -628,7 +666,9 @@ def _collect_warnings(recs: list[dict], world_size: list | None,
 
     # (§1.7) ballistic out-of-bounds forecast: a dynamic body with an initial velocity,
     # under zero damping + fixed dt, is projected forward; flag if it leaves the world.
-    if _is_vec2(world_size):
+    # Suppressed in a top-down world: the zero-damping ballistic projection is wrong there
+    # (linear_damp>0 makes bodies coast to a stop), so the forecast is meaningless.
+    if _is_vec2(world_size) and not topdown:
         warnings.extend(_forecast_oob(dynamics, world_size, gravity))
 
     return warnings
@@ -674,6 +714,9 @@ def _predicate_warnings(recs: list[dict], spec: dict,
     out: list[dict] = []
     body_by_name = {r["name"]: r["body"] for r in recs if isinstance(r["name"], str)}
     has_clamp = _has_velocity_clamp(spec)
+    # A top-down world with linear_damp>0 brings a free body to rest on its own (the
+    # friction analog), so a park-at-rest goal IS satisfiable there without a clamp.
+    damped_topdown = _view_of(spec) == "topdown" and _topdown_linear_damp(spec) > 0.0
 
     for label, expr in _iter_predicates(spec):
         # -- linter -------------------------------------------------------
@@ -699,7 +742,7 @@ def _predicate_warnings(recs: list[dict], spec: dict,
         # -- unsatisfiable park (§1.6) -----------------------------------
         if label == "success":
             park_body = _park_target(expr)
-            if park_body is not None and not has_clamp:
+            if park_body is not None and not has_clamp and not damped_topdown:
                 out.append({
                     "kind": "unsatisfiable_park", "bodies": [park_body],
                     "predicate": label,
