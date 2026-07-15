@@ -19,6 +19,8 @@ The root node picks the world's dimension; the fiction chooses which, and neithe
 
 Exactly one dynamic body is `{"controlled": true, "static": false}` - and it is a ship, a car, a plane, a boulder, a fish, a character, whatever your fiction is. Pick the body kind and the collision shape the design needs. NEVER default to a circle/ball because it is easy; the shape is a design decision like every other.
 
+Name each body for what it represents in the fiction; a name may later be used for optional render-only cosmetic dressing that never changes physics, gameplay, or verification.
+
 # The method convention - SIGNATURES, not a game to copy
 
 Implement these seven methods on your node (exact names + arities; the contract probe rejects a missing one). Fill the bodies from YOUR design - there is deliberately no skeleton and no example here:
