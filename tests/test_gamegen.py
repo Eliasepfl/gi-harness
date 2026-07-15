@@ -984,8 +984,9 @@ _NULL_CONTENT_BODY = {"choices": [{"message": {"content": None},
                                    "finish_reason": "length"}]}
 
 
-def test_null_content_salvage_halves_cap_once(monkeypatch):
-    # 200-with-null-content (reasoning ate the budget) -> retry ONCE at cap/2.
+def test_null_content_salvage_disables_thinking_once(monkeypatch):
+    # 200-with-null-content (reasoning ate the budget; providers ignore caps)
+    # -> retry ONCE with thinking DISABLED (the measured-reliable path).
     _fake_secrets(monkeypatch)
     fake = _FakeRequests([_FakeResp(200, _NULL_CONTENT_BODY),
                           _FakeResp(200, _chat("recovered"))])
@@ -997,7 +998,7 @@ def test_null_content_salvage_halves_cap_once(monkeypatch):
     assert len(fake.calls) == 2
     cap = GG._OPENROUTER_REASONING_DEFAULT
     assert fake.calls[0]["json"]["reasoning"] == {"max_tokens": cap}
-    assert fake.calls[1]["json"]["reasoning"] == {"max_tokens": cap // 2}
+    assert fake.calls[1]["json"]["reasoning"] == {"enabled": False}
 
 
 def test_null_content_twice_gives_up_key_free(monkeypatch):
@@ -1013,9 +1014,24 @@ def test_null_content_twice_gives_up_key_free(monkeypatch):
     assert secret not in str(ei.value)
 
 
-def test_null_content_no_salvage_when_cap_disabled(monkeypatch):
-    # With the reasoning field disabled there is no cap to halve -> fail fast.
+def test_null_content_cap_zero_still_salvages_with_thinking_off(monkeypatch):
+    # cap "0" (no reasoning field, provider-default thinking) can still yield
+    # null content -> the thinking-off salvage applies there too.
     _fake_secrets_with_cap(monkeypatch, "0")
+    fake = _FakeRequests([_FakeResp(200, _NULL_CONTENT_BODY),
+                          _FakeResp(200, _chat("recovered"))])
+    monkeypatch.setattr(GG, "requests", fake)
+
+    assert GG._openrouter_complete("SYS", []) == "recovered"
+    assert len(fake.calls) == 2
+    assert "reasoning" not in fake.calls[0]["json"]
+    assert fake.calls[1]["json"]["reasoning"] == {"enabled": False}
+
+
+def test_null_content_no_salvage_when_thinking_already_off(monkeypatch):
+    # Thinking already disabled and content still null: retrying the same
+    # setting is pointless -> fail fast.
+    _fake_secrets_with_cap(monkeypatch, "off")
     fake = _FakeRequests([_FakeResp(200, _NULL_CONTENT_BODY)])
     monkeypatch.setattr(GG, "requests", fake)
 
