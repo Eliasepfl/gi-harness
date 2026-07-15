@@ -270,7 +270,7 @@ def _extract_prompt(source):
     return None
 
 
-def _revise_user_msg(source, directive, engine="py"):
+def _revise_user_msg(source, directive, engine="py", skill_context=None):
     """Seed the loop with a CERTIFIED game + a MINIMAL-EDIT task (revise mode).
 
     Unlike ``_first_user_msg`` (design a whole new game from a prompt) this hands
@@ -278,11 +278,20 @@ def _revise_user_msg(source, directive, engine="py"):
     ``directive`` — keeping entities, actions, checkpoint names, the PROMPT line
     and every other stage intact. The model returns the FULL revised module, which
     then goes through the SAME verify->repair loop as a fresh generation.
+
+    ``skill_context`` (optional) is a pre-rendered skill reference block routed on the
+    DIRECTIVE/error text (not the game prompt) — the feedback-repair lane injects it
+    here so the model gets the orchestrator + targeted Godot API patterns for the
+    defect it is fixing, while the CURRENT game state stays authoritative (the
+    gd-agentic README routes "auditing an existing project" — which a revise turn is —
+    to the godot-master orchestrator, with the domain layer selected by the directive).
     """
     _, fence = _engine_lang(engine)
+    skills_block = f"{skill_context.rstrip()}\n\n" if skill_context else ""
     return (
+        skills_block +
         "This game is CERTIFIED — it already passes every verification oracle. "
-        "Apply ONLY the following curriculum directive, as a MINIMAL EDIT: change "
+        "Apply ONLY the following directive, as a MINIMAL EDIT: change "
         "as little as possible. KEEP every entity, the ACTIONS list, all "
         "checkpoint names, and every other stage exactly as they are; edit only "
         "what the directive asks for.\n\n"
@@ -968,7 +977,7 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
 
 
 def revise_game(source, directive, out_dir="scenes/games", backend="auto",
-                max_repairs=4, engine=None, use_bank=True):
+                max_repairs=4, engine=None, use_bank=True, skill_context=None):
     """Revise a CERTIFIED game by the SMALLEST edit that applies `directive`.
 
     This is generate_game's twin for the curriculum loop's *revise* mode: instead
@@ -981,12 +990,20 @@ def revise_game(source, directive, out_dir="scenes/games", backend="auto",
     be preserved (provenance; the task block asks for it), and the run is slugged /
     logged under that original prompt.
 
+    ``skill_context`` (optional) is a pre-rendered skill reference block that is
+    injected into the revise message alongside the directive + current source (the
+    feedback-repair lane routes it on the directive text via
+    skill_context.render_skill_context(..., orchestrator=True) — a revise turn is
+    the README's "audit an existing project" case, so the godot-master orchestrator
+    leads, with the domain layer selected by the directive). Default None keeps the
+    curriculum revise behaviour byte-identical.
+
     Returns the same report dict as generate_game (game_path, attempts, verdict,
     backend, design, engine, integrity, pipeline, note?).
     """
     engine = _resolve_engine(engine)
     prompt = _extract_prompt(source) or "game"
-    first_user = _revise_user_msg(source, directive, engine)
+    first_user = _revise_user_msg(source, directive, engine, skill_context)
     return _generate_core(prompt, out_dir=out_dir, backend=backend,
                           max_repairs=max_repairs, engine=engine,
                           use_bank=use_bank, first_user=first_user)

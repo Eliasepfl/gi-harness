@@ -129,6 +129,7 @@ def _build_callback_cls():
             self.best_success = 0.0
             self.updates_since_best = 0
             self.stopped_early = False
+            self.plateau_stopped = False      # True IFF the patience plateau tripped
             self._pending: list[dict] = []   # episodes finished since last rollout end
             self._stop = False
             self._t0 = 0.0
@@ -181,10 +182,16 @@ def _build_callback_cls():
                     f"plateau {self.updates_since_best}/{self.hp['patience']}")
 
             if self.updates_since_best >= self.hp["patience"]:
+                # The learning curve has CONVERGED (no new smoothed-return best in
+                # `patience` updates) — this is the "declare done and move on" stop, and
+                # the ONLY stop that means the curve was NOT still improving.
                 self.stopped_early = True
+                self.plateau_stopped = True
                 self._stop = True
             elif (self.wall_clock_budget_s is not None
                   and (time.time() - self._t0) > self.wall_clock_budget_s):
+                # A wall-clock cut is a BUDGET limit, not convergence: the curve may
+                # still have been improving, so this does NOT set plateau_stopped.
                 self.stopped_early = True
                 self._stop = True
 
@@ -342,6 +349,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
         "global_steps": int(model.num_timesteps),
         "updates": callback.updates,
         "stopped_early": callback.stopped_early,
+        "plateau_stopped": callback.plateau_stopped,
         "best_success_rate_train": round(callback.best_success, 3),
         "train_wall_s": round(train_wall, 1),
         "hp": hp,
