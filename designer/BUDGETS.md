@@ -24,9 +24,13 @@ and the defaults must agree.
 
 ## Skills (`designer/skills/*.md`, Tier-A direct)
 
-- **≤ 200 lines** and **~1500 tokens** per skill file — a skill is a focused
+- RETUNED (Elias, 2026-07-15): the numeric skill caps below are SOFT — a
+  large, well-structured library (e.g. gd-agentic-skills-scale) is acceptable
+  IF loading stays SELECTIVE (routed per task, never load-all). The hard
+  invariant is context discipline, not the count.
+- **≤ 200 lines** and **~1500 tokens** per skill file (soft) — a skill is a focused
   craft topic, not an essay (Voyager skill-library discipline).
-- **≤ 25 active** skill files — the library is a curated working set; the 26th
+- **≤ 25 active** skill files (soft, see retune above) — the working set; the 26th
   create is rejected until an existing skill is evicted to `memory/attic/`.
 - **~5000 tokens** total across all active skills — the whole library must fit
   a bounded slice of context.
@@ -54,9 +58,9 @@ and the defaults must agree.
 ## Machine-readable caps (the enforced source of truth)
 
 ```budgets
-skill_max_lines = 200
+skill_max_lines = 200        # soft since 2026-07-15 retune
 skill_max_tokens = 1500
-skills_max_active = 25
+skills_max_active = 25       # soft since 2026-07-15 retune (selective loading is the hard rule)
 skills_total_tokens = 5000
 prompt_max_lines = 120
 memory_delta_max_lines = 5
