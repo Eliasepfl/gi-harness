@@ -35,6 +35,7 @@ installed.
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -300,6 +301,15 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
                            info_keywords=("success", "n_latched"))
         return _init
 
+    # MULTI-CPU PER GAME — deferred to a custom async vec env (Elias, 2026-07-15).
+    # SB3's SubprocVecEnv does NOT fit here: each GodotServeEnv already spawns its
+    # OWN Godot serve subprocess + TCP socket, and forking a Python worker around
+    # that (fork/spawn) breaks the sockets (BrokenPipe). The library's own way is a
+    # CUSTOM vec env: ONE Python process holding k serve envs, stepped ASYNC (send
+    # all actions, recv all obs) so the k Godot procs run concurrently on k cores.
+    # DummyVecEnv (below) is correct but steps slots SEQUENTIALLY (one Godot proc
+    # busy at a time). FOLLOWUP: a GodotAsyncVecEnv mirroring godot_rl_agents'
+    # multi-socket stepping. Farm-level parallelism (1 game / array task) is live now.
     venv = DummyVecEnv([_make_init() for _ in range(num_envs)])
     # Seed each vec slot with base_seed+i, latched by the adapter and reused on
     # autoreset — the exact per-env fixed-seed scheme of the vendored VecEnv.
