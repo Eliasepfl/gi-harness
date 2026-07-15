@@ -297,18 +297,55 @@ def _is_phys_arch(name: str) -> bool:
     return any(h in name for h in _PHYS_ARCH_HINTS)
 
 
+def _llm_route(prompt: str, index: list, k: int) -> list:
+    """Semantic skill routing via one cheap LLM call (the godot-master pattern).
+
+    gd-agentic descriptions are API-keyword-stuffed (`CharacterBody2D`,
+    `move_and_slide`), so lexical BM25 whiffs on game-concept prompts ("herd",
+    "park", "dodge"). A model READS the name+description table and picks by
+    relevance. Selection is reference-context only (never the certified
+    artifact), so a non-deterministic-but-relevant pick beats a
+    deterministic-but-wrong one. Returns [] on any failure -> BM25 fallback.
+    """
+    try:
+        from harness.gen.gamegen import _openrouter_complete, _BackendUnavailable
+    except Exception:  # noqa: BLE001
+        return []
+    catalog = "\n".join(f"- {e['name']}: {(e.get('description') or '')[:180]}"
+                        for e in index)
+    system = ("You route a game-design prompt to the most relevant Godot skills. "
+              "Reply with ONLY the chosen skill names, one per line, most relevant "
+              "first, at most " + str(k) + ". Names must be copied EXACTLY from the "
+              "catalog. No prose.")
+    user = f"PROMPT: {prompt}\n\nCATALOG:\n{catalog}"
+    try:
+        raw = _openrouter_complete(system, [{"role": "user", "content": user}])
+    except Exception:  # noqa: BLE001 - _BackendUnavailable, network, etc.
+        return []
+    valid = {e["name"] for e in index}
+    picked = []
+    for line in (raw or "").splitlines():
+        name = line.strip().lstrip("-*0123456789. ").strip()
+        if name in valid and name not in picked:
+            picked.append(name)
+        if len(picked) >= k:
+            break
+    return picked
+
+
 def select_skills(prompt: str, k: int = 3, *, root: str | None = None) -> list:
     """The top-``k`` skills for ``prompt`` (``[]`` when the library is absent).
 
-    Deterministic ranking: BM25 over each skill's name + description + keywords
-    (the routing table), no LLM and no network. Only skills that score above zero
-    (a real lexical match) are eligible.
+    Routing is LLM-FIRST (``_llm_route``: a model reads the name+description
+    catalog and picks by relevance — semantically correct across the API-keyword
+    vs game-concept vocabulary gap), with a deterministic BM25 FALLBACK when
+    OpenRouter is unavailable/offline. Selection is reference-context only, never
+    the certified artifact, so its determinism is not load-bearing.
 
-    Preference (design anchoring, not pure score): a matched GENRE blueprint
-    (``godot-genre-*``) is promoted to the front, and a matched 2D/3D
-    physics/architecture skill is ensured a slot — the rest of the top-k fill
-    from the raw ranking. Returns ``Skill(name, description, body)`` with the
-    SKILL.md body loaded on demand; a skill whose body cannot be read is skipped.
+    Preference on the BM25 fallback (design anchoring, not pure score): a matched
+    GENRE blueprint (``godot-genre-*``) is promoted to the front and a matched
+    2D/3D physics/architecture skill is ensured a slot. Returns
+    ``Skill(name, description, body)``; a skill whose body cannot be read is skipped.
     """
     if k <= 0:
         return []
@@ -319,6 +356,19 @@ def select_skills(prompt: str, k: int = 3, *, root: str | None = None) -> list:
     if not index:
         return []
     by_name = {e["name"]: e for e in index}
+
+    # LLM-first routing; fall back to BM25 when it returns nothing.
+    llm_names = _llm_route(prompt, index, k)
+    if llm_names:
+        out = []
+        for name in llm_names[:k]:
+            body = _skill_body(d, name)
+            if body:
+                out.append(Skill(name=name,
+                                 description=(by_name.get(name) or {}).get("description", ""),
+                                 body=body))
+        if out:
+            return out
 
     ranked = _rank(prompt, d, index)
     matched = [name for name, sc in ranked if sc > 0.0]
