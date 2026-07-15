@@ -269,7 +269,7 @@ def _build_dqn(algo_cls, venv, hp: dict, seed: int):
 
 def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           seed: int = 0, device: str = "cpu", log=None, wall_clock_budget_s=None,
-          method: str = DEFAULT_METHOD, **overrides) -> dict:
+          method: str = DEFAULT_METHOD, make_batch_venv=None, **overrides) -> dict:
     """Train an SB3 learner on `make_env` (a 0-arg PlanckEnv factory) for
     ~`total_steps` env-steps and return the same dict shape as `ppo.train` (agent +
     curves + steps_to_first_success + bookkeeping, plus the resolved `method`).
@@ -301,16 +301,23 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
                            info_keywords=("success", "n_latched"))
         return _init
 
-    # MULTI-CPU PER GAME — deferred to a custom async vec env (Elias, 2026-07-15).
-    # SB3's SubprocVecEnv does NOT fit here: each GodotServeEnv already spawns its
-    # OWN Godot serve subprocess + TCP socket, and forking a Python worker around
-    # that (fork/spawn) breaks the sockets (BrokenPipe). The library's own way is a
-    # CUSTOM vec env: ONE Python process holding k serve envs, stepped ASYNC (send
-    # all actions, recv all obs) so the k Godot procs run concurrently on k cores.
-    # DummyVecEnv (below) is correct but steps slots SEQUENTIALLY (one Godot proc
-    # busy at a time). FOLLOWUP: a GodotAsyncVecEnv mirroring godot_rl_agents'
-    # multi-socket stepping. Farm-level parallelism (1 game / array task) is live now.
-    venv = DummyVecEnv([_make_init() for _ in range(num_envs)])
+    # MULTI-CPU PER GAME (Elias, 2026-07-15). SB3's SubprocVecEnv does NOT fit: each
+    # GodotServeEnv already spawns its OWN Godot serve subprocess + TCP socket, and
+    # forking a Python worker around that (fork/spawn) breaks the sockets (BrokenPipe).
+    # The library-aligned fix is IN-SCENE batching: when the caller supplies a
+    # `make_batch_venv` factory (godot/gdscript lane, num_envs>1) we run ONE Godot
+    # process with N in-scene instances over ONE socket (GodotBatchVecEnv), stepped
+    # together in the engine tick loop — vs DummyVecEnv, which steps its N slots
+    # SEQUENTIALLY (one Godot proc busy at a time, N round-trips per vec-step). The
+    # JS/PlanckEnv lane and num_envs==1 keep DummyVecEnv; HARNESS_VECENV=dummy forces
+    # the old path everywhere (debug). Farm-level parallelism (1 game/array task) is
+    # orthogonal and still live.
+    use_batch = (make_batch_venv is not None and num_envs > 1
+                 and os.environ.get("HARNESS_VECENV") != "dummy")
+    if use_batch:
+        venv = make_batch_venv(num_envs)
+    else:
+        venv = DummyVecEnv([_make_init() for _ in range(num_envs)])
     # Seed each vec slot with base_seed+i, latched by the adapter and reused on
     # autoreset — the exact per-env fixed-seed scheme of the vendored VecEnv.
     venv.seed(seed)

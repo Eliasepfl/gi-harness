@@ -172,6 +172,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         game_source = fh.read()
     engine = detect_engine(game_path, game_source)
 
+    make_batch_venv = None
     if engine in ("godot", "gdscript"):
         import itertools
         from harness.rl.godot_env import GodotServeEnv
@@ -181,6 +182,17 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
 
         def make_env():
             return GodotServeEnv(game_path, port_offset=next(_port_seq))
+
+        # MULTI-CPU PER GAME: the GDScript lane (serve_game.gd) can serve N in-scene
+        # instances over ONE process/socket, so hand the SB3 trainer a batch-vec-env
+        # factory (used for num_envs>1 unless HARNESS_VECENV=dummy). Its ONE process
+        # takes the next disjoint port offset. The godot/.spec.json (runner.gd) serve
+        # is not batched yet, so it stays on the sequential DummyVecEnv slots below.
+        if engine == "gdscript":
+            def make_batch_venv(n_instances):
+                from harness.rl.godot_vec_env import GodotBatchVecEnv
+                return GodotBatchVecEnv(game_path, n_instances,
+                                        port_offset=next(_port_seq), seed=seed)
     else:
         def make_env():
             return PlanckEnv(game_path)
@@ -198,6 +210,12 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # `method` is an SB3-only kwarg (the vendored ppo.train takes no such arg), so
     # forward it only on the sb3 lane; the vendored lane was already gated above.
     method_kw = {} if trainer == "vendored" else {"method": method}
+    # The batched in-scene vec env is an SB3-lane seam (the vendored ppo.train takes
+    # no such arg); forward the factory only there, and only when one was built (the
+    # gdscript lane). The trainer itself decides whether to use it (num_envs>1, not
+    # HARNESS_VECENV=dummy) — a None factory keeps the sequential DummyVecEnv path.
+    if trainer != "vendored" and make_batch_venv is not None:
+        method_kw["make_batch_venv"] = make_batch_venv
     train_res = trainer_mod.train(make_env, obs_dim, n_actions,
                                   total_steps=budget_steps, seed=seed, log=log,
                                   wall_clock_budget_s=wall_clock_budget_s,
