@@ -47,6 +47,9 @@ CONTRACT = "contract.md"
 API_PY = "api_py.md"
 API_JS = "api_js.md"
 API_GODOT = "api_godot.md"
+# The GDScript lane's SELF-CONTAINED contract: the GameAPI serve vocabulary the
+# agent-written .gd game must implement. Minimal + contract-only — the craft
+# KNOWLEDGE is injected separately (harness.gen.skill_context), never here.
 API_GDSCRIPT = "api_gdscript.md"
 RULES = "rules.md"
 ORIENTATION = "orientation.md"
@@ -162,6 +165,15 @@ def _render(text: str, engine: str) -> str:
 def section_text(name: str, engine="py") -> str:
     """One rendered section (for tests / introspection)."""
     return _render(_read(name), engine).strip()
+
+
+def gdscript_contract() -> str:
+    """The GDScript lane's GameAPI contract text (api_gdscript.md), verbatim.
+
+    Contract-only and engine-specific, so it carries no {..} placeholders and is
+    returned as-is. This is the whole system prompt the gdscript lane sends before
+    the advisory skill-knowledge section is appended (harness.gen.gamegen)."""
+    return _read(API_GDSCRIPT).strip()
 
 
 def compose(engine="py", menu_text=None) -> str:

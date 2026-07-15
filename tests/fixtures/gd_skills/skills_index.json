@@ -1,0 +1,46 @@
+[
+  {
+    "name": "godot-genre-platformer",
+    "description": "\"Expert blueprint for platformer games including precision movement (coyote time, jump buffering, variable jump height), game feel, and level design. Trigger keywords: platformer, jump, coyote_time, jump_buffer, precision_movement, game_feel.\"",
+    "keywords": [
+      "platformer",
+      "jump",
+      "coyote_time",
+      "jump_buffer",
+      "precision_movement",
+      "game_feel"
+    ]
+  },
+  {
+    "name": "godot-2d-physics",
+    "description": "\"Expert patterns for Godot 2D physics including collision layers, RigidBody2D, Area2D triggers, and raycasting. Use when implementing collision detection, jump arcs, or trigger zones. Trigger keywords: physics, collision, rigidbody, area2d, raycast, move_and_slide.\"",
+    "keywords": [
+      "physics",
+      "collision",
+      "rigidbody",
+      "area2d",
+      "raycast",
+      "move_and_slide"
+    ]
+  },
+  {
+    "name": "godot-audio-mixing",
+    "description": "\"Expert patterns for Godot audio mixing including bus layout, music playback, crossfades, and volume automation. Trigger keywords: audio, sound, music, AudioStreamPlayer, bus, volume.\"",
+    "keywords": [
+      "audio",
+      "sound",
+      "music",
+      "AudioStreamPlayer",
+      "bus",
+      "volume"
+    ]
+  },
+  {
+    "name": "godot-huge-guide",
+    "description": "\"An intentionally oversized reference used only to exercise the token budget. Trigger keywords: megamechanic, oversized.\"",
+    "keywords": [
+      "megamechanic",
+      "oversized"
+    ]
+  }
+]
