@@ -415,34 +415,65 @@ def estimate_tokens(text: str) -> int:
     return len(text or "") // _CHARS_PER_TOKEN
 
 
+_MASTER_SKILL = "godot-master"
+
+
+def _orchestrator_block(root: str) -> str:
+    """The godot-master orchestrator body (the library's own entry point).
+
+    Per the library README, godot-master is THE skill for "a new project from
+    scratch / designing architecture / choosing 2D vs 3D" — i.e. exactly game
+    GENERATION. Its Master Decision Matrix does positive AND negative routing to
+    domain skills, so it is the orchestrating context we lead with; the routed
+    domain skills (``select_skills``) follow for detailed patterns. Returns ""
+    when the master skill is absent (older library layout) → domain-only.
+    """
+    return _skill_body(root, _MASTER_SKILL) or ""
+
+
 def render_skill_context(prompt: str, k: int = 3, max_tokens: int = 4000,
-                         *, root: str | None = None) -> str:
+                         *, root: str | None = None,
+                         orchestrator: bool = True) -> str:
     """An attributed, budget-bounded reference block for ``prompt``.
 
-    Layout: the attribution header (provenance + LGPLv3 + pin), then each
-    selected skill's SKILL.md body, each truncated to a per-skill char budget so
-    the whole block's estimated token count stays under ``max_tokens``. Returns
-    ``""`` when the library is absent or nothing matches, so a caller can splice
-    it unconditionally and simply get nothing when there is nothing to add.
+    Layout: attribution header, then (when ``orchestrator``) the godot-master
+    orchestrator body — the library's own decision-matrix entry point for a new
+    project — then each routed DOMAIN skill's body for detail. Everything is
+    truncated to stay under ``max_tokens``. The orchestrator gets ~half the
+    budget (its decision frameworks are the high-value base), the domain skills
+    share the rest. Returns ``""`` when the library is absent and nothing routes.
     """
-    skills = select_skills(prompt, k=k, root=root)
-    if not skills:
+    d = library_root(root)
+    master = _orchestrator_block(d) if (orchestrator and d) else ""
+    skills = [s for s in select_skills(prompt, k=k, root=root)
+              if s.name != _MASTER_SKILL]  # the orchestrator is not a domain skill
+    if not skills and not master:
         return ""
 
     header = ATTRIBUTION
     char_budget = max(0, max_tokens) * _CHARS_PER_TOKEN
-    # Reserve the header + a "### name\n" title per skill from the char budget.
-    reserve = len(header) + sum(len(f"### {s.name}\n") + 4 for s in skills)
-    body_budget = char_budget - reserve
-    per_skill = max(_MIN_BODY_CHARS, body_budget // len(skills)) if body_budget > 0 \
-        else _MIN_BODY_CHARS
-
     blocks = [header]
-    for s in skills:
-        body = s.body
-        if len(body) > per_skill:
-            body = body[:per_skill].rstrip() + _TRUNCATION_MARK
-        blocks.append(f"### {s.name}\n{body}")
+
+    # The orchestrator leads and gets ~half the body budget (its decision
+    # frameworks are the base); domain skills share the remainder.
+    master_budget = char_budget // 2 if (master and skills) else char_budget
+    if master:
+        m = master
+        if len(m) > master_budget:
+            m = m[:master_budget].rstrip() + _TRUNCATION_MARK
+        blocks.append(f"### {_MASTER_SKILL} (orchestrator)\n{m}")
+
+    if skills:
+        remaining = char_budget - sum(len(b) for b in blocks)
+        reserve = sum(len(f"### {s.name}\n") + 4 for s in skills)
+        body_budget = remaining - reserve
+        per_skill = max(_MIN_BODY_CHARS, body_budget // len(skills)) if body_budget > 0 \
+            else _MIN_BODY_CHARS
+        for s in skills:
+            body = s.body
+            if len(body) > per_skill:
+                body = body[:per_skill].rstrip() + _TRUNCATION_MARK
+            blocks.append(f"### {s.name}\n{body}")
     text = "\n\n".join(blocks)
 
     # Hard cap: if the reserved-title overhead still pushed us over (many skills,
