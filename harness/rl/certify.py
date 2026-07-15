@@ -197,7 +197,8 @@ def _bridge_replay_gdscript(game_source: str, witness: dict) -> dict:
 def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              n_eval: int = N_EVAL, seed: int = 0, log=None,
              wall_clock_budget_s=None, trainer: str = "sb3",
-             method: str = "ppo", **train_kwargs) -> dict:
+             method: str = "ppo", save_model: str | None = None,
+             **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
     `trainer` selects the RL backend: ``"vendored"`` (default, the CleanRL-mirror
@@ -292,6 +293,16 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
                                   **method_kw, **train_kwargs)
     agent = train_res["agent"]
 
+    # Optional: persist the trained model cheaply (SB3 .zip) so the G4 inverse-value
+    # attacker (harness.rl.adversary) can reload the critic/policy artifact without
+    # retraining. Only the SB3 lane exposes .save(); vendored is skipped with a note.
+    saved_model_path = None
+    if save_model:
+        _save = getattr(agent, "save", None)
+        if callable(_save):
+            _save(save_model)
+            saved_model_path = save_model
+
     # --- Evaluation over fixed seeds ---
     # NB: the showcase games use no world.rng, so they are fully DETERMINISTIC —
     # every greedy episode is the SAME trajectory, making the greedy success rate
@@ -359,6 +370,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "still_improving": _still_improving(train_res),
         # WHICH milestones the policy reaches over the eval episodes (see helper).
         "per_checkpoint_latch_rate": per_checkpoint_latch_rate,
+        "saved_model_path": saved_model_path,          # SB3 .zip artifact (if save_model)
         # --- provenance / diagnostics ---
         "title": title,
         "game_path": game_path,

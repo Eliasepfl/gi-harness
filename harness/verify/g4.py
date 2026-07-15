@@ -102,6 +102,12 @@ DEFAULT_ATTACKS_PER_CALL = 5
 STALE_H = 60               # exploration horizon BEYOND the suspect prefix P (len(P)+H)
 STALE_TOP_M = 8            # cap on suspect prefixes escalated to the 1c oracle
 STALE_CAND_BUDGET = 6000   # tick budget for the inverted-objective candidate search
+
+# Inverse-value tier (the model-steered smart search) defaults ([eng.]).
+IV_SEEDS = 12              # parallel anti-policy rollout seeds
+IV_EPS = 0.1              # uniform-random exploration fraction per steered tick
+IV_WINDOW = 6             # DETECT sliding-window length (N in 5..10)
+IV_MAX_TICKS = PROBE_HORIZON  # per-rollout decision-tick cap
 # The oracle budget defaults to treesolve.TICK_BUDGET (one full G3 solve) — read at
 # call time so a test can shrink it; see _stale_oracle_budget().
 
@@ -1131,6 +1137,206 @@ def _run_stale(executor, game_source, engine, actions, report, *,
 
 
 # ======================================================================== #
+# INVERSE-VALUE TIER — the PRIMARY smart search (Elias's idea, gdscript lane).
+# Design: notes/adversarial/INVERSE_VALUE_G4.md. When a trained G3' model artifact is
+# available it STEERS the softlock hunt (anti-policy rollouts + V-frontier + witness-
+# prefix backplay, harness.rl.adversary) AHEAD of the random fuzz — a critic-guided
+# search that goes straight for the low-value/dead pockets random fuzz finds by luck.
+# The candidates it surfaces are CONFIRMED by the SAME refute_prefix tree oracle (1c),
+# so a certified prefix is the same hard `softlock` finding. Gated STRICTLY on a model:
+# with no model artifact the tier is skipped and the ladder is byte-for-byte unchanged.
+# ======================================================================== #
+def _load_iv_critic(model=None, model_path=None):
+    """Resolve an inverse-value critic. ``model`` may already satisfy the critic
+    contract (``action_probs``/``value`` — the test/handoff seam) or be a raw SB3
+    model to wrap; ``model_path`` loads a saved SB3 ``.zip``. Returns None when neither
+    is supplied. SB3/torch are imported lazily — only a real model artifact pays."""
+    from harness.rl.adversary import SB3PolicyCritic
+    if model is not None:
+        if hasattr(model, "action_probs") and hasattr(model, "value"):
+            return model                       # already a critic (injected/duck-typed)
+        return SB3PolicyCritic(model)
+    if model_path:
+        return SB3PolicyCritic(_load_sb3_any(model_path))
+    return None
+
+
+def _load_sb3_any(path):
+    """Load a saved SB3 model without knowing its algo up front (g3_prime saves a
+    ``.zip`` whose method may be ppo/a2c/dqn). Tries each class; the matching one wins."""
+    last = None
+    from stable_baselines3 import A2C, DQN, PPO
+    for cls in (PPO, A2C, DQN):
+        try:
+            return cls.load(path, device="cpu")
+        except Exception as exc:               # noqa: BLE001 - wrong class -> next
+            last = exc
+    raise VerifyError("iv_model_load_failed", f"could not load SB3 model {path!r}: {last}")
+
+
+def _iv_free_port() -> int:
+    """Grab an ephemeral loopback port and release it. The inverse-value search env
+    must NOT reuse the ``GdExecutor``'s serve port (both default to
+    ``godot_env.DEFAULT_PORT_BASE`` + offset 0, which the executor already holds for
+    the whole suite) — binding the same port raises ``port_in_use`` and sinks the
+    tier. A fresh ephemeral port sidesteps the collision."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _default_iv_env_factory(game_path):
+    """A 0-arg factory building the serve env the anti-policy rollout steps (gdscript
+    lane). Imported lazily so the common g4 path never touches the RL env module.
+
+    Each built env binds its OWN ephemeral port so it never collides with the CONFIRM
+    executor's long-lived serve host (see ``_iv_free_port``)."""
+    if not game_path:
+        return None
+
+    def _factory():
+        from harness.rl.godot_env import GodotServeEnv
+        return GodotServeEnv(game_path, port_base=_iv_free_port())
+
+    return _factory
+
+
+def _last_latched_checkpoint(checkpoints):
+    """The checkpoint that latched LAST (max tick) on a prefix replay — the anchor the
+    repair hint names ('the last milestone before the freeze')."""
+    latched = [(t, k) for k, t in (checkpoints or {}).items() if t is not None]
+    if not latched:
+        return None
+    return max(latched)[1]
+
+
+def _run_inverse_value(executor, game_source, engine, actions, report, *,
+                       requested, game_path=None, model=None, model_path=None,
+                       critic=None, candidates=None, env_factory=None, horizon,
+                       seed, stale_H, stale_budget, top_m, window,
+                       iv_seeds, iv_eps, iv_max_ticks):
+    """The inverse-value smart tier: SEARCH+DETECT (harness.rl.adversary) surfaces
+    softlock candidates, CONFIRM (refute_prefix) certifies them. A certified prefix ->
+    a hard `softlock` finding tagged ``inverse_value+tree_refute`` with a repair hint
+    naming the last latched checkpoint before the freeze.
+
+    Runs ONLY when a model artifact (or an injected critic/candidates) is available;
+    otherwise it is skipped and contributes nothing (ladder unchanged)."""
+    block = {"status": "skipped_no_model", "reason": "", "candidates": [],
+             "detected": 0, "certified": 0, "findings": [], "passed": True,
+             "critic_source": None}
+    if not requested:
+        block["reason"] = "no trained model artifact (inverse-value tier is model-gated)"
+        return block
+    if not actions:
+        block["status"] = "skipped"
+        block["reason"] = "no ACTIONS to steer"
+        return block
+
+    from harness.rl import adversary
+
+    block["status"] = "run"
+    witness = _witness(report) or {}
+    witness_actions = list(witness.get("actions") or [])
+    source = "injected"
+
+    # --- SEARCH + DETECT (skip when candidates are injected for a py/unit run) ---
+    if candidates is None:
+        critic = critic if critic is not None else _load_iv_critic(model, model_path)
+        if critic is None:
+            block["status"] = "skipped_no_model"
+            block["reason"] = "model/critic could not be resolved"
+            return block
+        factory = env_factory or _default_iv_env_factory(game_path)
+        if factory is None:
+            block["status"] = "skipped"
+            block["reason"] = ("inverse-value search needs a steppable env "
+                               "(gdscript game_path or an injected env_factory)")
+            return block
+        env = factory()
+        try:
+            res = adversary.search(
+                env, critic, seeds=list(range(iv_seeds)), eps=iv_eps, window=window,
+                witness_actions=witness_actions, max_ticks=iv_max_ticks)
+        finally:
+            close = getattr(env, "close", None)
+            if callable(close):
+                close()
+        cand_list = res["candidates"]
+        source = res["source"]
+    else:
+        # Injected candidate prefixes (test/handoff seam) — still confirmed by 1c.
+        cand_list = [c if isinstance(c, dict) else {"prefix": list(c),
+                     "provenance": {"source": "injected"}, "value": None}
+                     for c in candidates]
+
+    block["critic_source"] = source
+    block["detected"] = len(cand_list)
+    block["candidates"] = [{"prefix": list(c["prefix"]),
+                            "value": c.get("value"),
+                            "provenance": c.get("provenance", {})} for c in cand_list]
+
+    # --- CONFIRM: refute each candidate (lowest-V first, capped top-M) ---
+    findings = []
+    for cand in cand_list[:top_m]:
+        prefix = list(cand["prefix"])
+        if not prefix:
+            continue
+        try:
+            res = refute_prefix(executor, game_source, actions, prefix,
+                                H=stale_H, budget=stale_budget, engine=engine, seed=seed)
+        except VerifyError:
+            continue                           # a dead refutation must not sink the tier
+        if not res["certified"]:
+            continue
+        # Replay the prefix once for its own evidence + the last-latched checkpoint the
+        # repair hint names (the milestone reached just before the freeze).
+        try:
+            prefix_ep = executor.run_batch(
+                game_source, [{"seed": seed, "actions": prefix}], len(prefix),
+                escape_margin=ESCAPE_MARGIN)[0]
+        except VerifyError:
+            prefix_ep = {"result": "budget", "ticks": len(prefix), "checkpoints": {}}
+        last_cp = _last_latched_checkpoint(prefix_ep.get("checkpoints"))
+        block["certified"] += 1
+        prov = dict(cand.get("provenance") or {})
+        prov.update({"oracle": "inverse_value+tree_refute", "critic_source": source,
+                     "H": res["H"], "budget": res["budget"], "engine": engine,
+                     "seed": seed, "subtree_status": res["subtree_status"],
+                     "last_checkpoint": last_cp})
+        findings.append({
+            "outcome": "softlock", "tier": "inverse_value",
+            "family": "inverse_value+tree_refute", "hard": True,
+            "detail": (f"the inverse-value attacker steered the game into a frozen "
+                       f"pocket (len {len(prefix)} prefix); the G3 solver found no win "
+                       f"in {res['budget']} ticks under it (subtree "
+                       f"{res['subtree_status']})"),
+            "repair_hint": (
+                f"an inverse-value (anti-policy) attack soft-locks the game after the "
+                f"'{last_cp}' checkpoint — from that pocket no continuation can win. "
+                f"Ensure every reachable state past '{last_cp}' can still reach the "
+                f"goal, or add an escape/reset from the dead end."
+                if last_cp else
+                "an inverse-value (anti-policy) attack soft-locks the game before any "
+                "checkpoint latches — the early game has an inescapable pocket; add an "
+                "escape/reset or make the dead-end region unreachable."),
+            "reproducer": {
+                "engine": engine, "seed": seed,
+                "action_plan": {"kind": "sequence", "sequence": list(prefix)},
+                "provenance": prov,
+            },
+            "evidence": _evidence(prefix_ep, engine),
+        })
+
+    block["findings"] = findings
+    block["passed"] = not findings
+    return block
+
+
+# ======================================================================== #
 # Grade + public entry points
 # ======================================================================== #
 def _grade(findings, tier1_block, tiers):
@@ -1151,7 +1357,10 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
            anti_variants=DEFAULT_ANTI_VARIANTS,
            k=DEFAULT_ATTACKS_PER_CALL, models=None,
            stale=False, stale_H=STALE_H, stale_budget=None,
-           stale_cand_budget=STALE_CAND_BUDGET, top_m=STALE_TOP_M):
+           stale_cand_budget=STALE_CAND_BUDGET, top_m=STALE_TOP_M,
+           game_path=None, model=None, model_path=None, iv_critic=None,
+           iv_candidates=None, iv_env_factory=None, iv_seeds=IV_SEEDS,
+           iv_eps=IV_EPS, iv_window=IV_WINDOW, iv_max_ticks=IV_MAX_TICKS):
     """Run the adversarial suite on a certified game (source + its G0-G3 report).
 
     Returns the g4 report block (a machine-readable dict, schema `g4_report/v1`).
@@ -1204,18 +1413,33 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
                            k=k, models=models, controlled=controlled, initial=initial,
                            horizon=horizon, requested=1 in tiers)
 
+        # PRIMARY smart tier (ahead of random fuzz in the ladder): the model-steered
+        # inverse-value softlock hunt. Model-gated — skipped (no-op) with no artifact.
+        iv_requested = any(x is not None for x in
+                           (model, model_path, iv_critic, iv_candidates, iv_env_factory))
+        iv_block = _run_inverse_value(
+            executor, game_source, engine, actions, report,
+            requested=iv_requested, game_path=game_path, model=model,
+            model_path=model_path, critic=iv_critic, candidates=iv_candidates,
+            env_factory=iv_env_factory, horizon=horizon, seed=seed, stale_H=stale_H,
+            stale_budget=stale_budget, top_m=top_m, window=iv_window,
+            iv_seeds=iv_seeds, iv_eps=iv_eps, iv_max_ticks=iv_max_ticks)
+
         stale_block = _run_stale(executor, game_source, engine, actions, report,
                                  controlled=controlled, initial=initial, horizon=horizon,
                                  seed=seed, requested=bool(stale), stale_H=stale_H,
                                  stale_budget=stale_budget,
                                  stale_cand_budget=stale_cand_budget, top_m=top_m)
 
-        findings = (list(tier0["findings"]) + list(tier1["findings"])
-                    + list(stale_block["findings"]))
+        # Inverse-value findings lead the ladder (the PRIMARY smart tier), ahead of the
+        # tier-0 random fuzz and the heuristic stale tier.
+        findings = (list(iv_block["findings"]) + list(tier0["findings"])
+                    + list(tier1["findings"]) + list(stale_block["findings"]))
         grade = _grade(findings, tier1, tiers)
         out.update({
             "grade": grade,
             "passed": grade != "open",
+            "inverse_value": iv_block,
             "tier0": tier0,
             "tier1": tier1,
             "stale": stale_block,
@@ -1246,11 +1470,16 @@ def _actions_from_report(report):
 
 
 def attack_game(game_path, *, tiers=(0,), sandboxed=True, world_factory=None,
-                seed=0, k=DEFAULT_ATTACKS_PER_CALL, models=None, **fuzz_kwargs):
+                seed=0, k=DEFAULT_ATTACKS_PER_CALL, models=None,
+                model=None, model_path=None, **fuzz_kwargs):
     """Verify (to obtain the certified report + witness) then attack a game file.
 
     Only a game that PASSES the G0-G3 funnel is attacked (G4 rides after G3). An
     uncertified game returns a report with grade "uncertified" and the funnel hint.
+
+    ``model`` / ``model_path`` (a trained G3' SB3 artifact) turn on the PRIMARY
+    inverse-value smart tier (harness.rl.adversary): a critic-steered softlock hunt
+    ahead of the random fuzz. With neither, the ladder is unchanged.
     """
     from harness.verify.gameverify import verify_game
 
@@ -1277,7 +1506,8 @@ def attack_game(game_path, *, tiers=(0,), sandboxed=True, world_factory=None,
     report.setdefault("engine", engine)
     return run_g4(source, report, engine=engine, slug=_slug_of(game_path),
                   tiers=tiers, world_factory=world_factory, seed=seed, k=k,
-                  models=models, **fuzz_kwargs)
+                  models=models, game_path=game_path, model=model,
+                  model_path=model_path, **fuzz_kwargs)
 
 
 def _slug_of(game_path):
@@ -1311,11 +1541,16 @@ def to_repair_report(finding):
     """Shape a G4 finding as the author-repair report gamegen._repair_user_msg
     already renders (failure_class + hint + reproducer + JSON)."""
     outcome = finding.get("outcome")
+    # A finding-level `repair_hint` (the inverse-value tier names the last checkpoint
+    # before the freeze) wins over the generic per-outcome hint so the feedback
+    # compiler gets the specific, actionable pointer; else fall back by outcome.
+    hint = (finding.get("repair_hint")
+            or _REPAIR_HINTS.get(outcome, finding.get("detail", "adversarial finding")))
     return {
         "passed": False,
         "failure_class": "G4_FINDING",
         "outcome": outcome,
-        "hint": _REPAIR_HINTS.get(outcome, finding.get("detail", "adversarial finding")),
+        "hint": hint,
         "g4_reproducer": finding.get("reproducer"),
         "g4_evidence": finding.get("evidence"),
     }

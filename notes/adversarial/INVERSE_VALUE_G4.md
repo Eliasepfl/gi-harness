@@ -58,3 +58,22 @@ FREEZES. So flag on state-frozen-while-acting, not on low value alone.
   steering (but detection+confirm are still sound, just less efficient search).
 - Distinguishing "stuck" from "slow legit progress" is threshold-tuned (the
   N-window + no-checkpoint guard); the 1c oracle is the backstop against FPs.
+
+## Measured (2026-07-15, softlock_pit.gd, in-image, speedup 8)
+A/B at the SAME 1600-tick budget (6 seeds, eps 0.1, window 6, backplay handoffs
+8/16/32/48 from the certified G3 witness; CONFIRM = refute_prefix H=30/3000):
+
+| arm                          | detect/1k | certified/1k |
+|------------------------------|-----------|--------------|
+| inverse-value, competent critic | 10.80  | 2.70 (3/3 cap) |
+| random fuzz                  | 2.08      | 2.08 (1)     |
+| inverse-value, WEAK critic*  | 0.0       | 0.0          |
+
+*the weak-critic honest limit made concrete: a quicktest-budget PPO (8-24k steps,
+greedy success 0.0) has a near-uniform policy, so `argmin pi` degenerates to a
+CONSTANT action that dives into a terminal (play-bounds loss) — a LOSS, which
+DETECT correctly refuses to flag. With a competent critic (one that avoids the
+pit dive — what a real G3'-certified artifact looks like) the steering is ~5x
+random on detections and beats it on certified findings at the same budget.
+Follow-up worth taking: gate the ladder tier on g3_prime SUCCESS (final_success
+_rate > 0), not artifact existence alone. Zero false certifications in any arm.
