@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -26,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.verify.executors import (  # noqa: E402
     GodotExecutor, VerifyError, default_godot_project, find_godot_exe,
-    stepping_argv, _dotgodot_present,
+    stepping_argv, speedup_from_env, speedup_user_args, _dotgodot_present,
 )
 from harness.verify.gameverify import (  # noqa: E402
     detect_engine, run_g0_js, run_g2_js, verify_game,
@@ -256,6 +257,90 @@ def test_dotgodot_present_verifies_import_effect(tmp_path):
 
 
 # ====================================================================== #
+# SPEEDUP lever env validation + argv plumbing (pure python)
+# ====================================================================== #
+def test_speedup_from_env_default_and_valid(monkeypatch):
+    monkeypatch.delenv("HARNESS_GODOT_SPEEDUP", raising=False)
+    assert speedup_from_env() == 1                      # unset -> 1
+    monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", "")
+    assert speedup_from_env() == 1                      # empty -> 1
+    for v in ("1", "2", "8", "16", "  8  "):
+        monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", v)
+        assert speedup_from_env() == int(v.strip())
+
+
+@pytest.mark.parametrize("bad", ["0", "17", "-1", "abc", "3.5", "8x", "0x10", "1e2"])
+def test_speedup_from_env_rejects_invalid(monkeypatch, bad):
+    # Non-integer or out-of-[1,16] must be REJECTED (never silently coerced) so a bad
+    # farm env fails fast instead of voiding replay.
+    monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", bad)
+    with pytest.raises(ValueError):
+        speedup_from_env()
+
+
+def test_speedup_user_args_omits_default():
+    # The N==1 default appends NOTHING (invocation stays byte-identical to pre-speedup);
+    # any N>1 appends the single `--speedup=N` tail runner.gd parses.
+    assert speedup_user_args(1) == []
+    assert speedup_user_args(8) == ["--speedup=8"]
+    assert speedup_user_args(16) == ["--speedup=16"]
+
+
+def _fake_godot_project(tmp_path):
+    """A project dir the executor treats as provisioned (``.godot`` present) with a
+    stub ``runner.gd``, plus a stub exe — enough to reach argv construction with the
+    real subprocess.run stubbed out (no Godot needed)."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".godot").mkdir()
+    (proj / "runner.gd").write_text("", encoding="utf-8")
+    exe = tmp_path / "godot.exe"
+    exe.write_text("", encoding="utf-8")
+    return str(exe), str(proj)
+
+
+def test_speedup_env_flows_into_invocation_argv(monkeypatch, tmp_path):
+    # HARNESS_GODOT_SPEEDUP must reach the runner as `--speedup=N`; the default omits it.
+    import harness.verify.godot_exec as gx
+    exe, proj = _fake_godot_project(tmp_path)
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "__JSONL_BEGIN__\n{\"mode\":\"check\"}\n__JSONL_END__\n"
+        stderr = ""
+
+    def fake_run(argv, *a, **k):
+        captured["argv"] = list(argv)
+        return _Result()
+
+    monkeypatch.setattr(gx.subprocess, "run", fake_run)
+    ex = GodotExecutor(exe=exe, project=proj)
+
+    monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", "8")
+    ex.run_check('{"meta": {}}')
+    assert "--speedup=8" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--fixed-fps") + 1] == "60"  # dt pin intact
+
+    monkeypatch.delenv("HARNESS_GODOT_SPEEDUP", raising=False)
+    ex.run_check('{"meta": {}}')
+    assert not any(str(x).startswith("--speedup=") for x in captured["argv"])
+
+
+def test_invalid_speedup_env_is_verify_error(monkeypatch, tmp_path):
+    import harness.verify.godot_exec as gx
+    exe, proj = _fake_godot_project(tmp_path)
+    monkeypatch.setattr(gx.subprocess, "run",
+                        lambda *a, **k: pytest.fail("must reject before spawning Godot"))
+    monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", "999")
+    ex = GodotExecutor(exe=exe, project=proj)
+    with pytest.raises(VerifyError) as ei:
+        ex.run_check('{"meta": {}}')
+    assert ei.value.kind == "godot_bad_speedup"
+    assert "layers" not in ei.value.as_report()  # VERIFY_ERROR shape
+
+
+# ====================================================================== #
 # Godot "check" facts flow through the SHARED G0/G2 layers (pure python)
 # ====================================================================== #
 def _wellformed_facts() -> dict:
@@ -354,6 +439,76 @@ def test_batch_bytes_identical_x3():
     specs = [{"seed": 0, "actions": ["push_right", "push_right", "push_left"]}]
     runs = [json.dumps(ex.run_batch(src, specs, 3)) for _ in range(3)]
     assert runs[0] == runs[1] == runs[2]
+
+
+# ====================================================================== #
+# SPEEDUP lever end-to-end (skipped without the Godot binary)
+# ====================================================================== #
+# A long, non-terminating drive (run_left holds the marble against the left wall so
+# neither the spike-failure nor the beacon-success predicate ever fires) -> a full
+# fixed-length trajectory to compare byte-for-byte and to time.
+_LONG_LEFT = ["run_left"] * 260
+
+
+def _batch_at_speedup(monkeypatch, src, specs, max_ticks, speedup, frames_every=0):
+    if speedup == 1:
+        monkeypatch.delenv("HARNESS_GODOT_SPEEDUP", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_GODOT_SPEEDUP", str(speedup))
+    return GodotExecutor().run_batch(src, specs, max_ticks, frames_every=frames_every)
+
+
+@requires_godot
+def test_speedup_is_tick_identical(monkeypatch):
+    """THE load-bearing test: the SAME spec+actions replayed at speedup 1 vs 8 produce
+    BYTE-IDENTICAL trajectories. frames_every=1 records the FULL per-tick state history
+    (%.17f float64), so this compares the whole trajectory, not just the final snapshot
+    -- proving the paired scaling keeps per-tick dt at 1/60 and never perturbs a bit."""
+    src = open(_example_path("traverse"), encoding="utf-8").read()
+    specs = [{"seed": 0, "actions": _LONG_LEFT}]
+    base = _batch_at_speedup(monkeypatch, src, specs, len(_LONG_LEFT), 1, frames_every=1)
+    fast = _batch_at_speedup(monkeypatch, src, specs, len(_LONG_LEFT), 8, frames_every=1)
+    # A genuinely long, non-terminating episode (else the comparison is trivial).
+    assert base[0]["ticks"] == len(_LONG_LEFT), base[0]["ticks"]
+    assert base[0]["result"] in ("budget", "exhausted"), base[0]["result"]
+    assert json.dumps(base) == json.dumps(fast)   # byte-for-byte identical trajectory
+
+
+def _best_batch_dt(monkeypatch, src, specs, max_ticks, speedup, k=3):
+    """Min wall-clock over ``k`` runs at ``speedup`` (min filters shared-node jitter)."""
+    best = float("inf")
+    rec = None
+    for _ in range(k):
+        t0 = time.perf_counter()
+        rec = _batch_at_speedup(monkeypatch, src, specs, max_ticks, speedup)
+        best = min(best, time.perf_counter() - t0)
+    return best, rec
+
+
+@requires_godot
+def test_speedup_8_wall_clock_no_regression(monkeypatch):
+    """Wall-clock on a 200+ tick episode: speedup 8 is NOT a regression vs speedup 1.
+
+    NOTE (empirical): the paired scaling is wall-clock-NEUTRAL for this runner, not the
+    <0.7x the SPEEDUP note hoped for. Under `--fixed-fps` the headless loop already runs
+    physics as fast as the CPU allows, and the runner's cost scales with the PHYSICS-FRAME
+    count (K=6 explicit `await physics_frame` per tick -- fixed regardless of speedup), not
+    the process-frame count that speedup thins out. Measured ~1.0x at 8k ticks. So the
+    honest, robust guarantee is: speedup buys tick-identical trajectories (see the test
+    above) at NO wall-clock cost -- a regression guard, best-of-3 to filter node jitter.
+    Whether the lever is worth enabling is left to the deferred full-corpus soak."""
+    src = open(_example_path("traverse"), encoding="utf-8").read()
+    specs = [{"seed": 0, "actions": _LONG_LEFT}]
+    # Warm provisioning once so the .godot import cost is not charged to either timing.
+    _batch_at_speedup(monkeypatch, src, [{"seed": 0, "actions": ["run_left"]}], 1, 1)
+
+    slow_dt, slow = _best_batch_dt(monkeypatch, src, specs, len(_LONG_LEFT), 1)
+    fast_dt, fast = _best_batch_dt(monkeypatch, src, specs, len(_LONG_LEFT), 8)
+
+    assert slow[0]["ticks"] == len(_LONG_LEFT) >= 200      # a real 200+ tick episode
+    assert fast[0]["result"] == slow[0]["result"]           # same trajectory terminal
+    # No wall-clock regression (neutral within node jitter); NOT a <0.7x speedup claim.
+    assert fast_dt < 1.3 * slow_dt, (fast_dt, slow_dt)
 
 
 @requires_godot

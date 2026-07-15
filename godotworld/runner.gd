@@ -36,6 +36,14 @@ const K_STEPS := 6
 const VMAX := 1.0e5
 const DEFAULT_WORLD := Vector2(800.0, 600.0)
 
+# SPEEDUP lever (GODOT_RL_AGENTS_CAPABILITIES.md "Fixed-delta under speedup",
+# godot_rl_agents sync.gd:61-62). `--speedup=N` scales BOTH the physics rate and
+# time_scale by N so the per-tick delta cancels to exactly 1/60 -- trajectories stay
+# tick-identical, only wall-clock shrinks. Clamped to the [1,16] range the Python
+# seams validate (HARNESS_GODOT_SPEEDUP); N=1 is the byte-for-byte default.
+const SPEEDUP_MIN := 1
+const SPEEDUP_MAX := 16
+
 # Serve mode (INNER dual-dialect; GODOT_RL_AGENTS_CAPABILITIES.md section 3).
 const SERVE_MAX_FRAME := 16777216      # 16 MiB frame cap (protocol sanity guard)
 const SERVE_DEFAULT_HORIZON := 300     # decision-tick truncation budget (== PlanckEnv HORIZON)
@@ -133,6 +141,7 @@ var _serve_build_err := ""          # non-empty if the last seeded rebuild faile
 var _query_ctx = null               # QueryCtx (Expression base instance)
 var _expr_cache := {}               # expr String -> Expression | null (parse/scan failed)
 var _lines: PackedStringArray = []
+var _speedup := 1                   # paired physics/time_scale multiplier (see SPEEDUP_MIN)
 
 
 # =========================================================================== #
@@ -159,12 +168,31 @@ class QueryCtx extends RefCounted:
 # Lifecycle
 # =========================================================================== #
 func _initialize() -> void:
-	Engine.physics_ticks_per_second = 60
+	# SPEEDUP lever: scale the physics rate and time_scale TOGETHER (never one alone).
+	# per-tick delta == time_scale / physics_ticks_per_second == speedup / (60*speedup)
+	# == 1/60 for ANY speedup, so physics advances the SAME 1/60 s per tick and every
+	# recorded trajectory is byte-identical -- only the wall-clock to produce it shrinks.
+	# Unpaired scaling would move the delta off 1/60 and void witness replay; _preflight_
+	# pins re-asserts the pair at every world build.
+	_speedup = _speedup_arg()
+	Engine.physics_ticks_per_second = 60 * _speedup
+	Engine.time_scale = float(_speedup)
 	Engine.max_physics_steps_per_frame = 8
 	Engine.physics_jitter_fix = 0.0
 	_query_ctx = QueryCtx.new()
 	_query_ctx.rt = self
 	_main()  # coroutine; kept alive by the physics_frame/process_frame await chain
+
+
+func _speedup_arg() -> int:
+	# `--speedup=N` (default 1). Clamped to [SPEEDUP_MIN, SPEEDUP_MAX]; the Python seams
+	# already validate HARNESS_GODOT_SPEEDUP, so the clamp is a defensive backstop for a
+	# hand-run invocation. Applies to BOTH batch and serve (shared _initialize path).
+	var sp := SPEEDUP_MIN
+	for a in OS.get_cmdline_user_args():
+		if a.begins_with("--speedup="):
+			sp = a.substr(10).to_int()
+	return clampi(sp, SPEEDUP_MIN, SPEEDUP_MAX)
 
 
 func _main() -> void:
@@ -527,14 +555,19 @@ func _load_spec(source) -> String:
 func _preflight_pins() -> void:
 	# Episode-start determinism preflight (GODOT_DOCS_MINING.md section 3). Godot
 	# physics is only reproducibly replayable under a FIXED dt, a SINGLE physics
-	# thread, unscaled time, and synchronized ticks. These pins are set in
-	# `_initialize()` + project.godot; re-assert them at every world build so any
-	# drift (a bad project.godot edit, a 4.7 point-release default flip) fails LOUDLY
-	# HERE rather than silently voiding the witness replay far downstream.
-	assert(Engine.time_scale == 1.0,
-		"time_scale drifted from 1.0 -> sim-time desyncs from the tick index")
-	assert(Engine.physics_ticks_per_second == 60,
-		"physics_ticks_per_second drifted from 60 -> dt != 1/60")
+	# thread, and synchronized ticks. These pins are set in `_initialize()` +
+	# project.godot; re-assert them at every world build so any drift (a bad
+	# project.godot edit, a 4.7 point-release default flip) fails LOUDLY HERE rather
+	# than silently voiding the witness replay far downstream.
+	#
+	# Under the SPEEDUP lever the INVARIANT is dt == 1/60, NOT speedup == 1: the
+	# physics rate and time_scale are BOTH scaled by _speedup so the pair still cancels
+	# to a 1/60 s per-tick delta. Assert the PAIR against the requested speedup so an
+	# UNPAIRED drift (one scaled without the other -> dt off 1/60) trips here.
+	assert(Engine.time_scale == float(_speedup),
+		"time_scale must equal speedup (paired with the tick rate so dt stays 1/60)")
+	assert(Engine.physics_ticks_per_second == 60 * _speedup,
+		"physics_ticks_per_second must equal 60*speedup (paired with time_scale -> dt==1/60)")
 	assert(Engine.physics_jitter_fix == 0.0,
 		"physics_jitter_fix drifted from 0.0 -> ticks are no longer fully synchronized")
 	assert(not bool(ProjectSettings.get_setting("physics/2d/run_on_separate_thread", false)),
