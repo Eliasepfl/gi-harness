@@ -259,6 +259,9 @@ class GodotServeEnv:
         self._tick = 0
         self._done = False
         self._prev_latched: set[str] = self._latched_set(ready)
+        # Current world pose ({name:{pos,vel,angle}}); kept fresh on reset/step for the
+        # inverse-value attacker's fingerprint trail (harness.rl.adversary). Read-only.
+        self.last_snapshot: dict = self._snapshot_of(ready)
 
     # -- provisioning -----------------------------------------------------
     def _ensure_provisioned(self) -> None:
@@ -401,6 +404,16 @@ class GodotServeEnv:
     def _latched_set(frame: dict) -> set[str]:
         return {k for k, v in (frame.get("checkpoints") or {}).items() if v is not None}
 
+    @staticmethod
+    def _snapshot_of(frame: dict) -> dict:
+        """The frame's per-body pose in the shape ``statetree.fingerprint`` reads
+        (``{name: {pos, vel, angle}}``) — the current world snapshot. Read-only; used
+        by the inverse-value attacker (``harness.rl.adversary``) to fingerprint the
+        steered rollout's state trail for its softlock DETECT window."""
+        obs = frame.get("obs_state") or {}
+        return {n: {"pos": q.get("pos"), "vel": q.get("vel"), "angle": q.get("angle")}
+                for n, q in obs.items()}
+
     # -- Gymnasium API ----------------------------------------------------
     def reset(self, seed: int = 0):
         frame = self._exchange({"op": "reset", "seed": int(seed)})
@@ -409,6 +422,7 @@ class GodotServeEnv:
         self._tick = 0
         self._done = False
         self._prev_latched = self._latched_set(frame)
+        self.last_snapshot = self._snapshot_of(frame)
         return self._observe(frame), {"latched": dict(frame.get("checkpoints") or {})}
 
     def step(self, action_idx: int):
@@ -424,6 +438,7 @@ class GodotServeEnv:
         latched_now = self._latched_set(frame)
         new_latches = len(latched_now - self._prev_latched)
         self._prev_latched = latched_now
+        self.last_snapshot = self._snapshot_of(frame)
         reward = R_CHECKPOINT * new_latches
 
         # term/trunc split comes straight off the wire (INNER dialect); the reward
