@@ -48,6 +48,9 @@ const SERVE_DEFAULT_HORIZON := 300      # decision-tick truncation budget
 const SERVE_IDLE_TIMEOUT_MS := 120000   # self-quit after this long idle (orphan guard)
 const SPEEDUP_MIN := 1
 const SPEEDUP_MAX := 16
+const PLAY_MARGIN := 400.0              # px padding past the level extent -> play-bounds
+                                        # (Elias directive 2: a controlled body leaving
+                                        # this TRUNCATES the episode, it is not a break)
 
 # The GameAPI contract methods a generated game MUST implement (GAME_API.md).
 const REQUIRED_METHODS := ["build", "act", "state", "checkpoints",
@@ -71,6 +74,12 @@ var _world_w := DEFAULT_W
 var _world_h := DEFAULT_H
 var _actions_cache := []                # actions() captured at build (handshake)
 var _speedup := 1
+# Play-bounds (x,y) computed at (re)build from the world box + t=0 body positions +
+# PLAY_MARGIN; the controlled body leaving it truncates the episode (Elias directive 2).
+var _play_min_x := -PLAY_MARGIN
+var _play_min_y := -PLAY_MARGIN
+var _play_max_x := DEFAULT_W + PLAY_MARGIN
+var _play_max_y := DEFAULT_H + PLAY_MARGIN
 
 # --- Batched (in-scene) instances -- ONE socket serves N independent worlds ------ #
 # Populated only when init carries n_instances > 1; single-instance mode leaves these
@@ -91,6 +100,7 @@ var _done_term_arr := []                # per-instance terminal reached
 var _done_trunc_arr := []               # per-instance truncated at horizon
 var _frozen_arr := []                   # per-instance NaN/exploded physics
 var _nan_arr := []                      # per-instance NaN flag (frame diagnostic)
+var _play_bounds_arr := []              # per-instance [min_x, min_y, max_x, max_y]
 
 
 # =========================================================================== #
@@ -301,6 +311,7 @@ func _rebuild(world_seed: int) -> String:
 	# key as unlatched so frames report the full milestone map from t=0.
 	_actions_cache = _read_actions()
 	_read_world_size()
+	_compute_play_bounds()
 	_latches = {}
 	var cps = _safe_checkpoints()
 	for k in cps.keys():
@@ -331,6 +342,66 @@ func _read_world_size() -> void:
 	if typeof(ws) == TYPE_ARRAY and ws.size() == 2:
 		_world_w = float(ws[0])
 		_world_h = float(ws[1])
+
+
+func _compute_play_bounds() -> void:
+	# Play area = union(world box, every t=0 body position) padded by PLAY_MARGIN. A
+	# runaway CONTROLLED body that leaves it truncates the episode (Elias directive 2)
+	# rather than being flagged an escape/break; an unbounded world is not a failure.
+	var b := _play_bounds_from_state(_safe_state())
+	_play_min_x = b[0]
+	_play_min_y = b[1]
+	_play_max_x = b[2]
+	_play_max_y = b[3]
+
+
+func _play_bounds_from_state(st: Dictionary) -> Array:
+	var min_x := 0.0
+	var min_y := 0.0
+	var max_x := _world_w
+	var max_y := _world_h
+	var bodies = st.get("bodies", [])
+	if typeof(bodies) == TYPE_ARRAY:
+		for b in bodies:
+			if typeof(b) != TYPE_DICTIONARY:
+				continue
+			var p = b.get("pos", [])
+			if typeof(p) != TYPE_ARRAY or p.size() < 2:
+				continue
+			var px := float(p[0])
+			var py := float(p[1])
+			min_x = min(min_x, px)
+			min_y = min(min_y, py)
+			max_x = max(max_x, px)
+			max_y = max(max_y, py)
+	return [min_x - PLAY_MARGIN, min_y - PLAY_MARGIN, max_x + PLAY_MARGIN, max_y + PLAY_MARGIN]
+
+
+func _controlled_out_of_bounds(st: Dictionary, min_x: float, min_y: float,
+		max_x: float, max_y: float) -> bool:
+	# True once the CONTROLLED body's x,y centre leaves [min..max] (the depth axis of a
+	# 3D game is not boxed, matching the in-bounds plane). Only the controlled body
+	# triggers truncation -- a NON-controlled body leaving is a containment escape,
+	# reported via oob, never a truncation.
+	var bodies = st.get("bodies", [])
+	if typeof(bodies) != TYPE_ARRAY:
+		return false
+	for b in bodies:
+		if typeof(b) != TYPE_DICTIONARY or not bool(b.get("controlled", false)):
+			continue
+		var p = b.get("pos", [])
+		if typeof(p) != TYPE_ARRAY or p.size() < 2:
+			continue
+		var px := float(p[0])
+		var py := float(p[1])
+		if px < min_x or px > max_x or py < min_y or py > max_y:
+			return true
+	return false
+
+
+func _left_play_bounds() -> bool:
+	return _controlled_out_of_bounds(_safe_state(), _play_min_x, _play_min_y,
+		_play_max_x, _play_max_y)
 
 
 func _safe_state() -> Dictionary:
@@ -407,6 +478,9 @@ func _do_ticks(actions_list: Array, n_ticks: int, frames_every: int,
 		if _truthy(_game.is_success()):
 			_result = "success"
 			_done_term = true
+			break
+		if _left_play_bounds():
+			_done_trunc = true              # runaway -> clean truncation (directive 2)
 			break
 		if _applied >= _horizon:
 			_done_trunc = true
@@ -559,6 +633,7 @@ func _batch_init(msg: Dictionary) -> String:
 	_done_trunc_arr = []
 	_frozen_arr = []
 	_nan_arr = []
+	_play_bounds_arr = []
 	for i in range(_n_instances):
 		var vp := _batch_new_viewport()
 		var r := _batch_build_game(vp, _base_seed + i)
@@ -573,12 +648,15 @@ func _batch_init(msg: Dictionary) -> String:
 		_done_trunc_arr.append(false)
 		_frozen_arr.append(false)
 		_nan_arr.append(false)
+		_play_bounds_arr.append([])         # filled after world size is known (below)
 		var latches := {}
 		for k in _safe_checkpoints_of(r.game).keys():
 			latches[str(k)] = null
 		_latches_arr.append(latches)
 	_actions_cache = _read_actions_of(_games[0])
 	_read_world_size_of(_games[0])
+	for i in range(_n_instances):
+		_play_bounds_arr[i] = _play_bounds_from_state(_safe_state_of(_games[i]))
 	return _batch_frame_json(true)
 
 
@@ -632,6 +710,7 @@ func _batch_rebuild_instance(i: int, inst_seed: int) -> String:
 	_done_trunc_arr[i] = false
 	_frozen_arr[i] = false
 	_nan_arr[i] = false
+	_play_bounds_arr[i] = _play_bounds_from_state(_safe_state_of(r.game))
 	var latches := {}
 	for k in _safe_checkpoints_of(r.game).keys():
 		latches[str(k)] = null
@@ -693,8 +772,19 @@ func _batch_do_ticks(actions_list: Array, n_ticks: int) -> void:
 				_result_arr[i] = "success"
 				_done_term_arr[i] = true
 				continue
+			if _left_play_bounds_i(i):
+				_done_trunc_arr[i] = true   # runaway -> clean truncation (directive 2)
+				continue
 			if _applied_arr[i] >= _horizon:
 				_done_trunc_arr[i] = true
+
+
+func _left_play_bounds_i(i: int) -> bool:
+	var pb = _play_bounds_arr[i]
+	if typeof(pb) != TYPE_ARRAY or pb.size() < 4:
+		return false
+	return _controlled_out_of_bounds(_safe_state_of(_games[i]),
+		float(pb[0]), float(pb[1]), float(pb[2]), float(pb[3]))
 
 
 func _latch_i(i: int) -> void:
@@ -794,7 +884,10 @@ func _oob_json_of(game: Node, margin: float) -> String:
 	var bodies = st.get("bodies", [])
 	if typeof(bodies) == TYPE_ARRAY:
 		for b in bodies:
-			if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)):
+			# Controlled body leaving = truncation, not escape (directive 2); only a
+			# NON-controlled body escaping its containment is reported.
+			if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)) \
+					or bool(b.get("controlled", false)):
 				continue
 			var p = b.get("pos", [0.0, 0.0])
 			if typeof(p) != TYPE_ARRAY or p.size() < 2:
@@ -928,7 +1021,11 @@ func _oob_json(margin: float) -> String:
 	var bodies = st.get("bodies", [])
 	if typeof(bodies) == TYPE_ARRAY:
 		for b in bodies:
-			if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)):
+			# The CONTROLLED body leaving is a play-bounds TRUNCATION, not an escape
+			# (Elias directive 2); only a NON-controlled dynamic body escaping its
+			# required containment is reported here.
+			if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)) \
+					or bool(b.get("controlled", false)):
 				continue
 			var p = b.get("pos", [0.0, 0.0])
 			if typeof(p) != TYPE_ARRAY or p.size() < 2:
@@ -1019,6 +1116,18 @@ func _op_check(msg: Dictionary) -> String:
 	out["queries"] = queries
 	out["penetration"] = []             # no shape info in the GameAPI lane -> no probe
 
+	# t=0 GEOMETRY for the G0.5 reachability pre-filter (Elias directive 1): each body's
+	# pos + static/sensor/controlled flags + any footprint the game reports (aabb /
+	# half_extents / radius). A body WITHOUT a footprint is a bare marker (never a wall);
+	# the python side floods over the static footprints. Pure ADD to the check reply --
+	# it never touches the act/episode frames, so serve determinism is unchanged.
+	var geometry := []
+	if typeof(bodies) == TYPE_ARRAY:
+		for b in bodies:
+			if typeof(b) == TYPE_DICTIONARY:
+				geometry.append(_geometry_of(b))
+	out["geometry"] = geometry
+
 	# 6. Goal probes on the fresh t=0 world (predicates are pure/read-only).
 	out["g2"] = {
 		"success": _probe_bool("is_success"),
@@ -1029,6 +1138,27 @@ func _op_check(msg: Dictionary) -> String:
 	_teardown()
 	await process_frame
 	return JSON.stringify(out)
+
+
+func _geometry_of(b: Dictionary) -> Dictionary:
+	# One body's t=0 geometry fact for the G0.5 reachability pre-filter: position +
+	# static/sensor/controlled flags + whatever footprint the game reports (an explicit
+	# `aabb`/`half_extents` or a `radius`). Footprint keys are optional; a body reporting
+	# none is treated as a bare marker (a target region, never a wall) by the python side.
+	var g := {
+		"name": str(b.get("name", "")),
+		"pos": b.get("pos", []),
+		"static": bool(b.get("static", false)),
+		"sensor": bool(b.get("sensor", false)),
+		"controlled": bool(b.get("controlled", false)),
+	}
+	if b.has("aabb"):
+		g["aabb"] = b.get("aabb")
+	if b.has("half_extents"):
+		g["half_extents"] = b.get("half_extents")
+	if b.has("radius"):
+		g["radius"] = b.get("radius")
+	return g
 
 
 func _center_in_bounds(b: Dictionary) -> bool:

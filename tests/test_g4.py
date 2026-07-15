@@ -134,6 +134,32 @@ def checkpoints(world):
     return {"moved": world.query("player")["pos"][0] > 300}
 '''
 
+# Broken gating: success (reach the "door", x>500) does NOT actually require the
+# declared "got_key" checkpoint (rise to y<150). Spamming "door" wins while skipping
+# the key band -> a win that bypasses a declared gate -> broken_gating (HARD).
+GATING = '''
+TITLE = "KeyDoor"
+PROMPT = "grab the key up high, then reach the door"
+ACTIONS = ["key", "door"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(400, 10), size=(800, 20), static=True)
+    world.add("player", shape="box", pos=(100, 400), size=(20, 20))
+    world.control("player")
+
+def act(world, action):
+    if action == "key":
+        world.impulse("player", (0, -50))
+    elif action == "door":
+        world.impulse("player", (50, 0))
+
+def success(world):
+    return world.query("player")["pos"][0] > 500
+
+def checkpoints(world):
+    return {"got_key": world.query("player")["pos"][1] < 150}
+'''
+
 # One repeated action wins quickly on its own.
 SINGLE = '''
 TITLE = "Go"
@@ -230,6 +256,27 @@ def test_classify_shortcut_vs_intended():
     assert slow == "intended_success"
 
 
+def test_classify_broken_gating_vs_informational_shortcut():
+    # A win that SKIPS a required (declared) checkpoint -> broken_gating (HARD).
+    o, ev = g4.classify(
+        _ep(result="success", ticks=3, checkpoints={"got_key": None, "at_door": 2}),
+        "py", avoidance=False, witness_ticks=40, controlled="player",
+        initial_snapshot={}, required_checkpoints=["got_key", "at_door"])
+    assert o == "broken_gating"
+    assert ev["skipped_checkpoints"] == ["got_key"]
+    assert "broken_gating" in g4._HARD_OUTCOMES
+    # A fast win that still latches EVERY required gate -> informational shortcut (SOFT).
+    o2, _ = g4.classify(
+        _ep(result="success", ticks=3, checkpoints={"got_key": 1, "at_door": 2}),
+        "py", avoidance=False, witness_ticks=40, controlled="player",
+        initial_snapshot={}, required_checkpoints=["got_key", "at_door"])
+    assert o2 == "shortcut_beats_witness"
+    # No declared gates -> the old shortcut/intended split is unchanged.
+    o3, _ = g4.classify(_ep(result="success", ticks=3), "py", avoidance=False,
+                        witness_ticks=40, controlled="player", initial_snapshot={})
+    assert o3 == "shortcut_beats_witness"
+
+
 def test_classify_stuck_requires_travel_then_immobility():
     start = {"player": {"pos": [100, 60], "vel": [0, 0]}}
     parked = {"player": {"pos": [300, 60], "vel": [0.0, 0.0]}}
@@ -300,6 +347,22 @@ def test_fuzz_detects_escape_and_reproducer_replays():
     ep = ex.run_batch(ESCAPE, [{"seed": rep["seed"], "actions": plan}],
                       g4.PROBE_HORIZON, escape_margin=g4.ESCAPE_MARGIN)[0]
     assert ep["oob"], "reproducer did not reproduce the escape"
+
+
+def test_broken_gating_when_a_win_skips_a_declared_checkpoint():
+    # The witness declares "got_key" as a gating milestone; but a "door"-spam win
+    # reaches success without ever entering the key band -> broken_gating (HARD).
+    out = g4.run_g4(GATING, _report(["key"] * 8 + ["door"] * 20, 28,
+                                    checkpoints={"got_key": 8}),
+                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
+    broken = [f for f in out["findings"] if f["outcome"] == "broken_gating"]
+    assert broken, "a win that skips the declared gate must flag broken_gating"
+    assert all(f["hard"] for f in broken)
+    assert out["tier0"]["counts"]["broken_gating"] > 0
+    assert "got_key" in broken[0]["evidence"]["skipped_checkpoints"]
+    assert out["grade"] == "open" and out["passed"] is False
+    rr = g4.to_repair_report(broken[0])
+    assert "BROKEN GATING" in rr["hint"]
 
 
 def test_shortcut_beats_witness_is_soft():

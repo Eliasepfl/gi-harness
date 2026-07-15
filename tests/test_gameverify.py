@@ -789,5 +789,88 @@ def test_smoke_real_world(tmp_path):
                         "warnings", "progress", "witness"}
 
 
+# ====================================================================== #
+# Single-action anti-triviality probe (Elias directive 3) — engine-agnostic
+# ====================================================================== #
+def test_single_action_probe_flags_one_action_win_and_clears_multi_stage():
+    """The probe holds each action for the horizon: it flags the one-action-winnable
+    game (GAME_VALID: 'right' alone wins) and clears the genuine two-stage game
+    (GAME_TWO_STAGE: a tap-combo THEN hold — no single action wins)."""
+    from harness.verify.executors import PyExecutor
+    from harness.verify.gameverify import single_action_probe
+
+    ex = PyExecutor(world_factory=factory())
+    wins = single_action_probe(ex, GAME_VALID, ["right", "left"], horizon=120)
+    assert [a for a, _ in wins] == ["right"], wins
+    assert all(isinstance(t, int) and t >= 1 for _, t in wins)
+
+    none = single_action_probe(ex, GAME_TWO_STAGE, ["tap", "hold"], horizon=120)
+    assert none == [], none
+
+
+def test_single_action_gate_flips_report_to_goal_error():
+    """The gate flips an otherwise-certified report to a GOAL_ERROR with the BROKEN
+    repair hint when a single action wins, and leaves a multi-stage game untouched."""
+    from harness.verify.executors import PyExecutor
+    from harness.verify.gameverify import _single_action_gate, make_report
+
+    ex = PyExecutor(world_factory=factory())
+    good = make_report()
+    good["passed"] = True
+    good["failure_class"] = None
+    good["layers"]["G3_solve"] = {"passed": True, "checks": {}}
+    out = _single_action_gate(ex, GAME_VALID, ["right", "left"], good)
+    assert out["passed"] is False
+    assert out["failure_class"] == "GOAL_ERROR"
+    assert "BROKEN" in out["hint"] and "single action" in out["hint"]
+    assert out["layers"]["G3_solve"]["checks"]["single_action"]["pass"] is False
+
+    clean = make_report()
+    clean["passed"] = True
+    clean["layers"]["G3_solve"] = {"passed": True, "checks": {}}
+    out2 = _single_action_gate(ex, GAME_TWO_STAGE, ["tap", "hold"], clean)
+    assert out2["passed"] is True
+    assert out2["layers"]["G3_solve"]["checks"]["single_action"]["pass"] is True
+
+
+# ====================================================================== #
+# G0.5 geometric reachability pre-filter wiring (Elias directive 1)
+# ====================================================================== #
+def _walled_geometry_facts():
+    """Serve-host-shaped t=0 geometry facts: a gem sealed in a box of four wall
+    footprints, player spawned outside."""
+    return {"world_size": {"declared": [800, 600]}, "geometry": [
+        {"name": "player", "pos": [100, 300], "controlled": True, "static": False},
+        {"name": "gem", "pos": [400, 300], "static": True},
+        {"name": "wall_top", "pos": [400, 240], "static": True, "half_extents": [68, 8]},
+        {"name": "wall_bottom", "pos": [400, 360], "static": True, "half_extents": [68, 8]},
+        {"name": "wall_left", "pos": [340, 300], "static": True, "half_extents": [8, 68]},
+        {"name": "wall_right", "pos": [460, 300], "static": True, "half_extents": [8, 68]},
+    ]}
+
+
+def test_run_reachability_rejects_walled_goal():
+    from harness.verify.gameverify import _run_reachability
+    layer = _run_reachability(_walled_geometry_facts())
+    assert layer["passed"] is False
+    assert layer["checks"]["reachable"]["pass"] is False
+    assert "gem" in layer["checks"]["reachable"]["unreachable"]
+    assert "walled off" in layer["hint"]
+
+
+def test_run_reachability_passes_open_and_footprint_free_scenes():
+    from harness.verify.gameverify import _run_reachability
+    # No walls at all (mini_collect-shaped: two bare markers) -> passes, defers to G3.
+    open_facts = {"world_size": {"declared": [800, 600]}, "geometry": [
+        {"name": "player", "pos": [300, 300], "controlled": True, "static": False},
+        {"name": "gem_a", "pos": [300, 165], "static": True},
+        {"name": "gem_b", "pos": [560, 340], "static": True}]}
+    assert _run_reachability(open_facts)["passed"] is True
+    # A box with an OPENING (drop the right wall) -> reachable, passes.
+    open_box = _walled_geometry_facts()
+    open_box["geometry"] = [b for b in open_box["geometry"] if b["name"] != "wall_right"]
+    assert _run_reachability(open_box)["passed"] is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

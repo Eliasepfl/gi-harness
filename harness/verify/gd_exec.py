@@ -313,6 +313,7 @@ class GdExecutor:
             "final_snapshot": snap,
             "actions": actions[:ticks],
             "world_size": list(frame.get("world_size") or (800, 600)),
+            "done_trunc": bool(frame.get("done_trunc", False)),
             "error": frame.get("error"),
         }
         if escape_margin is not None:

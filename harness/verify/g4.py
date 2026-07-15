@@ -107,7 +107,10 @@ STALE_CAND_BUDGET = 6000   # tick budget for the inverted-objective candidate se
 
 # Which outcomes are HARD (route-to-repair) vs SOFT (warning/flag). `softlock` is a
 # 1c-certified prefix (design §4 grading); the heuristic `stuck` stays SOFT.
-_HARD_OUTCOMES = {"unintended_success", "nan", "escape", "softlock"}
+# `broken_gating` is a win that reaches success WITHOUT latching a declared checkpoint
+# that is supposed to gate it (the gate is bypassable) -> HARD (Elias directive 4);
+# a plain `shortcut_beats_witness` that still passes every gate stays SOFT/informational.
+_HARD_OUTCOMES = {"unintended_success", "nan", "escape", "softlock", "broken_gating"}
 
 
 class _InvalidPlan(Exception):
@@ -284,17 +287,26 @@ def _evidence(ep, engine) -> dict:
     }
 
 
-def classify(ep, engine, *, avoidance, witness_ticks, controlled, initial_snapshot):
+def classify(ep, engine, *, avoidance, witness_ticks, controlled, initial_snapshot,
+             required_checkpoints=None):
     """Map a replayed episode dict to (outcome, evidence).
 
     Outcome vocabulary (findings marked ✓; `nothing`/`intended_success` are not):
       unintended_success ✓  success under an avoidance plan
       nan                ✓  NaN/explosion during replay
       escape             ✓  a dynamic body left world+ESCAPE_MARGIN
-      shortcut_beats_witness ✓  success far faster than the certified witness
+      broken_gating      ✓  success reached WITHOUT latching a declared checkpoint
+                            that should gate it (the gate is bypassable) — HARD
+      shortcut_beats_witness ✓  success far faster than the certified witness, but
+                            every declared gate still latched — SOFT/informational
       stuck              ✓  the controlled body travelled then soft-locked
       intended_success      a normal, non-shortcut win (not a finding)
       nothing               the attack failed to break the game
+
+    `required_checkpoints` is the declared milestone set that SHOULD gate success
+    (the witness's checkpoint keys). A non-avoidance win that latches all of them
+    but is merely fast is an informational shortcut; one that reaches success while
+    a required gate stays unlatched is `broken_gating` (Elias directive 4).
     """
     ev = _evidence(ep, engine)
     result = ev["result"]
@@ -308,6 +320,15 @@ def classify(ep, engine, *, avoidance, witness_ticks, controlled, initial_snapsh
     if result == "success":
         if avoidance:
             return "unintended_success", ev
+        # Broken gating (HARD): a win that skips a declared/required checkpoint the
+        # game intends to gate success. Distinguishes a genuine gating hole from a
+        # benign shortcut (Elias directive 4) — checked BEFORE the shortcut lens so a
+        # fast win that ALSO skips a gate reports the stronger (hard) finding.
+        skipped = [k for k in (required_checkpoints or [])
+                   if ev["checkpoints"].get(k) is None]
+        if skipped:
+            ev["skipped_checkpoints"] = skipped
+            return "broken_gating", ev
         if (witness_ticks is not None
                 and ev["ticks"] < max(TRIVIAL_TICKS, witness_ticks * SHORTCUT_FACTOR)):
             return "shortcut_beats_witness", ev
@@ -473,6 +494,8 @@ def _run_tier0(executor, game_source, engine, actions, report, *,
     witness = _witness(report)
     witness_actions = list(witness.get("actions", [])) if witness else []
     witness_ticks = witness.get("ticks") if witness else None
+    # The declared checkpoints that SHOULD gate success (broken-gating detection).
+    required_checkpoints = list((witness.get("checkpoints") or {}).keys()) if witness else []
 
     specs = _tier0_specs(actions, witness_actions, horizon, seed,
                          fuzz_random=fuzz_random, fuzz_long=fuzz_long,
@@ -497,7 +520,8 @@ def _run_tier0(executor, game_source, engine, actions, report, *,
     single_flags = []
     shortcuts = []
     counts = {"nan": 0, "escape": 0, "stuck": 0, "unintended_success": 0,
-              "shortcut_beats_witness": 0, "single_action_win": 0, "intended_success": 0}
+              "broken_gating": 0, "shortcut_beats_witness": 0,
+              "single_action_win": 0, "intended_success": 0}
     families: dict = {}
 
     for (spec, plan), ep in zip(kept, episodes):
@@ -507,7 +531,8 @@ def _run_tier0(executor, game_source, engine, actions, report, *,
         avoidance = spec["group"] == "avoidance"
         outcome, ev = classify(ep, engine, avoidance=avoidance,
                                witness_ticks=witness_ticks, controlled=controlled,
-                               initial_snapshot=initial)
+                               initial_snapshot=initial,
+                               required_checkpoints=required_checkpoints)
 
         # Single-action-win is a separate lens on the spam family (a win at all is
         # a flag; the tick count is the payload the >=5-tick bar can miss).
@@ -579,9 +604,15 @@ def _tier0_detail(outcome, spec, ev, witness_ticks):
     if outcome == "unintended_success":
         return (f"avoidance probe '{fam}' still won at tick {ev['ticks']} — "
                 f"the goal is reachable without playing (degenerate/unavoidable)")
+    if outcome == "broken_gating":
+        skipped = ev.get("skipped_checkpoints", [])
+        return (f"fuzz family '{fam}' won at tick {ev['ticks']} WITHOUT latching "
+                f"required checkpoint(s) {', '.join(skipped)} — success is reachable "
+                f"while skipping a declared gate (broken gating)")
     if outcome == "shortcut_beats_witness":
         return (f"fuzz family '{fam}' won in {ev['ticks']} ticks "
-                f"(witness {witness_ticks}) — the intended path is bypassable")
+                f"(witness {witness_ticks}) — faster than the intended path, but every "
+                f"declared checkpoint still latched (informational shortcut)")
     if outcome == "nan":
         return f"fuzz family '{fam}' triggered a NaN/explosion during replay"
     if outcome == "escape":
@@ -757,6 +788,7 @@ def _run_tier1(executor, game_source, engine, actions, report, *,
     block["models"] = list(lanes)
     witness = _witness(report) or {}
     witness_ticks = witness.get("ticks")
+    required_checkpoints = list((witness.get("checkpoints") or {}).keys())
     system = _tier1_system()
     user = _tier1_user(game_source, report, actions, k)
 
@@ -805,7 +837,8 @@ def _run_tier1(executor, game_source, engine, actions, report, *,
         for (record, pattern, params, plan), ep in zip(prepared, episodes):
             outcome, ev = classify(ep, engine, avoidance=False,
                                    witness_ticks=witness_ticks, controlled=controlled,
-                                   initial_snapshot=initial)
+                                   initial_snapshot=initial,
+                                   required_checkpoints=required_checkpoints)
             record.pop("_pattern", None)
             record.pop("_params", None)
             record["evidence"] = ev
@@ -1258,12 +1291,16 @@ def _slug_of(game_path):
 _REPAIR_HINTS = {
     "unintended_success": "an avoidance policy won without playing; tighten the goal "
                           "so it cannot be reached by idling or the wrong moves",
+    "broken_gating": "BROKEN GATING: success is reachable WITHOUT passing a declared "
+                     "checkpoint that is supposed to gate it — make success actually "
+                     "require every gating milestone (no bypass)",
     "shortcut_beats_witness": "a fuzz policy won far faster than the intended path; "
                               "make the goal require the full progression",
     "nan": "adversarial input drove the physics to NaN/explosion; bound forces/velocities",
     "escape": "adversarial input drove a body out of the world; add bounds or damping",
     "stuck": "an adversarial player soft-locked the controlled body; avoid dead-end states",
-    "single_action_win": "one repeated action alone solves the game; require real play",
+    "single_action_win": "BROKEN: your game is winnable by repeating a single action — "
+                         "add a real obstacle/choice so success needs varied play",
     "softlock": "an action prefix drives the game into a state from which no continuation "
                 "can win (certified by the tree-refutation oracle); ensure every reachable "
                 "state can still reach the goal, or add an escape/reset from dead ends",
