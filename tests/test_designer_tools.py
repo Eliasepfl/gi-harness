@@ -35,6 +35,7 @@ def test_certify_has_no_threshold_parameter():
     assert not any("threshold" in k.lower() for k in props)
 
 
+@pytest.mark.skip(reason="banks/ retired (Elias, 2026-07-15): retrieve_parts tool sweeps out post-lane-merge")
 def test_dispatch_routes_by_name():
     out = T.dispatch("retrieve_parts", {"prompt": "a lava pool", "engine": "py"})
     assert set(out) == {"menu_text", "menu_mode", "names", "scores"}
@@ -45,6 +46,7 @@ def test_dispatch_routes_by_name():
 # --------------------------------------------------------------------------- #
 # retrieve_parts determinism
 # --------------------------------------------------------------------------- #
+@pytest.mark.skip(reason="banks/ retired (Elias, 2026-07-15): retrieve_parts tool sweeps out post-lane-merge")
 def test_retrieve_parts_deterministic():
     a = T.retrieve_parts("cross a lava pool on a moving platform", engine="py")
     b = T.retrieve_parts("cross a lava pool on a moving platform", engine="py")
@@ -53,6 +55,7 @@ def test_retrieve_parts_deterministic():
     assert len(a["names"]) == len(a["scores"])
 
 
+@pytest.mark.skip(reason="banks/ retired (Elias, 2026-07-15): retrieve_parts tool sweeps out post-lane-merge")
 def test_retrieve_parts_strong_prompt_yields_menu():
     out = T.retrieve_parts("lava pool", engine="py")
     assert out["menu_mode"] == "menu"

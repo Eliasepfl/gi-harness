@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="banks/ retired with the spec lane (Elias, 2026-07-15) - retrieval machinery sweeps out post-lane-merge")
+
 from harness.gen import retrieval as R
 from harness.core import bank as BANK
 
