@@ -286,6 +286,10 @@ class GdExecutor:
             act_msg = {"op": "act", "actions": actions, "n_ticks": n_ticks}
             if escape_margin is not None:
                 act_msg["escape_margin"] = float(escape_margin)
+            # frames_every>0 -> the host emits a per-tick frame trail on the act
+            # reply; 0 (default) leaves the wire byte-identical (no "frames" key).
+            if frames_every and int(frames_every) > 0:
+                act_msg["frames_every"] = int(frames_every)
             frame = self._exchange(act_msg)
             out.append(self._rec_from_frame(frame, actions, max_ticks, escape_margin))
         return out
@@ -314,6 +318,11 @@ class GdExecutor:
         if escape_margin is not None:
             rec["nan"] = bool(frame.get("nan", False))
             rec["oob"] = list(frame.get("oob") or [])
+        # Per-tick frame trail (only present when frames_every>0 was requested);
+        # the host already shapes each as {tick, entities:{name: query}}.
+        frames = frame.get("frames")
+        if frames is not None:
+            rec["frames"] = frames
         return rec
 
     # -- teardown ----------------------------------------------------------

@@ -195,6 +195,57 @@ def test_contract_probe_rejects_missing_method(tmp_path):
 # ====================================================================== #
 # 4. Env scrub does not break the lane (secret in the parent -> still certifies)
 # ====================================================================== #
+# ====================================================================== #
+# 5. Per-tick frame capture (replay/render substrate)
+# ====================================================================== #
+@requires_godot
+def test_gd_serve_emits_per_tick_frames():
+    """frames_every=1 -> a per-tick {tick, entities:{name: query}} trail: a t=0
+    frame, monotone ticks, one frame per applied tick ending at the final tick,
+    every scene non-empty with positional queries. The final_snapshot and terminal
+    keys are unchanged from the frame-free batch."""
+    with open(_MINI, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    plan = ["up"] * 8 + ["right"] * 6
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        rec = ex.run_batch(src, [{"seed": 0, "actions": plan}], len(plan),
+                            frames_every=1)[0]
+    finally:
+        ex.close()
+    frames = rec["frames"]
+    assert frames[0]["tick"] == 0                       # fresh-world frame
+    ticks = [fr["tick"] for fr in frames]
+    assert ticks == sorted(ticks)                       # monotone
+    assert frames[-1]["tick"] == rec["ticks"]           # ends at the applied tick
+    for fr in frames:
+        assert set(fr) == {"tick", "entities"}
+        assert fr["entities"]                           # non-empty scene
+        q = next(iter(fr["entities"].values()))
+        assert "pos" in q and len(q["pos"]) >= 2         # positional query
+
+
+@requires_godot
+def test_gd_frames_off_is_byte_identical_batch():
+    """frames_every=0 (the batch default) captures NO frames and emits no "frames"
+    key, and the final_snapshot matches a framed run tick-for-tick (frames ride
+    alongside; they never perturb the stepping)."""
+    with open(_MINI, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    plan = ["up"] * 8 + ["right"] * 6
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        plain = ex.run_batch(src, [{"seed": 0, "actions": plan}], len(plan))[0]
+        framed = ex.run_batch(src, [{"seed": 0, "actions": plan}], len(plan),
+                              frames_every=1)[0]
+    finally:
+        ex.close()
+    assert "frames" not in plain                         # no key in batch mode
+    assert plain["final_snapshot"] == framed["final_snapshot"]
+    assert plain["checkpoints"] == framed["checkpoints"]
+    assert plain["ticks"] == framed["ticks"]
+
+
 @requires_godot
 def test_gd_lane_verifies_under_scrubbed_env(monkeypatch):
     """With OPENROUTER_API_KEY set in the PARENT, the game still certifies — Godot

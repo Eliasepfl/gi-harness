@@ -269,8 +269,9 @@ def cmd_game_replay(args) -> int:
 
     Dispatches by ENGINE (py -> render.replay_gif unchanged; js -> the executors'
     render_js_replay; godot -> render_godot_replay, so a `.spec.json` no longer
-    crashes the py-only loader). ``--frames PATH`` additionally persists the replay
-    substrate ({meta, frames}) for all three engines. When ``--frames`` is given
+    crashes the py-only loader; gdscript -> render_gdscript_replay, driving a `.gd`
+    game through the serve host). ``--frames PATH`` additionally persists the replay
+    substrate ({meta, frames}) for all four engines. When ``--frames`` is given
     without an explicit ``--gif``, only the substrate is written."""
     game_path = args.game_path
     try:
@@ -324,14 +325,15 @@ def cmd_game_replay(args) -> int:
     # --- GIF (default output; skipped for a frames-only run) ---
     if want_gif:
         gif = args.gif or str(Path(game_path).with_suffix(".gif"))
-        if engine in ("js", "godot"):
+        if engine in ("js", "godot", "gdscript"):
             try:
                 from harness.verify.executors import (
-                    render_godot_replay, render_js_replay,
+                    render_gdscript_replay, render_godot_replay, render_js_replay,
                 )
             except Exception as exc:  # noqa: BLE001
                 return _module_missing("executors", exc, args.json)
-            render_fn = render_js_replay if engine == "js" else render_godot_replay
+            render_fn = {"js": render_js_replay, "godot": render_godot_replay,
+                         "gdscript": render_gdscript_replay}[engine]
             try:
                 w = witness()
                 gif_res = render_fn(source, gif, actions=w.get("actions", []),

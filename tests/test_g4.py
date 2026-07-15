@@ -496,6 +496,41 @@ def test_make_executor_routes_godot_to_godot_executor():
     assert isinstance(g4._make_executor("py", None), PyExecutor)
 
 
+def test_make_executor_routes_gdscript_to_gd_executor():
+    # Pure-python guard on the gdscript router branch (no Godot spawn): a .gd game
+    # must get a GdExecutor over the serve host, never fall to the pymunk default
+    # (which would error "invalid syntax" parsing GDScript as Python).
+    from harness.verify.gd_exec import GdExecutor
+    ex = g4._make_executor("gdscript", None)
+    try:
+        assert isinstance(ex, GdExecutor)
+    finally:
+        ex.close()
+
+
+_GD_MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
+_GD_MINI_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect_3d.gd")
+
+
+@requires_godot
+@pytest.mark.parametrize("path", [_GD_MINI, _GD_MINI_3D],
+                         ids=["mini_collect_2d", "mini_collect_3d"])
+def test_attack_game_routes_and_hardens_a_gd_game(path):
+    # The whole point of Track G4-gdscript: a .gd routes through detect_engine to
+    # the serve-host executor, attack_game verifies then hammers it, and tier 0
+    # returns a REAL grade (not the "invalid syntax" pymunk error). Both the 2D and
+    # 3D fixtures must flow through the same engine-agnostic G4 machinery.
+    out = g4.attack_game(path, tiers=(0,), sandboxed=False, seed=0,
+                         horizon=40, fuzz_random=6, fuzz_long=3, noop_heavy=3,
+                         alt_periods=(1, 2), anti_variants=1)
+    assert out["engine"] == "gdscript", out
+    assert "error" not in out, out
+    assert out.get("grade") in ("bulletproof", "hardened", "open"), out
+    # ACTIONS recovered from the G1 efficacy report (the shared js/gdscript path).
+    assert sorted(out["actions"]) == ["down", "left", "right", "up"], out
+    assert out["tier0"]["episodes"] > 0
+
+
 @requires_godot
 def test_attack_game_routes_and_hardens_a_godot_spec():
     out = g4.attack_game(_TRAVERSE_SPEC, tiers=(0,), sandboxed=False, seed=0,
