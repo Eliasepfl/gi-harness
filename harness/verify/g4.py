@@ -105,6 +105,17 @@ STALE_CAND_BUDGET = 6000   # tick budget for the inverted-objective candidate se
 # The oracle budget defaults to treesolve.TICK_BUDGET (one full G3 solve) — read at
 # call time so a test can shrink it; see _stale_oracle_budget().
 
+# Deep seeker tier (the TRAINED stale-seeker, harness/rl/stale_seek.py) defaults ([eng.]).
+# This tier costs ONE PPO training per game, so it is OFF unless the caller asks for the
+# DEEP grade (`deep=True`) AND the cheap tiers above certified NO softlock — it is a
+# last-resort escalation, never on the hot path. gdscript lane only (GodotBatchVecEnv is
+# the batched serve host); a game_path is required (the seeker spawns a Godot serve).
+SEEKER_BUDGET = 20000      # env-steps of PPO adversary training (the seeker's tick cost)
+SEEKER_NUM_ENVS = 4        # batched in-scene instances (N-in-one-proc at speedup 8)
+SEEKER_SEEDS = (0,)        # harvest seeds (seed 0 == WORLD_SEED, what CONFIRM replays at)
+SEEKER_WAYPOINTS = (0,)    # witness-trajectory prefix cuts to seed harvest rollouts from
+SEEKER_TOP_M = 8           # cap on seeker candidates escalated to the CONFIRM oracle
+
 # Which outcomes are HARD (route-to-repair) vs SOFT (warning/flag). `softlock` is a
 # 1c-certified prefix (design §4 grading); the heuristic `stuck` stays SOFT.
 # `broken_gating` is a win that reaches success WITHOUT latching a declared checkpoint
@@ -1131,6 +1142,93 @@ def _run_stale(executor, game_source, engine, actions, report, *,
 
 
 # ======================================================================== #
+# DEEP SEEKER TIER — the TRAINED stale-seeker (escalation above the greedy search)
+# Design: harness/rl/stale_seek.py + notes/adversarial/INVERSE_VALUE_G4.md. A PPO
+# adversary LEARNS to drive the game into a softlock; its candidates flow into the
+# SAME CONFIRM oracle (refute_prefix) as the cheap tiers — no new certification path.
+# ONE PPO training per game, so it runs ONLY on `deep=True` AND only when the cheap
+# tiers above certified nothing. gdscript lane + a game_path required.
+# ======================================================================== #
+def _has_hard_softlock(findings) -> bool:
+    return any(f.get("outcome") == "softlock" and f.get("hard") for f in (findings or []))
+
+
+def _seeker_discover_and_confirm(game_path, game_source, engine, actions, *, seed,
+                                 budget, num_envs, seeds, waypoints, top_m,
+                                 stale_H, stale_budget, witness):
+    """The heavy lane, isolated behind one seam so the ladder GATE (deep flag + cheap
+    tiers empty + engine/path availability) is unit-testable by monkeypatching this.
+
+    Trains the seeker, harvests candidates (training-time + witness-waypoint greedy
+    rollouts), and refutes each through the CONFIRM oracle. Returns the confirm result
+    dict (``findings`` + stats). Requires Godot; costs one PPO training."""
+    from harness.rl import stale_seek
+    from harness.rl.godot_env import GodotServeEnv
+
+    trained = stale_seek.train_stale_seeker(
+        game_path, budget_steps=budget, num_envs=num_envs, seed=seed)
+    candidates = list(trained["candidates"])
+
+    def make_env():
+        return GodotServeEnv(game_path)
+    candidates += stale_seek.harvest_candidates(
+        make_env, trained["policy"], seeds=seeds, witness=witness, waypoints=waypoints)
+
+    executor = _make_executor(engine, None)
+    try:
+        return stale_seek.confirm_candidates(
+            executor, game_source, actions, candidates, H=stale_H, budget=stale_budget,
+            engine=engine, top_m=top_m)
+    finally:
+        close = getattr(executor, "close", None)
+        if callable(close):
+            close()
+
+
+def _run_seeker(game_source, engine, actions, report, *, game_path, requested,
+                cheap_findings, seed, budget, num_envs, seeds, waypoints, top_m,
+                stale_H, stale_budget):
+    """The deep seeker tier. Gated: runs ONLY when `requested` (deep=True) AND the cheap
+    tiers certified NO softlock AND the lane can train (gdscript + a game_path). Findings
+    are the CONFIRM-certified softlocks — identical shape to the cheap stale tier's."""
+    block = {"status": "skipped_not_requested", "reason": "", "findings": [],
+             "certified": 0, "candidates_in": 0, "passed": True}
+    if not requested:
+        block["reason"] = "deep seeker tier not requested (pass deep=True)"
+        return block
+    if _has_hard_softlock(cheap_findings):
+        block["status"] = "skipped"
+        block["reason"] = "a cheap tier already certified a softlock — no deep escalation needed"
+        return block
+    if engine != "gdscript":
+        block["status"] = "skipped"
+        block["reason"] = f"deep seeker trains on the gdscript batched serve lane only (engine={engine})"
+        return block
+    if not game_path:
+        block["status"] = "skipped"
+        block["reason"] = "deep seeker needs a game_path to spawn the Godot serve host"
+        return block
+
+    block["status"] = "run"
+    try:
+        res = _seeker_discover_and_confirm(
+            game_path, game_source, engine, actions, seed=seed, budget=budget,
+            num_envs=num_envs, seeds=seeds, waypoints=waypoints, top_m=top_m,
+            stale_H=stale_H, stale_budget=stale_budget, witness=_witness(report))
+    except Exception as exc:                       # training/Godot failure must not sink the suite
+        block["status"] = "error"
+        block["reason"] = f"deep seeker failed: {exc}"
+        return block
+
+    block.update({"findings": res["findings"], "certified": res["certified"],
+                  "candidates_in": res["candidates_in"],
+                  "candidates_unique": res.get("candidates_unique", 0),
+                  "refuted": res.get("refuted", 0), "probed_out": res.get("probed_out", 0)})
+    block["passed"] = not res["findings"]
+    return block
+
+
+# ======================================================================== #
 # Grade + public entry points
 # ======================================================================== #
 def _grade(findings, tier1_block, tiers):
@@ -1151,7 +1249,10 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
            anti_variants=DEFAULT_ANTI_VARIANTS,
            k=DEFAULT_ATTACKS_PER_CALL, models=None,
            stale=False, stale_H=STALE_H, stale_budget=None,
-           stale_cand_budget=STALE_CAND_BUDGET, top_m=STALE_TOP_M):
+           stale_cand_budget=STALE_CAND_BUDGET, top_m=STALE_TOP_M,
+           deep=False, game_path=None, seeker_budget=SEEKER_BUDGET,
+           seeker_num_envs=SEEKER_NUM_ENVS, seeker_seeds=SEEKER_SEEDS,
+           seeker_waypoints=SEEKER_WAYPOINTS, seeker_top_m=SEEKER_TOP_M):
     """Run the adversarial suite on a certified game (source + its G0-G3 report).
 
     Returns the g4 report block (a machine-readable dict, schema `g4_report/v1`).
@@ -1162,7 +1263,16 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
     `stale=True` also runs the stale-state tier (softlock triggers 1a/1b + the
     bounded tree-refutation oracle 1c); a certified prefix is a hard `softlock`
     finding -> grade `open`. It rides the SAME executor + treesolve solver.
+
+    `deep=True` additionally arms the DEEP SEEKER tier — a TRAINED PPO stale-seeker
+    (harness/rl/stale_seek.py). It is COSTLY (one PPO training per game) so it runs
+    ONLY when the cheap tiers above certified NO softlock, and only on the gdscript
+    lane with a `game_path` (the seeker spawns a batched Godot serve host). Its
+    candidates flow into the SAME CONFIRM oracle, so a finding is an identical hard
+    `softlock`. `deep` implies `stale` (the cheap tiers run first, as the gate).
     """
+    if deep:
+        stale = True                          # the cheap stale tier is the deep gate
     tiers = tuple(sorted(set(tiers) | {0}))   # tier 0 always runs (free, seeds facts)
     engine = engine or "py"
     game = load_game(game_source) if engine == "py" else None
@@ -1210,8 +1320,19 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
                                  stale_budget=stale_budget,
                                  stale_cand_budget=stale_cand_budget, top_m=top_m)
 
-        findings = (list(tier0["findings"]) + list(tier1["findings"])
-                    + list(stale_block["findings"]))
+        cheap_findings = (list(tier0["findings"]) + list(tier1["findings"])
+                          + list(stale_block["findings"]))
+        # Deep seeker tier — armed by deep=True, but only escalated when the cheap
+        # tiers certified nothing (gate lives in _run_seeker). Uses the cheap stale
+        # tier's oracle budgets so CONFIRM stays consistent across tiers.
+        seeker_block = _run_seeker(
+            game_source, engine, actions, report, game_path=game_path,
+            requested=bool(deep), cheap_findings=cheap_findings, seed=seed,
+            budget=seeker_budget, num_envs=seeker_num_envs, seeds=seeker_seeds,
+            waypoints=seeker_waypoints, top_m=seeker_top_m, stale_H=stale_H,
+            stale_budget=stale_budget)
+
+        findings = cheap_findings + list(seeker_block["findings"])
         grade = _grade(findings, tier1, tiers)
         out.update({
             "grade": grade,
@@ -1219,6 +1340,7 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
             "tier0": tier0,
             "tier1": tier1,
             "stale": stale_block,
+            "seeker": seeker_block,
             "findings": findings,
             "hard_findings": [f for f in findings if f["hard"]],
         })
@@ -1277,7 +1399,7 @@ def attack_game(game_path, *, tiers=(0,), sandboxed=True, world_factory=None,
     report.setdefault("engine", engine)
     return run_g4(source, report, engine=engine, slug=_slug_of(game_path),
                   tiers=tiers, world_factory=world_factory, seed=seed, k=k,
-                  models=models, **fuzz_kwargs)
+                  models=models, game_path=game_path, **fuzz_kwargs)
 
 
 def _slug_of(game_path):
