@@ -1547,3 +1547,18 @@ def test_explicit_backend_never_falls_back_to_template(monkeypatch, tmp_path):
     monkeypatch.setitem(gamegen._LLM_RUNNERS, "anthropic", _unavailable)
     res_auto = gamegen._dispatch("a game", str(tmp_path), "auto", 1)
     assert res_auto["backend"] == "template"
+
+
+def test_reasoning_off_mode(monkeypatch):
+    """OPENROUTER_REASONING_MAX_TOKENS=off disables thinking entirely."""
+    from harness.gen import gamegen
+
+    monkeypatch.setenv("OPENROUTER_REASONING_MAX_TOKENS", "off")
+    cap = gamegen._reasoning_cap()
+    assert cap == -1
+    payload = gamegen._openrouter_payload("m", "sys", [], cap)
+    assert payload["reasoning"] == {"enabled": False}
+
+    monkeypatch.setenv("OPENROUTER_REASONING_MAX_TOKENS", "0")
+    payload0 = gamegen._openrouter_payload("m", "sys", [], gamegen._reasoning_cap())
+    assert "reasoning" not in payload0

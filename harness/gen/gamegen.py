@@ -419,10 +419,18 @@ def _openrouter_content(resp):
 
 
 def _reasoning_cap() -> int:
-    """Resolve the reasoning-token cap (secret > default; 0 disables the field)."""
+    """Resolve the reasoning-token cap (secret > default).
+
+    Secret values: an int caps reasoning tokens; "0" removes the reasoning
+    field (provider default thinking); "off" DISABLES thinking entirely
+    (payload {"reasoning": {"enabled": false}} -> returned as -1). Measured
+    2026-07-15: off = fastest/cheapest full-game path (49s/$0.04 vs
+    149s/$0.22 with thinking) — certification-quality A/B still open."""
     raw = _resolve_secret("OPENROUTER_REASONING_MAX_TOKENS")
     if raw is None:
         return _OPENROUTER_REASONING_DEFAULT
+    if str(raw).strip().lower() in ("off", "disabled", "none"):
+        return -1
     try:
         return max(0, int(str(raw).strip()))
     except (TypeError, ValueError):
@@ -437,6 +445,8 @@ def _openrouter_payload(model, system, messages, cap: int) -> dict:
     }
     if cap > 0:
         payload["reasoning"] = {"max_tokens": cap}
+    elif cap < 0:  # "off": disable thinking entirely (see _reasoning_cap)
+        payload["reasoning"] = {"enabled": False}
     return payload
 
 
