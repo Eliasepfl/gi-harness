@@ -21,3 +21,14 @@
   = budget-only vs the iter-2 baseline to isolate the variable. Lesson 1
   (near-straight first milestone) keeps its evidence: it was validated at
   the OLD 21k budget (start-failures 3/5 -> 0/5 on prompt change alone).
+
+- [2026-07-15, pilot iter-3 OUTCOME] Budget-only experiment CONFIRMED
+  Elias's hypothesis: at 63k ticks the same prompt certified (COMPLETED,
+  4 attempts) with the iter-2 prompt unchanged. The binding constraint was
+  solver budget, not chain length. "Short chains" hypothesis stays demoted.
+- [2026-07-15, pilot iter-3, G4] Hard finding on the certified game:
+  gates listed as checkpoints but NOT required by success - an avoidance
+  probe reached the bay skipping all gates. Designer lesson: every "must
+  pass through X" in the fiction needs X's flag ANDed into success, not
+  just a checkpoint. Surface: revise directive (iter-4); candidate for
+  rules_godot.md after one more occurrence (recurrence rule).
