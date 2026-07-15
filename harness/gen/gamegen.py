@@ -517,11 +517,15 @@ def _openrouter_complete(system, messages):
         content = _openrouter_content(resp)
         if content is not None:
             return content
-        # 200 with null/blank content. With no cap to halve (cap disabled)
-        # there is nothing to salvage; otherwise retry once at half the cap.
-        if salvage_left > 0 and cap > 0:
+        # 200 with null/blank content: the model spent the whole completion
+        # budget thinking (providers routinely ignore reasoning caps, and the
+        # think length varies run-to-run — measured 14.5k-24k+ tokens on the
+        # real payload). Halving the cap does nothing on cap-ignoring
+        # providers, so the salvage is to DISABLE thinking outright: measured
+        # to reliably return the full module (2026-07-15: 49s/$0.04).
+        if salvage_left > 0 and cap >= 0:
             salvage_left -= 1
-            cap = max(1, cap // 2)
+            cap = -1  # {"reasoning": {"enabled": false}}
             continue
         raise _BackendUnavailable(_openrouter_error(resp, key))
 
