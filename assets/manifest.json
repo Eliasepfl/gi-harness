@@ -31,36 +31,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/CrossTheRoad/Completed/assets/car.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -0.551977,
-          -0.75,
-          -0.954419
-        ],
-        "aabb_max": [
-          0.551977,
-          0.5,
-          0.954419
-        ],
-        "size": [
-          1.103953,
-          1.25,
-          1.908838
-        ],
-        "center": [
-          -0.0,
-          -0.125,
-          -0.0
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          0.551977,
-          0.625,
-          0.954419
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "robot",
@@ -82,36 +54,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/CrossTheRoad/Completed/assets/robot.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -0.18,
-          -0.132189,
-          -0.219033
-        ],
-        "aabb_max": [
-          0.209226,
-          0.517869,
-          0.219033
-        ],
-        "size": [
-          0.389226,
-          0.650058,
-          0.438065
-        ],
-        "center": [
-          0.014613,
-          0.19284,
-          -0.0
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          0.194613,
-          0.325029,
-          0.219033
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "robot-drone",
@@ -133,33 +77,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/MultiAgentSimple/assets/robot.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -0.558512,
-          -0.389965,
-          -0.599332
-        ],
-        "aabb_max": [
-          0.558501,
-          1.65,
-          0.5
-        ],
-        "size": [
-          1.117013,
-          2.039966,
-          1.099332
-        ],
-        "center": [
-          -5e-06,
-          0.630017,
-          -0.049666
-        ]
-      },
-      "collision": {
-        "primitive": "capsule",
-        "radius": 0.558506,
-        "height": 2.039966
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "tree-tile",
@@ -181,33 +100,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/CrossTheRoad/Completed/assets/tree_tile.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.0,
-          -1.0,
-          -1.0
-        ],
-        "aabb_max": [
-          1.0,
-          3.613183,
-          1.0
-        ],
-        "size": [
-          2.0,
-          4.613183,
-          2.0
-        ],
-        "center": [
-          0.0,
-          1.306591,
-          0.0
-        ]
-      },
-      "collision": {
-        "primitive": "capsule",
-        "radius": 1.0,
-        "height": 4.613183
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "road-tile",
@@ -230,36 +124,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/CrossTheRoad/Completed/assets/road_tile.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.0,
-          -1.0,
-          -1.0
-        ],
-        "aabb_max": [
-          1.0,
-          1.00001,
-          1.0
-        ],
-        "size": [
-          2.0,
-          2.00001,
-          2.0
-        ],
-        "center": [
-          0.0,
-          5e-06,
-          0.0
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.0,
-          1.000005,
-          1.0
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "goal-tile",
@@ -281,33 +147,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/CrossTheRoad/Completed/assets/goal_tile.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.0,
-          -1.0,
-          -1.0
-        ],
-        "aabb_max": [
-          1.0,
-          2.804059,
-          1.0
-        ],
-        "size": [
-          2.0,
-          3.804059,
-          2.0
-        ],
-        "center": [
-          0.0,
-          0.902029,
-          0.0
-        ]
-      },
-      "collision": {
-        "primitive": "capsule",
-        "radius": 1.0,
-        "height": 3.804059
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "turret",
@@ -329,36 +170,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/DefendTheGoal/assets/turret.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.0,
-          0.007799,
-          -1.0
-        ],
-        "aabb_max": [
-          1.0,
-          1.48,
-          1.0
-        ],
-        "size": [
-          2.0,
-          1.472201,
-          2.0
-        ],
-        "center": [
-          0.0,
-          0.743899,
-          0.0
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.0,
-          0.736101,
-          1.0
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "goal-net",
@@ -380,36 +193,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/DefendTheGoal/assets/goal.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -3.6,
-          -4.4e-05,
-          -1.000094
-        ],
-        "aabb_max": [
-          3.6,
-          3.0,
-          1.0
-        ],
-        "size": [
-          7.2,
-          3.000044,
-          2.000094
-        ],
-        "center": [
-          0.0,
-          1.499978,
-          -4.7e-05
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          3.6,
-          1.500022,
-          1.000047
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "launcher",
@@ -432,36 +217,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/RobotFPS/assets/launcher.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.108013,
-          -1.0,
-          -2.328342
-        ],
-        "aabb_max": [
-          1.108013,
-          1.347662,
-          4.242559
-        ],
-        "size": [
-          2.216025,
-          2.347662,
-          6.570901
-        ],
-        "center": [
-          0.0,
-          0.173831,
-          0.957109
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.108013,
-          1.173831,
-          3.285451
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "platform",
@@ -483,36 +240,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/MultiAgentSimple/assets/platform.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.0,
-          -0.523236,
-          -2.0
-        ],
-        "aabb_max": [
-          1.0,
-          0.523236,
-          2.0
-        ],
-        "size": [
-          2.0,
-          1.046472,
-          4.0
-        ],
-        "center": [
-          0.0,
-          0.0,
-          0.0
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.0,
-          0.523236,
-          2.0
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "flying-platform",
@@ -534,36 +263,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/MultiAgentSimple/assets/flying_platform.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.9633,
-          -0.375155,
-          -1.468996
-        ],
-        "aabb_max": [
-          1.9632,
-          0.135542,
-          1.468789
-        ],
-        "size": [
-          3.9265,
-          0.510696,
-          2.937785
-        ],
-        "center": [
-          -5e-05,
-          -0.119806,
-          -0.000104
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.96325,
-          0.255348,
-          1.468892
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "plane",
@@ -586,36 +287,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/FlyBy/cartoon_plane/scene.gltf"
       },
-      "dimensions": {
-        "aabb_min": [
-          -436.967133,
-          -180.527924,
-          -393.072968
-        ],
-        "aabb_max": [
-          431.953156,
-          99.216888,
-          418.064606
-        ],
-        "size": [
-          868.920288,
-          279.744812,
-          811.137573
-        ],
-        "center": [
-          -2.506989,
-          -40.655518,
-          12.495819
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          434.460144,
-          139.872406,
-          405.568787
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "jeep",
@@ -638,36 +311,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Racer/assets/glb_files/green_jeep.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.278847,
-          -0.6,
-          -2.199677
-        ],
-        "aabb_max": [
-          1.278847,
-          1.125868,
-          2.075746
-        ],
-        "size": [
-          2.557694,
-          1.725868,
-          4.275422
-        ],
-        "center": [
-          0.0,
-          0.262934,
-          -0.061965
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.278847,
-          0.862934,
-          2.137711
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "convertible",
@@ -689,36 +334,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Racer/assets/glb_files/red_convertible.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.278847,
-          -0.6,
-          -2.0
-        ],
-        "aabb_max": [
-          1.278847,
-          0.356416,
-          2.075746
-        ],
-        "size": [
-          2.557693,
-          0.956416,
-          4.075746
-        ],
-        "center": [
-          0.0,
-          -0.121792,
-          0.037873
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.278847,
-          0.478208,
-          2.037873
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "tree",
@@ -740,36 +357,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Racer/assets/glb_files/tree.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -2.011366,
-          -0.7,
-          -2.164852
-        ],
-        "aabb_max": [
-          1.388789,
-          4.193543,
-          1.798719
-        ],
-        "size": [
-          3.400155,
-          4.893543,
-          3.963571
-        ],
-        "center": [
-          -0.311289,
-          1.746772,
-          -0.183067
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.700078,
-          2.446772,
-          1.981786
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "rock",
@@ -793,32 +382,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Racer/assets/glb_files/rock.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -1.327404,
-          -0.902616,
-          -1.40445
-        ],
-        "aabb_max": [
-          1.434551,
-          0.767405,
-          1.196414
-        ],
-        "size": [
-          2.761955,
-          1.670021,
-          2.600864
-        ],
-        "center": [
-          0.053573,
-          -0.067605,
-          -0.104018
-        ]
-      },
-      "collision": {
-        "primitive": "sphere",
-        "radius": 1.380978
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "waypoint",
@@ -841,36 +406,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Racer/assets/glb_files/waypoint.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -4.44,
-          -0.0,
-          -0.375
-        ],
-        "aabb_max": [
-          4.44,
-          4.44,
-          0.375
-        ],
-        "size": [
-          8.88,
-          4.44,
-          0.75
-        ],
-        "center": [
-          0.0,
-          2.22,
-          0.0
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          4.44,
-          2.22,
-          0.375
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "track-piece-1",
@@ -892,36 +429,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Racer/assets/kenny_track1.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -89.610023,
-          -0.01,
-          -12.910023
-        ],
-        "aabb_max": [
-          20.910019,
-          3.9992,
-          49.610035
-        ],
-        "size": [
-          110.520042,
-          4.0092,
-          62.520058
-        ],
-        "center": [
-          -34.350002,
-          1.9946,
-          18.350006
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          55.260021,
-          2.0046,
-          31.260029
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "track-piece-2",
@@ -943,36 +452,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Racer/assets/kenny_track2.glb"
       },
-      "dimensions": {
-        "aabb_min": [
-          -89.610023,
-          -0.01,
-          -12.910023
-        ],
-        "aabb_max": [
-          20.910019,
-          3.9992,
-          49.610035
-        ],
-        "size": [
-          110.520042,
-          4.0092,
-          62.520058
-        ],
-        "center": [
-          -34.350002,
-          1.9946,
-          18.350006
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          55.260021,
-          2.0046,
-          31.260029
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "chest",
@@ -996,36 +477,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Ships/assets/chest.gltf"
       },
-      "dimensions": {
-        "aabb_min": [
-          -2.874783,
-          0.0,
-          -6.512868
-        ],
-        "aabb_max": [
-          -2.385183,
-          0.549215,
-          -6.075351
-        ],
-        "size": [
-          0.4896,
-          0.549215,
-          0.437517
-        ],
-        "center": [
-          -2.629983,
-          0.274607,
-          -6.294109
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          0.2448,
-          0.274607,
-          0.218758
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     },
     {
       "id": "ship",
@@ -1047,37 +500,8 @@
         "url": "https://github.com/edbeeching/godot_rl_agents_examples",
         "path": "examples/Ships/assets/ship_light.gltf"
       },
-      "dimensions": {
-        "aabb_min": [
-          -2.140195,
-          0.0,
-          -4.835192
-        ],
-        "aabb_max": [
-          0.71,
-          6.545873,
-          3.262374
-        ],
-        "size": [
-          2.850195,
-          6.545873,
-          8.097567
-        ],
-        "center": [
-          -0.715098,
-          3.272936,
-          -0.786409
-        ]
-      },
-      "collision": {
-        "primitive": "box",
-        "half_extents": [
-          1.425098,
-          3.272936,
-          4.048783
-        ]
-      }
+      "dimensions": null,
+      "collision": null
     }
-  ],
-  "measured": true
+  ]
 }

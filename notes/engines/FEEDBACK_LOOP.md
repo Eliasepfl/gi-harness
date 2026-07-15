@@ -43,16 +43,17 @@ dimensionality — inferred from the game (Node3D/state width), never assumed:
 a flying game needs the 3D box; a planar game the 2D grid. Wrong-dimension
 geometry checks produce false walls.
 
-## Skill routing on repair turns (Elias, 2026-07-15)
+## Skill routing on repair turns (Elias, 2026-07-15; corrected same day)
 
-Per the gd-agentic-skills README split: **godot-master orchestrator leads only on
-FRESH generation** ("starting a new Godot project from scratch"); **repair/revise
-turns use Domain Skills** ("adding a specific feature to an existing codebase,
-learning a targeted Godot API pattern"). Concretely: the revise/repair message
-carries (a) the directive/error, (b) the CURRENT game source, and its skill
-context is `render_skill_context(<directive text>, orchestrator=False)` — routed
-on the ERROR, not the original game prompt. Keeps the current state authoritative
-and avoids drift back toward a from-scratch rebuild.
+Revise turns keep the **godot-master orchestrator leading** — the README routes
+"Auditing an existing project to find anti-patterns or standards violations" to
+godot-master, and a revise turn IS an audit-and-fix of an existing project.
+(Earlier draft said domain-skills-only; Elias corrected it.) What changes vs
+fresh generation is the ROUTING QUERY: the domain-skill layer is selected on the
+**DIRECTIVE/ERROR text**, not the original game prompt —
+`render_skill_context(<directive text>, orchestrator=True)` — and the message
+carries (a) the directive and (b) the CURRENT game source. Route on the error,
+keep the current state authoritative, avoid drifting into a from-scratch rebuild.
 
 ## Convergence guard
 
