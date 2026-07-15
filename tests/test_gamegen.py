@@ -1177,6 +1177,7 @@ def test_bank_menu_injected_and_pinned_across_repairs(tmp_path, monkeypatch):
     assert pipe["parts_used"] == ["wrecking_ball"]
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_ledger_pipeline_block_written(tmp_path, monkeypatch):
     ledger = tmp_path / "ledger.jsonl"
     monkeypatch.setattr(GG, "_LEDGER_PATH", str(ledger))

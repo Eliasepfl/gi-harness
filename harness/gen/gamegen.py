@@ -33,6 +33,7 @@ import time
 from harness.core import integrity
 from harness.gen import prompts
 from harness.gen import retrieval
+from harness.gen import skill_context
 from harness.gen.prompts_js import SYSTEM_PROMPT_JS
 
 try:  # lazily needed: the template backend must run without the package
@@ -142,6 +143,8 @@ def _engine_lang(engine):
     if engine == "godot":
         # The godot artifact is a declarative JSON spec, not code.
         return ("JSON", "json")
+    if engine == "gdscript":
+        return ("GDScript", "gdscript")
     return ("Python", "python")
 
 
@@ -166,12 +169,58 @@ def _system_prompt(engine, menu_text=None):
     return _SYSTEM_PROMPT
 
 
+# --- GDScript lane: contract + advisory skill knowledge ----------------------
+# How many gd-agentic skills to retrieve + inject per generation (a genre
+# blueprint + a physics/architecture skill + one more; see skill_context).
+_SKILL_K = 3
+
+# Advisory framing for the injected knowledge block: the CONTRACT above is
+# binding; the reference knowledge is craft to draw on, never to copy.
+_SKILL_ADVISORY_HEADER = (
+    "## Reference knowledge (advisory)\n"
+    "Craft guidance you MAY draw on; adapt, never copy; the CONTRACT above is "
+    "binding, this is not.")
+
+
+def _gdscript_system_prompt(prompt, k=_SKILL_K):
+    """The gdscript system prompt: the GameAPI CONTRACT + an advisory skill block.
+
+    The CONTRACT (api_gdscript.md) is sent unchanged; when the gd-agentic-skills
+    library is present, a clearly delimited ``## Reference knowledge (advisory)``
+    section carries the retrieved skill bodies (attributed, budget-bounded). When
+    the library is absent, ``render_skill_context`` returns ``""`` and the prompt
+    degrades cleanly to the contract alone.
+    """
+    contract = prompts.gdscript_contract()
+    try:
+        context = skill_context.render_skill_context(prompt, k=k)
+    except Exception:  # noqa: BLE001 - a library hiccup must never break a run
+        context = ""
+    if not context:
+        return contract
+    return f"{contract}\n\n{_SKILL_ADVISORY_HEADER}\n\n{context}"
+
+
+def _injected_skills(prompt, k=_SKILL_K):
+    """The skill names injected into the gdscript prompt (for the ledger).
+
+    Deterministic and identical to what ``_gdscript_system_prompt`` splices in;
+    ``[]`` when the library is absent or nothing matches, so we can measure later
+    whether the injected knowledge helped."""
+    try:
+        return [s.name for s in skill_context.select_skills(prompt, k=k)]
+    except Exception:  # noqa: BLE001 - a library hiccup must never break a run
+        return []
+
+
 def _game_ext(engine):
     if engine == "js":
         return ".js"
     if engine == "godot":
         # The .spec.json extension is what detect_engine routes to the godot lane.
         return ".spec.json"
+    if engine == "gdscript":
+        return ".gd"
     return ".py"
 
 
@@ -471,6 +520,11 @@ def _extract_code(text, engine="py"):
             m = re.search(rf"```{lang}\s*\n(.*?)```", text, re.DOTALL)
             if m:
                 return m.group(1)
+    elif engine == "gdscript":
+        for lang in ("gdscript", "gd"):
+            m = re.search(rf"```{lang}\s*\n(.*?)```", text, re.DOTALL)
+            if m:
+                return m.group(1)
     else:
         m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
         if m:
@@ -712,10 +766,11 @@ def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None,
 def _resolve_engine(engine):
     """Target engine: explicit arg > HARNESS_ENGINE env > 'godot' default.
 
-    'godot' (declarative spec, the default post-pivot), 'js' (Planck) or 'py'
-    (pymunk). The py/js lanes are frozen legacy: still fully selectable (explicit
-    arg or HARNESS_ENGINE), but no longer the default target (see
-    notes/engines/GODOT_ONLY_PIVOT.md)."""
+    'godot' (declarative spec, the default post-pivot), 'gdscript' (agent-written
+    .gd game verified through the serve contract; see GDSCRIPT_LANE.md), 'js'
+    (Planck) or 'py' (pymunk). The py/js lanes are frozen legacy: still fully
+    selectable (explicit arg or HARNESS_ENGINE), but no longer the default target
+    (see notes/engines/GODOT_ONLY_PIVOT.md)."""
     if engine is None:
         engine = os.environ.get("HARNESS_ENGINE", "godot")
     e = str(engine).lower()
@@ -723,6 +778,8 @@ def _resolve_engine(engine):
         return "js"
     if e == "py":
         return "py"
+    if e == "gdscript":
+        return "gdscript"
     return "godot"
 
 
@@ -887,17 +944,27 @@ def _generate_core(prompt, *, out_dir, backend, max_repairs, engine, use_bank,
     run_dir = os.path.join(out_dir, slug)
     os.makedirs(run_dir, exist_ok=True)
 
-    # --- Tier-1b retrieval (pre-call, harness-side, pinned for the run) --------
+    # --- Pre-call context injection (harness-side, pinned for the run) ---------
     # Skip for the offline template backend (it ignores the system prompt) and
-    # when use_bank is off. On any retrieval hiccup, degrade to legend-only so a
-    # bank problem can never break generation.
+    # when use_bank is off.
     menu_text, menu_mode, retrieved = None, "off", []
-    if use_bank and backend != "template":
-        try:
-            menu_text, menu_mode, retrieved = retrieval.retrieve_menu(prompt, engine)
-        except Exception:  # noqa: BLE001 - retrieval must never break a run
-            menu_text, menu_mode, retrieved = None, "legend_only", []
-    system = _system_prompt(engine, menu_text)
+    skills = []
+    inject = use_bank and backend != "template"
+    if engine == "gdscript":
+        # The gdscript lane injects gd-agentic SKILL KNOWLEDGE (not the parts
+        # bank): the GameAPI contract + an advisory reference-knowledge section.
+        if inject:
+            skills = _injected_skills(prompt)
+        system = _gdscript_system_prompt(prompt) if inject else prompts.gdscript_contract()
+    else:
+        # Tier-1b parts retrieval. On any hiccup, degrade to legend-only so a
+        # bank problem can never break generation.
+        if inject:
+            try:
+                menu_text, menu_mode, retrieved = retrieval.retrieve_menu(prompt, engine)
+            except Exception:  # noqa: BLE001 - retrieval must never break a run
+                menu_text, menu_mode, retrieved = None, "legend_only", []
+        system = _system_prompt(engine, menu_text)
 
     # Freeze the base code for the duration of the run.
     root = _repo_root()
@@ -910,17 +977,19 @@ def _generate_core(prompt, *, out_dir, backend, max_repairs, engine, use_bank,
     result["engine"] = engine
     _finalize_game(run_dir, slug, result, _game_ext(engine))
 
-    # If auto fell all the way back to templates, the menu was never actually
-    # used — record the honest "off" so the ledger is not misleading.
+    # If auto fell all the way back to templates, no injected context was
+    # actually used — record the honest "off"/empty so the ledger is not misleading.
     if result.get("backend") == "template":
-        menu_mode, retrieved = "off", []
+        menu_mode, retrieved, skills = "off", [], []
 
-    # Pipeline telemetry: retrieved set (pinned), menu mode, and the bank parts
-    # the final game actually instantiated (parsed from its source).
+    # Pipeline telemetry: retrieved set (pinned), menu mode, the bank parts the
+    # final game actually instantiated (parsed from its source), and — for the
+    # gdscript lane — the gd-agentic skills injected into the prompt (so we can
+    # later measure whether the injected knowledge helped).
     parts_used = _parse_parts_used(_read_source(result.get("game_path")),
                                    engine, _bank_names())
     result["pipeline"] = {"retrieved": list(retrieved), "menu_mode": menu_mode,
-                          "parts_used": parts_used}
+                          "parts_used": parts_used, "skills": list(skills)}
 
     # Base code must be untouched: a mutation invalidates the whole run.
     violated = integrity.violations(before, root)
