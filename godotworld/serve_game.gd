@@ -72,6 +72,26 @@ var _world_h := DEFAULT_H
 var _actions_cache := []                # actions() captured at build (handshake)
 var _speedup := 1
 
+# --- Batched (in-scene) instances -- ONE socket serves N independent worlds ------ #
+# Populated only when init carries n_instances > 1; single-instance mode leaves these
+# empty and every op below takes the UNCHANGED, byte-identical legacy path. The N worlds
+# live in ONE SceneTree (each under its OWN SubViewport world -> isolated physics space),
+# so a single `await physics_frame` steps ALL N at once: the in-scene batching that
+# amortises the per-tick engine loop and the socket round-trip across N worlds (the
+# godot_rl_agents batching idea). Parallel arrays are indexed by instance 0..N-1.
+var _batched := false                   # true once init carried an n_instances key
+var _n_instances := 1                   # N worlds over one socket (>=1 when batched)
+var _base_seed := 0                     # instance i is (re)built at seed base_seed + i
+var _games := []                        # per-instance game Node
+var _viewports := []                    # per-instance SubViewport (own physics world)
+var _latches_arr := []                  # per-instance {checkpoint -> latch tick | null}
+var _applied_arr := []                  # per-instance decision ticks since (re)build
+var _result_arr := []                   # per-instance "" | success | failure | error
+var _done_term_arr := []                # per-instance terminal reached
+var _done_trunc_arr := []               # per-instance truncated at horizon
+var _frozen_arr := []                   # per-instance NaN/exploded physics
+var _nan_arr := []                      # per-instance NaN flag (frame diagnostic)
+
 
 # =========================================================================== #
 # Lifecycle -- determinism pins mirror runner.gd (paired physics/time scaling).
@@ -327,6 +347,8 @@ func _safe_checkpoints() -> Dictionary:
 # Stepping (act) -- mirrors runner.gd's per-tick body: act + K=6 + latch + terminal
 # =========================================================================== #
 func _op_act(msg: Dictionary) -> String:
+	if _batched:
+		return await _op_act_batch(msg)
 	if _game == null:
 		return '{"ok":false,"error":"no game (call init first)"}'
 	var actions_list = msg.get("actions", [])
@@ -445,6 +467,12 @@ func _op_init(msg: Dictionary) -> String:
 	if not comp.ok:
 		return '{"ok":false,"error":"%s"}' % _esc(comp.error)
 	_script = comp.script
+	# An explicit n_instances key (even ==1) selects the BATCHED array-frame path; its
+	# ABSENCE keeps the legacy single-instance scalar frame byte-identical to before.
+	_batched = msg.has("n_instances")
+	if _batched:
+		_n_instances = max(1, int(msg.get("n_instances", 1)))
+		return await _batch_init(msg)
 	_build_err = await _rebuild(int(msg.get("seed", 0)))
 	if _build_err != "":
 		return '{"ok":false,"error":"%s"}' % _esc("build failed: " + _build_err)
@@ -452,12 +480,364 @@ func _op_init(msg: Dictionary) -> String:
 
 
 func _op_reset(msg: Dictionary) -> String:
+	if _batched:
+		return _op_reset_batch(msg)             # synchronous: no physics stepped on reset
 	if _source == "":
 		return '{"ok":false,"error":"no game loaded"}'
 	_build_err = await _rebuild(int(msg.get("seed", 0)))
 	if _build_err != "":
 		return '{"ok":false,"error":"%s"}' % _esc("build failed: " + _build_err)
 	return _frame_json(false, 0.0)
+
+
+# =========================================================================== #
+# Batched (in-scene) stepping -- N independent worlds over ONE socket.
+#
+# Each instance lives under its OWN SubViewport world (a fresh World2D -> isolated 2D
+# physics space; own_world_3d -> isolated 3D space), so the N worlds never interact and
+# instance i stays byte-identical to a lone single-instance run at seed base_seed + i
+# (the determinism tests pin this). A single `await physics_frame` steps ALL N spaces at
+# once, so the K-frame decision-tick burst and the socket round-trip are shared across N.
+# The batched frame is ARRAYS (obs_state[N], checkpoints[N], done_term[N], ...); the
+# single-instance frame above is untouched, so N=1 (no n_instances key) is byte-identical.
+# =========================================================================== #
+func _batch_new_viewport() -> SubViewport:
+	# One PERSISTENT SubViewport per instance -> one isolated physics world (a fresh
+	# World2D -> its own 2D space; own_world_3d -> its own 3D space). The viewport (and
+	# its space) is reused across episodes -- exactly like the single-instance path reuses
+	# root's world -- so a reset only rebuilds the GAME node inside it.
+	var vp := SubViewport.new()
+	vp.world_2d = World2D.new()                     # isolated 2D physics space
+	vp.render_target_update_mode = SubViewport.UPDATE_DISABLED
+	vp.size = Vector2i(1, 1)
+	root.add_child(vp)
+	return vp
+
+
+func _batch_build_game(vp: SubViewport, inst_seed: int) -> Dictionary:
+	# Instantiate + add the game under `vp` + build(seed). Returns {ok, error, game}. The
+	# host grants the game nothing but tree membership (in vp's private world) + the seed.
+	if _script == null:
+		return {"ok": false, "error": "no compiled game script"}
+	var made := _instantiate(_script)
+	if not made.ok:
+		return {"ok": false, "error": made.error}
+	var inst = made.instance
+	var missing := _missing_methods(inst)
+	if not missing.is_empty():
+		inst.free()
+		return {"ok": false, "error": "missing contract method(s): " + ", ".join(missing)}
+	# Isolate the 3D space ONLY for a 3D game -- a 2D game (the common case) would else
+	# pay for an empty per-instance World3D space stepped every frame for nothing.
+	vp.own_world_3d = inst is Node3D
+	vp.add_child(inst)
+	inst.build(inst_seed)
+	return {"ok": true, "error": "", "game": inst}
+
+
+func _batch_teardown() -> void:
+	for vp in _viewports:
+		if vp != null and is_instance_valid(vp):
+			vp.queue_free()
+	_viewports = []
+	_games = []
+
+
+func _batch_init(msg: Dictionary) -> String:
+	# Build N INDEPENDENT copies of the game, instance i seeded base_seed + i. Handshake
+	# rides on the first batched frame (actions/world size captured from instance 0, which
+	# is shared -- same source -> same declared actions + world extent).
+	_base_seed = int(msg.get("base_seed", msg.get("seed", 0)))
+	_batch_teardown()
+	await process_frame                             # flush any prior deferred free
+	_games = []
+	_viewports = []
+	_latches_arr = []
+	_applied_arr = []
+	_result_arr = []
+	_done_term_arr = []
+	_done_trunc_arr = []
+	_frozen_arr = []
+	_nan_arr = []
+	for i in range(_n_instances):
+		var vp := _batch_new_viewport()
+		var r := _batch_build_game(vp, _base_seed + i)
+		if not r.ok:
+			return '{"ok":false,"error":"%s"}' % _esc(
+				"build failed (instance %d): %s" % [i, str(r.error)])
+		_viewports.append(vp)
+		_games.append(r.game)
+		_applied_arr.append(0)
+		_result_arr.append("")
+		_done_term_arr.append(false)
+		_done_trunc_arr.append(false)
+		_frozen_arr.append(false)
+		_nan_arr.append(false)
+		var latches := {}
+		for k in _safe_checkpoints_of(r.game).keys():
+			latches[str(k)] = null
+		_latches_arr.append(latches)
+	_actions_cache = _read_actions_of(_games[0])
+	_read_world_size_of(_games[0])
+	return _batch_frame_json(true)
+
+
+func _op_reset_batch(msg: Dictionary) -> String:
+	# Reset a SUBSET of instances (SB3 per-instance autoreset) or ALL (vec-env reset()).
+	# Instance i is rebuilt at seed base_seed + i (its FIXED per-slot seed, like the
+	# DummyVecEnv path), unless the op carries an explicit `seeds` list (test hook).
+	if _games.is_empty():
+		return '{"ok":false,"error":"no game loaded"}'
+	var base := int(msg.get("base_seed", _base_seed))
+	_base_seed = base
+	var instances = msg.get("instances", null)
+	var seeds = msg.get("seeds", null)
+	var idx_list := []
+	if typeof(instances) == TYPE_ARRAY:
+		for x in instances:
+			idx_list.append(int(x))
+	else:
+		for i in range(_n_instances):
+			idx_list.append(i)
+	for j in range(idx_list.size()):
+		var i := int(idx_list[j])
+		if i < 0 or i >= _n_instances:
+			continue
+		var inst_seed := base + i
+		if typeof(seeds) == TYPE_ARRAY and j < seeds.size():
+			inst_seed = int(seeds[j])
+		var err := _batch_rebuild_instance(i, inst_seed)
+		if err != "":
+			return '{"ok":false,"error":"%s"}' % _esc(
+				"build failed (instance %d): %s" % [i, str(err)])
+	return _batch_frame_json(false)
+
+
+func _batch_rebuild_instance(i: int, inst_seed: int) -> String:
+	# Reuse the PERSISTENT viewport (its isolated space) and rebuild only the game node.
+	# Immediate free() (NOT queue_free + await): an await here would step physics on the
+	# OTHER (live) instances during a partial autoreset, desyncing them from a clean run.
+	# free() is safe -- we are in the serve op handler BETWEEN frames (the busy-wait read
+	# froze the world), never inside a physics callback.
+	var old_game = _games[i]
+	if old_game != null and is_instance_valid(old_game):
+		old_game.free()
+	var r := _batch_build_game(_viewports[i], inst_seed)
+	if not r.ok:
+		return str(r.error)
+	_games[i] = r.game
+	_applied_arr[i] = 0
+	_result_arr[i] = ""
+	_done_term_arr[i] = false
+	_done_trunc_arr[i] = false
+	_frozen_arr[i] = false
+	_nan_arr[i] = false
+	var latches := {}
+	for k in _safe_checkpoints_of(r.game).keys():
+		latches[str(k)] = null
+	_latches_arr[i] = latches
+	return ""
+
+
+func _op_act_batch(msg: Dictionary) -> String:
+	if _games.is_empty():
+		return '{"ok":false,"error":"no game (call init first)"}'
+	var actions_list = msg.get("actions", [])
+	if typeof(actions_list) != TYPE_ARRAY:
+		actions_list = []
+	var n_ticks := int(msg.get("n_ticks", 1))
+	await _batch_do_ticks(actions_list, n_ticks)
+	return _batch_frame_json(false)
+
+
+func _batch_do_ticks(actions_list: Array, n_ticks: int) -> void:
+	# One decision tick = act(one action per LIVE instance) + K=6 physics frames (shared
+	# across all worlds) + per-instance latch + terminal. Mirrors the single-instance
+	# _do_ticks body exactly, per instance, so instance i matches a lone run tick for tick.
+	for _t in range(n_ticks):
+		for i in range(_n_instances):
+			if _done_term_arr[i] or _done_trunc_arr[i]:
+				continue
+			var action = null
+			if i < actions_list.size():
+				action = actions_list[i]
+			if action != null:
+				_games[i].act(str(action))
+			_applied_arr[i] += 1
+		for k in range(K_STEPS):
+			await physics_frame                     # steps EVERY instance's space at once
+		# NaN/explosion check ONCE after the K-frame burst (not per frame): the batched
+		# loop can't early-break a single world anyway, and state() per frame per instance
+		# is the batch's hot path. A NaN persists, so a single post-burst check still
+		# catches an exploded world (the single-instance path checks per frame only to
+		# break early, which a shared loop cannot do).
+		for i in range(_n_instances):
+			if _done_term_arr[i] or _done_trunc_arr[i]:
+				continue
+			if not _sane_of(_games[i]):
+				_frozen_arr[i] = true
+				_nan_arr[i] = true
+		for i in range(_n_instances):
+			if _done_term_arr[i] or _done_trunc_arr[i]:
+				continue
+			_latch_i(i)
+			if _frozen_arr[i]:
+				_result_arr[i] = "error"
+				_done_term_arr[i] = true
+				continue
+			if _truthy(_games[i].is_failure()):
+				_result_arr[i] = "failure"
+				_done_term_arr[i] = true
+				continue
+			if _truthy(_games[i].is_success()):
+				_result_arr[i] = "success"
+				_done_term_arr[i] = true
+				continue
+			if _applied_arr[i] >= _horizon:
+				_done_trunc_arr[i] = true
+
+
+func _latch_i(i: int) -> void:
+	var cps = _safe_checkpoints_of(_games[i])
+	var latches = _latches_arr[i]
+	for key in cps.keys():
+		var k := str(key)
+		if not latches.has(k):
+			latches[k] = null
+		if latches[k] == null and _truthy(cps[key]):
+			latches[k] = _applied_arr[i]
+
+
+# Game-parameterised twins of the single-instance _safe_state/_safe_checkpoints/
+# _read_actions/_read_world_size/_sane helpers (which read the _game member). Kept
+# separate so the single-instance functions above stay byte-identical.
+func _safe_state_of(game: Node) -> Dictionary:
+	var st = game.state()
+	return st if typeof(st) == TYPE_DICTIONARY else {}
+
+
+func _safe_checkpoints_of(game: Node) -> Dictionary:
+	var c = game.checkpoints()
+	return c if typeof(c) == TYPE_DICTIONARY else {}
+
+
+func _read_actions_of(game: Node) -> Array:
+	var a = game.actions()
+	var out := []
+	if typeof(a) == TYPE_ARRAY:
+		for v in a:
+			out.append(str(v))
+	return out
+
+
+func _read_world_size_of(game: Node) -> void:
+	_world_w = DEFAULT_W
+	_world_h = DEFAULT_H
+	var st = _safe_state_of(game)
+	var ws = st.get("world_size", null)
+	if typeof(ws) == TYPE_ARRAY and ws.size() == 2:
+		_world_w = float(ws[0])
+		_world_h = float(ws[1])
+
+
+func _sane_of(game: Node) -> bool:
+	var st = _safe_state_of(game)
+	var bodies = st.get("bodies", [])
+	if typeof(bodies) != TYPE_ARRAY:
+		return true
+	for b in bodies:
+		if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)):
+			continue
+		var p = b.get("pos", [])
+		var v = b.get("vel", [])
+		if typeof(p) != TYPE_ARRAY or typeof(v) != TYPE_ARRAY:
+			continue
+		for c in p:
+			if not is_finite(float(c)):
+				return false
+		var sq := 0.0
+		for c in v:
+			var cv := float(c)
+			if not is_finite(cv):
+				return false
+			sq += cv * cv
+		if sqrt(sq) > VMAX:
+			return false
+	return true
+
+
+func _entities_json_of(game: Node) -> String:
+	var st = _safe_state_of(game)
+	var bodies = st.get("bodies", [])
+	var parts := PackedStringArray()
+	if typeof(bodies) == TYPE_ARRAY:
+		for b in bodies:
+			if typeof(b) != TYPE_DICTIONARY:
+				continue
+			parts.append('"%s":%s' % [_esc(str(b.get("name", ""))), _body_obs_json(b)])
+	return "{%s}" % ",".join(parts)
+
+
+func _checkpoints_json_i(i: int) -> String:
+	var parts := PackedStringArray()
+	var latches = _latches_arr[i]
+	for key in latches.keys():
+		var t = latches[key]
+		var val := "null" if t == null else str(int(t))
+		parts.append('"%s":%s' % [_esc(str(key)), val])
+	return "{%s}" % ",".join(parts)
+
+
+func _oob_json_of(game: Node, margin: float) -> String:
+	var out := PackedStringArray()
+	var st = _safe_state_of(game)
+	var bodies = st.get("bodies", [])
+	if typeof(bodies) == TYPE_ARRAY:
+		for b in bodies:
+			if typeof(b) != TYPE_DICTIONARY or bool(b.get("static", false)):
+				continue
+			var p = b.get("pos", [0.0, 0.0])
+			if typeof(p) != TYPE_ARRAY or p.size() < 2:
+				continue
+			var px := float(p[0]); var py := float(p[1])
+			if px < -margin or py < -margin or px > _world_w + margin or py > _world_h + margin:
+				out.append('"%s"' % _esc(str(b.get("name", ""))))
+	return ",".join(out)
+
+
+func _batch_frame_json(with_handshake: bool) -> String:
+	# ARRAY frame: every field is a length-N list indexed by instance. world_size + actions
+	# are shared (same source). n_instances marks the batched frame for the Python reader.
+	var obs_parts := PackedStringArray()
+	var cp_parts := PackedStringArray()
+	var tick_parts := PackedStringArray()
+	var result_parts := PackedStringArray()
+	var term_parts := PackedStringArray()
+	var trunc_parts := PackedStringArray()
+	var nan_parts := PackedStringArray()
+	var oob_parts := PackedStringArray()
+	for i in range(_n_instances):
+		obs_parts.append(_entities_json_of(_games[i]))
+		cp_parts.append(_checkpoints_json_i(i))
+		tick_parts.append("%d" % int(_applied_arr[i]))
+		var res := "null"
+		if str(_result_arr[i]) != "":
+			res = '"%s"' % str(_result_arr[i])
+		result_parts.append(res)
+		term_parts.append(_b(bool(_done_term_arr[i])))
+		trunc_parts.append(_b(bool(_done_trunc_arr[i])))
+		nan_parts.append(_b(bool(_nan_arr[i])))
+		oob_parts.append("[%s]" % _oob_json_of(_games[i], 0.0))
+	var head := ""
+	if with_handshake:
+		head = '"ok":true,"actions":%s,' % _actions_json()
+	return ('{%s"n_instances":%d,"obs_state":[%s],"checkpoints":[%s],"tick":[%s],'
+		+ '"result":[%s],"done_term":[%s],"done_trunc":[%s],'
+		+ '"world_size":[%s,%s],"nan":[%s],"oob":[%s],"error":null}') % [
+		head, _n_instances, ",".join(obs_parts), ",".join(cp_parts),
+		",".join(tick_parts), ",".join(result_parts), ",".join(term_parts),
+		",".join(trunc_parts), _num(_world_w), _num(_world_h),
+		",".join(nan_parts), ",".join(oob_parts)]
 
 
 # =========================================================================== #
