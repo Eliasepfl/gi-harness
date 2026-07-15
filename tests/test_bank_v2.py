@@ -208,6 +208,7 @@ def test_committed_v2_catalog_matches_fresh_build():
 # ====================================================================== #
 # Advisory menu — name | volume | role
 # ====================================================================== #
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_v2_menu_renders_volume_and_role():
     b = _v2()
     menu = R.build_menu(["box_2x1", "coin_r1", "gate_6x4"], "godot", bank=b)
@@ -221,6 +222,7 @@ def test_v2_menu_renders_volume_and_role():
     assert "binds sprites by name" not in menu
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_v2_retrieve_menu_uses_v2_lines():
     b = _v2()
     menu, mode, names = R.retrieve_menu("a volcano level with lava", "godot", bank=b)

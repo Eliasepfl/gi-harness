@@ -49,6 +49,7 @@ def test_window_size_respects_scale():
 # ==========================================================================
 #  watch() runs a short explicit-actions episode to completion (dummy driver)
 # ==========================================================================
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_watch_runs_short_episode_to_completion():
     # Explicit witness actions -> no re-verification; high speed keeps it snappy.
     actions = ["drop_boulder", "drop_boulder", "drop_boulder", "drop_boulder",
@@ -64,6 +65,7 @@ def test_watch_runs_short_episode_to_completion():
     assert isinstance(result["ticks"], int) and result["ticks"] >= 1
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_watch_scale_parameter_runs():
     # A scaled window must still run and return cleanly under the dummy driver.
     result = viewer.watch(TEMPLATE_GAME, actions=["drop_boulder"] * 4,

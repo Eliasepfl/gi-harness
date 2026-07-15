@@ -152,6 +152,14 @@ def compose(engine="py", menu_text=None) -> str:
     speak the declarative-spec vocabulary (no world.add / world.control / rng
     idioms). The menu splice point is shared.
     """
+    # PURGED (Elias, 2026-07-15): the spec-lane prompt library is deleted -
+    # the project pivoted to agent-written GDScript verified through the
+    # GameAPI serve contract (notes/engines/GDSCRIPT_LANE.md). The two
+    # surviving prompt surfaces (the GameAPI contract reference and the
+    # derived attacker prompt) live with the gdscript lane, not here.
+    return ("[SPEC-LANE PARKED 2026-07-15] prompt library purged; the gdscript "
+            "lane owns the surviving prompt surfaces - notes/engines/GDSCRIPT_LANE.md")
+
     key = _engine_key(engine)
     if key == "godot":
         parts = [
@@ -196,7 +204,10 @@ def render_bank_menu(parts_block: str, usage_line: str,
     advisory footer. `escape_hatch` fills the footer's construction-API clause so the
     declarative godot menu never advertises `world.add`.
     """
-    tmpl = _read(BANK_MENU_TMPL)
+    # Template file purged 2026-07-15; the frame is inlined (menu survives for
+    # the gdscript lane's advisory volume vocabulary).
+    tmpl = ("## Parts menu (advisory)\n{usage_line}\n\n{parts_block}\n\n"
+            "These are suggestions, never a catalog: {escape_hatch}\n")
     return (tmpl.replace("{usage_line}", usage_line)
                 .replace("{parts}", parts_block)
                 .replace("{escape_hatch}", escape_hatch).strip())

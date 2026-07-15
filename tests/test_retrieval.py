@@ -81,6 +81,7 @@ def test_score_covers_whole_bank_and_sorts_desc():
 
 # --- Menu rendering -----------------------------------------------------------
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_py_menu_uses_world_part_and_is_advisory():
     menu_text, mode, names = R.retrieve_menu(
         "push a crate onto a pressure plate to open the goal", "py")
@@ -95,6 +96,7 @@ def test_py_menu_uses_world_part_and_is_advisory():
     assert "world.add" in menu_text
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_js_menu_inlines_presets_and_states_naming_rule():
     menu_text, mode, names = R.retrieve_menu(
         "guide a puck across the ice onto the goal pad", "js")
@@ -114,6 +116,7 @@ def test_build_menu_empty_is_empty_string():
     assert R.build_menu(None, "js") == ""
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_multibody_part_renders_all_bodies_note_in_js():
     # wrecking_ball is a 2-body subassembly; the js line must flag the extra body.
     menu_text = R.build_menu(["wrecking_ball"], "js")

@@ -247,6 +247,7 @@ def test_builtin_checkpoints_are_not_success_restatements():
 
 # --- The open prompt ----------------------------------------------------------
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_prompt_teaches_the_world_api():
     sp = GG._SYSTEM_PROMPT
     # Construction / dynamics / queries are all referenced.
@@ -260,6 +261,7 @@ def test_prompt_teaches_the_world_api():
         assert tok in sp, tok
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_prompt_requires_checkpoints():
     sp = GG._SYSTEM_PROMPT
     # v2.1: the checkpoints contract is taught in full.
@@ -281,6 +283,7 @@ def test_prompt_requires_checkpoints():
     assert '"halfway"' in m.group(1)
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_prompt_is_open_not_a_v1_worked_example():
     sp = GG._SYSTEM_PROMPT
     # No trace of the v1 closed prompt (SceneSDK genre-deciding vocabulary).
@@ -1133,6 +1136,7 @@ def checkpoints(world):
 '''
 
 
+@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
 def test_bank_menu_injected_and_pinned_across_repairs(tmp_path, monkeypatch):
     # The retrieved Tier-1b menu is spliced into the system prompt and PINNED:
     # every repair attempt sees the identical system prompt (same menu).
