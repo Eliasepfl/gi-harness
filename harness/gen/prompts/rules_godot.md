@@ -12,3 +12,9 @@ These are the moat the verifier replays your winning run against (G0-G4). None i
 - CONTAINMENT: no body may EVER leave the world under ANY input sequence - the adversarial suite hurls every body around with hostile inputs, and a single escape rejects the environment. Close the play space with static perimeter walls (and a ceiling if anything can be launched upward), and make falling into any open gap a failure kill-plane, never a silent exit.
 - SPEED CAP: clamp the controlled body's velocity in on_step (a velocity_clamp). Impulses stack across ticks - hostile spam builds thousands of px/s and crosses any wall or kill-plane within one tick, breaking containment. The clamp is two fields and makes the whole game robust.
 - Body budget is a SOFT target, not enforced: up to ~16 gameplay bodies plus up to ~16 decor/dressing bodies. Keep every body inside YOUR declared world at rest, and avoid initial overlaps.
+- Steering/vehicle games (thrust+turn control): exploration is far harder than
+  hopping - a random searcher rarely produces coherent driving. Place the FIRST
+  checkpoint within a few seconds of near-straight thrust from spawn, and each
+  later gate one short curve from the previous one. Long or twisty first legs
+  make the game unsolvable in search budget even when a human could drive it.
+  [lesson: pilot-2026-07-15, 3/5 attempts died at the first milestone]
