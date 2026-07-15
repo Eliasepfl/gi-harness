@@ -24,8 +24,16 @@ The taxonomy (one directive-producing row per defect; every other outcome yields
   G4 (adversarial) — directive-producing outcomes only; the rest are informational:
     * single_action_win            -> `single_action_win`: the game is winnable by one action.
     * broken_gating                -> `broken_gating`: success reachable WITHOUT a gating checkpoint.
-    * softlock / stuck             -> `softlock` / `stuck`: quotes the frozen-state reproducer.
-    * shortcut_beats_witness, escape, nan, unintended_success, ... -> NO directive (informational).
+    * softlock                     -> `softlock`: quotes the frozen-state reproducer. ONLY the
+                                      CERTIFIED class (tree-refutation confirmed — the
+                                      inverse-value tier's oracle) compiles; heuristic `stuck`
+                                      findings are informational. Rationale (first harden wave,
+                                      2026-07-15): unconfirmed fuzz-"stuck" directives are
+                                      unfixable-by-construction — a mostly-idle fuzzer looks
+                                      immobile in ANY game; drive-cart re-certified a fix and
+                                      the same fingerprint recurred (REPAIR_STALLED).
+    * stuck, shortcut_beats_witness, escape, nan, unintended_success, ... -> NO directive
+      (informational).
 
 PURE and deterministic: identical oracle dicts -> identical directives (same order, same
 fingerprints). No I/O, no network, no torch — the whole taxonomy is offline-testable.
@@ -42,9 +50,11 @@ UNREACHED_MAX = 0.05   # max latch rate <= this == "nothing ever latched" (unsol
 NO_SUCCESS_MAX = 0.0   # success rate <= this == "never wins" (difficulty-reduction row)
 
 # G4 outcomes that COMPILE to a directive. Everything else a G4 report can carry
-# (shortcut_beats_witness, escape, nan, unintended_success, intended_success, nothing)
-# is informational for the repair loop and yields NO directive.
-G4_DIRECTIVE_OUTCOMES = ("single_action_win", "broken_gating", "softlock", "stuck")
+# (stuck — the UNCONFIRMED heuristic class, shortcut_beats_witness, escape, nan,
+# unintended_success, intended_success, nothing) is informational and yields NO
+# directive: only defects with a PROOF (a replayable reproducer the model can be
+# held to) are worth a repair round.
+G4_DIRECTIVE_OUTCOMES = ("single_action_win", "broken_gating", "softlock")
 
 
 # ======================================================================== #

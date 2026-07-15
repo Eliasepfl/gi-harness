@@ -136,9 +136,12 @@ def test_g4_softlock_quotes_reproducer():
     assert "length 3" in ds[0].text            # the frozen-state reproducer summary
 
 
-def test_g4_stuck_directive():
+def test_g4_stuck_is_informational():
+    """Unconfirmed heuristic 'stuck' compiles NO directive (first harden wave:
+    fuzz-idleness looks identical in any game — an unfixable accusation). Only
+    the tree-refutation-CERTIFIED `softlock` class earns a repair round."""
     ds = F.compile_directives({"g4": g4(g4_finding("stuck", hard=False))})
-    assert sources(ds) == ["stuck"]
+    assert ds == []
 
 
 def test_g4_informational_findings_yield_no_directive():
