@@ -182,7 +182,7 @@ def _system_prompt(engine, menu_text=None):
 _SKILL_K = 2
 # Token budget for the whole injected block: the orchestrator's decision matrix
 # is the high-value base, so give it room (~half) + the domain skills (~half).
-_SKILL_MAX_TOKENS = 12000
+_SKILL_MAX_TOKENS = 24000  # godot-master (~12k) UNtruncated + 2 domain skills (~12k)
 
 # Advisory framing for the injected knowledge block: the CONTRACT above is
 # binding; the reference knowledge is craft to draw on, never to copy.
