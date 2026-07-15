@@ -765,7 +765,7 @@ def cmd_rl_probe(args) -> int:
         return _module_missing("rl.certify", exc, args.json)
     try:
         result = g3_prime(args.game_path, budget_steps=args.budget,
-                          trainer=args.trainer)
+                          trainer=args.trainer, method=args.method)
     except Exception as exc:  # noqa: BLE001
         return _call_error("rl probe", exc, args.json)
 
@@ -776,6 +776,7 @@ def cmd_rl_probe(args) -> int:
     else:
         wit = result.get("rl_witness")
         print(f"{result.get('game_path')}  trainer={result.get('trainer')}  "
+              f"method={result.get('method')}  "
               f"learnable={result.get('learnable')}  "
               f"stochastic_sr={result.get('stochastic_success_rate')}  "
               f"greedy_sr={result.get('final_success_rate')}  "
@@ -963,6 +964,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="RL trainer backend: 'vendored' CleanRL-mirror PPO "
                          "(default) or 'sb3' SB3 PPO (the [LF] migration, "
                          "GODOT_RL_AGENTS_CAPABILITIES.md §6.7)")
+    rp.add_argument("--method", default="ppo", choices=["ppo", "a2c", "dqn"],
+                    help="SB3 algorithm (trainer='sb3' only): 'ppo' (default), "
+                         "'a2c' or 'dqn'; recorded in the ledger as 'method'. "
+                         "trainer='vendored' accepts only 'ppo'.")
     rp.add_argument("--json", action="store_true")
     rp.set_defaults(func=cmd_rl_probe)
 

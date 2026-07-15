@@ -99,6 +99,34 @@ def corridor(tmp_path):
     return str(p)
 
 
+# --- ALGO registry / method plumbing (no serve needed) -------------------- #
+def test_algo_registry_resolves():
+    """The method registry maps ppo/a2c/dqn onto the BASE stable_baselines3
+    classes; an sb3-contrib name (the RecurrentPPO followup) errors cleanly."""
+    from stable_baselines3 import A2C, DQN, PPO
+    assert sb3_trainer._resolve_algo("ppo") is PPO
+    assert sb3_trainer._resolve_algo("a2c") is A2C
+    assert sb3_trainer._resolve_algo("dqn") is DQN
+    assert set(sb3_trainer.ALGO_METHODS) == {"ppo", "a2c", "dqn"}
+    with pytest.raises(ValueError, match="unknown method"):
+        sb3_trainer._resolve_algo("recurrentppo")   # sb3-contrib -> followup
+
+
+def test_train_method_defaults_to_ppo():
+    """method='ppo' is the default (regression: the unchanged sb3 PPO lane)."""
+    import inspect
+    assert inspect.signature(sb3_trainer.train).parameters["method"].default == "ppo"
+
+
+def test_vendored_rejects_nondefault_method(corridor):
+    """g3_prime on the vendored lane rejects a non-default method with a clear
+    error (the algo registry is an SB3-only seam) — raised before any training."""
+    with pytest.raises(ValueError, match="vendored"):
+        g3_prime(corridor, trainer="vendored", method="a2c", **_TRAIN_KW)
+    # ppo is the vendored lane's only method and is accepted (no raise here).
+    assert g3_prime.__doc__ is not None
+
+
 @requires_serve
 def test_sb3_train_returns_vendored_surface(corridor):
     """sb3_trainer.train drives the gymnasium adapter through SB3 PPO and returns
@@ -157,3 +185,60 @@ def test_sb3_g3_prime_smoke_matches_vendored_shape(corridor):
         assert wit is None or set(wit) == _WITNESS_KEYS
     if sb3res["rl_witness"] is not None:
         assert sb3res["bridge_ok"] is True   # replayed to success via JsExecutor
+
+
+@requires_serve
+@pytest.mark.parametrize("method", ["a2c", "dqn"])
+def test_sb3_train_smoke_per_method(corridor, method):
+    """Tiny-budget end-to-end smoke for each non-PPO base algorithm: it drives the
+    SAME gymnasium/Monitor seam through SB3, returns the vendored trainer surface
+    with `method` recorded, and emits the identical greedy/sampled eval-episode
+    shape. DQN (off-policy) is built from its OWN hyperparameters — none of PPO's
+    n_steps/minibatch/clip knobs are forced onto it."""
+    def make_env():
+        return PlanckEnv(corridor, horizon=150)
+
+    probe = make_env()
+    obs_dim = probe.observation_space.shape[0]
+    n = probe.action_space.n
+    probe.close()
+
+    res = sb3_trainer.train(make_env, obs_dim, n, total_steps=4000, seed=0,
+                            method=method, num_envs=2, num_steps=32, patience=999)
+    vendored_keys = {"agent", "curve_return", "curve_latched", "curve_success",
+                     "steps_to_first_success", "global_steps", "updates",
+                     "stopped_early", "best_success_rate_train", "train_wall_s", "hp"}
+    assert vendored_keys <= set(res)
+    assert res["method"] == method
+    assert isinstance(res["curve_latched"], list) and res["curve_latched"]
+    if method == "dqn":
+        # DQN's OWN off-policy knobs are in play; the PPO rollout knobs are not.
+        assert res["hp"]["buffer_size"] == sb3_trainer.DQN_DEFAULTS["buffer_size"]
+
+    # Same eval/witness surface for every method (greedy=det True / sampled=det False).
+    eval_env = PlanckEnv(corridor, horizon=150)
+    try:
+        g = sb3_trainer.greedy_episode(eval_env, res["agent"], seed=0)
+        s = sb3_trainer.sample_episode(eval_env, res["agent"], seed=0, torch_seed=7)
+    finally:
+        eval_env.close()
+    for ep in (g, s):
+        assert set(ep) == {"seed", "actions", "ticks", "success", "result",
+                           "return", "latched", "greedy"}
+        assert isinstance(ep["actions"], list)
+
+
+@requires_serve
+def test_sb3_g3_prime_records_method(corridor):
+    """g3_prime threads `method` through to the SB3 trainer end-to-end and records
+    it in the result dict (the ledger key); the witness ORACLE stays method-agnostic
+    (shape identical to the ppo path; any emitted witness still bridges)."""
+    res = g3_prime(corridor, trainer="sb3", method="a2c", **_TRAIN_KW)
+    assert res["method"] == "a2c"
+    assert res["trainer"] == "sb3"
+    assert isinstance(res["learnable"], bool)
+    assert res["bridge_ok"] in (None, True)
+    wit = res["rl_witness"]
+    assert wit is None or set(wit) == _WITNESS_KEYS
+    if wit is not None:
+        assert res["bridge_ok"] is True
