@@ -24,9 +24,11 @@ Public surface:
 * ``retrieve_menu(prompt, engine)`` -> ``(menu_text|None, menu_mode, names)`` —
                               the one call ``gamegen.generate_game`` makes.
 
-The menu is ADVISORY: ``build_menu`` frames it with the "optional, invent freely,
-world.add remains available" footer (``prompts/bank_menu.md.tmpl``), and every
-out-of-menu / escape-hatch use is telemetry, never an error (pipeline.md D.1).
+The menu is ADVISORY: ``build_menu`` frames it with an "optional, invent freely,
+raw-body escape hatch stays open" footer (``prompts/bank_menu.md.tmpl``; the escape
+clause is engine-specific so the declarative godot menu never advertises
+``world.add``), and every out-of-menu / escape-hatch use is telemetry, never an
+error (pipeline.md D.1).
 """
 
 from __future__ import annotations
@@ -298,6 +300,19 @@ def _py_line(entry: dict) -> str:
             f'{tail} | bodies: {len(entry.get("assembly", []))}')
 
 
+def _godot_line(entry: dict) -> str:
+    """Advisory godot menu line: name + category + summary + tunable ranges.
+
+    No world.add / world.part call — the declarative godot spec builds bodies as
+    DATA, so the menu is pure NAME + PHYSICS vocabulary, never a construction
+    snippet (and never anchors the design to a bank part).
+    """
+    over = _overrides_summary(entry)
+    tail = f" | tune: {over}" if over else ""
+    return (f'  {entry["name"]} ({entry["category"]}) - {entry["summary"]}'
+            f'{tail} | bodies: {len(entry.get("assembly", []))}')
+
+
 def _js_line(entry: dict) -> str:
     n_bodies = len(entry.get("assembly", []))
     note = "" if n_bodies == 1 else f"  (+ {n_bodies - 1} more body/joint - see world.pin/pivot/spring)"
@@ -314,8 +329,10 @@ def build_menu(names, engine="py", *, bank=None) -> str:
          canonical ``world.add`` preset (physics params from the bank JSON) and
          states THE NAMING RULE — name the primary entity with the exact part
          name so the renderer can bind a sprite by name.
-    godot : same as js — the declarative spec has no ``world.part()``; its body
-         NAMES drive sprite skinning exactly like js, so it reuses the js menu.
+    godot : the declarative spec has no ``world.part()`` OR ``world.add`` — bodies
+         are DATA — so the menu is ADVISORY name + physics VOCABULARY only. It
+         never anchors the design to a bank part (Elias: menu is vocabulary, not a
+         catalog) and its escape hatch is the spec's own raw body list.
 
     Returns ``""`` when ``names`` is empty (caller uses the legend-only prompt).
     """
@@ -323,9 +340,19 @@ def build_menu(names, engine="py", *, bank=None) -> str:
     if not names:
         return ""
     b = bank if bank is not None else _bank.load_bank("v1")
-    key = "js" if str(engine).lower() in ("js", "godot") else "py"
+    eng = str(engine).lower()
 
-    if key == "js":
+    if eng == "godot":
+        usage = ("Optional themed-NAME + calibrated-PHYSICS suggestions for this "
+                 "prompt - advisory VOCABULARY, never a catalog to fit your design "
+                 "to. Borrow a name (naming carries meaning) or a suggested number "
+                 "if it serves your mechanic; otherwise ignore the whole list and "
+                 "build the bodies your game needs.")
+        lines = [_godot_line(b.parts[n]) for n in names if n in b.parts]
+        return _prompts.render_bank_menu(
+            "\n".join(lines), usage, escape_hatch=_prompts.ESCAPE_HATCH_GODOT)
+
+    if eng == "js":
         usage = ("world.js has no world.part() yet: build each part with world.add "
                  "using the preset options below, and NAME the primary entity with "
                  "the EXACT part name shown (the renderer binds sprites by name). "

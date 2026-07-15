@@ -20,6 +20,10 @@ prompts, pour mieux les changer separement"):
                          the no-dead-action rule).
     orientation.md     - composition idioms ("invent a mechanic", proven patterns).
     design_block.md    - the DESIGN output format (Milestones + Parts used lines).
+    rules_godot.md /   - godot-specific siblings of rules/orientation/design: the
+    orientation_godot.md  declarative-spec lane emits DATA (no world.add/control/rng
+    design_block_godot.md idioms, no pymunk-only capabilities), so it gets clean,
+                         high-level versions instead of the py/js code-module ones.
     bank_menu.md.tmpl  - the Tier-1b themed parts-menu template (slots filled at
                          run time by harness.gen.retrieval.build_menu).
 
@@ -48,9 +52,19 @@ ORIENTATION = "orientation.md"
 DESIGN_BLOCK = "design_block.md"
 BANK_MENU_TMPL = "bank_menu.md.tmpl"
 
+# The Godot lane emits a declarative JSON spec, not a code module, so the py/js
+# rules/orientation/design sections (steeped in world.add / world.control / rng
+# idioms and pymunk-only capabilities like world.set_gravity) do not fit it. It
+# swaps them for godot-specific siblings that speak the spec vocabulary and carry
+# HIGH-LEVEL structure only — the model infers the specifics.
+RULES_GODOT = "rules_godot.md"
+ORIENTATION_GODOT = "orientation_godot.md"
+DESIGN_BLOCK_GODOT = "design_block_godot.md"
+
 # Every section a composed prompt draws from (used by tests to assert coverage).
 SECTIONS = (CONTRACT, API_PY, API_JS, API_GODOT, RULES, ORIENTATION,
-            DESIGN_BLOCK, BANK_MENU_TMPL)
+            DESIGN_BLOCK, RULES_GODOT, ORIENTATION_GODOT, DESIGN_BLOCK_GODOT,
+            BANK_MENU_TMPL)
 
 # Per-engine substitutions applied to the placeholder-bearing sections. Keys are
 # braced tokens ({lang}, ...) so they never collide with real code braces
@@ -133,35 +147,56 @@ def compose(engine="py", menu_text=None) -> str:
     legend-only/no-bank baseline. Deterministic: same inputs -> identical bytes.
 
     The Godot lane emits DATA, not code, so it swaps the code-module contract.md +
-    api_*.md pair for the SELF-CONTAINED api_godot.md (its own spec contract); the
-    rest of the pipeline (rules, orientation, menu, DESIGN block) is shared.
+    api_*.md pair for the SELF-CONTAINED api_godot.md (its own spec contract) AND
+    the py/js rules/orientation/design sections for godot-specific siblings that
+    speak the declarative-spec vocabulary (no world.add / world.control / rng
+    idioms). The menu splice point is shared.
     """
     key = _engine_key(engine)
     if key == "godot":
-        parts = [_render(_read(API_GODOT), key)]
+        parts = [
+            _render(_read(API_GODOT), key),
+            _render(_read(RULES_GODOT), key),
+            _render(_read(ORIENTATION_GODOT), key),
+        ]
+        design = DESIGN_BLOCK_GODOT
     else:
         api = API_JS if key == "js" else API_PY
         parts = [
             _render(_read(CONTRACT), key),
             _render(_read(api), key),
+            _render(_read(RULES), key),
+            _render(_read(ORIENTATION), key),
         ]
-    parts += [
-        _render(_read(RULES), key),
-        _render(_read(ORIENTATION), key),
-    ]
+        design = DESIGN_BLOCK
     if menu_text:
         parts.append(menu_text.replace("\r\n", "\n").replace("\r", "\n"))
-    parts.append(_render(_read(DESIGN_BLOCK), key))
+    parts.append(_render(_read(design), key))
     return "\n\n".join(p.strip() for p in parts)
 
 
-def render_bank_menu(parts_block: str, usage_line: str) -> str:
+# The advisory footer's escape-hatch clause is engine-specific: py/js point at the
+# `world.add` construction API; the declarative godot lane has no such call, so the
+# raw body list in the spec IS the escape hatch. Kept out of the static template so
+# the godot menu never leaks a py/js idiom.
+ESCAPE_HATCH_CODE = ("The full construction API (world.add and the joints) remains "
+                     "fully available for anything the bank lacks.")
+ESCAPE_HATCH_GODOT = ("Invent any bodies your game needs directly in the spec's body "
+                      "list - the menu never constrains the design.")
+
+
+def render_bank_menu(parts_block: str, usage_line: str,
+                     escape_hatch: str = ESCAPE_HATCH_CODE) -> str:
     """Fill the Tier-1b menu template with the usage line and the per-part lines.
 
     `usage_line` (how to consume the parts: world.part for py, world.add presets
-    for js) and `parts_block` (one rendered line per retrieved part) are produced
-    by harness.gen.retrieval.build_menu from the pinned bank; this only frames
-    them with the always-present header + advisory footer.
+    for js, advisory name/physics vocabulary for godot) and `parts_block` (one
+    rendered line per retrieved part) are produced by harness.gen.retrieval.build_menu
+    from the pinned bank; this only frames them with the always-present header +
+    advisory footer. `escape_hatch` fills the footer's construction-API clause so the
+    declarative godot menu never advertises `world.add`.
     """
     tmpl = _read(BANK_MENU_TMPL)
-    return tmpl.replace("{usage_line}", usage_line).replace("{parts}", parts_block).strip()
+    return (tmpl.replace("{usage_line}", usage_line)
+                .replace("{parts}", parts_block)
+                .replace("{escape_hatch}", escape_hatch).strip())
