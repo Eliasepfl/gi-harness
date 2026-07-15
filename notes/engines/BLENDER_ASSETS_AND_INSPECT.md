@@ -70,6 +70,16 @@ Kenney CC0 GLBs, keeps `.blend` source-only); (C) zero external assets (FPS =
 
 ## 3. ADDON POLICY for generated games — the decision, framed
 
+> **REVERSED (Elias, 2026-07-15):** do NOT ban addons. Elias's intent — an
+> addon is a capability that ships WITH an asset/kit (e.g. the RaycastSensor2D
+> that comes with the car), and banning "just in case" throws away exactly the
+> reusable machinery the examples rely on. New policy: **allow vendored addons**
+> that arrive with an asset or are first-party harness-runtime nodes; the G0
+> banned-API SCAN still governs the game's own code (no OS/file/net/wall-clock/
+> unseeded-RNG), and any addon a game pulls in is hashed + scanned the same way
+> (support dirs hashed AND gated — the existing rule). Capability is allowed;
+> ambient authority is not. The distinction is scanner-enforced, not a blanket ban.
+
 The question is **blanket ban vs allowlist**. Recommendation: **keep the blanket
 ban.** It costs nothing on the asset side — no importer/tool addon exists in the
 whole corpus; GLB and `.blend` import are Godot-core. The single addon that appears,
