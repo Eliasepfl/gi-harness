@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json as _json
 import math as _math
+import re as _re
 from typing import Any, Callable
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +195,41 @@ _BOUNDS_EPS = 0.5       # ignore sub-pixel out-of-bounds excursions
 _SUPPORT_TOL = 4.0      # a static is "supported" if resting within this of a surface
 _REACH_TOL = 40.0       # a sensor is "reachable" if a body is within this of it
 
+# Engine invariants mirrored from the frozen runner.gd / project.godot so the analyzer
+# reasons about EXACT engine semantics, not approximations (GODOT_DOCS_MINING.md §1).
+_DEFAULT_GRAVITY = 900.0            # project.godot 2d/default_gravity
+_DEFAULT_GRAVITY_VEC = (0.0, -1.0)  # 2d/default_gravity_vector — y-UP world, down = -Y
+_TICK_DT = 1.0 / 60.0              # fixed physics dt (--fixed-fps 60); zero damping
+_CONTACT_CAP = 8                   # RigidBody2D.max_contacts_reported — silently drops >8
+_TUNNEL_THIN_PX = 6.0             # a static wall thinner than this can be tunnelled (CCD off)
+_STILL_EPS = 30.0                 # speed below this reads as "at rest" for park detection
+_FORECAST_HORIZON = 1200           # cap ballistic projection at 20 s (1200 physics ticks)
+
+# The whitelisted predicate grammar, a static replica of runner.gd's `_pred_error`
+# boundary (ALLOWED_IDENTS / ALLOWED_OPS) so the linter flags what the engine rejects.
+_ALLOWED_IDENTS = frozenset({
+    "pos_x", "pos_y", "vel_x", "vel_y", "speed", "angle", "grounded", "contacts",
+    "contained", "dist", "flag", "steps",
+    "abs", "min", "max", "clamp", "sqrt", "floor", "ceil", "sign",
+    "and", "or", "not", "true", "false",
+})
+_ALLOWED_OPS = "+-*/%(),<>=!"
+# Exact arity Godot's Expression demands (ALL params required — a short call is null,
+# so the whole predicate is silently False).
+_FN_ARITY = {
+    "pos_x": 1, "pos_y": 1, "vel_x": 1, "vel_y": 1, "speed": 1, "angle": 1,
+    "grounded": 1, "contacts": 2, "contained": 2, "dist": 2, "flag": 1,
+    "abs": 1, "sqrt": 1, "floor": 1, "ceil": 1, "sign": 1,
+    "min": 2, "max": 2, "clamp": 3,
+}
+# Which argument positions of a query fn are BODY names (checked against defined bodies);
+# `flag(k)` takes a flag KEY, not a body, so it is deliberately absent here.
+_FN_BODY_ARGS = {
+    "pos_x": (0,), "pos_y": (0,), "vel_x": (0,), "vel_y": (0,), "speed": (0,),
+    "angle": (0,), "grounded": (0,), "contacts": (0, 1), "contained": (0, 1),
+    "dist": (0, 1),
+}
+
 
 def _is_num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -293,6 +329,25 @@ def _round(x: float) -> float:
     return round(float(x), 6)
 
 
+def _gravity_of(meta: dict) -> list:
+    """The world gravity vector ``[gx, gy]`` (px/s²), y-UP so default down = -Y (§1.1).
+    Reads ``meta.gravity`` (magnitude) + ``meta.gravity_vector`` (direction) when a spec
+    carries them, else the project.godot defaults ``(0,-1)·900 = (0,-900)`` — the exact
+    vector the runner's floating/OOB verdicts must reference or they invert sign."""
+    mag = _DEFAULT_GRAVITY
+    vx, vy = _DEFAULT_GRAVITY_VEC
+    if isinstance(meta, dict):
+        g = meta.get("gravity")
+        if _is_num(g):
+            mag = float(g)
+        gv = meta.get("gravity_vector")
+        if _is_vec2(gv):
+            length = _math.hypot(float(gv[0]), float(gv[1]))
+            if length > 0:
+                vx, vy = float(gv[0]) / length, float(gv[1]) / length
+    return [vx * mag, vy * mag]
+
+
 def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
                   bank_version: str = "v1") -> dict:
     """Static, engine-free placement feedback for a Godot spec (or bodies fragment).
@@ -332,6 +387,7 @@ def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
     meta = spec.get("meta") if isinstance(spec.get("meta"), dict) else {}
     ws = meta.get("world_size")
     world_size = list(ws) if _is_vec2(ws) else (None if is_fragment else [800, 600])
+    gravity = _gravity_of(meta)  # [gx, gy]; default [0, -900] (y-UP world, down = -Y)
 
     roles = _bank_roles([b.get("name") for b in bodies], use_bank, bank_version)
 
@@ -351,9 +407,10 @@ def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
             "shape": body.get("shape"),
             "kind": kind,
         })
-        recs.append({"name": name, "aabb": aabb, "kind": kind})
+        recs.append({"name": name, "aabb": aabb, "kind": kind,
+                     "shape": body.get("shape"), "body": body})
 
-    warnings = _collect_warnings(recs, world_size)
+    warnings = _collect_warnings(recs, world_size, spec, gravity)
 
     # -- summary -----------------------------------------------------------
     counts = {"static": 0, "dynamic": 0, "sensor": 0, "total": len(entities)}
@@ -376,6 +433,8 @@ def inspect_world(spec_or_fragment: Any, *, use_bank: bool = True,
             "by_shape": by_shape,
             "world_size": world_size,
             "world_bbox": world_bbox,
+            "gravity": [_round(gravity[0]), _round(gravity[1])],
+            "ballistic": _ballistic_summary(recs, spec, gravity),
             "is_fragment": is_fragment,
             "n_entities": len(entities),
             "n_warnings": len(warnings),
@@ -405,12 +464,19 @@ def _bank_roles(names: list, use_bank: bool, bank_version: str) -> dict[str, str
     return out
 
 
-def _collect_warnings(recs: list[dict], world_size: list | None) -> list[dict]:
-    """The warning taxonomy: overlapping solid statics, out-of-bounds bodies, isolated
-    sensors, floating statics, duplicate names — deterministic, in declaration order."""
+def _collect_warnings(recs: list[dict], world_size: list | None,
+                      spec: dict, gravity: list) -> list[dict]:
+    """The placement-warning taxonomy (GODOT_DOCS_MINING.md §1): overlapping solid
+    statics, out-of-bounds bodies, isolated sensors, floating statics, duplicate names,
+    PLUS the precision upgrades — non-convex polys, tunnelling-thin walls, contact-cap
+    pile-ups, sensor layer/mask mismatch, rotatable-body containment goals, unsatisfiable
+    'park at rest' goals, ballistic out-of-bounds forecasts, and a predicate linter.
+    Deterministic, appended in a fixed pass order."""
     warnings: list[dict] = []
     solids = [r for r in recs if r["kind"] != "sensor" and r["aabb"] is not None]
     statics = [r for r in recs if r["kind"] == "static" and r["aabb"] is not None]
+    dynamics = [r for r in recs if r["kind"] == "dynamic" and r["aabb"] is not None]
+    known_bodies = {r["name"] for r in recs if isinstance(r["name"], str)}
 
     # duplicate names (across ALL bodies, geometry or not).
     seen: dict[Any, int] = {}
@@ -433,9 +499,15 @@ def _collect_warnings(recs: list[dict], world_size: list | None) -> list[dict]:
                     "penetration": _round(pen),
                     "detail": "two solid static bodies overlap by "
                               f"{pen:.1f}px (AABB)",
+                    # (§1.5) this is a tick-0 GEOMETRY fact; Area2D overlap lists/signals
+                    # are one-step-latent (they reflect pre-move positions and first
+                    # update only AFTER a physics step elapses), so the engine will not
+                    # SIGNAL this until stepped.
+                    "note": "tick-0 geometry; overlap signals are one-step-latent",
                 })
 
-    # bodies out of world bounds (only when bounds are known).
+    # bodies out of world bounds (only when bounds are known). Down is the gravity
+    # direction (§1.1): with gravity_vector (0,-1) the floor is the low-Y world edge.
     if _is_vec2(world_size):
         wx, wy = float(world_size[0]), float(world_size[1])
         for r in recs:
@@ -451,7 +523,8 @@ def _collect_warnings(recs: list[dict], world_size: list | None) -> list[dict]:
                 })
 
     # floating statics (no support: not near the world floor, not resting on / touching
-    # another solid). A heuristic — free-floating platforms are often intentional.
+    # another solid). A heuristic — free-floating platforms are often intentional. The
+    # "floor" is the low-Y edge because gravity points -Y (§1.1).
     for r in statics:
         bb = r["aabb"]
         if bb[1] <= _SUPPORT_TOL:  # bottom near world floor (y=0)
@@ -492,7 +565,494 @@ def _collect_warnings(recs: list[dict], world_size: list | None) -> list[dict]:
                           f"{_REACH_TOL:g}px)",
             })
 
+    # (§1.8) non-convex poly shapes: verts go straight into ConvexPolygonShape2D with NO
+    # hull repair, so a concave outline collides as UNDEFINED while _bbox still looks fine.
+    for r in recs:
+        if r["shape"] != "poly":
+            continue
+        verts = _local_verts(r["body"], "poly")
+        if verts is not None and not _is_convex(verts):
+            warnings.append({
+                "kind": "nonconvex_poly", "bodies": [r["name"]],
+                "detail": "poly vertices are not convex; ConvexPolygonShape2D does no hull "
+                          "repair, so collision is undefined (make the outline convex)",
+            })
+
+    # (§1.10) tunnelling: CCD is DISABLED and VMAX=1e5 px/s is allowed, so a static wall
+    # thinner than a body's per-step displacement can be passed through in one 1/60 s tick.
+    if dynamics:
+        for r in statics:
+            body, bb = r["body"], r["aabb"]
+            thin = min(bb[2] - bb[0], bb[3] - bb[1])
+            if r["shape"] == "segment" or thin < _TUNNEL_THIN_PX:
+                warnings.append({
+                    "kind": "tunneling", "bodies": [r["name"]],
+                    "thinnest_px": _round(thin),
+                    "detail": f"thin static wall (thinnest dim {thin:.1f}px) with CCD off — a "
+                              "fast body can tunnel it in one tick; thicken it, cap speed, "
+                              "or enable CCD",
+                })
+
+    # (§1.9) contact-cap pile-ups: max_contacts_reported=8 silently drops the rest, so a
+    # body touching >8 others may read "not grounded"/miss contacts.
+    for r in dynamics:
+        touch = sum(1 for o in recs if o is not r and o["aabb"] is not None
+                    and _aabb_gap(r["aabb"], o["aabb"]) <= 0.0)
+        if touch > _CONTACT_CAP:
+            warnings.append({
+                "kind": "contact_cap", "bodies": [r["name"]], "contacts": touch,
+                "detail": f"body touches {touch} others but max_contacts_reported=8 drops "
+                          "the excess — contacts()/grounded() can read false",
+                "note": "one-step-latent: contact lists update after a physics step",
+            })
+
+    # (§1.11) sensor layer/mask mismatch: all bodies share collision_layer=1, so a raycast
+    # sensor whose collision_mask excludes bit 1 sees NOTHING.
+    sensors = spec.get("sensors")
+    if isinstance(sensors, list):
+        for s in sensors:
+            if not isinstance(s, dict):
+                continue
+            mask = s.get("collision_mask", 1)
+            if _is_num(mask) and (int(mask) & 1) == 0:
+                warnings.append({
+                    "kind": "layer_mask_mismatch", "bodies": [s.get("attach_to")],
+                    "collision_mask": int(mask),
+                    "detail": f"sensor collision_mask={int(mask)} excludes layer 1, where "
+                              "ALL bodies live — its rays will hit nothing",
+                })
+
+    # (§1.4 / §1.6 / §1.12) predicate-driven passes: rotatable containment goals,
+    # unsatisfiable park goals, and the predicate linter.
+    warnings.extend(_predicate_warnings(recs, spec, known_bodies))
+
+    # (§1.7) ballistic out-of-bounds forecast: a dynamic body with an initial velocity,
+    # under zero damping + fixed dt, is projected forward; flag if it leaves the world.
+    if _is_vec2(world_size):
+        warnings.extend(_forecast_oob(dynamics, world_size, gravity))
+
     return warnings
+
+
+def _is_convex(verts: list[tuple[float, float]]) -> bool:
+    """Whether a polygon (CCW or CW) is convex: every consecutive edge turns the same
+    way (the cross products share a sign; collinear zeros are tolerated). A degenerate
+    all-collinear outline is treated as non-convex (undefined as a 2D collision hull)."""
+    n = len(verts)
+    if n < 3:
+        return False
+    sign = 0
+    for i in range(n):
+        ax, ay = verts[i]
+        bx, by = verts[(i + 1) % n]
+        cx, cy = verts[(i + 2) % n]
+        cross = (bx - ax) * (cy - by) - (by - ay) * (cx - bx)
+        if cross > 1e-9:
+            if sign < 0:
+                return False
+            sign = 1
+        elif cross < -1e-9:
+            if sign > 0:
+                return False
+            sign = -1
+    return sign != 0
+
+
+def _body_is_rotatable(body: dict) -> bool:
+    """A dynamic, non-circle body free to spin (torque/collision) — its AABB inflates as
+    it tilts, so a containment goal on it can read false even when geometrically inside."""
+    if body.get("static") or body.get("sensor") or body.get("locked_rotation"):
+        return False
+    return body.get("shape") in ("box", "poly", "segment")
+
+
+def _predicate_warnings(recs: list[dict], spec: dict,
+                        known_bodies: set) -> list[dict]:
+    """Warnings derived from the predicate strings: rotatable-body containment goals
+    (§1.4), unsatisfiable park-at-rest goals (§1.6), and the full predicate linter
+    (§1.12: &&/||, integer division, arity, undefined body refs, illegal tokens)."""
+    out: list[dict] = []
+    body_by_name = {r["name"]: r["body"] for r in recs if isinstance(r["name"], str)}
+    has_clamp = _has_velocity_clamp(spec)
+
+    for label, expr in _iter_predicates(spec):
+        # -- linter -------------------------------------------------------
+        for problem, detail in _lint_predicate(expr, known_bodies):
+            out.append({"kind": "predicate_lint", "bodies": [], "predicate": label,
+                        "problem": problem, "detail": f"[{label}] {detail}"})
+        calls = _find_calls(expr)
+        # -- rotatable containment (§1.4) --------------------------------
+        for name, args in calls:
+            if name == "contained" and len(args) >= 2 \
+                    and _is_str_literal(args[0]) and _is_str_literal(args[1]):
+                a, b = args[0][1:-1], args[1][1:-1]
+                body = body_by_name.get(a)
+                if body is not None and _body_is_rotatable(body):
+                    out.append({
+                        "kind": "rotatable_containment", "bodies": [a, b],
+                        "predicate": label,
+                        "detail": f"[{label}] contained('{a}','{b}') on a rotatable body — a "
+                                  "tilted box/poly has an inflated AABB, so containment can "
+                                  "read false when it is geometrically inside; lock rotation "
+                                  "or widen the zone",
+                    })
+        # -- unsatisfiable park (§1.6) -----------------------------------
+        if label == "success":
+            park_body = _park_target(expr)
+            if park_body is not None and not has_clamp:
+                out.append({
+                    "kind": "unsatisfiable_park", "bodies": [park_body],
+                    "predicate": label,
+                    "detail": f"success requires '{park_body}' to come to rest (speed near 0) "
+                              "but damping=0 and sleeping is disabled, so a free body coasts "
+                              "forever — add an on_step velocity_clamp or a friction surface, "
+                              "or use an explicit stillness-window predicate",
+                })
+    return out
+
+
+def _has_velocity_clamp(spec: dict) -> bool:
+    on_step = spec.get("on_step")
+    if not isinstance(on_step, list):
+        return False
+    return any(isinstance(b, dict) and b.get("kind") == "velocity_clamp" for b in on_step)
+
+
+def _park_target(expr: str):
+    """If ``expr`` demands a body be (nearly) at rest — ``speed("b") < c`` / ``<= c`` /
+    ``== 0`` with a small ``c`` — return that body name, else None."""
+    if not isinstance(expr, str):
+        return None
+    m = _re.search(r"""speed\(\s*["']([^"']+)["']\s*\)\s*(<=|<|==)\s*([0-9]+(?:\.[0-9]+)?)""",
+                   expr)
+    if m and float(m.group(3)) <= _STILL_EPS:
+        return m.group(1)
+    return None
+
+
+def _iter_predicates(spec: dict):
+    preds = spec.get("predicates")
+    if not isinstance(preds, dict):
+        return
+    for key in ("success", "failure"):
+        v = preds.get(key)
+        if isinstance(v, str):
+            yield (key, v)
+    cps = preds.get("checkpoints")
+    if isinstance(cps, dict):
+        for k, v in cps.items():
+            if isinstance(v, str):
+                yield (f"checkpoint:{k}", v)
+
+
+def _is_str_literal(tok: str) -> bool:
+    return (len(tok) >= 2 and tok[0] in "\"'" and tok[-1] == tok[0])
+
+
+def _read_arglist(expr: str, open_idx: int):
+    """Return (arg_substrings, close_idx) for the call whose '(' is at ``open_idx``,
+    splitting on top-level commas and respecting string literals + nested parens."""
+    args: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    i, n = open_idx, len(expr)
+    while i < n:
+        c = expr[i]
+        if c in "\"'":
+            q = c
+            cur.append(c)
+            i += 1
+            while i < n and expr[i] != q:
+                cur.append(expr[i])
+                if expr[i] == "\\" and i + 1 < n:
+                    i += 1
+                    cur.append(expr[i])
+                i += 1
+            if i < n:
+                cur.append(expr[i])
+            i += 1
+            continue
+        if c == "(":
+            depth += 1
+            if depth > 1:
+                cur.append(c)
+            i += 1
+            continue
+        if c == ")":
+            depth -= 1
+            if depth == 0:
+                arg = "".join(cur).strip()
+                if arg != "" or args:
+                    args.append(arg)
+                return args, i
+            cur.append(c)
+            i += 1
+            continue
+        if c == "," and depth == 1:
+            args.append("".join(cur).strip())
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    args.append("".join(cur).strip())
+    return args, n
+
+
+def _find_calls(expr: str) -> list[tuple[str, list[str]]]:
+    """Every ``name(...)`` call in ``expr`` (including nested), as (name, arg_substrings)."""
+    calls: list[tuple[str, list[str]]] = []
+    if not isinstance(expr, str):
+        return calls
+    n = len(expr)
+    i = 0
+    while i < n:
+        c = expr[i]
+        if c in "\"'":
+            q = c
+            i += 1
+            while i < n and expr[i] != q:
+                if expr[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+            continue
+        if c.isalpha() or c == "_":
+            j = i
+            while j < n and (expr[j].isalnum() or expr[j] == "_"):
+                j += 1
+            k = j
+            while k < n and expr[k] in " \t":
+                k += 1
+            if k < n and expr[k] == "(":
+                args, _end = _read_arglist(expr, k)
+                calls.append((expr[i:j], args))
+                i = k + 1  # keep scanning inside the args for nested calls
+                continue
+            i = j
+            continue
+        i += 1
+    return calls
+
+
+def _lint_predicate(expr, known_bodies: set) -> list[tuple[str, str]]:
+    """Static replica of runner.gd's `_pred_error`, but COLLECTING every problem (not
+    stopping at the first): illegal tokens/identifiers, &&/|| logical operators, integer
+    division traps, wrong call arity, and undefined body references. Returns
+    (problem, detail) pairs — empty when the predicate is clean."""
+    if not isinstance(expr, str):
+        return [("bad_type", "predicate is not a string")]
+    issues = _lint_scan(expr) + _lint_int_division(expr)
+    for name, args in _find_calls(expr):
+        if name in _FN_ARITY and len(args) != _FN_ARITY[name]:
+            issues.append(("bad_arity",
+                           f"{name}() needs {_FN_ARITY[name]} arg(s), got {len(args)} — "
+                           "Expression requires ALL params, so a short call is silently false"))
+        for p in _FN_BODY_ARGS.get(name, ()):
+            if p < len(args) and _is_str_literal(args[p]):
+                ref = args[p][1:-1]
+                if ref not in known_bodies:
+                    issues.append(("undefined_body",
+                                   f"{name}() references body '{ref}', which is not defined"))
+    return issues
+
+
+def _lint_scan(expr: str) -> list[tuple[str, str]]:
+    """Char scan mirroring `_pred_error`: reject identifiers outside the allow-list, `.`/
+    `[`/`]`/`\\` and other stray characters, and &&/||/&/| (rewrite to and/or/not)."""
+    issues: list[tuple[str, str]] = []
+    n = len(expr)
+    i = 0
+    while i < n:
+        c = expr[i]
+        if c in "\"'":
+            q = c
+            i += 1
+            while i < n and expr[i] != q:
+                if expr[i] == "\\":
+                    issues.append(("bad_char", "backslash not allowed in a string literal"))
+                i += 1
+            if i >= n:
+                issues.append(("bad_char", "unterminated string literal"))
+                break
+            i += 1
+            continue
+        if c in " \t\r\n":
+            i += 1
+            continue
+        if c.isalpha() or c == "_":
+            j = i
+            while j < n and (expr[j].isalnum() or expr[j] == "_"):
+                j += 1
+            word = expr[i:j]
+            if word not in _ALLOWED_IDENTS:
+                issues.append(("bad_identifier", f"identifier not allowed: '{word}'"))
+            i = j
+            continue
+        if c.isdigit():
+            j = i
+            while j < n and (expr[j].isdigit() or expr[j] == "."):
+                j += 1
+            i = j
+            continue
+        if expr[i:i + 2] in ("&&", "||"):
+            issues.append(("logical_operator",
+                           f"'{expr[i:i + 2]}' is rejected; use 'and'/'or'"))
+            i += 2
+            continue
+        if c in "&|":
+            issues.append(("logical_operator",
+                           f"'{c}' is rejected; use 'and'/'or'/'not'"))
+            i += 1
+            continue
+        if c in _ALLOWED_OPS:
+            i += 1
+            continue
+        issues.append(("bad_char", f"character not allowed: '{c}'"))
+        i += 1
+    return issues
+
+
+def _lint_int_division(expr: str) -> list[tuple[str, str]]:
+    """Flag ``/`` whose right operand is an INTEGER literal — Godot's Expression floors
+    int/int, so ``steps / 2`` silently truncates; suggest a float literal."""
+    issues: list[tuple[str, str]] = []
+    n = len(expr)
+    i = 0
+    while i < n:
+        c = expr[i]
+        if c in "\"'":
+            q = c
+            i += 1
+            while i < n and expr[i] != q:
+                if expr[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+            continue
+        if c == "/":
+            k = i + 1
+            while k < n and expr[k] in " \t":
+                k += 1
+            if k < n and expr[k].isdigit():
+                m = k
+                while m < n and expr[m].isdigit():
+                    m += 1
+                if not (m < n and expr[m] == "."):
+                    lit = expr[k:m]
+                    issues.append(("integer_division",
+                                   f"'/ {lit}' floors (integer division); write '{lit}.0' "
+                                   "for a real fraction"))
+        i += 1
+    return issues
+
+
+# --------------------------------------------------------------------------- #
+# Ballistic forecast (§1.7): zero damping + fixed dt ⇒ exact per-tick projection.
+# --------------------------------------------------------------------------- #
+def ballistic_forecast(x0: float, y0: float, vx: float, vy: float,
+                       gx: float, gy: float, n_ticks: int,
+                       dt: float = _TICK_DT) -> list[tuple[float, float]]:
+    """Project a free body's centre N physics ticks forward, EXACTLY as the engine
+    integrates it under zero damping: per tick ``v += g·dt`` then ``x += v·dt`` (the
+    semi-implicit Euler the runner steps at a fixed dt=1/60). Returns the per-tick
+    positions."""
+    out: list[tuple[float, float]] = []
+    x, y, vX, vY = float(x0), float(y0), float(vx), float(vy)
+    for _ in range(int(n_ticks)):
+        vX += gx * dt
+        vY += gy * dt
+        x += vX * dt
+        y += vY * dt
+        out.append((x, y))
+    return out
+
+
+def _controlled_body(recs: list[dict]):
+    for r in recs:
+        b = r["body"]
+        if b.get("control") and not b.get("static"):
+            return b
+    return None
+
+
+def _launch_dv(spec: dict, name, mass: float) -> tuple[float, float]:
+    """The strongest instantaneous launch (|Δvx|, |Δvy|) the action set imparts to the
+    named body via impulse/set_velocity (impulse Δv = J/mass). Heading-dependent verbs
+    (thrust/force/torque) are excluded — their direction is not known statically."""
+    max_vx = max_vy = 0.0
+    act = spec.get("act")
+    if not isinstance(act, dict):
+        return (0.0, 0.0)
+    for binds in act.values():
+        if not isinstance(binds, list):
+            continue
+        for vc in binds:
+            if not isinstance(vc, dict) or vc.get("body") != name:
+                continue
+            verb = vc.get("verb")
+            vec = vc.get("vec")
+            if verb in ("impulse", "set_velocity") and _is_vec2(vec):
+                vx, vy = float(vec[0]), float(vec[1])
+                if verb == "impulse" and mass > 0:
+                    vx /= mass
+                    vy /= mass
+                max_vx = max(max_vx, abs(vx))
+                max_vy = max(max_vy, abs(vy))
+    return (max_vx, max_vy)
+
+
+def _ballistic_summary(recs: list[dict], spec: dict, gravity: list):
+    """A closed-form jump forecast for the controlled body (§1.7): apex height, airtime,
+    and horizontal range at its strongest launch. None when there is no controllable jump."""
+    body = _controlled_body(recs)
+    if body is None:
+        return None
+    name = body.get("name")
+    mass = float(body.get("mass", 1.0) or 1.0)
+    vx, vy = _launch_dv(spec, name, mass)
+    g = abs(gravity[1]) if gravity and gravity[1] != 0 else _DEFAULT_GRAVITY
+    if vy <= 0 or g <= 0:
+        return None
+    apex = vy * vy / (2.0 * g)          # peak height above launch
+    airtime_s = 2.0 * vy / g            # up-and-back to the launch height
+    return {
+        "body": name,
+        "gravity": [_round(gravity[0]), _round(gravity[1])],
+        "launch_dv": [_round(vx), _round(vy)],
+        "apex_px": _round(apex),
+        "airtime_ticks": int(round(airtime_s / _TICK_DT)),
+        "horizontal_range_px": _round(vx * airtime_s),
+    }
+
+
+def _forecast_oob(dynamics: list[dict], world_size: list, gravity: list) -> list[dict]:
+    """For each dynamic body with an explicit initial velocity, project its centre forward
+    (zero damping, fixed dt) and flag the tick at which it first leaves the world — the
+    §1.7 quantitative complement to the static out-of-bounds check."""
+    out: list[dict] = []
+    wx, wy = float(world_size[0]), float(world_size[1])
+    gx, gy = float(gravity[0]), float(gravity[1])
+    for r in dynamics:
+        body = r["body"]
+        vel = body.get("velocity")
+        pos = body.get("pos")
+        if not (_is_vec2(vel) and _is_vec2(pos)):
+            continue
+        if float(vel[0]) == 0.0 and float(vel[1]) == 0.0:
+            continue
+        path = ballistic_forecast(pos[0], pos[1], vel[0], vel[1], gx, gy, _FORECAST_HORIZON)
+        for tick, (x, y) in enumerate(path, start=1):
+            if x < 0.0 or y < 0.0 or x > wx or y > wy:
+                out.append({
+                    "kind": "forecast_oob", "bodies": [r["name"]], "tick": tick,
+                    "position": [_round(x), _round(y)],
+                    "detail": f"initial velocity carries '{r['name']}' out of the "
+                              f"[0,0,{wx:g},{wy:g}] world by tick {tick} "
+                              f"(≈{tick / 60.0:.2f}s), ballistic under gravity",
+                })
+                break
+    return out
 
 
 # --------------------------------------------------------------------------- #

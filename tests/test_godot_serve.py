@@ -109,6 +109,16 @@ def test_port_collision_raises_typed_error():
         occupier.close()
 
 
+def test_serve_argv_pins_fixed_fps():
+    # The serve seam spawns through the SAME shared builder as the batch executor, so
+    # --fixed-fps 60 is guaranteed here too (GODOT_DOCS_MINING.md section 3).
+    from harness.verify.godot_exec import stepping_argv
+    argv = stepping_argv("/opt/godot", "/proj", "res://runner.gd",
+                         ["--serve", "--port=47000"])
+    assert argv[argv.index("--fixed-fps") + 1] == "60"
+    assert argv[argv.index("--") + 1:] == ["--serve", "--port=47000"]
+
+
 def test_port_base_and_offset_compose():
     # port = base + offset; the collision message reports the derived port.
     base = _free_port()

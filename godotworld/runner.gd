@@ -76,8 +76,15 @@ const ALLOWED_OPS := "+-*/%(),<>=!"
 # spec-v2 sensors: a FIXED whitelist mapping a spec `type` to a vendored, audited
 # sensor script (godotworld/addons/sensors/). The spec supplies DATA only (which
 # type + params); no spec string is ever executed. Unlisted types are ignored.
+#
+# PRELOADED, not load()ed (GODOT_DOCS_MINING.md section 2/3): the finite whitelist is
+# resolved to Script resources at SCRIPT-COMPILE time, so (a) there is NO load() hitch
+# in the physics-sensitive per-episode rebuild path (`_add_sensor`), and (b) a bad or
+# wrong-case path FAILS FAST at boot with a parse error instead of load() silently
+# returning null and the runner dropping the sensor mid-run. A const preload table is
+# the "validate paths at certify time" the note asks for, enforced by the compiler.
 const SENSOR_SCRIPTS := {
-	"raycast2d": "res://addons/sensors/RaycastSensor2D.gd",
+	"raycast2d": preload("res://addons/sensors/RaycastSensor2D.gd"),
 }
 
 # --------------------------------------------------------------------------- #
@@ -517,8 +524,26 @@ func _load_spec(source) -> String:
 # =========================================================================== #
 # Scene construction (fresh per episode / per check build)
 # =========================================================================== #
+func _preflight_pins() -> void:
+	# Episode-start determinism preflight (GODOT_DOCS_MINING.md section 3). Godot
+	# physics is only reproducibly replayable under a FIXED dt, a SINGLE physics
+	# thread, unscaled time, and synchronized ticks. These pins are set in
+	# `_initialize()` + project.godot; re-assert them at every world build so any
+	# drift (a bad project.godot edit, a 4.7 point-release default flip) fails LOUDLY
+	# HERE rather than silently voiding the witness replay far downstream.
+	assert(Engine.time_scale == 1.0,
+		"time_scale drifted from 1.0 -> sim-time desyncs from the tick index")
+	assert(Engine.physics_ticks_per_second == 60,
+		"physics_ticks_per_second drifted from 60 -> dt != 1/60")
+	assert(Engine.physics_jitter_fix == 0.0,
+		"physics_jitter_fix drifted from 0.0 -> ticks are no longer fully synchronized")
+	assert(not bool(ProjectSettings.get_setting("physics/2d/run_on_separate_thread", false)),
+		"physics/2d/run_on_separate_thread must stay false (PhysicsServer2D is not thread-safe)")
+
+
 func _build_scene() -> String:
 	# Returns "" on success, else a build error message.
+	_preflight_pins()
 	_container = Node2D.new()
 	_bodies = {}
 	_order = []
@@ -721,7 +746,8 @@ func _add_sensor(s) -> void:
 	var rec = _bodies.get(str(s.get("attach_to", "")), null)
 	if rec == null or rec.removed:
 		return
-	var script = load(SENSOR_SCRIPTS[stype])
+	# Preloaded const table (no runtime load() hitch; the path was validated at boot).
+	var script = SENSOR_SCRIPTS.get(stype, null)
 	if script == null:
 		return
 	var node = script.new()

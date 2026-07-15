@@ -286,3 +286,300 @@ def test_smoke_on_fixture_collect2_spec():
     assert isinstance(out["warnings"], list)
     # the union world_bbox spans all entities.
     assert out["summary"]["world_bbox"] is not None and len(out["summary"]["world_bbox"]) == 4
+
+
+# =========================================================================== #
+# PRECISION UPGRADES (GODOT_DOCS_MINING.md section 1, all 12 items)
+# =========================================================================== #
+def _full(bodies, success="false", *, checkpoints=None, failure=None,
+          world_size=(1000, 600), **extra):
+    """A minimal FULL spec (meta/act/predicates present -> not a fragment) so the
+    predicate-driven warning passes run. Two no-op actions keep it structurally sane."""
+    preds = {"success": success, "checkpoints": checkpoints or {}}
+    if failure is not None:
+        preds["failure"] = failure
+    spec = {
+        "meta": {"title": "t", "prompt": "p", "world_size": list(world_size),
+                 "actions": ["a", "b"]},
+        "bodies": bodies,
+        "act": {"a": [], "b": []},
+        "predicates": preds,
+    }
+    spec.update(extra)
+    return spec
+
+
+def _kinds(out, kind):
+    return [w for w in out["warnings"] if w["kind"] == kind]
+
+
+_FLOOR = {"name": "floor", "shape": "box", "pos": [500, 10], "size": [1000, 20],
+          "static": True}
+
+
+# ---- Item 1: gravity convention (y-UP, down = -Y) --------------------------
+def test_summary_carries_gravity_vector_default_down_is_negative_y():
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}]), use_bank=False)
+    assert out["summary"]["gravity"] == [0.0, -900.0]  # (0,-1)*900, down = -Y
+
+
+def test_summary_gravity_reads_meta_override():
+    spec = _full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}])
+    spec["meta"]["gravity"] = 500.0
+    spec["meta"]["gravity_vector"] = [0, -1]
+    out = T.inspect_world(spec, use_bank=False)
+    assert out["summary"]["gravity"] == [0.0, -500.0]
+
+
+# ---- Items 2 & 3: byte-identical AABB parity + exact rotated-box formula ----
+def test_aabb_adds_no_safe_margin():
+    # 2D collision shapes get NO grow/safe margin (unlike 3D CharacterBody) — a unit
+    # box's AABB is exactly its extents, not inflated.
+    assert _aabb({"name": "u", "shape": "box", "pos": [0, 0], "size": [1, 1]}) \
+        == [-0.5, -0.5, 0.5, 0.5]
+
+
+def test_rotated_box_matches_abs_sum_basis_formula():
+    # The exact rotated-box half-extents are |hx*cos|+|hy*sin|, |hx*sin|+|hy*cos|
+    # (abs-sum of the rotated Transform2D basis columns) — not a heuristic.
+    hx, hy, ang = 10.0, 20.0, math.radians(30)
+    ex = abs(hx * math.cos(ang)) + abs(hy * math.sin(ang))
+    ey = abs(hx * math.sin(ang)) + abs(hy * math.cos(ang))
+    got = _aabb({"name": "r", "shape": "box", "pos": [100, 100],
+                 "size": [2 * hx, 2 * hy], "angle": ang})
+    # inspect_world rounds its output to 6 decimals, so compare at that resolution.
+    assert got == pytest.approx([100 - ex, 100 - ey, 100 + ex, 100 + ey], abs=1e-6)
+
+
+# ---- Item 4: rotatable-body containment goal -------------------------------
+def _car_spec(success='contained("car", "slot")', **car_extra):
+    car = {"name": "car", "shape": "box", "pos": [130, 68], "size": [60, 30],
+           "control": True}
+    car.update(car_extra)
+    return _full([_FLOOR,
+        {"name": "slot", "shape": "box", "pos": [820, 90], "size": [170, 130],
+         "static": True, "sensor": True}, car], success=success)
+
+
+def test_rotatable_containment_goal_warns():
+    out = T.inspect_world(_car_spec(), use_bank=False)
+    w = _kinds(out, "rotatable_containment")
+    assert len(w) == 1 and w[0]["bodies"] == ["car", "slot"]
+
+
+def test_locked_rotation_containment_is_not_warned():
+    out = T.inspect_world(_car_spec(locked_rotation=True), use_bank=False)
+    assert _kinds(out, "rotatable_containment") == []
+
+
+def test_circle_containment_is_not_rotatable():
+    # A circle's AABB is rotation-invariant, so a containment goal on it is fine.
+    out = T.inspect_world(_car_spec(shape="circle", radius=20), use_bank=False)
+    assert _kinds(out, "rotatable_containment") == []
+
+
+# ---- Item 5: one-step-latent annotation on overlap warnings ----------------
+def test_overlap_warning_annotated_one_step_latent():
+    out = T.inspect_world({"bodies": [
+        {"name": "s1", "shape": "box", "pos": [100, 100], "size": [40, 40], "static": True},
+        {"name": "s2", "shape": "box", "pos": [120, 100], "size": [40, 40], "static": True},
+    ]}, use_bank=False)
+    ov = _kinds(out, "overlap_solid_statics")
+    assert len(ov) == 1
+    assert "one-step-latent" in ov[0]["note"]
+
+
+# ---- Item 6: unsatisfiable park (rest-at-goal with no damping/clamp) --------
+def test_unsatisfiable_park_warns_without_clamp():
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}], success='speed("ball") < 5'), use_bank=False)
+    w = _kinds(out, "unsatisfiable_park")
+    assert len(w) == 1 and w[0]["bodies"] == ["ball"]
+
+
+def test_park_with_velocity_clamp_is_satisfiable():
+    spec = _full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}], success='speed("ball") < 5',
+        on_step=[{"kind": "velocity_clamp", "body": "ball", "vx_max": 0}])
+    out = T.inspect_world(spec, use_bank=False)
+    assert _kinds(out, "unsatisfiable_park") == []
+
+
+def test_fast_speed_threshold_is_not_a_park_goal():
+    # speed("ball") < 5000 is a plausible speed CAP, not a rest condition -> no warning.
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}], success='speed("ball") < 5000'), use_bank=False)
+    assert _kinds(out, "unsatisfiable_park") == []
+
+
+# ---- Item 7: closed-form ballistic forecast --------------------------------
+def test_ballistic_forecast_is_exact_semi_implicit_euler():
+    # v += g*dt then x += v*dt, dt=1/60, g=(0,-900): tick1 vy=-15 -> y=-0.25;
+    # tick2 vy=-30 -> y=-0.75.
+    path = T.ballistic_forecast(0, 0, 0, 0, 0, -900, 3)
+    assert path[0] == pytest.approx((0.0, -0.25))
+    assert path[1] == pytest.approx((0.0, -0.75))
+    assert path[2] == pytest.approx((0.0, -1.5))
+
+
+def test_ballistic_forecast_horizontal_carry():
+    # constant vx, no gravity -> pure translation of vx*dt per tick.
+    path = T.ballistic_forecast(100, 50, 600, 0, 0, 0, 1)
+    assert path[0] == pytest.approx((110.0, 50.0))
+
+
+def test_forecast_oob_flags_a_launched_body():
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "rocket", "shape": "circle", "pos": [500, 300], "radius": 8,
+         "velocity": [0, 900], "control": True}]), use_bank=False)
+    w = _kinds(out, "forecast_oob")
+    assert len(w) == 1 and w[0]["bodies"] == ["rocket"]
+    assert w[0]["tick"] > 0  # a concrete tick at which it leaves the world
+
+
+def test_no_forecast_for_a_body_at_rest():
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [500, 300], "radius": 8,
+         "control": True}]), use_bank=False)
+    assert _kinds(out, "forecast_oob") == []
+
+
+def test_ballistic_summary_reports_jump_kinematics():
+    spec = _full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "mass": 1.0, "control": True}])
+    spec["act"] = {"a": [{"verb": "impulse", "body": "ball", "vec": [0, 460]}], "b": []}
+    b = T.inspect_world(spec, use_bank=False)["summary"]["ballistic"]
+    assert b["body"] == "ball"
+    assert b["launch_dv"] == [0.0, 460.0]
+    assert b["apex_px"] == pytest.approx(460 * 460 / (2 * 900), abs=1e-3)
+
+
+# ---- Item 8: convexity check on poly shapes --------------------------------
+def test_nonconvex_poly_is_warned():
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "el", "shape": "poly", "pos": [300, 300], "static": True,
+         "vertices": [[0, 0], [40, 0], [40, 10], [10, 10], [10, 40], [0, 40]]},
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}]), use_bank=False)
+    w = _kinds(out, "nonconvex_poly")
+    assert len(w) == 1 and w[0]["bodies"] == ["el"]
+
+
+def test_convex_poly_is_not_warned():
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "tri", "shape": "poly", "pos": [300, 300], "static": True,
+         "vertices": [[0, 0], [20, 0], [0, 30]]},
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}]), use_bank=False)
+    assert _kinds(out, "nonconvex_poly") == []
+
+
+# ---- Item 9: contact-cap pile-up -------------------------------------------
+def test_contact_cap_warns_over_eight_contacts():
+    bodies = [{"name": "ball", "shape": "circle", "pos": [500, 300], "radius": 30,
+               "control": True}]
+    for i in range(9):  # nine tiny statics all inside the ball's AABB
+        bodies.append({"name": f"s{i}", "shape": "box", "pos": [500, 300],
+                       "size": [4, 4], "static": True})
+    out = T.inspect_world(_full(bodies), use_bank=False)
+    w = _kinds(out, "contact_cap")
+    assert len(w) == 1 and w[0]["bodies"] == ["ball"] and w[0]["contacts"] == 9
+
+
+def test_few_contacts_do_not_trip_the_cap():
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [500, 25], "radius": 8,
+         "control": True}]), use_bank=False)  # ball touches only the floor
+    assert _kinds(out, "contact_cap") == []
+
+
+# ---- Item 10: tunneling (thin/fast) ----------------------------------------
+def test_thin_wall_and_segment_warn_tunneling_but_thick_wall_does_not():
+    out = T.inspect_world(_full([
+        {"name": "floor", "shape": "box", "pos": [500, 20], "size": [1000, 40],
+         "static": True},                                     # thick -> no warn
+        {"name": "thinwall", "shape": "box", "pos": [500, 300], "size": [4, 200],
+         "static": True},                                     # 4px thin -> warn
+        {"name": "seg", "shape": "segment", "pos": [200, 300], "a": [-50, 0],
+         "b": [50, 0], "static": True},                       # zero-thickness -> warn
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}]), use_bank=False)
+    hit = {b for w in _kinds(out, "tunneling") for b in w["bodies"]}
+    assert hit == {"thinwall", "seg"}
+    assert "floor" not in hit
+
+
+def test_no_tunneling_warning_without_a_dynamic_body():
+    out = T.inspect_world({"bodies": [
+        {"name": "seg", "shape": "segment", "pos": [200, 300], "a": [-50, 0],
+         "b": [50, 0], "static": True}]}, use_bank=False)
+    assert _kinds(out, "tunneling") == []  # nothing to tunnel it
+
+
+# ---- Item 11: sensor layer/mask mismatch -----------------------------------
+def _sensor_spec(mask):
+    return _full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}], spec_version=2,
+        sensors=[{"type": "raycast2d", "attach_to": "ball", "collision_mask": mask}])
+
+
+def test_sensor_mask_excluding_layer_one_warns():
+    out = T.inspect_world(_sensor_spec(2), use_bank=False)  # bit 0 unset
+    w = _kinds(out, "layer_mask_mismatch")
+    assert len(w) == 1 and w[0]["bodies"] == ["ball"] and w[0]["collision_mask"] == 2
+
+
+def test_sensor_mask_including_layer_one_is_ok():
+    assert _kinds(T.inspect_world(_sensor_spec(1), use_bank=False),
+                  "layer_mask_mismatch") == []
+    assert _kinds(T.inspect_world(_sensor_spec(3), use_bank=False),
+                  "layer_mask_mismatch") == []  # bit 0 set
+
+
+# ---- Item 12: predicate linter ---------------------------------------------
+def _lint_problems(success):
+    out = T.inspect_world(_full([_FLOOR,
+        {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True},
+        {"name": "goal", "shape": "box", "pos": [900, 100], "size": [40, 40],
+         "static": True, "sensor": True}], success=success), use_bank=False)
+    return {w["problem"] for w in _kinds(out, "predicate_lint")}
+
+
+def test_lint_flags_c_style_logical_operators():
+    assert "logical_operator" in _lint_problems('grounded("ball") && pos_x("ball") > 0')
+    assert "logical_operator" in _lint_problems('grounded("ball") || pos_x("ball") > 0')
+
+
+def test_lint_flags_integer_division_trap():
+    assert "integer_division" in _lint_problems("steps / 2 > 5")
+    assert "integer_division" not in _lint_problems("steps / 2.0 > 5")
+
+
+def test_lint_flags_wrong_arity():
+    assert "bad_arity" in _lint_problems("pos_x() > 0")
+    assert "bad_arity" in _lint_problems('dist("ball") > 0')  # dist needs 2
+
+
+def test_lint_flags_undefined_body_reference():
+    assert "undefined_body" in _lint_problems('contacts("ball", "ghost")')
+    assert "undefined_body" not in _lint_problems('contacts("ball", "goal")')
+
+
+def test_lint_flags_forbidden_identifier_and_attribute_access():
+    probs = _lint_problems('OS.get_name() == "x"')
+    assert "bad_identifier" in probs   # OS / get_name not in the allow-list
+    assert "bad_char" in probs          # the '.' attribute access
+
+
+def test_clean_predicate_has_no_lint_warnings():
+    assert _lint_problems('contacts("ball", "goal") and pos_x("ball") > 100.0') == set()
