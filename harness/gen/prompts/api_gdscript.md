@@ -37,6 +37,10 @@ Implement these seven methods on your node (exact names + arities; the contract 
 
 How it runs: `build(world_seed)` runs once, then each decision tick the host calls `act(action)` once, advances the physics a fixed number of steps, reads `checkpoints()`, then `is_failure()` then `is_success()`. The action is the player's/solver's; there is no built-in idle move.
 
+# Visuals - WELCOME but never required (render-only, verification-blind)
+
+Certification is pixel-blind: it reads only `state()`, so nothing you add for looks can help OR hurt the verdict, and a separate demo lane already auto-dresses every certified game (colored proxies matched to your collision shapes, a fit-to-scene camera, a light) - you need add NOTHING. But if you want the demo to look its best, you MAY attach render-only nodes, built in code from primitives the same way you build the rest: a `Polygon2D`/`Sprite2D` or a `MeshInstance3D` + `StandardMaterial3D` on a body, a `Camera2D`/`Camera3D`, a `DirectionalLight3D`, a `WorldEnvironment`. There is deliberately NO prescribed node list, size, or colour - choose what your fiction wants, or nothing. What still binds: visuals stay PURELY cosmetic (never a physics body, collision shape, or joint, and never mutate game state - `state()` remains the single source of truth); no external assets and no `load()`/`preload()` (both banned - construct any mesh/material in code).
+
 # Determinism + randomness - a hard rule
 
 The verifier REPLAYS your run and must reproduce it byte-for-byte. The ONLY randomness allowed is an rng you seed FROM `world_seed`; the global `randi()`/`randf()`/`randomize()` are unseeded and BANNED. Physics is pinned (a fixed step, single thread); never touch the loop, the clock, or the physics/time pins.
