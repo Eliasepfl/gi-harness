@@ -409,15 +409,19 @@ def build_menu(names, engine="py", *, bank=None) -> str:
 
     eng = str(engine).lower()
 
-    if eng == "godot":
+    if eng in ("godot", "gdscript"):
+        # Both Godot lanes skin a body by its NAME and build bodies themselves (the
+        # declarative spec in a body list, the .gd game via add_body); the menu is
+        # advisory name + physics vocabulary, never a world.part/world.add catalog.
         usage = ("Optional themed-NAME + calibrated-PHYSICS suggestions for this "
                  "prompt - advisory VOCABULARY, never a catalog to fit your design "
                  "to. Borrow a name (naming carries meaning) or a suggested number "
                  "if it serves your mechanic; otherwise ignore the whole list and "
                  "build the bodies your game needs.")
+        hatch = (_prompts.ESCAPE_HATCH_GDSCRIPT if eng == "gdscript"
+                 else _prompts.ESCAPE_HATCH_GODOT)
         lines = [_godot_line(b.parts[n]) for n in names if n in b.parts]
-        return _prompts.render_bank_menu(
-            "\n".join(lines), usage, escape_hatch=_prompts.ESCAPE_HATCH_GODOT)
+        return _prompts.render_bank_menu("\n".join(lines), usage, escape_hatch=hatch)
 
     if eng == "js":
         usage = ("world.js has no world.part() yet: build each part with world.add "

@@ -1196,6 +1196,18 @@ def detect_engine(game_path: str, source: str = "") -> str:
     return "py"
 
 
+def gdscript_route_available() -> bool:
+    """Whether the GDScript verify route — the G0 code-gates + serve-contract
+    executor (TRACK C) — is importable in this build. The generator writes `.gd`
+    games regardless; this only tells callers/tests whether the FULL G0-G3 funnel
+    can run yet, so a template-backend e2e can skip gracefully until TRACK C merges."""
+    try:
+        import harness.verify.gd_exec  # noqa: F401  (TRACK C: the serve-contract executor)
+        return True
+    except ImportError:
+        return False
+
+
 # ======================================================================== #
 # Orchestration
 # ======================================================================== #
@@ -1232,6 +1244,8 @@ def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -
         return _verify_gdscript(source, report)
     if engine == "godot":
         return _verify_godot(source, report)
+    if engine == "gdscript":
+        return _verify_gdscript(source, report)
     if engine == "js":
         return _verify_js(source, report)
     return _verify_py(source, report, world_factory)

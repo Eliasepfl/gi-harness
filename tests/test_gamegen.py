@@ -1410,3 +1410,188 @@ def test_game_new_default_engine_writes_spec_json(tmp_path, monkeypatch):
     assert path and path.endswith(".spec.json")
     from harness.verify.gameverify import detect_engine
     assert detect_engine(path) == "godot"
+
+
+# --- GDScript engine wiring (agent-written .gd game class) ---------------------
+# The code lane emits a real .gd class implementing the GameAPI contract, verified
+# through the serve contract (notes/engines/GDSCRIPT_LANE.md). The FULL G0-G3 funnel
+# needs TRACK C (the code-gates + executor); until it merges the route reports itself
+# absent, so the full-pipeline e2e skips gracefully while the emission wiring is
+# exercised with a mocked verifier.
+
+from harness.verify.gameverify import gdscript_route_available  # noqa: E402
+
+requires_gdscript_route = pytest.mark.skipif(
+    (not gdscript_route_available()) or GODOT_EXE is None,
+    reason="gdscript verify route (TRACK C) or Godot binary not present")
+
+
+def test_engine_helpers_route_gdscript():
+    assert GG._resolve_engine("gdscript") == "gdscript"
+    assert GG._game_ext("gdscript") == ".gd"
+    assert GG._engine_lang("gdscript") == ("GDScript", "gdscript")
+
+
+def test_system_prompt_gdscript_is_compose():
+    from harness.gen import prompts as P
+    assert GG._system_prompt("gdscript") == P.compose("gdscript")
+    assert GG._SYSTEM_PROMPT_GDSCRIPT == P.compose("gdscript")
+
+
+def test_first_user_msg_gdscript_asks_for_a_gd_file():
+    msg = GG._first_user_msg("bounce a ball", "gdscript")
+    assert "```gdscript" in msg
+    assert "GDScript game class (one .gd file)" in msg
+    assert "```python" not in msg and "```json" not in msg
+
+
+def test_extract_gdscript_roundtrip_from_padded_reply():
+    # A realistic model reply: DESIGN block, a ```gdscript fence, and trailing prose.
+    reply = ("DESIGN\nTheme: drift\nMilestones: a -> b\n\n```gdscript\n"
+             + GG._DRIFT_GDSCRIPT + "```\nThat is my game.\n")
+    got = GG._extract_code(reply, "gdscript")
+    assert got == GG._DRIFT_GDSCRIPT              # clean round-trip -> the .gd bytes
+
+
+def test_extract_gdscript_tolerates_gd_fence_and_keepalive_padding():
+    reply = ("\n\n: OPENROUTER PROCESSING\n```gd\nextends GameBase\n"
+             "func success() -> bool:\n\treturn true\n```")
+    got = GG._extract_code(reply, "gdscript")
+    assert got.startswith("extends GameBase")
+    assert "func success" in got
+
+
+def test_openrouter_gdscript_uses_compose_and_writes_gd(tmp_path, monkeypatch):
+    # The openrouter backend (the volume LLM path) drives the gdscript lane through
+    # the SAME engine-agnostic loop: it hands the model compose("gdscript") and writes
+    # the extracted .gd. (verify mocked to pass; TRACK C not needed for emission.)
+    from harness.gen import prompts as P
+    _fake_secrets(monkeypatch)
+    content = "DESIGN\nTheme: t\n```gdscript\n" + GG._DRIFT_GDSCRIPT + "```"
+    fake = _FakeRequests([_FakeResp(200, _chat(content))])
+    monkeypatch.setattr(GG, "requests", fake)
+    _install_gameverify(monkeypatch, lambda p: {"passed": True, "failure_class": None,
+                                                "hint": "", "witness": {}})
+
+    res = GG.generate_game("drift a puck onto the pad", out_dir=str(tmp_path),
+                           backend="openrouter", engine="gdscript", max_repairs=1,
+                           use_bank=False)
+
+    assert res["engine"] == "gdscript" and res["backend"] == "openrouter"
+    assert res["game_path"].endswith(".gd")
+    # The request carried the gdscript system prompt (menu-free; use_bank=False).
+    sys_msg = fake.calls[0]["json"]["messages"][0]
+    assert sys_msg["role"] == "system" and sys_msg["content"] == P.compose("gdscript")
+    assert "extends GameBase" in open(res["game_path"], encoding="utf-8").read()
+
+
+def test_builtin_gdscript_fixture_is_contract_shaped():
+    src = GG._DRIFT_GDSCRIPT
+    assert src.startswith("extends GameBase")
+    # Every required + optional GameAPI method the host calls.
+    for method in ("func game_meta", "func build_world", "func on_action",
+                   "func on_step", "func checkpoints", "func success"):
+        assert method in src, method
+    # Exactly one controlled body.
+    assert src.count("control(") == 1
+    # 2..8 declared actions.
+    actions = re.search(r'"actions":\s*\[([^\]]*)\]', src).group(1)
+    assert 2 <= len(re.findall(r'"[a-z_]+"', actions)) <= 8
+    # Tab-indented (matches godotworld/runner.gd), never space-indented bodies.
+    indented = [ln for ln in src.splitlines() if ln[:1] in (" ", "\t")]
+    assert indented and all(ln.startswith("\t") for ln in indented)
+    # Free of every BANNED family (it must pass the G0 code-gate when TRACK C lands).
+    for banned in ("OS.", "FileAccess", "HTTPRequest", "Thread", "Time.",
+                   "randi(", "randf(", "preload(", "load(", "set_script",
+                   "get_tree(", "queue_free"):
+        assert banned not in src, banned
+
+
+def test_parse_parts_used_gdscript_matches_body_names():
+    # gdscript: add_static/add_sensor/add_body names carry part identity (skinned by
+    # name, like godot/js) - in source order, deduped, filtered to the bank.
+    bank_names = {"puck", "switch", "pad", "wall_top", "wall_left"}
+    used = GG._parse_parts_used(GG._DRIFT_GDSCRIPT, "gdscript", bank_names)
+    assert used == ["wall_top", "wall_left", "switch", "pad", "puck"]
+
+
+def test_detect_engine_and_route_available_gdscript():
+    from harness.verify.gameverify import detect_engine, gdscript_route_available as avail
+    assert detect_engine("/games/foo.gd") == "gdscript"
+    assert detect_engine("/games/x.txt", "# engine: gdscript\nextends GameBase") == "gdscript"
+    # Other lanes still win their own path/marker.
+    assert detect_engine("/games/foo.spec.json") == "godot"
+    assert detect_engine("/games/foo.js") == "js"
+    assert isinstance(avail(), bool)             # TRACK C absent -> False in this build
+
+
+def test_ledger_records_engine_gdscript(tmp_path):
+    from harness.core import telemetry
+    ledger = tmp_path / "ledger.jsonl"
+    result = {"backend": "template", "engine": "gdscript", "verdict": "COMPLETED",
+              "attempts": [{"report": {"passed": True}}]}
+    entry = telemetry.record_run(result, "arm the pad then dock", "template", 1.0,
+                                 path=str(ledger))
+    assert entry["engine"] == "gdscript"
+    line = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert line["engine"] == "gdscript"
+
+
+def test_generate_game_gdscript_emits_gd_with_mocked_verify(tmp_path, monkeypatch):
+    # Emission wiring works WITHOUT TRACK C: verify is mocked to pass, so this pins
+    # the generation path only (ext .gd, engine recorded, clean artifact written).
+    _install_gameverify(monkeypatch, lambda p: {
+        "passed": True, "failure_class": None, "hint": "",
+        "witness": {"ticks": 6, "actions": [], "seed": 0, "checkpoints": {}}})
+
+    res = GG.generate_game("guide the puck onto the glowing pad",
+                           out_dir=str(tmp_path), backend="template",
+                           engine="gdscript", max_repairs=1, use_bank=False)
+
+    assert res["engine"] == "gdscript"
+    assert res["backend"] == "template"
+    assert res["verdict"] == "COMPLETED"
+    path = res["game_path"]
+    assert path and path.endswith(".gd")
+    src = open(path, encoding="utf-8").read()
+    assert "extends GameBase" in src and "func build_world" in src
+    # The written artifact is the clean .gd game, not the DESIGN prose.
+    assert not src.lstrip().startswith("DESIGN")
+
+
+def test_verify_game_gdscript_route_absent_is_typed(tmp_path):
+    # With TRACK C absent, verify_game routes a .gd through _verify_gdscript, which
+    # returns a typed gdscript_route_absent report (no funnel layers) so the repair
+    # loop recognises an infra error and stops honestly, never misrouting the code
+    # into the pymunk path. In-process (sandboxed=False): fast + hermetic.
+    if gdscript_route_available():
+        pytest.skip("gdscript route present; the absent-route path is not exercised")
+    from harness.verify.gameverify import verify_game
+    gd = tmp_path / "g.gd"
+    gd.write_text(GG._DRIFT_GDSCRIPT, encoding="utf-8")
+
+    report = verify_game(str(gd), sandboxed=False)
+
+    assert report["engine"] == "gdscript"
+    assert report["failure_class"] == "VERIFY_ERROR"
+    assert report.get("error", {}).get("type") == "gdscript_route_absent"
+    assert "layers" not in report                # the VERIFY_ERROR shape the loop catches
+
+
+@requires_gdscript_route
+def test_generate_game_gdscript_template_roundtrip(tmp_path):
+    """Acceptance: a template-backend prompt -> .gd -> the FULL G0-G3 funnel through
+    the serve contract, all green, engine recorded end to end. Skips until TRACK C
+    (the G0 code-gates + serve-contract executor) merges."""
+    res = GG.generate_game("arm the pad then dock the puck", out_dir=str(tmp_path),
+                           backend="template", engine="gdscript", max_repairs=1,
+                           use_bank=False)
+    assert res["engine"] == "gdscript"
+    assert res["backend"] == "template"
+    assert res["verdict"] == "COMPLETED", res.get("attempts")
+    path = res["game_path"]
+    assert path and path.endswith(".gd")
+    from harness.verify.gameverify import detect_engine
+    assert detect_engine(path) == "gdscript"
+    final = res["attempts"][-1]["report"]
+    assert final["engine"] == "gdscript" and final["passed"]
