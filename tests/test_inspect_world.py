@@ -583,3 +583,91 @@ def test_lint_flags_forbidden_identifier_and_attribute_access():
 
 def test_clean_predicate_has_no_lint_warnings():
     assert _lint_problems('contacts("ball", "goal") and pos_x("ball") > 100.0') == set()
+
+
+# =========================================================================== #
+# TOP-DOWN world mode (SPEC.md §2b): zero gravity flips the gravity-dependent
+# oracles — floating statics + ballistic forecast are meaningless (suppressed),
+# and a linear_damp makes a park-at-rest goal satisfiable.
+# =========================================================================== #
+_BALL = {"name": "ball", "shape": "circle", "pos": [100, 100], "radius": 8,
+         "control": True}
+
+
+def _topdown(bodies, **extra):
+    extra.setdefault("world", {"view": "topdown", "linear_damp": 1.5})
+    return _full(bodies, **extra)
+
+
+def test_topdown_summary_reports_view_and_zero_gravity():
+    out = T.inspect_world(_topdown([_FLOOR, _BALL]), use_bank=False)
+    assert out["summary"]["view"] == "topdown"
+    assert out["summary"]["gravity"] == [0.0, 0.0]
+    assert out["summary"]["ballistic"] is None       # no gravity -> no jump forecast
+
+
+def test_side_view_is_the_default_with_gravity():
+    out = T.inspect_world(_full([_FLOOR, _BALL]), use_bank=False)
+    assert out["summary"]["view"] == "side"
+    assert out["summary"]["gravity"] == [0.0, -900.0]
+
+
+def test_topdown_suppresses_floating_static_but_side_warns():
+    ledge = {"name": "ledge", "shape": "box", "pos": [400, 300], "size": [100, 20],
+             "static": True}                          # nothing under it
+    side = T.inspect_world(_full([_FLOOR, ledge, _BALL]), use_bank=False)
+    assert [b for w in _kinds(side, "floating_static") for b in w["bodies"]] == ["ledge"]
+    top = T.inspect_world(_topdown([_FLOOR, ledge, _BALL]), use_bank=False)
+    assert _kinds(top, "floating_static") == []      # no "floor" in a plan view
+
+
+def test_topdown_suppresses_ballistic_forecast_oob():
+    rocket = {"name": "rocket", "shape": "circle", "pos": [500, 300], "radius": 8,
+              "velocity": [0, 900], "control": True}
+    side = T.inspect_world(_full([_FLOOR, rocket]), use_bank=False)
+    assert len(_kinds(side, "forecast_oob")) == 1
+    top = T.inspect_world(_topdown([_FLOOR, rocket]), use_bank=False)
+    assert _kinds(top, "forecast_oob") == []         # damped coast, not ballistic
+
+
+def test_topdown_with_damping_makes_park_satisfiable():
+    # side view: a rest-at-goal with no clamp is unsatisfiable (bodies coast forever).
+    side = T.inspect_world(_full([_FLOOR, _BALL], success='speed("ball") < 5'),
+                           use_bank=False)
+    assert len(_kinds(side, "unsatisfiable_park")) == 1
+    # top-down with linear_damp>0: friction brings it to rest -> satisfiable, no warning.
+    top = T.inspect_world(_topdown([_FLOOR, _BALL], success='speed("ball") < 5'),
+                          use_bank=False)
+    assert _kinds(top, "unsatisfiable_park") == []
+
+
+def test_topdown_zero_damp_still_warns_unsatisfiable_park():
+    # linear_damp explicitly 0 -> a top-down body still coasts forever, so the park
+    # goal is unsatisfiable and the warning must fire.
+    spec = _full([_FLOOR, _BALL], success='speed("ball") < 5',
+                 world={"view": "topdown", "linear_damp": 0})
+    out = T.inspect_world(spec, use_bank=False)
+    assert len(_kinds(out, "unsatisfiable_park")) == 1
+
+
+def test_topdown_still_flags_out_of_bounds():
+    # View-independent geometry checks (bounds, duplicates, overlaps) are unaffected.
+    spec = _topdown([
+        {"name": "g", "shape": "box", "pos": [100, 100], "size": [40, 40], "static": True},
+        {"name": "esc", "shape": "circle", "pos": [1180, 100], "radius": 10, "control": True},
+    ], world_size=(200, 200))
+    out = T.inspect_world(spec, use_bank=False)
+    oob = [w for w in out["warnings"] if w["kind"] == "out_of_bounds"]
+    assert oob and oob[0]["bodies"] == ["esc"]
+
+
+def test_smoke_on_topdown_slalom_fixture():
+    with open(os.path.join(_FIXTURES, "topdown_slalom.spec.json"), encoding="utf-8") as fh:
+        spec = json.load(fh)
+    out = T.inspect_world(spec)
+    assert out["summary"]["view"] == "topdown"
+    assert out["summary"]["gravity"] == [0.0, 0.0]
+    # the cart parks via contained()+speed on a rotatable box, but the damped top-down
+    # world means it is NOT flagged unsatisfiable, and there is no floating-static noise.
+    assert _kinds(out, "unsatisfiable_park") == []
+    assert _kinds(out, "floating_static") == []

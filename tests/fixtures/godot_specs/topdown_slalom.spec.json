@@ -1,0 +1,37 @@
+{
+  "engine": "godot",
+  "spec_version": 1,
+  "world": {"view": "topdown", "linear_damp": 1.5},
+  "meta": {
+    "title": "Rink Slalom",
+    "prompt": "Steer the cart through the two cones and settle onto the bay - a top-down rink seen from above.",
+    "world_size": [1200, 700],
+    "actions": ["thrust", "steer_left", "steer_right"]
+  },
+  "bodies": [
+    {"name": "wall_top", "shape": "box", "pos": [600, 690], "size": [1200, 20], "static": true},
+    {"name": "wall_bottom", "shape": "box", "pos": [600, 10], "size": [1200, 20], "static": true},
+    {"name": "wall_left", "shape": "box", "pos": [10, 350], "size": [20, 700], "static": true},
+    {"name": "wall_right", "shape": "box", "pos": [1190, 350], "size": [20, 700], "static": true},
+    {"name": "cone", "shape": "circle", "pos": [500, 430], "radius": 40, "static": true, "friction": 0.4},
+    {"name": "cone_2", "shape": "circle", "pos": [760, 270], "radius": 40, "static": true, "friction": 0.4},
+    {"name": "bay", "shape": "box", "pos": [1000, 350], "size": [240, 240], "static": true, "sensor": true},
+    {"name": "cart", "shape": "box", "pos": [170, 350], "size": [60, 30], "mass": 1.0, "friction": 0.5, "control": true}
+  ],
+  "act": {
+    "thrust": [{"verb": "thrust", "body": "cart", "magnitude": 70}],
+    "steer_left": [{"verb": "torque", "body": "cart", "magnitude": 150}],
+    "steer_right": [{"verb": "torque", "body": "cart", "magnitude": -150}]
+  },
+  "on_step": [
+    {"kind": "velocity_clamp", "body": "cart", "vx_max": 220, "vy_min": -220, "vy_max": 220}
+  ],
+  "predicates": {
+    "success": "contained(\"cart\", \"bay\") and speed(\"cart\") < 55",
+    "checkpoints": {
+      "rolling": "pos_x(\"cart\") > 320",
+      "through_gate": "pos_x(\"cart\") > 800",
+      "settled": "contained(\"cart\", \"bay\") and speed(\"cart\") < 55"
+    }
+  }
+}

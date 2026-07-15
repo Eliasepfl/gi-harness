@@ -151,6 +151,61 @@ def test_schema_rejects_unknown_verb_and_stray_field():
         jsonschema.validate(stray, schema)  # additionalProperties: false
 
 
+# ---- top-down world block (view / linear_damp) ------------------------------
+def test_schema_accepts_topdown_world_block():
+    import jsonschema
+    schema = _schema()
+    spec = json.loads(json.dumps(_load_spec("traverse")))
+    spec["world"] = {"view": "topdown", "linear_damp": 1.5}
+    jsonschema.validate(spec, schema)  # raises on non-conformance
+    # linear_damp is optional; a bare view validates too.
+    spec["world"] = {"view": "topdown"}
+    jsonschema.validate(spec, schema)
+    spec["world"] = {"view": "side"}
+    jsonschema.validate(spec, schema)
+
+
+def test_schema_default_is_side_no_world_block_required():
+    # Back-compat: every shipped example omits `world` and must still validate (the
+    # runner defaults the view to side).
+    import jsonschema
+    schema = _schema()
+    for name in _SPEC_NAMES:
+        spec = _load_spec(name)
+        assert "world" not in spec
+        jsonschema.validate(spec, schema)
+
+
+def test_schema_rejects_bad_view_and_stray_world_field():
+    import jsonschema
+    schema = _schema()
+    base = json.loads(json.dumps(_load_spec("traverse")))
+
+    bad_view = json.loads(json.dumps(base))
+    bad_view["world"] = {"view": "isometric"}     # not in the enum
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad_view, schema)
+
+    stray = json.loads(json.dumps(base))
+    stray["world"] = {"view": "topdown", "bogus": True}  # additionalProperties: false
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(stray, schema)
+
+    neg_damp = json.loads(json.dumps(base))
+    neg_damp["world"] = {"view": "topdown", "linear_damp": -1}  # minimum 0
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(neg_damp, schema)
+
+
+def test_topdown_slalom_fixture_matches_schema():
+    import jsonschema
+    schema = _schema()
+    with open(_example_path("topdown_slalom"), encoding="utf-8") as fh:
+        spec = json.load(fh)
+    jsonschema.validate(spec, schema)
+    assert spec["world"] == {"view": "topdown", "linear_damp": 1.5}
+
+
 def test_schema_accepts_contained_predicate_string():
     # Predicate strings are opaque to the schema (the whitelist scan lives in the
     # frozen runner) — contained(...) must at least validate structurally.

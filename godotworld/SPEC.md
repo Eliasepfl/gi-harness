@@ -14,8 +14,10 @@ The spec mirrors `CONTRACTS.md §1-2` one-for-one: `bodies` are `World.add` kwar
 `joints` are `World.pin/pivot/spring`, `act` is the per-action `world.impulse/force/
 set_velocity`, `predicates` are `success/failure/checkpoints`. The runner enforces the
 same decision-tick semantics as `nodeworld/runner.js` (act, then K=6 physics steps,
-latch checkpoints, check failure then success), the same y-UP px world with gravity
-`(0, -900)` at `dt = 1/60`, seeded determinism, and full-precision `%.17f` float output.
+latch checkpoints, check failure then success), the same y-UP px world at `dt = 1/60`,
+seeded determinism, and full-precision `%.17f` float output. Gravity is set per **view
+mode** (§2b): the default `side` view keeps the historical `(0, -900)`; a `topdown`
+view zeroes gravity for a plan-view arena.
 
 ---
 
@@ -24,6 +26,7 @@ latch checkpoints, check failure then success), the same y-UP px world with grav
 ```jsonc
 {
   "engine": "godot",                 // optional marker
+  "world":  { ... },                 // optional: view (side|topdown) + linear_damp
   "meta":   { ... },                 // title, prompt, world_size?, actions
   "bodies": [ ... ],                 // >= 2 bodies; exactly one "control": true
   "joints": [ ... ],                 // optional
@@ -43,6 +46,33 @@ latch checkpoints, check failure then success), the same y-UP px world with grav
 | `prompt` | string | the originating user prompt |
 | `world_size` | `[w, h]` | optional; width 800..2400, height 600..1600 (G0 validates); default `[800, 600]` |
 | `actions` | `[str]` | 2..8 game-chosen action names (the move set) |
+
+## 2b. `world` — view mode (side vs top-down)
+
+Optional top-level block selecting how gravity reads. **Omitting it is the default
+`side` view**, and a spec with no `world` block is byte-for-byte identical to before
+this field existed — the frozen runner touches no body property in side view.
+
+| field | type | notes |
+|---|---|---|
+| `view` | `"side"` \| `"topdown"` | default `"side"` |
+| `linear_damp` | number ≥ 0 | **top-down only**; the per-body linear-damping friction analog. Default `1.5`. Ignored in side view. |
+
+- **`side`** (default): gravity `(0, -900)`, zero linear damping — the historical
+  platformer/tower/pit world. Down is `-Y`; a released body falls and rests on a floor.
+- **`topdown`**: gravity `(0, 0)` — the `x`/`y` plane is the **floor seen from above**
+  (a plan-view arena: BallChase / AirHockey / CrossTheRoad / the steer family). No body
+  falls; bodies **glide**. `world.linear_damp` (default `1.5`) is applied to **every
+  dynamic body** as the friction analog, so a body pushed by `impulse`/`thrust` and then
+  released **coasts to a stop** instead of drifting forever. Bound the arena on **all
+  four sides** (there is no floor to catch a body). `grounded(...)` is meaningless
+  (nothing is "below"); success is a reach / `contained(...)` / stillness read, not a
+  landing.
+
+Realisation (runner, per dynamic `RigidBody2D`, at world build): side view leaves
+`gravity_scale = 1` and `linear_damp = 0` (engine defaults, untouched); top-down sets
+`gravity_scale = 0` and `linear_damp = world.linear_damp` (`DAMP_MODE_REPLACE`). Static
+and sensor bodies are unaffected. Both serve and batch modes honour the view.
 
 ## 3. `bodies` — mirrors `World.add`
 

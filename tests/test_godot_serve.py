@@ -35,6 +35,7 @@ from harness.verify.executors import GodotExecutor, find_godot_exe  # noqa: E402
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _EXAMPLES = os.path.join(_ROOT, "tests", "fixtures", "godot_specs")
 TRAVERSE = os.path.join(_EXAMPLES, "traverse.spec.json")
+TOPDOWN_SLALOM = os.path.join(_EXAMPLES, "topdown_slalom.spec.json")
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -254,6 +255,30 @@ def test_serve_batch_parity_is_the_bridge():
     serve_latch = {k: v for k, v in info["latched"].items() if v is not None}
     batch_latch = {k: v for k, v in rec["checkpoints"].items() if v is not None}
     assert serve_latch == batch_latch
+
+
+# ====================================================================== #
+# 2b. Serve mode honours the top-down view (skipped without the Godot binary)
+# ====================================================================== #
+@requires_godot
+def test_serve_topdown_cart_glides_forward():
+    """Serve mode must build the top-down world too: with zero gravity the cart does not
+    pin to a floor, and repeated `thrust` glides it forward far enough to latch the first
+    checkpoint (`rolling`, pos_x > 320). Proves the view branch is live in serve/batch."""
+    env = GodotServeEnv(TOPDOWN_SLALOM, port_base=_free_port(), horizon=120)
+    try:
+        assert env.actions == ["thrust", "steer_left", "steer_right"]
+        env.reset(seed=0)
+        ti = env.actions.index("thrust")
+        info = None
+        for _ in range(50):
+            _o, _r, term, trunc, info = env.step(ti)
+            if term or trunc:
+                break
+        # thrusting from spawn (x=170) crosses the rolling gate (pos_x > 320).
+        assert info["latched"].get("rolling") is not None, info["latched"]
+    finally:
+        env.close()
 
 
 # ====================================================================== #
