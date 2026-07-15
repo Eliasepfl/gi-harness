@@ -109,6 +109,59 @@ def test_schema_rejects_malformed_specs():
         jsonschema.validate(bad_shape, schema)
 
 
+# ---- heading-control verbs (torque / thrust) + contained() ------------------
+def _schema() -> dict:
+    with open(_SCHEMA, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_schema_accepts_torque_and_thrust_verbs():
+    import jsonschema
+    schema = _schema()
+    base = _load_spec("traverse")
+    body = base["bodies"][-1]["name"]  # the controlled body
+    spec = json.loads(json.dumps(base))
+    spec["meta"]["actions"] = ["torque_it", "thrust_it"]
+    spec["act"] = {
+        "torque_it": [{"verb": "torque", "body": body, "magnitude": 180}],
+        # thrust with a signed magnitude + an optional gate is still data-only.
+        "thrust_it": [{"verb": "thrust", "body": body, "magnitude": -90,
+                       "when": "grounded(\"%s\")" % body}],
+    }
+    jsonschema.validate(spec, schema)  # raises on non-conformance
+
+
+def test_schema_rejects_unknown_verb_and_stray_field():
+    import jsonschema
+    schema = _schema()
+    base = _load_spec("traverse")
+    body = base["bodies"][-1]["name"]
+
+    unknown = json.loads(json.dumps(base))
+    unknown["act"] = {a: [{"verb": "warp", "body": body, "magnitude": 1}]
+                      for a in unknown["meta"]["actions"]}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(unknown, schema)
+
+    stray = json.loads(json.dumps(base))
+    stray["act"] = {a: [{"verb": "thrust", "body": body, "magnitude": 1,
+                         "bogus": True}] for a in stray["meta"]["actions"]}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(stray, schema)  # additionalProperties: false
+
+
+def test_schema_accepts_contained_predicate_string():
+    # Predicate strings are opaque to the schema (the whitelist scan lives in the
+    # frozen runner) — contained(...) must at least validate structurally.
+    import jsonschema
+    schema = _schema()
+    spec = json.loads(json.dumps(_load_spec("traverse")))
+    spec["predicates"]["success"] = "contained(\"marble\", \"goal_zone\")"
+    spec["predicates"]["checkpoints"] = {
+        "parked": "contained(\"marble\", \"goal_zone\")"}
+    jsonschema.validate(spec, schema)
+
+
 # ====================================================================== #
 # Engine detection (pure python)
 # ====================================================================== #
@@ -290,6 +343,116 @@ def test_forbidden_predicate_rejected_by_whitelist(tmp_path):
     assert rep["engine"] == "godot"
     assert rep["failure_class"] == "GOAL_ERROR"
     assert rep["layers"]["G2_goal"]["checks"]["success_callable_bool"]["pass"] is False
+
+
+# ====================================================================== #
+# Heading-control verbs + contained() — end-to-end (skipped without Godot)
+# ====================================================================== #
+
+# The 2D-parking archetype: a dynamic car, driven by thrust along its heading and
+# steered by torque, must end FULLY inside the slot sensor (contained, not merely
+# touching). Tuned to be tree-solvable in a few dozen decision ticks.
+_PARKING_SPEC = {
+    "engine": "godot",
+    "spec_version": 1,
+    "meta": {
+        "title": "Pull Into The Slot",
+        "prompt": "Drive the car fully inside the parking slot.",
+        "world_size": [1000, 600],
+        "actions": ["drive", "spin_left", "spin_right"],
+    },
+    "bodies": [
+        {"name": "floor", "shape": "box", "pos": [500, 25], "size": [1000, 50],
+         "static": True, "friction": 0.6},
+        {"name": "wall_left", "shape": "box", "pos": [10, 300], "size": [20, 600],
+         "static": True},
+        {"name": "wall_right", "shape": "box", "pos": [990, 300], "size": [20, 600],
+         "static": True},
+        # The slot is a generous sensor zone; a level car (60x30) fully fits.
+        {"name": "slot", "shape": "box", "pos": [820, 90], "size": [170, 130],
+         "static": True, "sensor": True},
+        {"name": "car", "shape": "box", "pos": [130, 68], "size": [60, 30],
+         "mass": 1.0, "friction": 0.5, "control": True},
+    ],
+    "act": {
+        "drive": [{"verb": "thrust", "body": "car", "magnitude": 95}],
+        "spin_left": [{"verb": "torque", "body": "car", "magnitude": 220}],
+        "spin_right": [{"verb": "torque", "body": "car", "magnitude": -220}],
+    },
+    "on_step": [
+        {"kind": "velocity_clamp", "body": "car", "vx_max": 210,
+         "vy_min": -600, "vy_max": 400},
+    ],
+    "predicates": {
+        "success": "contained(\"car\", \"slot\")",
+        "checkpoints": {
+            "rolling": "pos_x(\"car\") > 260",
+            "approaching": "pos_x(\"car\") > 560",
+            "parked": "contained(\"car\", \"slot\")",
+        },
+    },
+}
+
+
+@requires_godot
+def test_parking_spec_verifies_end_to_end(tmp_path):
+    """thrust + torque + contained() drive the full G0-G3 funnel: the tree solver
+    finds a replayable witness that parks the car fully inside the slot."""
+    p = tmp_path / "parking.spec.json"
+    p.write_text(json.dumps(_PARKING_SPEC), encoding="utf-8")
+    rep = verify_game(str(p), sandboxed=False)
+    assert rep["passed"] is True, rep
+    assert rep["failure_class"] is None
+    assert rep["engine"] == "godot"
+    for layer in ("G0_static", "G1_rollout", "G2_goal", "G3_solve"):
+        assert rep["layers"][layer]["passed"], (layer, rep["layers"][layer])
+    w = rep["witness"]
+    assert w is not None and w["ticks"] >= 20                 # non-trivial park
+    assert all(t is not None for t in w["checkpoints"].values()), w["checkpoints"]
+
+
+@requires_godot
+def test_contained_is_stricter_than_contacts():
+    """contained(a, b) is FULL AABB containment, not the overlap contacts() reports.
+    Same scene: the wide car OVERLAPS the narrow slot (contacts latches) yet never
+    fits inside it (contained never latches), while a chip fully inside the slot
+    IS contained. Driven directly through the executor (no G0/G2 false-at-t0 gate)."""
+    ex = GodotExecutor()
+    spec = {
+        "engine": "godot",
+        "meta": {"title": "strict", "prompt": "strict",
+                 "actions": ["wait", "nudge"]},
+        "bodies": [
+            {"name": "floor", "shape": "box", "pos": [400, 50], "size": [800, 100],
+             "static": True},
+            # zone: a NARROW sensor (40 wide) — the car cannot fit across it.
+            {"name": "zone", "shape": "box", "pos": [400, 200], "size": [40, 240],
+             "static": True, "sensor": True},
+            # chip: small static box parked fully inside the zone.
+            {"name": "chip", "shape": "box", "pos": [400, 200], "size": [10, 10],
+             "static": True},
+            # car: WIDER (80) than the zone, resting on the floor, overlapping it.
+            {"name": "car", "shape": "box", "pos": [400, 120], "size": [80, 40],
+             "mass": 1.0, "locked_rotation": True, "control": True},
+        ],
+        "act": {
+            "wait": [{"verb": "impulse", "body": "car", "vec": [0, 0]}],
+            "nudge": [{"verb": "impulse", "body": "car", "vec": [10, 0]}],
+        },
+        "predicates": {
+            "success": "contained(\"car\", \"chip\")",  # never (car is huge)
+            "checkpoints": {
+                "touch": "contacts(\"car\", \"zone\")",       # overlap -> latches
+                "chip_inside": "contained(\"chip\", \"zone\")",  # fully in -> latches
+                "car_inside": "contained(\"car\", \"zone\")",    # pokes out -> never
+            },
+        },
+    }
+    rec = ex.run_batch(json.dumps(spec), [{"seed": 0, "actions": [None, None, None]}], 3)[0]
+    cps = rec["checkpoints"]
+    assert cps["touch"] is not None, cps        # the car DOES overlap the zone
+    assert cps["chip_inside"] is not None, cps  # a body fully inside IS contained
+    assert cps["car_inside"] is None, cps       # overlapping-but-not-contained -> false
 
 
 if __name__ == "__main__":

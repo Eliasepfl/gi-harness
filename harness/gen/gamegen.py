@@ -710,17 +710,20 @@ def _dispatch(prompt, run_dir, backend, max_repairs, engine="py", system=None,
 
 
 def _resolve_engine(engine):
-    """Target engine: explicit arg > HARNESS_ENGINE env > 'py' default.
+    """Target engine: explicit arg > HARNESS_ENGINE env > 'godot' default.
 
-    'js' (Planck), 'godot' (declarative spec) or 'py' (pymunk, the default)."""
+    'godot' (declarative spec, the default post-pivot), 'js' (Planck) or 'py'
+    (pymunk). The py/js lanes are frozen legacy: still fully selectable (explicit
+    arg or HARNESS_ENGINE), but no longer the default target (see
+    notes/engines/GODOT_ONLY_PIVOT.md)."""
     if engine is None:
-        engine = os.environ.get("HARNESS_ENGINE", "py")
+        engine = os.environ.get("HARNESS_ENGINE", "godot")
     e = str(engine).lower()
     if e == "js":
         return "js"
-    if e == "godot":
-        return "godot"
-    return "py"
+    if e == "py":
+        return "py"
+    return "godot"
 
 
 def _finalize_game(run_dir, slug, result, ext=".py"):

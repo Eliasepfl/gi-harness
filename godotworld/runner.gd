@@ -64,7 +64,8 @@ const DEFAULT_SPEC := {
 # OS / FileAccess / load / preload / set_script and every other name is rejected).
 const ALLOWED_IDENTS := {
 	"pos_x": true, "pos_y": true, "vel_x": true, "vel_y": true, "speed": true,
-	"angle": true, "grounded": true, "contacts": true, "dist": true, "flag": true,
+	"angle": true, "grounded": true, "contacts": true, "contained": true,
+	"dist": true, "flag": true,
 	"steps": true,
 	"abs": true, "min": true, "max": true, "clamp": true, "sqrt": true,
 	"floor": true, "ceil": true, "sign": true,
@@ -142,6 +143,7 @@ class QueryCtx extends RefCounted:
 	func angle(nm): return rt._q_angle(nm)
 	func grounded(nm): return rt._q_grounded(nm)
 	func contacts(a, b): return rt._q_contacts(a, b)
+	func contained(a, b): return rt._q_contained(a, b)
 	func dist(a, b): return rt._q_dist(a, b)
 	func flag(k): return rt._q_flag(k)
 
@@ -855,6 +857,14 @@ func _apply_action(action) -> void:
 				(node as RigidBody2D).linear_velocity = v
 			"force":
 				_tick_forces.append([node, v])
+			"torque":
+				# Signed angular kick (heading control): +CCW, -CW.
+				(node as RigidBody2D).apply_torque_impulse(float(vc.get("magnitude", 0.0)))
+			"thrust":
+				# Impulse along the body's CURRENT heading: (magnitude, 0) rotated by
+				# body.rotation -- drives cars/ships/drills the way they point.
+				var mag := float(vc.get("magnitude", 0.0))
+				(node as RigidBody2D).apply_central_impulse(Vector2(mag, 0.0).rotated(node.rotation))
 
 
 func _apply_tick_forces() -> void:
@@ -1102,6 +1112,23 @@ func _q_contacts(a, b) -> bool:
 	if nb is RigidBody2D:
 		return (nb as RigidBody2D).get_colliding_bodies().has(na)
 	return false
+
+
+func _q_contained(a, b) -> bool:
+	# True iff body a's AABB is FULLY inside body b's AABB (containment, NOT the
+	# mere overlap that contacts() reports). AABBs are the same axis-aligned boxes
+	# the G0 init check uses (_bbox: circle -> center +/- r; box/poly/segment ->
+	# rotated-vertex extents). Containment holds when a's min corner is >= b's min
+	# corner AND a's max corner is <= b's max corner on BOTH axes; any part of a
+	# poking outside b (a sticking edge) makes it false. b is typically a sensor /
+	# zone. A removed or missing body is never contained.
+	var ra = _bodies.get(str(a), null)
+	var rb = _bodies.get(str(b), null)
+	if ra == null or rb == null or ra.removed or rb.removed:
+		return false
+	var ba := _bbox(ra)  # [left, bottom, right, top]
+	var bb := _bbox(rb)
+	return ba[0] >= bb[0] and ba[1] >= bb[1] and ba[2] <= bb[2] and ba[3] <= bb[3]
 
 
 func _q_grounded(nm) -> bool:
