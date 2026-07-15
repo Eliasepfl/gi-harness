@@ -246,48 +246,7 @@ def test_in_bounds():
 # --------------------------------------------------------------------- #
 # Scènes d'exemple (fixtures)
 # --------------------------------------------------------------------- #
-def test_push_ball_scene_is_solvable():
-    """Vérifie que la démo pousser-la-balle est résoluble par 'right' répété."""
-    from scenes.examples import push_ball_to_zone as scene
-    s = SceneSDK(seed=0)
-    scene.build_scene(s)
-    assert scene.get_success(s) is False  # pas trivialement vraie
-    s.step(30)
-    solved = False
-    for _ in range(1200):
-        s.apply("right")
-        s.step()
-        if scene.get_success(s):
-            solved = True
-            break
-    assert solved
-
-
-def test_climb_scene_is_solvable():
-    from scenes.examples import climb_platforms as scene
-    s = SceneSDK(seed=0)
-    scene.build_scene(s)
-    assert scene.get_success(s) is False
-    s.step(20)
-    solved = False
-    for _ in range(1500):
-        if s._agent_grounded():
-            s.apply("jump")
-        s.apply("right")
-        s.step()
-        if scene.get_success(s):
-            solved = True
-            break
-    assert solved
-
-
-def test_broken_floating_is_invalid_after_settling():
-    """La fixture négative : succès à t=0, mais la boîte tombe au settling."""
-    from scenes.examples import broken_floating as scene
-    s = SceneSDK(seed=0)
-    scene.build_scene(s)
-    assert scene.get_success(s) is True  # vraie au départ (dégénéré)
-    y0 = s.query("floating")["pos"][1]
-    s.step(300)
-    assert s.query("floating")["pos"][1] < y0 - 100  # a chuté
-    assert scene.get_success(s) is False
+# RETIRED (Elias, 2026-07-15): the example-scene solvability tests are deleted with
+# scenes/examples/ (push_ball_to_zone / climb_platforms / broken_floating). The
+# SceneSDK mechanism itself (still imported by harness.core.sandbox's verify job) is
+# covered by the direct-API tests above.

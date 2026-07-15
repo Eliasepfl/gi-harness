@@ -246,18 +246,9 @@ def test_duplicate_names_are_warned():
 # --------------------------------------------------------------------------- #
 # Bank role matching (role_if_bank_matched)
 # --------------------------------------------------------------------------- #
-def test_bank_role_matches_names_exact_and_base():
-    out = T.inspect_world({"bodies": [
-        {"name": "ground", "shape": "box", "pos": [400, 10], "size": [800, 20], "static": True},
-        {"name": "wall_2", "shape": "box", "pos": [10, 100], "size": [20, 200], "static": True},
-        {"name": "marble", "shape": "circle", "pos": [50, 50], "radius": 8, "control": True},
-        {"name": "zzz_unknown", "shape": "circle", "pos": [90, 90], "radius": 8},
-    ]}, use_bank=True)
-    role = {e["name"]: e["role_if_bank_matched"] for e in out["entities"]}
-    assert role["ground"] == "terrain"       # exact bank hit
-    assert role["wall_2"] == "terrain"        # base-name (wall) hit
-    assert role["marble"] == "prop"           # exact bank hit (its catalog category)
-    assert role["zzz_unknown"] is None
+# RETIRED (Elias, 2026-07-15): the exact/base-name bank-role-match test is deleted
+# with banks/ — no catalog data means no role to match. inspect_world's use_bank
+# flag still resolves to None (the graceful no-bank path), asserted below.
 
 
 def test_use_bank_false_yields_no_roles():

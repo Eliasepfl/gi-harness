@@ -17,7 +17,9 @@ import pytest
 from harness import viewer
 
 
-TEMPLATE_GAME = "scenes/games/row2b_seesaw.py"
+# A nominal game path — the missing-pygame test surfaces its RuntimeError BEFORE the
+# file is ever loaded, so this need not exist (the real fixture was retired 2026-07-15).
+TEMPLATE_GAME = "scenes/games/_nonexistent.py"
 
 
 # ==========================================================================
@@ -49,29 +51,9 @@ def test_window_size_respects_scale():
 # ==========================================================================
 #  watch() runs a short explicit-actions episode to completion (dummy driver)
 # ==========================================================================
-@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
-def test_watch_runs_short_episode_to_completion():
-    # Explicit witness actions -> no re-verification; high speed keeps it snappy.
-    actions = ["drop_boulder", "drop_boulder", "drop_boulder", "drop_boulder",
-               "drop_anvil", "drop_anvil", "drop_anvil", "drop_crate",
-               "drop_crate", "drop_crate", "drop_crate"]
-    result = viewer.watch(TEMPLATE_GAME, actions=actions, speed=8.0)
-
-    assert isinstance(result, dict)
-    assert set(result) >= {"result", "ticks", "closed_by"}
-    # No user interaction under the dummy driver -> episode auto-ends and holds.
-    assert result["closed_by"] == "end"
-    assert result["result"] in ("success", "failure", "timeout")
-    assert isinstance(result["ticks"], int) and result["ticks"] >= 1
-
-
-@pytest.mark.skip(reason="spec-lane parked: prompts + generated games purged (Elias, 2026-07-15) - revisit if the lane revives")
-def test_watch_scale_parameter_runs():
-    # A scaled window must still run and return cleanly under the dummy driver.
-    result = viewer.watch(TEMPLATE_GAME, actions=["drop_boulder"] * 4,
-                          speed=8.0, scale=0.5)
-    assert result["closed_by"] == "end"
-    assert result["result"] in ("success", "failure", "timeout")
+# RETIRED (Elias, 2026-07-15): the watch()-to-completion tests are deleted with the
+# generated game fixture they drove (scenes/games/row2b_seesaw.py). The pure
+# cadence/scale helpers above still guard viewer's wall-clock-free logic.
 
 
 def test_watch_bad_path_returns_error_dict():
