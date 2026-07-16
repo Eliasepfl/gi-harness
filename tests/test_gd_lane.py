@@ -34,6 +34,7 @@ _FLYOFF = os.path.join(_GD, "flyoff.gd")
 _NO_PRESSURE = os.path.join(_GD, "no_pressure.gd")
 _LOSABLE = os.path.join(_GD, "losable.gd")
 _SOFTLOCK_PIT = os.path.join(_GD, "softlock_pit.gd")
+_DEAD_SPACE = os.path.join(_GD, "dead_space.gd")
 
 
 def _src(path):
@@ -178,6 +179,43 @@ def test_losable_fixture_certifies_and_gate_witnesses_a_failure():
     assert not any("PRESSURE" in w for w in rep["warnings"]), rep["warnings"]
     from harness.gen import feedback as F
     assert F.compile_directives({"pressure": F.pressure_finding(rep)}) == []
+
+
+# ====================================================================== #
+# 1e2. Dead-space / PROPORTION gate (WAVE 2, DEMO_GAP_ANALYSIS §Gap 3)
+# ====================================================================== #
+@requires_godot
+def test_dead_space_fixture_certifies_but_gate_flags_over_empty_world():
+    """The dead_space fixture (a tiny scene in a 2000x1400 world) certifies G0-G3 (the
+    gate is ADVISORY, not a block) yet the proportion gate flags it `dead_space` with a
+    warning, and the finding compiles to a repair directive (the revise-loop hook)."""
+    rep = verify_game(_DEAD_SPACE, sandboxed=False)
+    assert rep["passed"] is True, rep                    # ADVISORY: still certifies
+    assert rep["engine"] == "gdscript"
+    wit = rep["witness"]
+    assert wit is not None and wit["ticks"] >= 20, wit   # a real, non-trivial play
+    dsc = rep["layers"]["G3_solve"]["checks"]["dead_space"]
+    assert dsc["dead_space"] is True and dsc["linear_ratio"] > 5.0, dsc
+    assert rep["dead_space"]["outcome"] == "dead_space", rep.get("dead_space")
+    assert any("PROPORTION" in w for w in rep["warnings"]), rep["warnings"]
+    from harness.gen import feedback as F
+    ds = F.compile_directives({"dead_space": F.dead_space_finding(rep)})
+    assert [d.source for d in ds] == ["dead_space"]
+    assert ds[0].severity == F.DIFFICULTY
+    assert "empty" in ds[0].text.lower()
+
+
+@requires_godot
+def test_mini_collect_proportioned_no_dead_space_key():
+    """A reasonably-proportioned game records the measurement in a non-gating sub-check
+    but does NOT flag: no warning, and no top-level `dead_space` key (report schema
+    unchanged, so the strict-key certification test still holds)."""
+    rep = verify_game(_MINI, sandboxed=False)
+    assert rep["passed"] is True, rep
+    dsc = rep["layers"]["G3_solve"]["checks"].get("dead_space")
+    assert dsc is not None and dsc["dead_space"] is False, dsc
+    assert "dead_space" not in rep, rep.get("dead_space")
+    assert not any("PROPORTION" in w for w in rep["warnings"]), rep["warnings"]
 
 
 # ====================================================================== #

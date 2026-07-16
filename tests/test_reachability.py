@@ -18,8 +18,15 @@ import pytest  # noqa: E402
 from harness.verify import gameverify as gv  # noqa: E402
 from harness.verify import treesolve as ts  # noqa: E402
 from harness.verify.reachability import (  # noqa: E402
-    check_reachability, failure_reachable, targets_and_occupancy, terminal_reachable,
+    DEAD_SPACE_LINEAR_2D, DEAD_SPACE_LINEAR_3D, check_reachability, failure_reachable,
+    space_utilization, targets_and_occupancy, terminal_reachable,
 )
+
+
+def _body(name, pos, *, controlled=False, static=False, **extra):
+    d = {"name": name, "pos": pos, "static": static, "controlled": controlled}
+    d.update(extra)
+    return d
 
 
 def _box_walls(cx, cy, half=60.0, thick=12.0):
@@ -277,6 +284,82 @@ def test_failure_reachable_none_when_unfailable(small_thresholds):
 def test_failure_reachable_empty_actions():
     r = failure_reachable(TrekExecutor(), "trek", [])
     assert r == {"reachable": False, "witness": None, "n_plans": 0, "n_failed": 0}
+
+
+# ====================================================================== #
+# WAVE 2 — SPACE / PROPORTION: space_utilization (dead-space ratio)
+# ====================================================================== #
+# Pure geometry over the SAME t=0 body facts the flood reads. The reference fixtures'
+# own geometry must NOT false-flag (they certify); a tiny scene in a huge world must.
+_MINI = [_body("player", [300, 300], controlled=True), _body("gem_a", [300, 165], static=True),
+         _body("gem_b", [560, 340], static=True)]
+_LOSABLE = [_body("boat", [120, 300], controlled=True), _body("goal", [620, 260], static=True)]
+_MINI_3D = [_body("puck", [400, 300, 0], controlled=True),
+            _body("goal_left", [280, 300, 0], static=True),
+            _body("goal_right", [560, 300, 0], static=True),
+            _body("table", [400, 300, -20], static=True)]
+
+
+def test_space_utilization_reference_fixtures_are_proportioned():
+    # mini_collect / losable / mini_collect_3d certify; their OWN geometry must pass the
+    # dead-space threshold with margin (documented ratios: ~2.9, ~3.8, ~4.0).
+    mini = space_utilization(_MINI, [800, 600])
+    los = space_utilization(_LOSABLE, [800, 600])
+    m3d = space_utilization(_MINI_3D, [800, 600])
+    assert mini["dims"] == 2 and mini["dead_space"] is False and mini["linear_ratio"] < 5.0
+    assert los["dead_space"] is False and los["linear_ratio"] < DEAD_SPACE_LINEAR_2D
+    assert m3d["dims"] == 3 and m3d["dead_space"] is False
+    assert m3d["linear_ratio"] < DEAD_SPACE_LINEAR_3D
+
+
+def test_space_utilization_flags_tiny_scene_in_huge_world():
+    # A dead_space.gd-shaped scene: a tiny body + two close gems in a 2000x1400 world.
+    dead = [_body("mote", [200, 200], controlled=True),
+            _body("gem_down", [200, 380], static=True),
+            _body("gem_right", [420, 200], static=True)]
+    su = space_utilization(dead, [2000, 1400])
+    assert su["dims"] == 2 and su["dead_space"] is True
+    assert su["linear_ratio"] > DEAD_SPACE_LINEAR_2D
+    assert su["playfield"] == [2000.0, 1400.0]       # the declared world is the playfield
+    # measure_ratio (AREA) is the linear ratio to the power of dims.
+    assert su["measure_ratio"] == round(su["linear_ratio"] ** 2, 3) or \
+        abs(su["measure_ratio"] - su["linear_ratio"] ** 2) < 1.0
+
+
+def test_space_utilization_flags_tiny_scene_in_huge_world_3d():
+    dead3d = [_body("probe", [200, 200, 200], controlled=True),
+              _body("pad_a", [260, 200, 200], static=True),
+              _body("pad_b", [200, 260, 260], static=True)]
+    su = space_utilization(dead3d, [1600, 1200])
+    assert su["dims"] == 3 and su["dead_space"] is True
+    assert su["linear_ratio"] > DEAD_SPACE_LINEAR_3D
+
+
+def test_space_utilization_span_uses_only_reachable_targets():
+    # A gem sealed in a wall-box is UNreachable -> excluded from the action span, so the
+    # span shrinks to the controlled body + the free gem (the flood filters it out).
+    walls = _box_walls(400, 300)
+    bodies = [_body("player", [120, 300], controlled=True, half_extents=[16, 16]),
+              _body("free_gem", [200, 300], static=True),
+              _body("trapped_gem", [400, 300], static=True)]
+    for i, (mn, mx) in enumerate(walls):
+        bodies.append(_body(f"wall_{i}", [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2],
+                            static=True, aabb=[list(mn), list(mx)]))
+    su = space_utilization(bodies, [800, 600])
+    assert su["n_targets"] == 2 and su["n_reachable"] == 1   # trapped gem dropped
+
+
+def test_space_utilization_none_without_controlled_body():
+    # No controlled spawn -> nothing to measure (a certified game always has one).
+    assert space_utilization([_body("gem", [300, 300], static=True)], [800, 600]) is None
+    assert space_utilization([], [800, 600]) is None
+
+
+def test_space_utilization_ratio_never_below_one():
+    # A single body filling the world: the span floors at the playfield -> ratio ~1, no flag.
+    su = space_utilization([_body("blob", [400, 300], controlled=True, half_extents=[400, 300]),
+                            _body("edge", [780, 580], static=True)], [800, 600])
+    assert su["linear_ratio"] >= 1.0 and su["dead_space"] is False
 
 
 if __name__ == "__main__":

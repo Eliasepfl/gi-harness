@@ -984,6 +984,71 @@ def test_failure_witness_gate_finding_compiles_to_directive(small_pressure):
 
 
 # ====================================================================== #
+# Dead-space / PROPORTION gate (WAVE 2) — advisory, geometry-only
+# ====================================================================== #
+def _geom_facts(world_size, bodies):
+    return {"world_size": {"declared": list(world_size)}, "geometry": list(bodies)}
+
+
+def _gb(name, pos, *, controlled=False, static=False):
+    return {"name": name, "pos": pos, "static": static, "controlled": controlled}
+
+
+def test_dead_space_gate_flags_over_empty_world():
+    """A tiny scene in a huge world -> advisory `dead_space`: a warning + the top-level
+    finding, but certification is NOT blocked (passed stays True)."""
+    facts = _geom_facts([2000, 1400], [
+        _gb("mote", [200, 200], controlled=True),
+        _gb("gem_down", [200, 380], static=True),
+        _gb("gem_right", [420, 200], static=True)])
+    rep = gv._dead_space_gate(facts, _certified_report())
+    dsc = rep["layers"]["G3_solve"]["checks"]["dead_space"]
+    assert dsc["pass"] is True and dsc["advisory"] is True   # NON-gating sub-check
+    assert dsc["dead_space"] is True and dsc["linear_ratio"] > 5.0
+    assert rep["dead_space"]["outcome"] == "dead_space"       # top-level finding when flagged
+    assert any("PROPORTION" in w for w in rep["warnings"])
+    # ADVISORY: never blocks certification.
+    assert rep["passed"] is True and rep["failure_class"] is None
+
+
+def test_dead_space_gate_passes_proportioned_world():
+    """mini_collect-shaped geometry -> no flag: sub-check records the measurement, but no
+    warning, no top-level `dead_space` key (so the report schema is unchanged)."""
+    facts = _geom_facts([800, 600], [
+        _gb("player", [300, 300], controlled=True),
+        _gb("gem_a", [300, 165], static=True),
+        _gb("gem_b", [560, 340], static=True)])
+    rep = gv._dead_space_gate(facts, _certified_report())
+    dsc = rep["layers"]["G3_solve"]["checks"]["dead_space"]
+    assert dsc["dead_space"] is False
+    assert "dead_space" not in rep                            # only set when flagged
+    assert not any("PROPORTION" in w for w in rep["warnings"])
+    assert rep["passed"] is True
+
+
+def test_dead_space_gate_no_geometry_is_a_noop():
+    """No controlled spawn -> nothing to measure -> the verdict is untouched (no key added)."""
+    facts = _geom_facts([800, 600], [_gb("gem", [300, 300], static=True)])
+    rep = gv._dead_space_gate(facts, _certified_report())
+    assert "dead_space" not in rep
+    assert "dead_space" not in rep["layers"]["G3_solve"]["checks"]
+
+
+def test_dead_space_gate_finding_compiles_to_directive():
+    """The gate's finding is proof-carrying: it feeds the feedback compiler's dead_space
+    row (the revise-loop path), at DIFFICULTY severity."""
+    from harness.gen import feedback as F
+    facts = _geom_facts([2000, 1400], [
+        _gb("mote", [200, 200], controlled=True),
+        _gb("gem_down", [200, 380], static=True),
+        _gb("gem_right", [420, 200], static=True)])
+    rep = gv._dead_space_gate(facts, _certified_report())
+    ds = F.compile_directives({"dead_space": F.dead_space_finding(rep)})
+    assert [d.source for d in ds] == ["dead_space"]
+    assert ds[0].severity == F.DIFFICULTY
+
+
+# ====================================================================== #
 # G0.5 geometric reachability pre-filter wiring (Elias directive 1)
 # ====================================================================== #
 def _walled_geometry_facts():
