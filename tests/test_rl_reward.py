@@ -42,9 +42,10 @@ def _shaping_terms(latch_ticks, n_cp, absorbing, term_tick):
         yield tick - 1, E.shaping_reward(c_before, c_after, n_cp, is_term), c_after
 
 
-def _episode_return(latch_ticks, n_cp, terminal, term_tick, horizon=H):
+def _episode_return(latch_ticks, n_cp, terminal, term_tick, horizon=H, mode=None):
     """UNDISCOUNTED episode return (what the trainer logs as episodic return): the sum of
-    ``step_reward`` over the episode. ``terminal`` in {"success","failure",None(=timeout)}."""
+    ``step_reward`` over the episode. ``terminal`` in {"success","failure",None(=timeout)}.
+    ``mode`` defaults to the module default (additive); pass ``"pbrs"`` for the PBRS scheme."""
     latch_ticks = list(latch_ticks)
     total = 0.0
     c = 0
@@ -52,16 +53,22 @@ def _episode_return(latch_ticks, n_cp, terminal, term_tick, horizon=H):
         c_before = c
         c += latch_ticks.count(tick)
         result = terminal if tick == term_tick else None
-        total += E.step_reward(c_before, c, n_cp, result, tick, horizon)
+        total += E.step_reward(c_before, c, n_cp, result, tick, horizon, mode=mode)
     return total
 
 
 # ====================================================================== #
 # 0. Constant sizing + PBRS gamma matches the trainer
 # ====================================================================== #
+def test_default_reward_mode_is_additive():
+    # additive shaping GUIDES the policy and CONVERGES (mini_collect: stochastic 0.69 @ 400k,
+    # demo_ready @ 1.5M); PBRS is invariant-but-non-guiding and stalls, so it is opt-in.
+    assert E.REWARD_MODE == "additive"
+
+
 def test_constant_sizing_gives_terminal_dominance():
-    # the MINIMUM success payoff (decay floor) strictly dominates the whole PBRS shaping mass
-    # (max Φ = SHAPING_MASS) — this is what makes invariants (a) and (c) hold with margin.
+    # the MINIMUM success payoff (decay floor) strictly dominates the whole shaping mass
+    # (SHAPING_MASS) — this is what makes invariants (a) and (c) hold with margin, both modes.
     assert E.R_SUCCESS * E.SUCCESS_TIME_FLOOR > E.SHAPING_MASS
     assert 0.0 < E.SUCCESS_TIME_FLOOR < 1.0
     assert E.R_SUCCESS > 0.0
@@ -78,7 +85,32 @@ def test_pbrs_gamma_matches_trainer_gamma():
 
 
 # ====================================================================== #
-# 1. Potential Φ and single-step PBRS shaping
+# 1a. Additive shaping (the DEFAULT, converging scheme)
+# ====================================================================== #
+@pytest.mark.parametrize("n_cp", [1, 2, 3, 5, 8])
+def test_additive_shaping_is_bounded_and_sticky(n_cp):
+    # each newly latched checkpoint pays SHAPING_MASS/n_cp; latching ALL accrues SHAPING_MASS.
+    assert sum(E.additive_shaping(c, c + 1, n_cp) for c in range(n_cp)) == pytest.approx(E.SHAPING_MASS)
+    assert E.additive_shaping(0, 1, n_cp) == pytest.approx(E.SHAPING_MASS / n_cp)
+    assert E.additive_shaping(0, 2, n_cp) == pytest.approx(2 * E.SHAPING_MASS / n_cp)  # two at once
+    assert E.additive_shaping(1, 1, n_cp) == 0.0                                       # no new latch
+    assert E.additive_shaping(1, 1, 0) == 0.0                                          # no checkpoints
+
+
+def test_step_reward_default_is_additive():
+    # default mode: additive shaping + living cost (+ terminal). Non-terminal / success / failure.
+    assert E.step_reward(0, 1, 2, None, 10, H) == pytest.approx(
+        E.additive_shaping(0, 1, 2) + E.tick_cost(H))
+    assert E.step_reward(1, 2, 2, "success", 10, H) == pytest.approx(
+        E.additive_shaping(1, 2, 2) + E.tick_cost(H) + E.success_payoff(10, H))
+    assert E.step_reward(1, 1, 2, "failure", 10, H) == pytest.approx(
+        E.additive_shaping(1, 1, 2) + E.tick_cost(H) + E.R_FAILURE)
+    # additive success reward clears the decayed floor (no PBRS terminal potential-zeroing).
+    assert E.step_reward(1, 2, 2, "success", 10, H) >= E.R_SUCCESS * E.SUCCESS_TIME_FLOOR
+
+
+# ====================================================================== #
+# 1b. Potential Φ and single-step PBRS shaping (opt-in mode)
 # ====================================================================== #
 @pytest.mark.parametrize("n_cp", [1, 2, 3, 5, 8])
 def test_potential_is_bounded_and_normalized(n_cp):
@@ -178,19 +210,20 @@ def test_tick_cost_default_off():
     assert E.tick_cost(H) == pytest.approx(-E.LIVING_COST_TOTAL / H)
 
 
-def test_step_reward_composition():
+def test_step_reward_composition_pbrs_mode():
     # non-terminal: PBRS shaping + living cost
-    assert E.step_reward(0, 1, 2, None, 10, H) == pytest.approx(
+    assert E.step_reward(0, 1, 2, None, 10, H, mode="pbrs") == pytest.approx(
         E.shaping_reward(0, 1, 2, False) + E.tick_cost(H))
     # success: absorbing PBRS shaping + living cost + decayed terminal bonus
-    assert E.step_reward(1, 2, 2, "success", 10, H) == pytest.approx(
+    assert E.step_reward(1, 2, 2, "success", 10, H, mode="pbrs") == pytest.approx(
         E.shaping_reward(1, 2, 2, True) + E.tick_cost(H) + E.success_payoff(10, H))
     # failure/error: absorbing PBRS shaping + living cost + flat negative terminal
-    assert E.step_reward(1, 1, 2, "failure", 10, H) == pytest.approx(
+    assert E.step_reward(1, 1, 2, "failure", 10, H, mode="pbrs") == pytest.approx(
         E.shaping_reward(1, 1, 2, True) + E.tick_cost(H) + E.R_FAILURE)
-    assert E.step_reward(1, 1, 2, "error", 10, H) == E.step_reward(1, 1, 2, "failure", 10, H)
-    # the shaping γ passes through
-    assert E.step_reward(0, 1, 2, None, 10, H, gamma=0.5) == pytest.approx(
+    assert E.step_reward(1, 1, 2, "error", 10, H, mode="pbrs") == \
+        E.step_reward(1, 1, 2, "failure", 10, H, mode="pbrs")
+    # the shaping γ passes through (pbrs mode)
+    assert E.step_reward(0, 1, 2, None, 10, H, gamma=0.5, mode="pbrs") == pytest.approx(
         E.shaping_reward(0, 1, 2, False, 0.5) + E.tick_cost(H))
 
 
@@ -205,26 +238,27 @@ def test_invariant_a_shaping_mass_below_success_payoff(n_cp):
 
 
 # ====================================================================== #
-# (b) earlier success > later success (strictly)
+# (b) earlier success > later success (strictly) — BOTH modes
 # ====================================================================== #
-def test_invariant_b_earlier_win_yields_greater_return():
+@pytest.mark.parametrize("mode", ["additive", "pbrs"])
+def test_invariant_b_earlier_win_yields_greater_return(mode):
     def win_at(t):
-        return _episode_return([10, t], 2, "success", t)      # got_first@10, got_both+win@t
+        return _episode_return([10, t], 2, "success", t, mode=mode)   # got_first@10, win@t
     assert win_at(30) > win_at(100) > win_at(299)
 
 
 # ====================================================================== #
-# (c) any success return > any no-success return
+# (c) any success return > any no-success return — BOTH modes
 # ====================================================================== #
-@pytest.mark.parametrize("n_cp", [1, 2, 3])
-def test_invariant_c_success_beats_no_success(n_cp):
+@pytest.mark.parametrize("mode", ["additive", "pbrs"])
+def test_invariant_c_success_beats_no_success(mode):
     # WORST success: win at the buzzer (max rent, min decayed payoff), got_first early.
-    worst_win = _episode_return([10, H], n_cp, "success", H)
-    bare_win = _episode_return([], n_cp, "success", H)         # a win with no shaping at all
-    # BEST no-success: latch EVERY checkpoint at the last (truncation) tick — the most shaping
+    worst_win = _episode_return([10, H], 2, "success", H, mode=mode)
+    bare_win = _episode_return([], 2, "success", H, mode=mode)      # a win with no shaping at all
+    # BEST no-success: latch BOTH checkpoints at the last (truncation) tick — the most shaping
     # mass a non-winning episode can show.
-    best_timeout = _episode_return([H] * n_cp, n_cp, None, H)
-    farmed_fail = _episode_return([10, H], n_cp, "failure", H)
+    best_timeout = _episode_return([H, H], 2, None, H, mode=mode)
+    farmed_fail = _episode_return([10, H], 2, "failure", H, mode=mode)
     assert worst_win > best_timeout
     assert bare_win > best_timeout
     assert worst_win > farmed_fail
@@ -233,25 +267,27 @@ def test_invariant_c_success_beats_no_success(n_cp):
 # ====================================================================== #
 # (d) for equal progress, failure < timeout (no-success)
 # ====================================================================== #
+@pytest.mark.parametrize("mode", ["additive", "pbrs"])
 @pytest.mark.parametrize("n_latched", [0, 1, 2])
 @pytest.mark.parametrize("fail_tick", [1, 50, 150, 299])
-def test_invariant_d_failure_below_timeout_at_equal_progress(n_latched, fail_tick):
+def test_invariant_d_failure_below_timeout_at_equal_progress(n_latched, fail_tick, mode):
     n_cp = 2
     latch = list(range(1, n_latched + 1))                     # same shaping prefix for both
-    fail_ret = _episode_return(latch, n_cp, "failure", fail_tick)
-    timeout_ret = _episode_return(latch, n_cp, None, H)
+    fail_ret = _episode_return(latch, n_cp, "failure", fail_tick, mode=mode)
+    timeout_ret = _episode_return(latch, n_cp, None, H, mode=mode)
     assert fail_ret < timeout_ret
 
 
 # ====================================================================== #
 # The DIAGNOSIS, encoded: on mini_collect (n_cp=2) FINISHING crushes farming — the terminal
-# payoff dominates the whole (bounded) PBRS shaping mass.
+# payoff dominates the whole (bounded) shaping mass, in BOTH modes.
 # ====================================================================== #
-def test_mini_collect_finishing_dominates_farming():
+@pytest.mark.parametrize("mode", ["additive", "pbrs"])
+def test_mini_collect_finishing_dominates_farming(mode):
     n_cp = 2                                                  # got_first, got_both
-    farm = _episode_return([10], n_cp, None, H)               # camp got_first, never win
-    win = _episode_return([10, 30], n_cp, "success", 30)      # got_first@10, got_both+win@30
-    best_farm = _episode_return([H, H], n_cp, None, H)        # even farming BOTH at truncation
+    farm = _episode_return([10], n_cp, None, H, mode=mode)    # camp got_first, never win
+    win = _episode_return([10, 30], n_cp, "success", 30, mode=mode)   # got_first@10, win@30
+    best_farm = _episode_return([H, H], n_cp, None, H, mode=mode)     # even farming BOTH
     assert win > farm + 5.0, "finishing must crush single-checkpoint camping"
     assert win > best_farm, "finishing beats farming every checkpoint (terminal dominance)"
     assert E.success_payoff(H, H) > E.SHAPING_MASS            # payoff alone > whole shaping mass

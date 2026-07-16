@@ -570,12 +570,11 @@ def test_planckenv_reward_shaping(corridor):
     try:
         env.reset(seed=0)
         n_cp = len(env._cp_keys)
-        # PBRS reward: latching the FIRST checkpoint (c 0->1, non-terminal) pays
-        # shaping_reward(0, 1, n_cp)=γ·Φ(1) net of the (off-by-default) living cost. A success
-        # pays the decayed terminal bonus MINUS the absorbing PBRS potential-zeroing (bounded by
-        # the whole shaping mass), so it clears (floor − SHAPING_MASS).
-        cp_step = rlenv.shaping_reward(0, 1, n_cp, False) + rlenv.tick_cost(env.horizon)
-        min_success_r = rlenv.R_SUCCESS * rlenv.SUCCESS_TIME_FLOOR - rlenv.SHAPING_MASS
+        # DEFAULT (additive) reward: latching the FIRST checkpoint pays additive_shaping(0,1,n_cp)
+        # = SHAPING_MASS/n_cp, net of the (off-by-default) living cost. A success pays the decayed
+        # terminal bonus on top of the last checkpoint's shaping, so it clears the decay floor.
+        cp_step = rlenv.additive_shaping(0, 1, n_cp) + rlenv.tick_cost(env.horizon)
+        min_success_r = rlenv.R_SUCCESS * rlenv.SUCCESS_TIME_FLOOR
         got_checkpoint_reward = False
         reached_goal = False
         prev_halfway = None
