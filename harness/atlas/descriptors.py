@@ -376,36 +376,61 @@ def _n_mechanics(report):
     return len(sigs)
 
 
-def _static_footprints(facts):
-    """AABBs of static, non-sensor, non-controlled bodies that carry a REAL footprint.
+def _static_footprint_info(facts):
+    """Inspect the static geometry ONCE, returning ``(boxes, n_candidates, n_extent)``
+    or ``None`` when there is no geometry to read.
 
-    ANTI-GAMING GUARD: footprint-less / zero-extent bodies (bare position markers) are
-    excluded via ``reachability._aabb_of`` (which returns ``None`` for no real extent),
-    so state()-padding with marker bodies cannot inflate the structural count. Returns
-    a list of ``(min_corner, max_corner)`` tuples, or ``None`` when there is no
-    geometry to read at all."""
+      * ``boxes``        — ``(min, max)`` AABBs of static, non-sensor, non-controlled
+                           bodies that carry a REAL footprint (``reachability._aabb_of``,
+                           which returns ``None`` for no/zero extent).
+      * ``n_candidates`` — how many static bodies were considered (footprint or not).
+      * ``n_extent``     — how many DECLARE an extent field (``half_extents``/``aabb``/
+                           ``radius``), present or zero.
+
+    The last count is the honesty hinge: it separates "no footprint because the body is
+    a zero-extent MARKER" (measurable — the anti-gaming zero) from "no footprint because
+    this facts channel never emits extents" (UNCOMPUTABLE — must be ``None``, not a
+    false 0). The serve host's t=0 ``run_check`` geometry currently carries only
+    ``pos``+flags, so ``n_extent`` is 0 across today's library and the partition count is
+    correctly ``None`` rather than a misleading 0."""
     geom = _facts_geometry(facts)
     if geom is None:
         return None
     try:
         from harness.verify.reachability import _aabb_of
     except Exception:
-        return None
-    boxes = []
+        _aabb_of = None
+    boxes, n_candidates, n_extent = [], 0, 0
     for b in geom:
         if not isinstance(b, dict):
             continue
         if not b.get("static") or b.get("sensor") or b.get("controlled"):
             continue
+        n_candidates += 1
+        if any(k in b for k in ("half_extents", "aabb", "radius")):
+            n_extent += 1
         pos = b.get("pos")
-        if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+        if _aabb_of is None or not isinstance(pos, (list, tuple)) or len(pos) < 2:
             continue
-        pos = tuple(float(v) for v in pos)
-        aabb = _aabb_of(b, pos)
+        aabb = _aabb_of(b, tuple(float(v) for v in pos))
         if aabb is not None:
             boxes.append((tuple(float(c) for c in aabb[0]),
                           tuple(float(c) for c in aabb[1])))
-    return boxes
+    return boxes, n_candidates, n_extent
+
+
+def _n_static_footprint(info):
+    """Count of footprint-carrying static bodies (the anti-gaming guard's visible
+    companion). ``0`` when there are no static bodies at all; ``None`` when static
+    bodies exist but the facts channel omits their extents (unmeasurable)."""
+    if info is None:
+        return None
+    boxes, n_cand, n_extent = info
+    if n_cand == 0:
+        return 0
+    if n_extent == 0:
+        return None
+    return len(boxes)
 
 
 def _aabb_near(a, b, tol):
@@ -418,18 +443,23 @@ def _aabb_near(a, b, tol):
     return True
 
 
-def _structural_sections(facts, report):
+def _structural_sections(info, facts, report):
     """Count of distinct static-body clusters — the world's spatial partitions. Static
     footprints that touch / nearly touch are one structure; a wider gap separates
     regions. Union-find over the footprint AABBs (guarded to footprint-carrying bodies
-    only). ``0`` when geometry exists but carries no real static structure; ``None``
-    when there is no geometry to read."""
-    boxes = _static_footprints(facts)
-    if boxes is None:
+    only). ``0`` when there are no static bodies (no structure to partition) OR extents
+    are declared but all zero; ``None`` when static bodies exist yet the facts channel
+    omits their extents (unmeasurable — never a false 0)."""
+    if info is None:
         return None
+    boxes, n_cand, n_extent = info
+    if n_cand == 0:
+        return 0                       # genuinely no static bodies -> no partitions
+    if n_extent == 0:
+        return None                    # static bodies exist but no extent data -> unknown
     n = len(boxes)
     if n == 0:
-        return 0
+        return 0                       # extents declared but all zero -> no real structure
     ws = _world_size_list(facts, report) or [800, 600]
     span = max((abs(float(v)) for v in ws), default=800.0)
     tol = max(1.0, _SECTION_ADJ_FRAC * span)
@@ -559,6 +589,7 @@ def describe_game(game_path, verify_report=None, extras=None) -> dict:
 
     lin, meas, dead, su_dims = _space_util(report, facts)
     counts = _body_counts(facts) or {}
+    _sf_info = _static_footprint_info(facts)   # static geometry inspected once (L1)
     # Engine-free fallback: when there are no t=0 facts to classify bodies, the G0 static
     # report still carries a total body count (and the controlled bodies) — enough for the
     # geometry comparison, with the per-class splits left None.
@@ -591,9 +622,8 @@ def describe_game(game_path, verify_report=None, extras=None) -> dict:
         "n_dynamic": counts.get("n_dynamic"),
         # --- L1 complexity (measurement; anti-gaming guard on structural_sections) ---
         "n_mechanics": _n_mechanics(report),
-        "structural_sections": _structural_sections(facts, report),
-        "n_static_footprint": (lambda b: None if b is None else len(b))(
-            _static_footprints(facts)),
+        "structural_sections": _structural_sections(_sf_info, facts, report),
+        "n_static_footprint": _n_static_footprint(_sf_info),
         "gating_depth": _gating_depth(report),
         "autonomous_bodies": _autonomous_bodies(report, facts, extras),
     }

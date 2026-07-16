@@ -569,6 +569,20 @@ def test_structural_sections_zero_when_no_static_structure():
     assert d["structural_sections"] == 0
 
 
+def test_structural_sections_none_when_static_bodies_lack_extents():
+    # The REAL-library case: the serve host's t=0 run_check emits static bodies with only
+    # pos+flags (NO half_extents/aabb/radius). Extent is unmeasurable -> the count must be
+    # None (uncomputable), NEVER a misleading 0 for a world full of static bodies.
+    facts = fab_facts([body("ship", (50, 50), controlled=True),
+                       body("wall1", (100, 100), static=True),   # no half_extents
+                       body("wall2", (400, 300), static=True),   # no half_extents
+                       body("wall3", (700, 500), static=True)])
+    d = describe_game("scenes/games/x/x.gd", fab_report(actions=["a"]), {"facts": facts})
+    assert d["n_static"] == 3                    # the static bodies are counted
+    assert d["structural_sections"] is None      # but their partitioning is unmeasurable
+    assert d["n_static_footprint"] is None
+
+
 # ---- gating_depth: length of the ordered checkpoint chain ----
 def test_gating_depth_counts_distinct_latch_ticks():
     rep = fab_report(actions=["a", "b", "c"], witness_ticks=30,

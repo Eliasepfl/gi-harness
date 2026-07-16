@@ -71,6 +71,23 @@ whether 0 or 50 markers are padded in).
 games richest-first — it never touches axis selection or the existing layout. Default off,
 so the existing map is unchanged.
 
+**Measurement-channel finding (regen over the 21-game library, `--facts` pass).** The
+serve host's t=0 `run_check` geometry emits bodies as `{pos, controlled, static, sensor}`
+ONLY — no `half_extents`/`aabb`/`radius`. So body EXTENTS are absent from the facts
+channel, and `structural_sections`/`n_static_footprint` are correctly **None**
+(uncomputable) for the 18 games that HAVE static bodies, and `0` for the 3 with none
+(cargo-port, herding, maze — themselves surprising: a "maze"/"4-room mansion" exposes 0-3
+static bodies, i.e. walls are modelled as tilemap/boundary, not per-wall static bodies).
+The initial run reported a misleading `0` here; **fixed** so the descriptor distinguishes
+"no extent data → None" from "extents present but zero → anti-gaming 0". `n_mechanics` and
+`gating_depth` need the funnel REPORT (a `--verify` pass, not `--facts`), and
+`autonomous_bodies` needs replay FRAMES — so `--facts` alone populates no L1 axis over
+today's library; all five are validated on fixtures (with the right inputs) instead.
+To populate them library-wide: run `--verify` (gives `n_mechanics`+`gating_depth`); for
+`structural_sections`, the serve host must emit body extents, OR compute it from
+`run_batch` frames' `bbox` (which the solidity scan already receives) — a follow-up owned
+outside this lane.
+
 Tests: `tests/test_atlas.py` — each descriptor's correctness/determinism/None-safety, the
 anti-gaming inflation fixture, panel off-by-default + renders-when-enabled.
 
