@@ -68,6 +68,29 @@ NO_SUCCESS_MAX = 0.0   # success rate <= this == "never wins" (difficulty-reduct
 G4_DIRECTIVE_OUTCOMES = ("single_action_win", "broken_gating", "softlock")
 
 
+# --- Directive SEVERITY tiers ([eng.], 2026-07-15 harden wave) ---------------
+# A DEFECT is a real, proof-carrying brokenness (a single-action win, a bypassed gate,
+# a softlock, no stakes, an unsolvable opening): worth the FULL repair budget — the game
+# is BROKEN. A DIFFICULTY finding means the game is HARD-TO-LEARN, not broken: it
+# RE-CERTIFIES unchanged (it stays valid), so grinding revise rounds on it wastes budget
+# and can DEGRADE a good game chasing a phantom fix. Only the two G3' learnability-CURVE
+# rows are soft — the agent plateaus (`g3_plateau`) or reaches every milestone yet never
+# wins (`g3_difficulty`). Everything else — the G4 shapes, the PRESSURE no-stakes rows, and
+# `g3_unsolvable` (NOTHING latched -> the game is broken, not merely hard) — is a DEFECT.
+# The harden loop reads this tier to budget rounds (defects get `max_rounds`, difficulty a
+# small `difficulty_budget` nudge) and to pick the terminal verdict (a difficulty that
+# survives its nudge is HARDENED_HARD, a SUCCESS-ish terminal — never a repair failure).
+DEFECT = "defect"
+DIFFICULTY = "difficulty"
+DIFFICULTY_SOURCES = frozenset({"g3_plateau", "g3_difficulty"})
+
+
+def severity_of(source: str) -> str:
+    """Map a taxonomy row id onto its severity tier — ``DIFFICULTY`` for the two G3'
+    learnability-curve rows, ``DEFECT`` for every proof-carrying brokenness. Pure."""
+    return DIFFICULTY if source in DIFFICULTY_SOURCES else DEFECT
+
+
 # ======================================================================== #
 # The directive
 # ======================================================================== #
@@ -84,6 +107,9 @@ class Directive:
       fingerprint     — a STABLE dedup id (source + checkpoint keys only; volatile run data
                         such as tick counts is excluded) so a defect that survives a repair
                         recompiles to the SAME fingerprint and the convergence guard can stop.
+      severity        — the tier the harden loop budgets by: ``DEFECT`` (worth the full
+                        repair budget) or ``DIFFICULTY`` (hard-to-learn; a small nudge only).
+                        Derived from ``source`` via :func:`severity_of`.
       detail          — optional extra provenance (reproducer summary, action, rates).
     """
     source: str
@@ -91,6 +117,7 @@ class Directive:
     checkpoint_keys: tuple = ()
     text: str = ""
     fingerprint: str = ""
+    severity: str = DEFECT
     detail: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -100,6 +127,7 @@ class Directive:
             "checkpoint_keys": list(self.checkpoint_keys),
             "text": self.text,
             "fingerprint": self.fingerprint,
+            "severity": self.severity,
             "detail": dict(self.detail),
         }
 
@@ -121,7 +149,7 @@ def _mk(source: str, origin: str, checkpoint_keys, text: str, detail=None) -> Di
     keys = tuple(checkpoint_keys or ())
     return Directive(source=source, origin=origin, checkpoint_keys=keys,
                      text=text, fingerprint=_fingerprint(source, keys),
-                     detail=dict(detail or {}))
+                     severity=severity_of(source), detail=dict(detail or {}))
 
 
 # ======================================================================== #

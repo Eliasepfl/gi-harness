@@ -268,6 +268,141 @@ def test_continue_training_signal_from_g3(tmp_path, monkeypatch):
 
 
 # ======================================================================== #
+# SEVERITY-TIERED budget (2026-07-15 harden wave): DIFFICULTY findings (g3_plateau /
+# g3_difficulty) are HARD-TO-LEARN, not broken — they re-certify unchanged, so they earn a
+# small `difficulty_budget` nudge and a SUCCESS-ish terminal (HARDENED_HARD), never the
+# MAX_ROUNDS/REPAIR_* failure track a DEFECT gets. The certified defect-clean game is
+# preserved: a difficulty nudge never advances the deliverable.
+# ======================================================================== #
+def _g3_plateau():
+    """A plateaued learnability curve -> the g3_plateau (DIFFICULTY) directive."""
+    return {"still_improving": False, "learnable": False,
+            "checkpoint_keys": ["m1", "m2", "m3"],
+            "per_checkpoint_latch_rate": {"m1": 1.0, "m2": 0.9, "m3": 0.05},
+            "stochastic_success_rate": 0.0, "final_success_rate": 0.0,
+            "budget_steps": 1_000_000, "n_eval": 32}
+
+
+def _install_difficulty_seams(monkeypatch, *, attack, revise_verdict="COMPLETED",
+                              g3=_g3_plateau):
+    """Certified game (verify passes so G3' runs), a configurable G4 + G3', and a revise
+    that writes only into the sandbox. Returns the call log (paths + verdicts per revise)."""
+    monkeypatch.setattr(H, "verify_fn", lambda p: {"passed": True})
+    monkeypatch.setattr(H, "attack_fn",
+                        lambda gp, src, rep, **kw: attack() if callable(attack) else attack)
+    monkeypatch.setattr(H, "g3_fn", lambda gp, budget_steps, **kw: g3())
+    monkeypatch.setattr(H, "render_skills_fn", lambda text, **kw: "")
+
+    calls = []
+
+    def fake_revise(source, directive, *, out_dir, backend, max_repairs, engine,
+                    skill_context):
+        os.makedirs(out_dir, exist_ok=True)
+        p = os.path.join(out_dir, "revised.gd")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("extends Node2D\n# a revised game\n")
+        calls.append({"out_dir": out_dir, "path": p, "directive": directive})
+        return {"verdict": revise_verdict, "game_path": p}
+
+    monkeypatch.setattr(H, "revise_fn", fake_revise)
+    return calls
+
+
+def test_difficulty_only_spends_one_nudge_then_hardened_hard(tmp_path, monkeypatch):
+    game = tmp_path / "hard.gd"
+    original = _write_game(str(game))
+    ledger = tmp_path / "ledger.jsonl"
+    calls = _install_difficulty_seams(monkeypatch, attack=_g4_clean)
+
+    report = H.harden_game(str(game), out_dir=str(tmp_path / "sb"), backend="template",
+                           run_g3=True, budget_steps=1_000_000, max_rounds=3,
+                           difficulty_budget=1, ledger_path=str(ledger))
+
+    # A difficulty is hard-to-learn, not broken: <= difficulty_budget rounds, HARDENED_HARD
+    # (a SUCCESS-ish terminal), NOT MAX_ROUNDS/REPAIR_*.
+    assert report["final_verdict"] == "HARDENED_HARD"
+    assert report["rounds"] == 1                        # exactly one nudge, no grind
+    assert len(calls) == 1                              # one bonus revise attempt
+    assert report["directives_issued"] == 1
+    # the certified defect-clean game is PRESERVED — the nudge never advances the deliverable
+    assert report["final_game_path"] == str(game)
+    assert report["original_untouched"] is True
+    with open(game, encoding="utf-8") as fh:
+        assert fh.read() == original
+
+
+def test_difficulty_budget_zero_never_nudges(tmp_path, monkeypatch):
+    game = tmp_path / "hard.gd"
+    _write_game(str(game))
+    calls = _install_difficulty_seams(monkeypatch, attack=_g4_clean)
+
+    report = H.harden_game(str(game), out_dir=str(tmp_path / "sb"), backend="template",
+                           run_g3=True, max_rounds=3, difficulty_budget=0,
+                           ledger_path=str(tmp_path / "l.jsonl"))
+    assert report["final_verdict"] == "HARDENED_HARD"
+    assert len(calls) == 0                              # budget 0 -> no revise at all
+    assert report["directives_issued"] == 0
+    assert report["final_game_path"] == str(game)
+    assert report["original_untouched"] is True
+
+
+def test_difficulty_nudge_failing_recert_is_not_a_failure(tmp_path, monkeypatch):
+    # The nudge does NOT re-certify (verdict != COMPLETED). For a DEFECT this is
+    # REPAIR_FAILED; for a DIFFICULTY it is still HARDENED_HARD — the game is valid and
+    # defect-clean, merely hard to learn, and the certified version is preserved.
+    game = tmp_path / "hard.gd"
+    original = _write_game(str(game))
+    _install_difficulty_seams(monkeypatch, attack=_g4_clean, revise_verdict="UNSOLVED")
+
+    report = H.harden_game(str(game), out_dir=str(tmp_path / "sb"), backend="template",
+                           run_g3=True, max_rounds=3, difficulty_budget=1,
+                           ledger_path=str(tmp_path / "l.jsonl"))
+    assert report["final_verdict"] == "HARDENED_HARD"
+    assert report["final_verdict"] not in ("REPAIR_FAILED", "MAX_ROUNDS", "REPAIR_STALLED")
+    assert report["final_game_path"] == str(game)      # certified version preserved
+    assert report["original_untouched"] is True
+    with open(game, encoding="utf-8") as fh:
+        assert fh.read() == original
+
+
+def test_defect_and_difficulty_mix_spends_defects_first(tmp_path, monkeypatch):
+    game = tmp_path / "mix.gd"
+    original = _write_game(str(game))
+    ledger = tmp_path / "ledger.jsonl"
+
+    # round 1 attack surfaces a DEFECT (single_action_win) alongside a persistent plateau;
+    # round 2 (after the defect fix re-certifies) the attack is clean, plateau remains.
+    state = {"round": 0}
+
+    def attack():
+        state["round"] += 1
+        return _g4_single_action() if state["round"] == 1 else _g4_clean()
+
+    calls = _install_difficulty_seams(monkeypatch, attack=attack)
+
+    report = H.harden_game(str(game), out_dir=str(tmp_path / "sb"), backend="template",
+                           run_g3=True, max_rounds=3, difficulty_budget=1,
+                           ledger_path=str(ledger))
+
+    assert report["final_verdict"] == "HARDENED_HARD"
+    recs = report["round_records"]
+    # round 1 addressed the DEFECT first (difficulty deferred), round 2 nudged the difficulty
+    assert [d["source"] for d in recs[0]["directives"]] == ["single_action_win"]
+    assert recs[0]["verdict"] == "COMPLETED"
+    assert recs[0].get("deferred_difficulty") == ["g3_plateau"]
+    assert recs[1].get("severity") == "difficulty" and recs[1].get("nudged") is True
+    assert [d["source"] for d in recs[1]["directives"]] == ["g3_plateau"]
+    assert report["directives_issued"] == 2            # 1 defect + 1 difficulty
+    # the DEFECT fix (round 1 sandbox) is the deliverable; the difficulty nudge did NOT
+    # advance it, and the on-disk original is untouched throughout.
+    assert report["final_game_path"] == calls[0]["path"]
+    assert report["final_game_path"] != calls[1]["path"]
+    assert report["original_untouched"] is True
+    with open(game, encoding="utf-8") as fh:
+        assert fh.read() == original
+
+
+# ======================================================================== #
 # In-image end-to-end smoke on the real single_action_win.gd fixture (Godot).
 # Uses the REAL oracle + revise seams (template backend, no LLM). Verifies the whole
 # loop: G4 surfaces single_action_win -> a directive compiles -> the revise loop runs

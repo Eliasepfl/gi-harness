@@ -259,6 +259,56 @@ def test_single_action_fingerprint_ignores_volatile_action():
 
 
 # ======================================================================== #
+# Directive SEVERITY tiers (2026-07-15 harden wave): DEFECT vs DIFFICULTY.
+# A DEFECT is a proof-carrying brokenness worth the full repair budget; a DIFFICULTY
+# finding (the two G3' learnability-curve rows) is hard-to-learn, not broken — a nudge only.
+# ======================================================================== #
+def test_severity_of_pure_mapping():
+    assert F.severity_of("g3_plateau") == F.DIFFICULTY
+    assert F.severity_of("g3_difficulty") == F.DIFFICULTY
+    for defect in ("g3_unsolvable", "single_action_win", "broken_gating", "softlock",
+                   "no_pressure", "failure_unreachable", "stuck", "anything_else"):
+        assert F.severity_of(defect) == F.DEFECT
+    assert F.DIFFICULTY_SOURCES == frozenset({"g3_plateau", "g3_difficulty"})
+    assert F.DEFECT == "defect" and F.DIFFICULTY == "difficulty"
+
+
+def test_severity_on_compiled_g3_rows():
+    # plateau + stall-at-first + all-latched-never-wins are the SOFT difficulty rows...
+    plateau = F.compile_directives({"g3_prime": g3(latch={"m1": 1.0, "m2": 0.9, "m3": 0.05})})
+    assert plateau[0].source == "g3_plateau" and plateau[0].severity == F.DIFFICULTY
+    stall = F.compile_directives({"g3_prime": g3(latch={"m1": 0.2, "m2": 0.0, "m3": 0.0})})
+    assert stall[0].source == "g3_plateau" and stall[0].severity == F.DIFFICULTY
+    diff = F.compile_directives({"g3_prime": g3(latch={"m1": 1.0, "m2": 1.0, "m3": 1.0},
+                                                sr=0.0, greedy=0.0)})
+    assert diff[0].source == "g3_difficulty" and diff[0].severity == F.DIFFICULTY
+    # ...but NOTHING-latched is a broken game -> DEFECT, worth the full budget.
+    uns = F.compile_directives({"g3_prime": g3(latch={"m1": 0.0, "m2": 0.0, "m3": 0.0})})
+    assert uns[0].source == "g3_unsolvable" and uns[0].severity == F.DEFECT
+
+
+def test_severity_on_compiled_g4_and_pressure_rows_is_defect():
+    sa = F.compile_directives({"g4": g4(
+        g4_finding("single_action_win", hard=False, action="right", ticks=9))})
+    bg = F.compile_directives({"g4": g4(
+        g4_finding("broken_gating", evidence={"skipped_checkpoints": ["k"]}))})
+    sl = F.compile_directives({"g4": g4(
+        g4_finding("softlock", detail="dead end", reproducer={"seed": 1}))})
+    npr = F.compile_directives({"pressure": pressure("no_pressure", constant_false=True)})
+    fur = F.compile_directives({"pressure": pressure("failure_unreachable")})
+    for ds in (sa, bg, sl, npr, fur):
+        assert ds[0].severity == F.DEFECT
+
+
+def test_severity_round_trips_through_to_dict():
+    d = F.compile_directives({"g3_prime": g3(latch={"m1": 1.0, "m2": 0.9, "m3": 0.05})})[0]
+    assert d.to_dict()["severity"] == F.DIFFICULTY
+    d2 = F.compile_directives({"g4": g4(
+        g4_finding("single_action_win", hard=False, action="up", ticks=3))})[0]
+    assert d2.to_dict()["severity"] == F.DEFECT
+
+
+# ======================================================================== #
 # checkpoint-pair localiser (direct)
 # ======================================================================== #
 def test_checkpoint_pair_monotone():

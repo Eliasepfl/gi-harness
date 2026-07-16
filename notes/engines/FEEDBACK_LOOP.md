@@ -25,19 +25,27 @@ Two entry modes, both already exist:
 
 ## Feedback taxonomy (the compiler)
 
-| Oracle outcome | Directive fed back (personalized, against current code) |
-|---|---|
-| G0.5 walled-off checkpoint | **Engine facts raised**: "checkpoint '<key>' is geometrically unreachable from spawn — enclosed by static bodies <AABBs/names>. Open a corridor or move the checkpoint." Facts, not vibes. |
-| G3 tree UNSOLVED w/ progress | (EXISTS, v2.1) "stuck between '<k>' and '<next>' — fix that segment." |
-| G3' RL **progressing** | **NO feedback — keep training.** Progress-gated budget up to 1M steps (plateau-patience already encodes this: early-stop only fires on stall). Optional variant: if latch is high but success never fires → difficulty-reduction directive. |
-| G3' RL **plateaued mid-course** | Checkpoint-pair directive from the latch curve: "a trained agent latches '<k>' reliably (rate r) but never '<next>' — the defect is between these two checkpoints." Same shape as the tree lane's `stuck_after`, fed from RL. |
-| G3' RL **zero progress** (full budget) | "Unsolvable by a trained agent: no checkpoint ever latched — the first objective is unreachable or the controls cannot produce progress." (Payoff run confirmed this class is real: drive-cart/hop latched 0.) |
-| G4 `single_action_win` | **Broken game** directive: "winnable by repeating one action — add a real obstacle/choice." (Cheap probe runs in-loop, pre-cert.) |
-| G4 shortcut w/ **broken gating** | "success reachable WITHOUT checkpoint '<key>' — gate the win on it or remove the checkpoint." Informational shortcuts (merely easier than witness) do NOT re-enter the loop. |
-| PRESSURE gate **`no_pressure`** (WAVE 1) | **No stakes** (static proof): "the game cannot be lost — is_failure() is hardcoded false; add a real failure condition (hazard, timeout, out-of-bounds, resource depletion) so play has stakes." ADVISORY — warn + directive, never a hard cert-block (see below). |
-| PRESSURE gate **`failure_unreachable`** (WAVE 1) | "is_failure() never fires from any reachable state under a broad adversarial rollout — the win always resolves first (the race), or the detector never triggers. Make failure a condition a real player could actually trigger." ADVISORY; a bounded reproducer-ABSENCE. Distinct from `no_pressure`. |
-| PRESSURE gate **`has_pressure`** | NO directive — a reachable failure was WITNESSED; the game has stakes. |
-| body leaves play bounds | NOT a defect — episode truncation in serve (bounds termination). Never fed back. |
+The **Severity** column tiers each compiled directive (`feedback.severity_of`, the field on
+`Directive`): **DEFECT** = a proof-carrying brokenness, worth the FULL repair budget; **DIFF**
+= HARD-TO-LEARN, not broken (it re-certifies unchanged), worth a small nudge only. Only the
+two G3' learnability-CURVE rows are soft; every proof-carrying defect is a DEFECT. See the
+severity-budget rule below.
+
+| Oracle outcome | Severity | Directive fed back (personalized, against current code) |
+|---|---|---|
+| G0.5 walled-off checkpoint | gate | **Engine facts raised**: "checkpoint '<key>' is geometrically unreachable from spawn — enclosed by static bodies <AABBs/names>. Open a corridor or move the checkpoint." Facts, not vibes. (Pre-cert G0.5 gate, not a post-cert budgeted directive.) |
+| G3 tree UNSOLVED w/ progress | gate | (EXISTS, v2.1) "stuck between '<k>' and '<next>' — fix that segment." (Pre-cert G3 gate.) |
+| G3' RL **progressing** | — | **NO feedback — keep training.** Progress-gated budget up to 1M steps (plateau-patience already encodes this: early-stop only fires on stall). |
+| G3' RL **plateaued mid-course** (`g3_plateau`) | **DIFF** | Checkpoint-pair directive from the latch curve: "a trained agent latches '<k>' reliably (rate r) but never '<next>' — the defect is between these two checkpoints." Same shape as the tree lane's `stuck_after`, fed from RL. Hard-to-learn -> nudge budget only. |
+| G3' RL **all latched, never wins** (`g3_difficulty`) | **DIFF** | "reaches every milestone yet success stays 0 — the final win condition is mis-gated/too strict; loosen it just past the last milestone." Hard-to-learn -> nudge budget only. |
+| G3' RL **zero progress** (full budget) (`g3_unsolvable`) | **DEFECT** | "Unsolvable by a trained agent: no checkpoint ever latched — the first objective is unreachable or the controls cannot produce progress." NOTHING latched = broken, NOT merely hard. (Payoff run confirmed this class is real: drive-cart/hop latched 0.) |
+| G4 `single_action_win` | **DEFECT** | **Broken game** directive: "winnable by repeating one action — add a real obstacle/choice." (Cheap probe runs in-loop, pre-cert.) |
+| G4 shortcut w/ **broken gating** | **DEFECT** | "success reachable WITHOUT checkpoint '<key>' — gate the win on it or remove the checkpoint." Informational shortcuts (merely easier than witness) do NOT re-enter the loop. |
+| G4 `softlock` (tree-refutation confirmed) | **DEFECT** | "dead-end state reachable — quote the frozen-state reproducer; add an escape/reset." Only the CERTIFIED class compiles; heuristic `stuck` is informational. |
+| PRESSURE gate **`no_pressure`** (WAVE 1) | **DEFECT** | **No stakes** (static proof): "the game cannot be lost — is_failure() is hardcoded false; add a real failure condition (hazard, timeout, out-of-bounds, resource depletion) so play has stakes." ADVISORY — warn + directive, never a hard cert-block (see below). |
+| PRESSURE gate **`failure_unreachable`** (WAVE 1) | **DEFECT** | "is_failure() never fires from any reachable state under a broad adversarial rollout — the win always resolves first (the race), or the detector never triggers. Make failure a condition a real player could actually trigger." ADVISORY; a bounded reproducer-ABSENCE. Distinct from `no_pressure`. |
+| PRESSURE gate **`has_pressure`** | — | NO directive — a reachable failure was WITNESSED; the game has stakes. |
+| body leaves play bounds | — | NOT a defect — episode truncation in serve (bounds termination). Never fed back. |
 
 ## Dimension-awareness (Elias)
 
@@ -104,6 +112,43 @@ unfailable, so idling is free and ANTI-IDLING has no in-game meaning).
   an earlier gate is caught immediately, no oscillation goes unrecorded.
 - Directives are idempotent-checked: the same finding twice in a row = the model
   failed to fix it → stop, mark `REPAIR_STALLED`, keep the last certified version.
+
+## Severity tiers & the difficulty budget (2026-07-15 harden wave)
+
+Observed failure: `fly_a_craft` burned all 3 rounds on `g3_plateau` — each revise
+RE-CERTIFIED (the game stayed valid) but the plateau persisted, because a plateau means
+HARD-TO-LEARN, not BROKEN. Treating difficulty as a defect wastes rounds and can DEGRADE a
+good game chasing a phantom fix. Fix — tier the directives by severity and budget by tier
+(`feedback.severity_of`; `harden.harden_game`):
+
+- **DEFECT** (`single_action_win`, `broken_gating`, `softlock`, `g3_unsolvable`,
+  `no_pressure`, `failure_unreachable`): worth the FULL `max_rounds` (default 3) + the
+  `REPAIR_STALLED`/`REPAIR_FAILED` convergence guard. A real, proof-carrying brokenness.
+- **DIFFICULTY** (`g3_plateau`, `g3_difficulty`): the two G3' learnability-curve rows.
+  Hard-to-learn, not broken — it re-certifies unchanged, so it earns a small
+  `difficulty_budget` of BONUS nudge rounds (default **1**; **0** disables nudging entirely).
+  A nudge is attempted in the sandbox but **NEVER advances the deliverable** — the certified,
+  defect-clean game is preserved (a phantom fix must not overwrite a good game). One nudge,
+  no grind.
+- **Priority**: when a round carries BOTH, the DEFECTS are revised FIRST (difficulty is
+  deferred, recorded under `deferred_difficulty`); a difficulty nudge fires only once the
+  game is defect-clean and certified.
+
+### Terminal verdicts + CLI exit code (`harden.HARDEN_SUCCESS_VERDICTS`)
+
+| Verdict | Meaning | Exit |
+|---|---|---|
+| `HARDENED` / `BULLETPROOF` | No findings — clean/bulletproof. | 0 |
+| `HARDENED_HARD` | Defect-clean + certified; a DIFFICULTY persists past its nudge budget. A SUCCESS-ish terminal (valid + hardened, merely hard to learn) — **not** a failed harden. | **0** |
+| `CONTINUE_TRAINING` | G3' curve was still climbing at budget — give more steps, no repair. | 1¹ |
+| `REPAIR_STALLED` | A DEFECT fingerprint recurred after its fix — the model could not remove it; last certified version kept. | 1 |
+| `REPAIR_FAILED` | A DEFECT fix did not re-certify (verdict != COMPLETED); last certified version kept. | 1 |
+| `MAX_ROUNDS` | DEFECTs still unresolved when the defect budget ran out. | 1 |
+| `OPEN_UNMAPPED` / `G4_ERROR` | A hard G4 finding outside the taxonomy / a G4 error. | 1 |
+
+¹ `CONTINUE_TRAINING` is not in `HARDEN_SUCCESS_VERDICTS` (it is a "needs more training",
+not a "hardened" terminal). The key change vs the old vocabulary: a difficulty-only remainder
+now reads `HARDENED_HARD` (exit 0), not `MAX_ROUNDS`/`REPAIR_STALLED` (exit 1).
 
 ## Status
 

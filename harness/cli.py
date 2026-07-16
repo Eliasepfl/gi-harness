@@ -711,7 +711,7 @@ def cmd_game_harden(args) -> int:
     revise attempt writes only into the sandbox; the last certified version is never
     overwritten by a fix that fails to re-certify. Emits one JSON record."""
     try:
-        from harness.gen.harden import harden_game
+        from harness.gen.harden import harden_game, HARDEN_SUCCESS_VERDICTS
     except Exception as exc:  # noqa: BLE001
         return _module_missing("harden", exc, args.json)
 
@@ -725,7 +725,7 @@ def cmd_game_harden(args) -> int:
 
     if args.json:
         _emit_json(report)
-        return 0 if report.get("final_verdict") in ("HARDENED", "BULLETPROOF") else 1
+        return 0 if report.get("final_verdict") in HARDEN_SUCCESS_VERDICTS else 1
 
     print(f"{str(report.get('final_verdict'))}  {args.game_path}")
     print(f"  directives : {report.get('directives_issued')} issued over "
@@ -737,7 +737,7 @@ def cmd_game_harden(args) -> int:
                   f"{str(d.get('text'))[:100]}")
     print(f"  final game : {report.get('final_game_path')}")
     print(f"  original untouched : {report.get('original_untouched')}")
-    return 0 if report.get("final_verdict") in ("HARDENED", "BULLETPROOF") else 1
+    return 0 if report.get("final_verdict") in HARDEN_SUCCESS_VERDICTS else 1
 
 
 # ---- bank (parts bank list / certify) ----------------------------------------
