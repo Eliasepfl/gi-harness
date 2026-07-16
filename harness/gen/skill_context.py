@@ -64,6 +64,10 @@ _SKILL_FILE = "SKILL.md"
 _CHARS_PER_TOKEN = 4          # rough English estimate; only used for the budget
 _MIN_BODY_CHARS = 200         # never truncate a body below this (a usable stub)
 _TRUNCATION_MARK = "\n... [truncated]"
+# Safety ceiling on the LLM router's pick count — NOT a design cap. The router is
+# told to pick every genuinely relevant skill; this only stops a pathological
+# whole-catalog dump. The token budget (render_skill_context) is the real limiter.
+_LLM_ROUTE_CEILING = 10
 
 # --- Selection tuning --------------------------------------------------------
 # The description + keywords are the curated retrieval keys (that is their whole
@@ -311,12 +315,18 @@ def _llm_route(prompt: str, index: list, k: int) -> list:
         from harness.gen.gamegen import _openrouter_complete, _BackendUnavailable
     except Exception:  # noqa: BLE001
         return []
-    catalog = "\n".join(f"- {e['name']}: {(e.get('description') or '')[:180]}"
+    # FULL descriptions — do NOT truncate (Elias, 2026-07-15). 92% of the gd-agentic
+    # descriptions exceed 180 chars (mean ~409, max ~683); cutting them made the router
+    # route on less than half of each skill's own description, undercutting selection
+    # quality. The whole catalog is one cheap routing call; tokens are not the constraint.
+    catalog = "\n".join(f"- {e['name']}: {(e.get('description') or '')}"
                         for e in index)
-    system = ("You route a game-design prompt to the most relevant Godot skills. "
+    system = ("You route a game-design prompt to the relevant Godot skills. "
               "Reply with ONLY the chosen skill names, one per line, most relevant "
-              "first, at most " + str(k) + ". Names must be copied EXACTLY from the "
-              "catalog. No prose.")
+              "first. Pick EVERY skill that genuinely helps build this game (a game "
+              "usually needs several: its genre, its physics/dimension, its controls, "
+              "its camera) and STOP when the rest are irrelevant — do not pad. Names "
+              "must be copied EXACTLY from the catalog. No prose.")
     user = f"PROMPT: {prompt}\n\nCATALOG:\n{catalog}"
     try:
         raw = _openrouter_complete(system, [{"role": "user", "content": user}])
@@ -359,10 +369,16 @@ def select_skills(prompt: str, k: int = 3, *, root: str | None = None,
     by_name = {e["name"]: e for e in index}
 
     # LLM-first routing; fall back to BM25 when it returns nothing.
-    llm_names = _llm_route(prompt, index, k) if use_llm else []
+    # The ORCHESTRATOR is not restricted to k (Elias, 2026-07-15): the LLM router
+    # picks EVERY genuinely relevant skill (capping the count starves a game that
+    # needs, say, physics-3d AND camera AND its genre). A generous safety ceiling
+    # only guards against a pathological whole-catalog dump; the REAL limiter is the
+    # token budget in render_skill_context. The `k` cap applies ONLY to the
+    # deterministic BM25 fallback below.
+    llm_names = _llm_route(prompt, index, _LLM_ROUTE_CEILING) if use_llm else []
     if llm_names:
         out = []
-        for name in llm_names[:k]:
+        for name in llm_names:
             body = _skill_body(d, name)
             if body:
                 out.append(Skill(name=name,
@@ -452,7 +468,13 @@ def render_skill_context(prompt: str, k: int = 3, max_tokens: int = 4000,
         return ""
 
     header = ATTRIBUTION
-    char_budget = max(0, max_tokens) * _CHARS_PER_TOKEN
+    # max_tokens <= 0 (or None) => UNBOUNDED: include the orchestrator + every routed
+    # skill at FULL length, no truncation (Elias, 2026-07-15: "I want great games, I
+    # don't care about spending tokens"). The LLM router's count ceiling is the only
+    # limiter. A huge sentinel budget lets the bounded path below include everything
+    # whole without special-casing. Positive max_tokens keeps the old bounded behavior
+    # (used by fixtures/tests).
+    char_budget = (max_tokens * _CHARS_PER_TOKEN) if (max_tokens and max_tokens > 0) else 10**9
     blocks = [header]
 
     # The orchestrator leads and gets ~half the body budget (its decision
@@ -465,16 +487,27 @@ def render_skill_context(prompt: str, k: int = 3, max_tokens: int = 4000,
         blocks.append(f"### {_MASTER_SKILL} (orchestrator)\n{m}")
 
     if skills:
-        remaining = char_budget - sum(len(b) for b in blocks)
-        reserve = sum(len(f"### {s.name}\n") + 4 for s in skills)
-        body_budget = remaining - reserve
-        per_skill = max(_MIN_BODY_CHARS, body_budget // len(skills)) if body_budget > 0 \
-            else _MIN_BODY_CHARS
-        for s in skills:
+        # Include skills in RELEVANCE ORDER at FULL length; when the budget is hit,
+        # truncate only the marginal skill and DROP the rest (Elias, 2026-07-15).
+        # Now that the LLM router is uncapped, an even split would shred every skill
+        # into fragments once it picks many; instead the most-relevant skills stay
+        # WHOLE and the least-relevant overflow is dropped — graceful degradation.
+        used = sum(len(b) for b in blocks)
+        for idx, s in enumerate(skills):
+            title = f"### {s.name}\n"
+            avail = char_budget - used - len(title) - 4
+            if idx > 0 and avail < _MIN_BODY_CHARS:
+                break                                     # drop the least-relevant TAIL
             body = s.body
-            if len(body) > per_skill:
-                body = body[:per_skill].rstrip() + _TRUNCATION_MARK
-            blocks.append(f"### {s.name}\n{body}")
+            cap_here = avail if idx > 0 else max(avail, _MIN_BODY_CHARS)  # 1st skill always in
+            truncated = len(body) > cap_here
+            if truncated:
+                body = body[:max(0, cap_here)].rstrip() + _TRUNCATION_MARK
+            block = f"{title}{body}"
+            blocks.append(block)
+            used += len(block) + 2                        # +2 for the "\n\n" join
+            if truncated:
+                break                                     # budget exhausted on this one
     text = "\n\n".join(blocks)
 
     # Hard cap: if the reserved-title overhead still pushed us over (many skills,

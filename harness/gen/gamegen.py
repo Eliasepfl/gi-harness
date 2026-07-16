@@ -185,10 +185,15 @@ def _system_prompt(engine, menu_text=None):
 # How many gd-agentic DOMAIN skills to retrieve alongside the godot-master
 # orchestrator (a genre blueprint + a physics/architecture skill; see
 # skill_context). The orchestrator (godot-master, ~12k tokens) leads the block.
-_SKILL_K = 2
+_SKILL_K = 3   # BM25-fallback cap ONLY; the LLM router is uncapped (token-bounded)
 # Token budget for the whole injected block: the orchestrator's decision matrix
 # is the high-value base, so give it room (~half) + the domain skills (~half).
-_SKILL_MAX_TOKENS = 24000  # godot-master (~12k) UNtruncated + 2 domain skills (~12k)
+_SKILL_MAX_TOKENS = 0       # UNBOUNDED (Elias 2026-07-15: "I want great games, I don't
+                           # care about spending tokens" — the wasted tokens are the
+                           # repairs, not the skills). The LLM router's count ceiling
+                           # (_LLM_ROUTE_CEILING) is the only limiter; every routed skill
+                           # is injected at FULL length. Diagnosis: the router picks
+                           # ~4-8 skills (mean 5.8) — the old cap of 2 starved it.
 
 # Advisory framing for the injected knowledge block: the CONTRACT above is
 # binding; the reference knowledge is craft to draw on, never to copy.
