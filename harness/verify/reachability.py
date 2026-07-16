@@ -418,3 +418,141 @@ def failure_reachable(executor, game_source, actions, *, horizon=None,
         return {"reachable": True, "witness": _failure_witness(fail, gv.WORLD_SEED),
                 "n_plans": n_plans, "n_failed": n_failed + 1}
     return {"reachable": False, "witness": None, "n_plans": n_plans, "n_failed": n_failed}
+
+
+# ======================================================================== #
+# WAVE 2 — SPACE / PROPORTION: the dead-space (space-utilization) ratio.
+# ======================================================================== #
+# DEMO_GAP_ANALYSIS.md §Gap 3 (dead space, ranked HIGH): our generated worlds are
+# 20-69x emptier than the reference demos — a radius-16 puck on an 800x600 table, the
+# mechanic confined to a sliver. Most frames of any rollout show featureless drift.
+# The instrument this gap wants is a CHEAP, purely-geometric FACT computed from the
+# game's OWN t=0 geometry (the same body facts the G0.5 flood reads): how big is the
+# declared PLAYFIELD relative to the SPAN the action actually uses?
+#
+# THE METRIC (dimension-aware):
+#   * PLAYFIELD box = the declared world box [0, w] x [0, h] (x [0, d]) unioned with
+#     every body position and every static wall footprint — "the extent the game
+#     presents". For a 3D game whose world_size only bounds x,y, the depth extent comes
+#     from the geometry (a z-flat game reads as z-thin, not z-empty).
+#   * ACTION-SPAN box = the bounding box of the controlled body's footprint together
+#     with every REACHABLE checkpoint/goal (the non-wall targets the G0.5 flood can
+#     reach) — "the region the mechanic touches". The controlled body is the FLOOR of
+#     the span, so a single-goal 'survive' game still has a meaningful span.
+#   * measure_ratio = playfield_measure / span_measure (AREA in 2D, VOLUME in 3D):
+#     "how many action-spans fit in the world".
+#   * linear_ratio  = measure_ratio ** (1 / dims): the dimension-NORMALISED reading,
+#     "the world is ~N times larger than the action needs, per axis" — directly
+#     comparable across 2D and 3D and the number the repair directive quotes.
+#
+# NECESSARY-not-SUFFICIENT and ADVISORY by construction (see gameverify._dead_space_gate):
+# a bounded heuristic over static geometry, never a hard cert-block. The threshold lives
+# HERE, harness-side, never on any generation surface.
+
+# Dead-space thresholds ([eng.], dimension-aware — thresholded per-dimension on the
+# LINEAR ratio = measure_ratio**(1/dims), so the 2D AREA ratio and the 3D VOLUME ratio
+# become comparable per-axis numbers). Calibrated on the reference fixtures' OWN geometry
+# so none false-flags, with margin: mini_collect 2D ~2.9, losable 2D ~3.8,
+# mini_collect_3d ~4.0 (a plane-locked 3D game, thin in y — the tightest reference). A
+# game whose world is >5x the action span PER AXIS is >~96% empty area (2D) / >99.2%
+# empty volume (3D): dead space. Both are 5.0 after calibration (the 3D reference sits at
+# 4.0, so 3D cannot be stricter without a false reject); kept as separate knobs.
+DEAD_SPACE_LINEAR_2D = 5.0
+DEAD_SPACE_LINEAR_3D = 5.0
+SPAN_MIN_EXTENT = 2.0 * MIN_CELL   # px: floor a degenerate span axis (avoid /0) [eng.]
+
+
+def _dead_space_threshold(dims: int) -> float:
+    return DEAD_SPACE_LINEAR_2D if dims == 2 else DEAD_SPACE_LINEAR_3D
+
+
+def _measure(extent) -> float:
+    m = 1.0
+    for e in extent:
+        m *= float(e)
+    return m
+
+
+def space_utilization(bodies, world_size, *, clearance=None):
+    """The dead-space / space-utilization proportion FACT from t=0 geometry (DEMO_GAP §Gap 3).
+
+    ``bodies``     : the serve host's ``geometry`` facts — the SAME list the G0.5 flood
+                     reads (``{pos, static, sensor, controlled, aabb?/half_extents?/radius?}``).
+    ``world_size`` : the declared ``[w, h]`` (2D bound; a 3D game keeps its depth extent
+                     from the geometry). ``clearance`` overrides the controlled radius.
+
+    Returns a dict (or ``None`` when there is not enough geometry — no controlled spawn):
+
+        {"dims", "playfield", "span", "playfield_measure", "span_measure",
+         "measure_ratio", "linear_ratio", "threshold", "dead_space", "n_targets",
+         "n_reachable", "detail"}
+
+    ``dead_space`` is ``linear_ratio > threshold[dims]`` — a BOUNDED heuristic, advisory
+    only (see the section header). Pure geometry: no engine, no physics, deterministic."""
+    spawn, clr, targets, occ = targets_and_occupancy(bodies)
+    if spawn is None:
+        return None                                  # no controlled body -> nothing to measure
+    dims = len(spawn)
+    clr = float(clearance) if clearance is not None else float(clr)
+    ws = [float(v) for v in (world_size or [])]
+
+    # Which targets can the action actually reach? Reuse the G0.5 flood so a walled-off
+    # marker does not count toward the span (it cannot be part of the play). With no
+    # occupancy the flood is trivial -> every target is reachable.
+    reachable = list(targets)
+    if occ and targets:
+        res = check_reachability(spawn, targets, occ, ws, clearance=clr)
+        blocked = set(res.get("unreachable") or [])
+        reachable = [t for t in targets if t.get("name") not in blocked]
+
+    # --- PLAYFIELD box: world box (per bounded axis) U every body position U walls. ---
+    all_pts = [spawn] + [t["pos"] for t in targets
+                         if isinstance(t.get("pos"), (list, tuple)) and len(t["pos"]) >= dims]
+    lo_p = [min(float(p[i]) for p in all_pts) for i in range(dims)]
+    hi_p = [max(float(p[i]) for p in all_pts) for i in range(dims)]
+    for i in range(dims):
+        if i < len(ws):                              # this axis has a declared world bound
+            lo_p[i] = min(lo_p[i], 0.0)
+            hi_p[i] = max(hi_p[i], ws[i])
+    for mn, mx in occ:                               # walls can push the extent outward
+        for i in range(dims):
+            lo_p[i] = min(lo_p[i], float(mn[i]))
+            hi_p[i] = max(hi_p[i], float(mx[i]))
+
+    # --- ACTION-SPAN box: controlled footprint U every reachable target (get-near). ---
+    lo_s = [spawn[i] - clr for i in range(dims)]
+    hi_s = [spawn[i] + clr for i in range(dims)]
+    for t in reachable:
+        p = t["pos"]
+        if not isinstance(p, (list, tuple)) or len(p) < dims:
+            continue                                 # ragged pos -> skip (never crash verify)
+        for i in range(dims):
+            lo_s[i] = min(lo_s[i], float(p[i]) - clr)
+            hi_s[i] = max(hi_s[i], float(p[i]) + clr)
+
+    span = [max(hi_s[i] - lo_s[i], SPAN_MIN_EXTENT) for i in range(dims)]
+    # The playfield always CONTAINS the span; floor it so the ratio can never dip below 1.
+    playfield = [max(hi_p[i] - lo_p[i], span[i]) for i in range(dims)]
+
+    pf_measure = _measure(playfield)
+    sp_measure = _measure(span)
+    measure_ratio = pf_measure / sp_measure if sp_measure > 0 else 1.0
+    linear_ratio = measure_ratio ** (1.0 / dims)
+    threshold = _dead_space_threshold(dims)
+    dead = linear_ratio > threshold
+
+    kind = "area" if dims == 2 else "volume"
+    detail = (f"the playfield is ~{linear_ratio:.1f}x larger per axis than the region the "
+              f"action uses ({dims}D {kind} ratio {measure_ratio:.0f}x); "
+              + ("most of the world is empty space the mechanic never touches"
+                 if dead else "the world is proportioned to the action"))
+    return {"dims": dims,
+            "playfield": [round(v, 2) for v in playfield],
+            "span": [round(v, 2) for v in span],
+            "playfield_measure": round(pf_measure, 2),
+            "span_measure": round(sp_measure, 2),
+            "measure_ratio": round(measure_ratio, 3),
+            "linear_ratio": round(linear_ratio, 3),
+            "threshold": threshold, "dead_space": bool(dead),
+            "n_targets": len(targets), "n_reachable": len(reachable),
+            "detail": detail}

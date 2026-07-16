@@ -46,6 +46,14 @@ The taxonomy (one directive-producing row per defect; every other outcome yields
                               detector never triggers). Repair: make failure triggerable.
     * has_pressure / other -> NO directive (a reachable failure was witnessed; healthy).
 
+  DEAD SPACE (WAVE 2 proportion gate, gameverify._dead_space_gate) — read from
+  ``oracle_results["dead_space"]`` (extract with :func:`dead_space_finding`):
+    * dead_space           -> `dead_space`: the declared playfield is ~Nx (per axis)
+                              larger than the span the action uses — an over-empty world.
+                              A DIFFICULTY-tier POLISH (still certifies): tighten the world
+                              to the action, or spread the elements to fill it.
+    * proportioned / other -> NO directive (the world is sized to the action; healthy).
+
   RUNTIME ERROR (gdscript verify-lane stderr capture, gd_exec.parse_runtime_errors) —
   read from ``oracle_results["runtime_error"]`` (extract from a verify report with
   :func:`runtime_error_finding`):
@@ -83,16 +91,18 @@ G4_DIRECTIVE_OUTCOMES = ("single_action_win", "broken_gating", "softlock")
 # a softlock, no stakes, an unsolvable opening): worth the FULL repair budget — the game
 # is BROKEN. A DIFFICULTY finding means the game is HARD-TO-LEARN, not broken: it
 # RE-CERTIFIES unchanged (it stays valid), so grinding revise rounds on it wastes budget
-# and can DEGRADE a good game chasing a phantom fix. Only the two G3' learnability-CURVE
-# rows are soft — the agent plateaus (`g3_plateau`) or reaches every milestone yet never
-# wins (`g3_difficulty`). Everything else — the G4 shapes, the PRESSURE no-stakes rows, and
-# `g3_unsolvable` (NOTHING latched -> the game is broken, not merely hard) — is a DEFECT.
-# The harden loop reads this tier to budget rounds (defects get `max_rounds`, difficulty a
-# small `difficulty_budget` nudge) and to pick the terminal verdict (a difficulty that
-# survives its nudge is HARDENED_HARD, a SUCCESS-ish terminal — never a repair failure).
+# and can DEGRADE a good game chasing a phantom fix. The soft rows are the two G3'
+# learnability-CURVE rows — the agent plateaus (`g3_plateau`) or reaches every milestone
+# yet never wins (`g3_difficulty`) — plus the WAVE-2 `dead_space` PROPORTION polish (an
+# over-empty world still certifies; it is a design polish, not a brokenness). Everything
+# else — the G4 shapes, the PRESSURE no-stakes rows, and `g3_unsolvable` (NOTHING latched
+# -> the game is broken, not merely hard) — is a DEFECT. The harden loop reads this tier to
+# budget rounds (defects get `max_rounds`, difficulty a small `difficulty_budget` nudge)
+# and to pick the terminal verdict (a difficulty that survives its nudge is HARDENED_HARD,
+# a SUCCESS-ish terminal — never a repair failure).
 DEFECT = "defect"
 DIFFICULTY = "difficulty"
-DIFFICULTY_SOURCES = frozenset({"g3_plateau", "g3_difficulty"})
+DIFFICULTY_SOURCES = frozenset({"g3_plateau", "g3_difficulty", "dead_space"})
 
 
 def severity_of(source: str) -> str:
@@ -441,6 +451,46 @@ def pressure_finding(verify_report: dict) -> dict:
 
 
 # ======================================================================== #
+# DEAD SPACE / PROPORTION (WAVE 2 space-utilization gate) -> directive
+# ======================================================================== #
+# The dead-space gate (gameverify._dead_space_gate, DEMO_GAP_ANALYSIS §Gap 3) measures a
+# purely-geometric FACT: the declared playfield is ~Nx (per axis) larger than the span the
+# action uses. An over-empty world still CERTIFIES (advisory, non-gating), so this is a
+# DIFFICULTY-tier POLISH, not a defect — a small nudge toward a tighter world, never worth
+# the full repair budget. Proof-carrying: the finding quotes the measured ratio (a bounded
+# static fact the model can be held to). ``dead_space`` compiles; ``proportioned`` does not.
+DEAD_SPACE_DIRECTIVE_OUTCOMES = ("dead_space",)
+
+
+def _compile_dead_space(finding: dict) -> list:
+    if not finding:
+        return []
+    if finding.get("outcome") not in DEAD_SPACE_DIRECTIVE_OUTCOMES:
+        return []                              # proportioned / other -> healthy, no directive
+    detail = finding.get("detail") or ""
+    fallback = ("the playfield dwarfs the region the action uses; tighten the world to the "
+                "action or spread the elements to fill it. Keep the goal reachable.")
+    text = f"DEAD SPACE — MOST OF THE WORLD IS EMPTY: {detail or fallback}"
+    return [_mk("dead_space", "proportion", [], text,
+                {"linear_ratio": finding.get("linear_ratio"),
+                 "measure_ratio": finding.get("measure_ratio"),
+                 "threshold": finding.get("threshold"), "dims": finding.get("dims")})]
+
+
+def dead_space_finding(verify_report: dict) -> dict:
+    """Pull the machine-readable ``dead_space`` finding off a verify report (the gdscript
+    lane stashes it at ``report["dead_space"]`` ONLY when the proportion gate flagged an
+    over-empty world — parallel to ``report["runtime_error"]``). Returns ``{}`` for a
+    proportioned game (or a non-gdscript engine). A one-line bridge for the harden driver
+    (``oracle_results["dead_space"] = dead_space_finding(rep)``) that keeps this compiler
+    PURE."""
+    try:
+        return dict((verify_report or {}).get("dead_space") or {})
+    except Exception:
+        return {}
+
+
+# ======================================================================== #
 # RUNTIME ERROR (verify-lane stderr capture) -> directive
 # ======================================================================== #
 # A generated game that PARSES but CRASHES AT RUNTIME (a null deref in act(), a
@@ -501,17 +551,19 @@ def compile_directives(oracle_results: dict) -> list:
 
     ``oracle_results`` carries optional ``"runtime_error"`` (a captured SCRIPT ERROR
     record — see :func:`runtime_error_finding`), ``"g4"`` (a `run_g4` report),
-    ``"pressure"`` (a failure-witness finding — see :func:`pressure_finding`) and
+    ``"pressure"`` (a failure-witness finding — see :func:`pressure_finding`),
+    ``"dead_space"`` (a proportion finding — see :func:`dead_space_finding`) and
     ``"g3_prime"`` (a `g3_prime` result) dicts. Returns the directives to feed the revise
     loop — RUNTIME CRASH (the root defect) first, then G4 (broken-game shapes), then
-    PRESSURE (no stakes), then G3' (learnability) — deduplicated by fingerprint. An empty
-    list means either a CLEAN game or a still-progressing G3' run (see
-    :func:`continue_training`)."""
+    PRESSURE (no stakes), then DEAD SPACE (proportion polish), then G3' (learnability) —
+    deduplicated by fingerprint. An empty list means either a CLEAN game or a
+    still-progressing G3' run (see :func:`continue_training`)."""
     oracle_results = oracle_results or {}
     directives, seen = [], set()
     for d in (_compile_runtime_error(oracle_results.get("runtime_error") or {})
               + _compile_g4(oracle_results.get("g4") or {})
               + _compile_pressure(oracle_results.get("pressure") or {})
+              + _compile_dead_space(oracle_results.get("dead_space") or {})
               + _compile_g3(oracle_results.get("g3_prime") or {})):
         if d.fingerprint in seen:
             continue

@@ -1598,6 +1598,13 @@ def _verify_gdscript(source: str, report: dict) -> dict:
         # blocked (see _failure_witness_gate). Runs LAST, only on a still-certified game.
         if report.get("passed"):
             report = _failure_witness_gate(executor, source, actions, report)
+
+        # --- G3.7: dead-space / PROPORTION gate (WAVE 2, DEMO_GAP_ANALYSIS §Gap 3)
+        # ADVISORY: measures the space-utilization ratio from t=0 geometry (world vs the
+        # span the action uses). An over-empty world records a warning + repair directive
+        # but is NOT blocked (see _dead_space_gate). Only on a still-certified game.
+        if report.get("passed"):
+            report = _dead_space_gate(facts, report)
         return report
     except VerifyError as exc:
         # Godot missing / spawn stale / crash / unparseable -> VERIFY_ERROR shape.
@@ -1816,4 +1823,80 @@ def _failure_witness_gate(executor, game_source, actions, report):
         witness=(reproducer or None), finding=finding)
     if not has_failure:
         report.setdefault("warnings", []).append("PRESSURE: " + hint)
+    return report
+
+
+# ======================================================================== #
+# Dead-space / PROPORTION gate — WAVE 2 SPACE (DEMO_GAP_ANALYSIS §Gap 3)
+# ======================================================================== #
+# Our generated worlds are 20-69x emptier than the reference demos (a radius-16 puck on
+# an 800x600 table; the mechanic in a sliver) — the #3 ranked demo gap. This gate turns
+# that into a measured, purely-geometric FACT: the dead-space ratio (reachability.
+# space_utilization) — how big the declared PLAYFIELD is versus the SPAN the action
+# actually uses (the controlled body + the reachable checkpoints/goals). Dimension-aware
+# (a 2D AREA ratio, a 3D VOLUME ratio, normalised to a per-axis LINEAR ratio).
+#
+# ADVISORY, mirroring the PRESSURE gate EXACTLY (the mission's brief): a bounded
+# heuristic over static geometry is NON-gating — never a hard cert-block. Over-emptiness
+# is a POLISH concern (DIFFICULTY-tier in the feedback taxonomy), not a defect; a genuine
+# but sprawling design (a wide track, a scattered-collectible hunt) must never be wrongly
+# rejected, so it records a warning + a proof-carrying finding that ALWAYS compiles a
+# repair directive (feedback._compile_dead_space) and drives the loop toward tighter
+# worlds — it never blocks. Stored as a NON-GATING sub-check under G3_solve
+# (``dead_space``, always pass=True; the real signal is the ``dead_space`` bool + the
+# ratio) plus, ONLY when flagged, a report warning and the top-level ``report["dead_space"]``
+# finding the feedback bridge reads (parallel to ``report["runtime_error"]`` — present iff
+# there is something to repair). report["passed"] / failure_class are untouched either way.
+
+def _dead_space_hint(su: dict) -> str:
+    """The principle-phrased repair directive body (no numbers baked into a rule, no node
+    list — a bounded fact + a design principle the model acts on)."""
+    ratio = su.get("linear_ratio")
+    return (f"the playfield is ~{ratio:.1f}x larger (per axis) than the region the action "
+            "needs — most of the world is empty space the mechanic never touches, so play "
+            "reads as aimless drift. Tighten the world to the action (shrink the arena / "
+            "WORLD_SIZE toward the region the controlled body and its goals occupy), or "
+            "spread the elements so they fill the space, so the world is proportioned to "
+            "the mechanic. Keep the goal reachable and the mechanic intact.")
+
+
+def _dead_space_finding(su: dict) -> dict:
+    """The machine-readable proportion finding the feedback compiler's dead_space row
+    consumes. ``outcome`` is ``dead_space`` (over-empty) or ``proportioned`` (healthy);
+    only the former compiles to a directive (feedback._compile_dead_space)."""
+    dead = bool(su.get("dead_space"))
+    return {"outcome": "dead_space" if dead else "proportioned",
+            "detail": _dead_space_hint(su) if dead else (su.get("detail") or ""),
+            "linear_ratio": su.get("linear_ratio"),
+            "measure_ratio": su.get("measure_ratio"),
+            "threshold": su.get("threshold"), "dims": su.get("dims"),
+            "playfield": su.get("playfield"), "span": su.get("span"),
+            "n_targets": su.get("n_targets"), "n_reachable": su.get("n_reachable")}
+
+
+def _dead_space_gate(facts, report):
+    """The dead-space (PROPORTION) gate. ADVISORY: measures the space-utilization ratio
+    from the serve host's t=0 geometry and records it as a non-gating sub-check; on an
+    over-empty world it ALSO warns and stashes the finding at ``report["dead_space"]``
+    for the feedback bridge. Never blocks certification (see the section header). A game
+    without measurable geometry (no controlled spawn) leaves the verdict untouched."""
+    from harness.verify.reachability import space_utilization
+    bodies = facts.get("geometry") or []
+    ws = (facts.get("world_size") or {}).get("declared") or [800, 600]
+    try:
+        su = space_utilization(bodies, ws)
+    except Exception:
+        return report                              # advisory: a measurement hiccup never blocks
+    if su is None:
+        return report                              # not enough geometry -> no verdict change
+    finding = _dead_space_finding(su)
+    layer = report.setdefault("layers", {}).setdefault(
+        "G3_solve", {"passed": True, "checks": {}})
+    layer.setdefault("checks", {})["dead_space"] = check(
+        True, advisory=True, dead_space=bool(su["dead_space"]),
+        linear_ratio=su["linear_ratio"], measure_ratio=su["measure_ratio"],
+        threshold=su["threshold"], dims=su["dims"], finding=finding)
+    if su["dead_space"]:
+        report["dead_space"] = finding             # only when flagged (cf. runtime_error)
+        report.setdefault("warnings", []).append("PROPORTION: " + finding["detail"])
     return report

@@ -286,6 +286,60 @@ def test_pressure_finding_extracts_from_verify_report():
 
 
 # ======================================================================== #
+# DEAD SPACE (WAVE 2 proportion gate) taxonomy row
+# ======================================================================== #
+def dead_space(outcome, *, linear_ratio=8.0, measure_ratio=64.0, threshold=5.0, dims=2,
+               detail=""):
+    return {"outcome": outcome, "linear_ratio": linear_ratio, "measure_ratio": measure_ratio,
+            "threshold": threshold, "dims": dims, "detail": detail}
+
+
+def test_dead_space_directive():
+    ds = F.compile_directives({"dead_space": dead_space(
+        "dead_space", linear_ratio=8.2, detail="the playfield is ~8.2x larger per axis")})
+    assert sources(ds) == ["dead_space"]
+    assert ds[0].origin == "proportion"
+    assert "DEAD SPACE" in ds[0].text.upper() and "8.2x" in ds[0].text
+    assert ds[0].detail["linear_ratio"] == 8.2
+
+
+def test_dead_space_is_difficulty_severity():
+    # An over-empty world still CERTIFIES -> a DIFFICULTY-tier polish, not a defect.
+    ds = F.compile_directives({"dead_space": dead_space("dead_space")})
+    assert ds[0].severity == F.DIFFICULTY
+    assert ds[0].to_dict()["severity"] == F.DIFFICULTY
+
+
+def test_dead_space_proportioned_yields_no_directive():
+    assert F.compile_directives({"dead_space": dead_space("proportioned")}) == []
+    assert F.compile_directives({"dead_space": {}}) == []
+    assert F.compile_directives({}) == []            # no dead_space key at all
+
+
+def test_dead_space_fingerprint_stable():
+    a = F.compile_directives({"dead_space": dead_space("dead_space", linear_ratio=8.0)})[0]
+    b = F.compile_directives({"dead_space": dead_space("dead_space", linear_ratio=12.0)})[0]
+    assert a.fingerprint == b.fingerprint             # same defect (row) -> same id
+
+
+def test_dead_space_finding_extracts_from_verify_report():
+    finding = dead_space("dead_space", detail="the playfield is ~7x larger per axis")
+    # The gdscript lane stashes it top-level only when flagged (cf. runtime_error).
+    report = {"dead_space": finding}
+    assert F.dead_space_finding(report) == finding
+    assert F.dead_space_finding({}) == {}             # proportioned / not flagged -> {}
+    # End-to-end: extracted finding compiles to the directive.
+    assert F.compile_directives({"dead_space": F.dead_space_finding(report)})[0].source \
+        == "dead_space"
+
+
+def test_dead_space_3d_directive_carries_dims():
+    ds = F.compile_directives({"dead_space": dead_space(
+        "dead_space", dims=3, measure_ratio=272.0, linear_ratio=6.5)})
+    assert ds[0].detail["dims"] == 3 and ds[0].detail["measure_ratio"] == 272.0
+
+
+# ======================================================================== #
 # Combined + fingerprints
 # ======================================================================== #
 def test_combined_g4_first_then_g3():
@@ -301,6 +355,14 @@ def test_combined_g4_pressure_then_g3_order():
          "g3_prime": g3(latch={"m1": 1.0, "m2": 0.9, "m3": 0.0})}
     ds = F.compile_directives(o)
     assert sources(ds) == ["broken_gating", "no_pressure", "g3_plateau"]  # G4 -> pressure -> G3'
+
+
+def test_combined_pressure_dead_space_g3_order():
+    o = {"pressure": pressure("no_pressure", constant_false=True),
+         "dead_space": dead_space("dead_space"),
+         "g3_prime": g3(latch={"m1": 1.0, "m2": 0.9, "m3": 0.0})}
+    ds = F.compile_directives(o)
+    assert sources(ds) == ["no_pressure", "dead_space", "g3_plateau"]  # pressure -> space -> G3'
 
 
 def test_empty_oracle_results():
@@ -337,10 +399,11 @@ def test_single_action_fingerprint_ignores_volatile_action():
 def test_severity_of_pure_mapping():
     assert F.severity_of("g3_plateau") == F.DIFFICULTY
     assert F.severity_of("g3_difficulty") == F.DIFFICULTY
+    assert F.severity_of("dead_space") == F.DIFFICULTY   # WAVE-2 proportion polish
     for defect in ("g3_unsolvable", "single_action_win", "broken_gating", "softlock",
                    "no_pressure", "failure_unreachable", "stuck", "anything_else"):
         assert F.severity_of(defect) == F.DEFECT
-    assert F.DIFFICULTY_SOURCES == frozenset({"g3_plateau", "g3_difficulty"})
+    assert F.DIFFICULTY_SOURCES == frozenset({"g3_plateau", "g3_difficulty", "dead_space"})
     assert F.DEFECT == "defect" and F.DIFFICULTY == "difficulty"
 
 
