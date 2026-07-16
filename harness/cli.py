@@ -231,6 +231,41 @@ def cmd_game_new(args) -> int:
     return 0 if result.get("game_path") else 1
 
 
+def cmd_game_breed(args) -> int:
+    """Breed two certified parent games into one child (atlas D1 experiment).
+
+    Arm A hands the model both parent SOURCES + an objective-search fusion brief;
+    arm B fuses the two parent PROMPTS into one transversal seed through the normal
+    generation path. Both arms run the untouched verify->repair funnel."""
+    try:
+        from harness.gen.gamegen import breed_game
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("gamegen", exc, args.json)
+
+    try:
+        result = breed_game(args.parent_a, args.parent_b, arm=args.arm,
+                            out_dir=args.out_dir, backend=args.backend,
+                            engine=getattr(args, "engine", None),
+                            prompt_a=args.prompt_a, prompt_b=args.prompt_b)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game breed", exc, args.json)
+    if args.json:
+        _emit_json(result)
+    else:
+        print(f"verdict : {result.get('verdict')}  (backend {result.get('backend')}, "
+              f"arm {args.arm})")
+        print(f"game    : {result.get('game_path')}")
+        print(f"tries   : {len(result.get('attempts', []))}")
+        breed = result.get("breed") or {}
+        if breed.get("fused_prompt"):
+            print(f"fused   : {breed['fused_prompt']}")
+        if result.get("design"):
+            print("design  :")
+            for line in str(result["design"]).splitlines():
+                print(f"  {line}")
+    return 0 if result.get("game_path") else 1
+
+
 def cmd_game_verify(args) -> int:
     """Run the universal oracles (gameverify) on a generated game."""
     try:
@@ -1025,6 +1060,30 @@ def build_parser() -> argparse.ArgumentParser:
     gn.add_argument("--out-dir", default="scenes/games")
     gn.add_argument("--json", action="store_true")
     gn.set_defaults(func=cmd_game_new)
+
+    gb = gmsub.add_parser(
+        "breed",
+        help="breed two certified parent games into one child (atlas D1): arm A = "
+             "objective search over both SOURCES; arm B = transversal PROMPT fusion")
+    gb.add_argument("parent_a", help="parent A game file (e.g. scenes/games/<slug>/<slug>.gd)")
+    gb.add_argument("parent_b", help="parent B game file")
+    gb.add_argument("--arm", default="A", choices=["A", "B"],
+                    help="A: both parent sources + objective-search fusion brief; "
+                         "B: fuse the two prompts into one seed through the normal path")
+    gb.add_argument("--prompt-a", default=None, dest="prompt_a",
+                    help="parent A's original seed prompt (recommended; .gd sources "
+                         "carry no PROMPT line)")
+    gb.add_argument("--prompt-b", default=None, dest="prompt_b",
+                    help="parent B's original seed prompt")
+    gb.add_argument("--backend", default="auto",
+                    choices=["auto", "anthropic", "openrouter", "template"])
+    gb.add_argument("--engine", default=None,
+                    choices=["py", "js", "godot", "gdscript"],
+                    help="default: inferred from parent A's extension "
+                         "(.gd -> gdscript)")
+    gb.add_argument("--out-dir", default="scenes/games")
+    gb.add_argument("--json", action="store_true")
+    gb.set_defaults(func=cmd_game_breed)
 
     gv = gmsub.add_parser("verify", help="run the universal oracles on a game")
     gv.add_argument("game_path")

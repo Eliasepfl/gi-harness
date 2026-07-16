@@ -318,6 +318,66 @@ def _revise_user_msg(source, directive, engine="py", skill_context=None):
         "add a short version suffix to TITLE.")
 
 
+def _artifact_desc(engine):
+    """Human name of the deliverable per engine (mirrors _first_user_msg's mapping;
+    kept as a separate additive helper so the frozen builders stay byte-identical)."""
+    if engine == "godot":
+        return "spec (one JSON object)"
+    if engine == "gdscript":
+        return "GDScript game class (one .gd file)"
+    return "module"
+
+
+def _breed_user_msg(source_a, source_b, prompt_a, prompt_b, engine="py"):
+    """Seed the loop with TWO CERTIFIED parents + an objective-search fusion brief
+    (breed mode, arm A of the atlas breeding experiment; sibling of _revise_user_msg).
+
+    Where ``_revise_user_msg`` hands the model ONE certified source and a minimal-edit
+    task, this hands it BOTH full parent modules and asks it to FIND the child's
+    objective: a win condition — one objective or a sequence of objectives — that only
+    makes sense because ingredients from both parents coexist in one world; a win
+    neither parent alone could host. The brief is deliberately anti-anchoring: it
+    prescribes NO mechanic list, no inheritance recipe, no worked example — which
+    ingredients each parent contributes is the model's own design judgement. The reply
+    follows the standard DESIGN + single code fence contract, so the child goes
+    through the SAME verify->repair loop as any fresh generation.
+    """
+    _, fence = _engine_lang(engine)
+    artifact = _artifact_desc(engine)
+    return (
+        "Two CERTIFIED parent games follow — both fully working, each born from its "
+        "own prompt. BREED them: design ONE new child game that inherits from both.\n\n"
+        f'Parent A — prompt: "{prompt_a}"\n'
+        f"Parent A — source:\n```{fence}\n{source_a}\n```\n\n"
+        f'Parent B — prompt: "{prompt_b}"\n'
+        f"Parent B — source:\n```{fence}\n{source_b}\n```\n\n"
+        "THE TASK IS AN OBJECTIVE SEARCH. Do not staple the parents together, do not "
+        "re-skin either one, and do not simply play one then the other. Search for "
+        "the child's win: one objective — or a sequence of objectives — that only "
+        "makes sense because ingredients from BOTH parents coexist in one world; a "
+        "win that neither parent alone could host. Which ingredients to inherit from "
+        "each parent is your design judgement; discard whatever does not serve the "
+        "child. The child must stand alone as a complete, original game.\n\n"
+        f"Return the DESIGN block, then exactly one ```{fence} {artifact} that "
+        "follows the required format and every hard constraint.")
+
+
+def fuse_prompts(prompt_a, prompt_b):
+    """Arm B of the breeding experiment: fuse two seed PROMPTS into ONE transversal
+    seed line, fed through the NORMAL generation path (_first_user_msg -> funnel).
+
+    A deterministic template (no extra LLM call): it quotes both parent fantasies and
+    asks for one new game honoring both at once. The child never sees parent code —
+    the fusion happens purely in prompt space, which is exactly the arm-A/arm-B
+    contrast the experiment measures. The leading marker also keeps the child's slug
+    distinct from both parents' run dirs (a fused line that STARTED with prompt_a
+    verbatim would collide with parent A's slug after _slug's 40-char truncation and
+    overwrite its artifacts).
+    """
+    return (f"a fusion of two games — ({prompt_a}) and ({prompt_b}) — design one new "
+            "transversal game that honors both fantasies at once")
+
+
 def _repair_user_msg(report):
     fc = report.get("failure_class") if isinstance(report, dict) else None
     hint = report.get("hint", "") if isinstance(report, dict) else ""
@@ -1043,6 +1103,95 @@ def revise_game(source, directive, out_dir="scenes/games", backend="auto",
     return _generate_core(prompt, out_dir=out_dir, backend=backend,
                           max_repairs=max_repairs, engine=engine,
                           use_bank=use_bank, first_user=first_user)
+
+
+_EXT_ENGINE = {".gd": "gdscript", ".js": "js", ".py": "py"}
+
+
+def _engine_from_path(path):
+    """Infer the engine lane from a game file's extension (None if unknown).
+    ``.spec.json`` -> godot; ``.gd``/``.js``/``.py`` -> their lanes."""
+    p = str(path or "")
+    if p.endswith(".spec.json"):
+        return "godot"
+    return _EXT_ENGINE.get(os.path.splitext(p)[1])
+
+
+def _humanize_slug(path):
+    """A last-resort prompt reconstructed from a game file's slug (stem, or the
+    slug-named parent dir): underscores -> spaces. Only used when the caller gave no
+    prompt and the source carries no PROMPT line (the gdscript lane does not)."""
+    p = str(path or "")
+    stem = os.path.splitext(os.path.basename(p))[0]
+    if stem.endswith(".spec"):        # godot's two-part .spec.json extension
+        stem = stem[:-5]
+    return stem.replace("_", " ").strip() or "game"
+
+
+def breed_game(parent_a_path, parent_b_path, arm="A", out_dir="scenes/games",
+               backend="auto", max_repairs=4, engine=None, use_bank=True,
+               prompt_a=None, prompt_b=None):
+    """Breed TWO certified parent games into one child (the atlas D1 experiment).
+
+    Two arms, one per fusion hypothesis (Elias 2026-07-16):
+
+      * arm "A" — objective search over SOURCES: the model gets both FULL parent
+        modules + a fusion brief (``_breed_user_msg``) asking it to FIND the child's
+        objective — a win that only makes sense because both parents' ingredients
+        coexist, one neither parent alone could host.
+      * arm "B" — transversal PROMPT fusion: the two parents' seed prompts are fused
+        into one line (``fuse_prompts``) and fed through the NORMAL generation path;
+        the model never sees parent code.
+
+    Both arms run the FULL verify->repair loop via ``_generate_core`` (same sandbox
+    layout, integrity freeze, pipeline telemetry, ledger record as generate_game /
+    revise_game — the funnel is byte-untouched). Parent prompts come from
+    ``prompt_a``/``prompt_b`` (recommended; gdscript sources carry no PROMPT line),
+    else the source's PROMPT constant, else the humanized slug.
+
+    ``engine`` defaults to the lane inferred from parent A's file extension (a .gd
+    parent breeds a .gd child) rather than the HARNESS_ENGINE/godot default.
+
+    Returns the standard result dict plus ``result["breed"] = {arm, parent_a,
+    parent_b, prompt_a, prompt_b, fused_prompt}``.
+    """
+    arm = str(arm).strip().upper()
+    if arm not in ("A", "B"):
+        raise ValueError(f"breed arm must be 'A' or 'B', got {arm!r}")
+    source_a = _read_source(parent_a_path)
+    source_b = _read_source(parent_b_path)
+    if not source_a or not source_b:
+        missing = parent_a_path if not source_a else parent_b_path
+        raise FileNotFoundError(f"parent game unreadable: {missing}")
+    if engine is None:
+        engine = _engine_from_path(parent_a_path)
+    engine = _resolve_engine(engine)
+    prompt_a = prompt_a or _extract_prompt(source_a) or _humanize_slug(parent_a_path)
+    prompt_b = prompt_b or _extract_prompt(source_b) or _humanize_slug(parent_b_path)
+
+    fused = None
+    if arm == "A":
+        # The run prompt carries both fantasies (slug identity + skill routing +
+        # ledger provenance); the actual task lives in the breed first_user message.
+        run_prompt = f"breed: {prompt_a} || {prompt_b}"
+        first_user = _breed_user_msg(source_a, source_b, prompt_a, prompt_b, engine)
+    else:
+        fused = fuse_prompts(prompt_a, prompt_b)
+        run_prompt = fused
+        first_user = None          # arm B rides the untouched normal path
+
+    result = _generate_core(run_prompt, out_dir=out_dir, backend=backend,
+                            max_repairs=max_repairs, engine=engine,
+                            use_bank=use_bank, first_user=first_user)
+    result["breed"] = {
+        "arm": arm,
+        "parent_a": os.path.abspath(str(parent_a_path)),
+        "parent_b": os.path.abspath(str(parent_b_path)),
+        "prompt_a": prompt_a,
+        "prompt_b": prompt_b,
+        "fused_prompt": fused,
+    }
+    return result
 
 
 def _generate_core(prompt, *, out_dir, backend, max_repairs, engine, use_bank,
