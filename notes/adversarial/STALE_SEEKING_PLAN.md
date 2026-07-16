@@ -205,6 +205,21 @@ failures move yield, never validity (see §3.3 for the one soundness asterisk).
   γ=1 telescoping argument), and makes sit-still dominated whenever a V-decreasing
   action exists. **Enabled only after R5 is verified** (truncation-as-terminal flips
   this term pro-camping).
+  - **R4b — VALUE-DEATH (the DETECT-side sibling of R4, IMPLEMENTED 2026-07-15).** R4 uses
+    V as a training-reward *shaping* pressure toward low-V; R4b uses V as a *DETECT signal*
+    for a softlock that MOTION cannot see. `adversary.detect_value_death` fires when V(s)
+    is at/below a RELATIVE collapse floor (`Vmin + 0.25·(Vmax−Vmin)` over the rollout's own
+    V — relative so it adapts per game; a flat critic yields no floor) for a full window,
+    no new latch, non-terminal — REGARDLESS of fingerprint deltas, so a body WIGGLING in a
+    trap (which `frozen`/`cycle` structurally miss — the Mawhorter-Smith wiggle-room hole)
+    is caught. Its reward-side twin is `StaleSeekReward.low_v_occupancy_coef`/`low_v_floor`:
+    a motion-invariant low-V occupancy reward ALONGSIDE the freeze term, same mobility gate
+    + decay, off by default. Fixture `softlock_wiggle.gd` proves it. EFFICIENCY-ONLY —
+    inherits the critic's quality; the fingerprint modes stay the critic-free floor; CONFIRM
+    is the sole certifier (a value_death candidate is a suspect until `refute_prefix`).
+    Unlike R4 this needs NO R5 precondition: it is a detector, not a training-reward term
+    (the reward twin is off by default and never the certifier), so no truncation-hygiene
+    dependency binds it.
 - **R5 — truncation hygiene (precondition).** Idle-kick and horizon caps emit
   `truncated` with partial-episode bootstrapping; normalized elapsed-time in the
   observation (R1 is time-indexed → keep Markov). env.py already splits
@@ -220,9 +235,10 @@ failures move yield, never validity (see §3.3 for the one soundness asterisk).
   softlock**, replayable {seed, actions}. Label it exactly that unless the subtree is
   saturated (then it is exhaustive). Zero-false-certification invariant stays enforced
   by witness replay assertion (certify.py pattern).
-- **EFFICIENCY-ONLY:** S1.5 entirely; R1–R4; DETECT thresholds; waypoint selection;
+- **EFFICIENCY-ONLY:** S1.5 entirely; R1–R4 AND R4b value_death (the DETECT trigger +
+  its reward twin); DETECT thresholds and the relative collapse floor; waypoint selection;
   candidate ordering. Their failure modes move detect/certified yield and recall,
-  never certificate validity.
+  never certificate validity — value_death only widens DETECT recall; CONFIRM is unchanged.
 
 ### 3.4 S2+ contingencies (do not build preemptively)
 

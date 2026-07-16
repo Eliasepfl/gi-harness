@@ -8,8 +8,12 @@ This module owns the FIRST TWO layers; layer 3 (CONFIRM) is the existing
 ``harness.verify.g4.refute_prefix`` tree-refutation oracle, driven by the g4 ladder.
 
     SEARCH  — anti-optimal rollouts STEERED by the G3'-trained PPO artifacts.
-    DETECT  — a sliding-window state-freeze / cycle test over the steered rollout.
-    (CONFIRM lives in g4: the frozen prefix P is refuted by the G3 tree solver.)
+    DETECT  — a sliding-window softlock test over the steered rollout: the critic-FREE
+              state-freeze / cycle motion tests (detect_softlock_window) PLUS the
+              motion-INVARIANT value-death test (detect_value_death) that catches a body
+              WIGGLING aperiodically in a trap — where V(s) stays collapsed no matter how
+              the body jiggles — which the motion tests structurally MISS.
+    (CONFIRM lives in g4: the frozen/collapsed prefix P is refuted by the G3 tree solver.)
 
 Why steer, and with WHAT (honest choice). PPO gives a policy ``pi`` (max value) and a
 critic ``V(s)`` — NOT ``Q(s, a)``. So there is no exact ``argmin_a Q(s, a)`` to take.
@@ -54,6 +58,7 @@ Critic contract (duck-typed):
 
 from __future__ import annotations
 
+import math
 import random
 
 import numpy as np
@@ -68,6 +73,22 @@ DEFAULT_EPS = 0.1          # fraction of ticks taken uniformly-random (breadth) 
 PREFIX_HANDOFF = (2, 4, 8, 16)  # witness-prefix backplay handoff ticks [eng.]
 V_FRONTIER_K = 4           # lowest-V visited states re-seeded per search [eng.]
 DEFAULT_MAX_TICKS = 120    # per-rollout decision-tick cap (matches g4 PROBE_HORIZON) [eng.]
+
+# --- VALUE-DEATH DETECT (the motion-INVARIANT third trigger, Elias 2026-07-15) ---- #
+# The frozen/cycle motion tests have an irreducible hole: a body trapped in a pocket
+# but WIGGLING aperiodically over many distinct positions evades both (its fingerprint
+# keeps changing, never freezing, never closing a short cycle). The wiggle-proof signal
+# is VALUE, not motion — a trained critic's V(s) stays COLLAPSED in a true trap no
+# matter how the body jiggles. value_death fires when V(s) sits below a RELATIVE
+# collapse floor for a full window, regardless of fingerprint deltas. It is CRITIC-
+# GATED (only meaningful with a competent critic; a flat/degenerate V yields no floor)
+# and its candidates flow into the SAME escapability probe + refute_prefix CONFIRM, so
+# soundness is unchanged — value_death only widens DETECT's recall.
+VALUE_DEATH_WINDOW = 6     # N decision ticks that must ALL sit below the floor to fire [eng.]
+VALUE_DEATH_BAND = 0.25    # collapse floor = Vmin + BAND*(Vmax-Vmin): the bottom BAND of the
+                           # run's OWN observed V range -> relative, adapts per game [eng.]
+VALUE_DEATH_MIN_SPREAD = 1e-9  # min Vmax-Vmin for a "collapse" to be meaningful; a flat critic
+                               # (no gradient) yields NO floor -> no value_death [eng.]
 
 # --- S1.5 policy-guided descent ([eng.]) ---------------------------------- #
 # The descent tier (Elias's "return-then-descend": navigate the working policy INTO a
@@ -388,18 +409,102 @@ def detect_softlock_window(fps, latched, terminal_tick, *, window: int = DETECT_
 
 
 # ======================================================================== #
+# VALUE-DEATH DETECT — the motion-INVARIANT third trigger (pure function)
+# ======================================================================== #
+def value_collapse_floor(values, *, band: float = VALUE_DEATH_BAND):
+    """The RELATIVE collapse floor for a rollout's critic-value trail: ``Vmin + band *
+    (Vmax - Vmin)`` — the bottom ``band`` fraction of the run's OWN observed V range.
+
+    RELATIVE (not absolute) because V scales vary per game: a competent critic's V range
+    is game-specific, so the floor is derived from THIS rollout's own statistics. Keying
+    off the RANGE (not a distribution quantile) makes it insensitive to how much of the
+    rollout is trapped vs. approaching — only states within ``band`` of the minimum count
+    as collapsed, so the cut lands at the pocket entry, not the healthy approach. [eng.]
+
+    Returns ``(floor, ok)``. ``ok`` is False when there is NO meaningful spread
+    (``Vmax - Vmin <= VALUE_DEATH_MIN_SPREAD`` — a flat / degenerate critic, the
+    'weak critic is useless' A/B lesson made mechanical) or too few finite values."""
+    vs = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if len(vs) < 2:
+        return None, False
+    v_lo, v_hi = min(vs), max(vs)
+    if (v_hi - v_lo) <= VALUE_DEATH_MIN_SPREAD:
+        return None, False                       # no gradient -> nothing has "collapsed"
+    return v_lo + float(band) * (v_hi - v_lo), True
+
+
+def detect_value_death(values, latched, terminal_tick, *, window: int = VALUE_DEATH_WINDOW,
+                       band: float = VALUE_DEATH_BAND):
+    """VALUE-DEATH DETECT (Elias's motion-INVARIANT third trigger) — the wiggle-proof
+    softlock test over the critic-value trail. Slides a length-``window`` window and
+    returns the EARLIEST value-death window. A window opening at index ``i`` covers ticks
+    ``i .. i+window`` (values ``values[i] .. values[i+window]``). It FIRES when, over that
+    FULL window:
+      * the critic value has COLLAPSED — every ``values[j]`` at or below the RELATIVE
+        collapse floor (:func:`value_collapse_floor`), REGARDLESS of fingerprint deltas
+        (a body wiggling aperiodically over many distinct positions still fires — that is
+        the whole point; the frozen/cycle motion tests MISS it), AND
+      * NO new checkpoint latched (``latched[i+window] == latched[i]``), AND
+      * the episode did NOT terminate inside the window (a loss is not a softlock).
+    Critic-gated: with no critic (all ``values`` None) or a flat/degenerate V (no spread)
+    there is no floor, so it never fires — byte-identical to the value-less path.
+
+    Returns ``(fired, cut, info)``. ``cut = i`` cuts the suspect PREFIX (``actions[:i]``
+    — the moves that led INTO the collapsed pocket). ``info`` carries ``kind``
+    (``value_death``), ``freeze_index``, ``window`` and the ``floor`` used."""
+    n = len(values)
+    info = {"kind": None, "freeze_index": None, "window": window, "floor": None}
+    if window < 1 or n <= window:
+        return False, None, info
+    floor, ok = value_collapse_floor(values, band=band)
+    if not ok:
+        return False, None, info
+    info["floor"] = floor
+    last_i = n - 1 - window
+    for i in range(0, last_i + 1):
+        end = i + window
+        if terminal_tick is not None and terminal_tick < end:
+            # A terminal inside (or opening) the window disqualifies it; once terminated,
+            # no later full window exists either (mirrors detect_softlock_window).
+            if terminal_tick <= i:
+                break
+            continue
+        if latched[end] != latched[i]:
+            continue                             # progress in the window -> not stale
+        collapsed = all(values[j] is not None and float(values[j]) <= floor
+                        for j in range(i, end + 1))
+        if collapsed:
+            info.update(kind="value_death", freeze_index=i)
+            return True, i, info
+    return False, None, info
+
+
+# ======================================================================== #
 # SEARCH driver — many seeds + backplay + V-frontier -> ordered candidates
 # ======================================================================== #
-def _candidate_from_rollout(roll, *, window, eps, source, extra=None):
-    """Run DETECT on one rollout; return a candidate dict or None."""
+def _candidate_from_rollout(roll, *, window, eps, source, extra=None,
+                            value_death=True, vd_band=VALUE_DEATH_BAND):
+    """Run DETECT on one rollout; return a candidate dict or None.
+
+    The motion tests (frozen/cycle) run FIRST — they are the critic-FREE floor. Only when
+    they MISS does the motion-INVARIANT :func:`detect_value_death` get its say (the same
+    rollout already records ``values`` when a critic is in hand), so a body wiggling in a
+    trap that evades frozen+cycle is still caught. value_death is a no-op without a critic
+    (all ``values`` None -> no floor), so the value-less path is byte-identical to today."""
     fired, cut, info = detect_softlock_window(
         roll["fps"], roll["latched"], roll["terminal_tick"], window=window, eps=eps)
+    if not fired and value_death:
+        fired, cut, info = detect_value_death(
+            roll["values"], roll["latched"], roll["terminal_tick"], window=window,
+            band=vd_band)
     if not fired:
         return None
     prefix = list(roll["actions"])[:max(1, cut)]     # never an empty prefix
     val = roll["values"][cut] if cut < len(roll["values"]) else None
     prov = {"source": source, "seed": roll["seed"], "handoff_tick": roll["handoff_tick"],
             "kind": info["kind"], "value_at_freeze": val}
+    if info.get("floor") is not None:
+        prov["value_floor"] = info["floor"]          # the relative collapse floor (value_death)
     if extra:
         prov.update(extra)
     return {"prefix": prefix, "freeze_fp": roll["fps"][cut], "provenance": prov,
@@ -409,7 +514,8 @@ def _candidate_from_rollout(roll, *, window, eps, source, extra=None):
 def search(env, critic, *, seeds=None, eps=DEFAULT_EPS, window=DETECT_WINDOW,
            fp_eps=EFFICACY_EPS, witness_actions=None, handoffs=PREFIX_HANDOFF,
            v_frontier=True, v_frontier_k=V_FRONTIER_K,
-           max_ticks=DEFAULT_MAX_TICKS, budget_ticks=None):
+           max_ticks=DEFAULT_MAX_TICKS, budget_ticks=None,
+           value_death=False, vd_band=VALUE_DEATH_BAND):
     """Run the inverse-value SEARCH + DETECT over one env, returning ordered softlock
     CANDIDATES (pre-CONFIRM). Layers:
 
@@ -423,6 +529,10 @@ def search(env, critic, *, seeds=None, eps=DEFAULT_EPS, window=DETECT_WINDOW,
     ``V`` ascending (lowest-value / most-likely-dead first) — the V-frontier ordering
     that the confirm cap (top-M) then rides. ``budget_ticks`` caps total simulated
     decision ticks (for the A/B and cheap real runs). Deterministic under ``seeds``.
+
+    ``value_death`` (OPT-IN, default OFF) arms the motion-invariant value-death trigger as
+    a FALLBACK when frozen/cycle miss — the g4 smart tiers enable it (a competent critic is
+    in hand); the direct-call tests keep it off so the motion-only baseline is unchanged.
     """
     seeds = list(range(DEFAULT_SEEDS)) if seeds is None else list(seeds)
     choose = anti_policy_chooser(critic, eps=eps) if critic is not None else random_chooser()
@@ -440,7 +550,7 @@ def search(env, critic, *, seeds=None, eps=DEFAULT_EPS, window=DETECT_WINDOW,
         ticks_used += roll["ticks"]
         rollouts += 1
         cand = _candidate_from_rollout(roll, window=window, eps=fp_eps, source=src,
-                                       extra=extra)
+                                       extra=extra, value_death=value_death, vd_band=vd_band)
         if cand is None:
             return
         detections += 1         # this rollout walked into a softlock (counted even if the
@@ -611,7 +721,8 @@ def descent_search(env, critic, *, witness_actions=None, handoffs=PREFIX_HANDOFF
                    n_waypoints=WAYPOINT_K, descent_ticks=DESCENT_TICKS,
                    frontier_k=WAYPOINT_FRONTIER_K, explore_seeds=EXPLORE_SEEDS,
                    eps=DEFAULT_EPS, window=DETECT_WINDOW, fp_eps=EFFICACY_EPS,
-                   max_ticks=DEFAULT_MAX_TICKS, budget_ticks=None):
+                   max_ticks=DEFAULT_MAX_TICKS, budget_ticks=None,
+                   value_death=False, vd_band=VALUE_DEATH_BAND):
     """S1.5 POLICY-GUIDED DESCENT search. For each selected low-V waypoint: RETURN by
     deterministic prefix replay (``rollout(prefix=...)`` — the return phase), then
     DESCEND with the alpha-ramped :func:`descent_chooser`, and run DETECT on the trail.
@@ -653,7 +764,8 @@ def descent_search(env, critic, *, witness_actions=None, handoffs=PREFIX_HANDOFF
         ticks_used += roll["ticks"]
         rollouts += 1
         cand = _candidate_from_rollout(
-            roll, window=window, eps=fp_eps, source=source,
+            roll, window=window, eps=fp_eps, source=source, value_death=value_death,
+            vd_band=vd_band,
             extra={"waypoint_source": wp["source"], "waypoint_value": wp["value"],
                    "waypoint_rank": rank, "descent": True,
                    "return_len": len(prefix)})

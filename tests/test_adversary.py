@@ -17,14 +17,18 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import math  # noqa: E402
+
 from harness.rl import adversary  # noqa: E402
 from harness.rl.adversary import (  # noqa: E402
     ab_bench,
     anti_policy_chooser,
     detect_softlock_window,
+    detect_value_death,
     random_chooser,
     rollout,
     search,
+    value_collapse_floor,
 )
 
 
@@ -151,6 +155,168 @@ def test_detect_fires_on_a_closed_cycle():
     latched = [0] * len(fps)
     fired, cut, info = detect_softlock_window(fps, latched, None, window=6)
     assert fired is True and info["kind"] == "cycle"
+
+
+# ====================================================================== #
+# VALUE-DEATH — the motion-INVARIANT third trigger (Elias's wiggle fix)
+# ====================================================================== #
+def _wiggle_fp(k):
+    """A fingerprint on an aperiodic golden-angle stir: distinct POSITION *and* distinct
+    VELOCITY every tick, so no two states within a window are eps-equal — exactly the
+    wiggle that defeats the motion-based frozen AND cycle tests."""
+    ang = k * 2.399963                       # golden angle (rad) -> equidistributed, aperiodic
+    px, py = 3.0 + 2.0 * math.cos(ang), 2.0 * math.sin(ang)
+    vx, vy = 5.0 * math.cos(ang), 5.0 * math.sin(ang)
+    return (("body", round(px, 6), round(py, 6), round(vx, 6), round(vy, 6), 0.0),)
+
+
+def test_value_collapse_floor_is_relative_and_rejects_a_flat_critic():
+    # Floor = Vmin + 0.25*(Vmax-Vmin): the bottom quarter of the run's OWN V range.
+    floor, ok = value_collapse_floor([1.0, 1.0, 1.0, -3.0, -3.0, -3.0])
+    assert ok and abs(floor - (-3.0 + 0.25 * 4.0)) < 1e-9      # -3 + 0.25*(1-(-3)) = -2.0
+    # A FLAT / degenerate critic (no spread) yields NO floor -> value-death cannot fire
+    # (the 'weak critic is useless' lesson made mechanical).
+    assert value_collapse_floor([0.0] * 8)[1] is False
+    assert value_collapse_floor([2.5, 2.5, 2.5])[1] is False
+
+
+def test_value_death_catches_a_wiggle_that_frozen_and_cycle_MISS():
+    # THE honest hole: a body trapped but WIGGLING aperiodically over many distinct
+    # positions. Approach (states 0..2), then a golden-angle wiggle pocket (states 3..).
+    fps = [_fp(0), _fp(1), _fp(2)] + [_wiggle_fp(k) for k in range(3, 16)]
+    latched = [0] * len(fps)                 # never a new checkpoint -> guard satisfied
+    # (i) the motion tests MISS it: never frozen (state always moves), never a short
+    #     closed cycle (every state distinct in pos AND vel -> no eps-recurrence).
+    m_fired, _m_cut, m_info = detect_softlock_window(fps, latched, None, window=6)
+    assert m_fired is False and m_info["kind"] is None
+    # (ii) value_death CATCHES it: the critic V has COLLAPSED in the pocket. Approach V
+    #      high (+1), pocket V collapsed (-4) for the whole tail.
+    values = [1.0, 1.0, 1.0] + [-4.0] * 13
+    v_fired, v_cut, v_info = detect_value_death(values, latched, None, window=6)
+    assert v_fired is True and v_info["kind"] == "value_death"
+    assert v_cut == 3                         # cut at the pocket entry (approach was 0..2)
+    assert v_info["floor"] is not None and v_info["floor"] < 0.0
+
+
+def test_value_death_respects_the_no_checkpoint_and_terminal_guards():
+    values = [1.0, 1.0] + [-5.0] * 10
+    # A new checkpoint latching in every window span -> progress -> suppressed.
+    assert detect_value_death(values, list(range(12)), None, window=6)[0] is False
+    # A terminal inside the collapsed tail -> a LOSS, not a softlock -> suppressed.
+    assert detect_value_death(values, [0] * 12, terminal_tick=4, window=6)[0] is False
+
+
+def test_value_death_needs_a_critic_no_values_never_fires():
+    # No critic -> the value trail is all None -> no floor -> never fires (byte-identical
+    # to the value-less path; the search's random baseline arm relies on this).
+    assert detect_value_death([None] * 12, [0] * 12, None, window=6)[0] is False
+
+
+class FakeWigglePocketEnv:
+    """A corridor with a WIGGLE POCKET (not a pin): ``fwd`` walks the body toward a pocket
+    at ``x >= trap_x``; once inside it is CONFINED but keeps WANDERING on a golden-angle
+    stir (a distinct pos AND vel every tick), is never terminal, latches nothing new, and
+    the goal beyond is never reached. The body never FREEZES and never closes a short
+    CYCLE, so ``detect_softlock_window`` MISSES it — only value_death (a collapsed critic
+    V) catches it. Duck-types the same env contract as :class:`FakeCorridorEnv`."""
+
+    actions = ["fwd", "back", "noop"]
+
+    def __init__(self, *, horizon=60, trap_x=8, goal=100):
+        self.horizon = horizon
+        self._trap_x = trap_x
+        self._goal = goal
+        self.reset(0)
+
+    def _snap(self):
+        return {"body": {"pos": [float(self._x), float(self._y)],
+                         "vel": [float(self._vx), float(self._vy)], "angle": 0.0}}
+
+    def reset(self, seed=0):
+        self._x = 0.0
+        self._y = 0.0
+        self._vx = 0.0
+        self._vy = 0.0
+        self._trapped = False
+        self._latched = 0
+        self._k = 0
+        self.last_snapshot = self._snap()
+        return [float(self._x)], {"latched": {"mid": None}, "n_latched": 0}
+
+    def step(self, idx):
+        a = self.actions[int(idx)]
+        if not self._trapped:
+            if a == "fwd":
+                self._x += 1
+            elif a == "back":
+                self._x -= 1
+            if self._x >= self._trap_x:
+                self._trapped = True
+        if self._trapped:
+            # Golden-angle stir: confined band, distinct pos + vel each tick, aperiodic.
+            self._k += 1
+            ang = self._k * 2.399963
+            self._x = self._trap_x + 3.0 + 2.0 * math.cos(ang)
+            self._y = 2.0 * math.sin(ang)
+            self._vx = 5.0 * math.cos(ang)
+            self._vy = 5.0 * math.sin(ang)
+        if self._x >= 3:
+            self._latched = 1
+        term = (self._x >= self._goal) and not self._trapped   # unreachable once trapped
+        self.last_snapshot = self._snap()
+        info = {"latched": {"mid": (0 if self._latched else None)},
+                "n_latched": self._latched,
+                "result": "success" if term else "budget"}
+        return [float(self._x)], (1.0 if term else 0.0), term, False, info
+
+
+class FakeWiggleCritic:
+    """Anti-policy argmin -> ``fwd`` (steers into the pocket); V COLLAPSES inside the
+    pocket (``x >= trap_x``) and is high outside — the wiggle-proof value signal."""
+
+    source = "fake_wiggle_critic"
+
+    def __init__(self, trap_x=8):
+        self._trap_x = trap_x
+
+    def action_probs(self, obs):
+        return np.array([0.10, 0.45, 0.45])              # lowest on idx 0 ("fwd")
+
+    def value(self, obs):
+        x = float(np.asarray(obs).reshape(-1)[0])
+        return -4.0 if x >= self._trap_x else 1.0        # collapsed in the pocket
+
+
+def test_search_value_death_surfaces_a_wiggle_candidate_that_motion_misses():
+    env = FakeWigglePocketEnv(horizon=60, trap_x=8)
+    crit = FakeWiggleCritic(trap_x=8)
+    # value_death ARMED (the g4 smart tiers do this): the wiggle pocket is surfaced.
+    res_on = search(env, crit, seeds=[0], eps=0.0, window=6, max_ticks=40,
+                    value_death=True)
+    assert res_on["candidates"], "value_death must surface the wiggle pocket"
+    kinds = {c["provenance"]["kind"] for c in res_on["candidates"]}
+    assert kinds == {"value_death"}, kinds
+    cand = res_on["candidates"][0]
+    assert cand["prefix"] and set(cand["prefix"]) <= set(env.actions)
+    assert cand["provenance"].get("value_floor") is not None
+
+    # value_death OFF (the default): the motion tests alone MISS the wiggle -> no candidate.
+    res_off = search(FakeWigglePocketEnv(horizon=60, trap_x=8), FakeWiggleCritic(8),
+                     seeds=[0], eps=0.0, window=6, max_ticks=40, value_death=False)
+    assert res_off["candidates"] == []
+
+
+def test_search_value_death_without_a_critic_is_byte_identical():
+    # No critic -> value trail all None -> value_death cannot fire; arming it changes
+    # nothing (the random baseline arm stays byte-identical).
+    def run(vd):
+        return search(FakeWigglePocketEnv(horizon=60, trap_x=8), None, seeds=list(range(3)),
+                      window=6, max_ticks=40, value_death=vd)
+
+    on, off = run(True), run(False)
+    assert on["candidates"] == off["candidates"]
+    assert on["detections"] == off["detections"]
+    assert on["ticks_simulated"] == off["ticks_simulated"]
 
 
 # ====================================================================== #

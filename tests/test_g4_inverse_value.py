@@ -76,6 +76,29 @@ def test_inverse_value_findings_lead_the_ladder():
 
 
 # ====================================================================== #
+# VALUE-DEATH wiring: a value_death-kind candidate certifies with its kind carried
+# through to the finding's provenance (motion-invariant trigger, identical CONFIRM).
+# ====================================================================== #
+def test_value_death_candidate_certifies_and_carries_its_kind():
+    out = g4.run_g4(
+        SOFTLOCK, _softlock_report(), engine="py", world_factory=factory(), tiers=(0,),
+        iv_candidates=[{"prefix": ["run", "run", "run", "run"],
+                        "provenance": {"kind": "value_death", "source": "injected"},
+                        "value": -9.0}],
+        **IV, **SMALL)
+    iv = out["inverse_value"]
+    assert iv["detected"] == 1 and iv["certified"] >= 1
+    soft = [f for f in out["findings"] if f["outcome"] == "softlock"
+            and f["tier"] == "inverse_value"]
+    assert soft, "the value_death prefix must certify through the SAME tree oracle"
+    prov = soft[0]["reproducer"]["provenance"]
+    # The motion-invariant trigger's provenance kind survives CONFIRM (findings shape
+    # is identical to frozen/cycle -> the certified softlock class is unchanged).
+    assert prov["kind"] == "value_death"
+    assert prov["oracle"] == "inverse_value+tree_refute"
+
+
+# ====================================================================== #
 # A refutable (benign) candidate is DETECTED but NOT certified -> no finding
 # ====================================================================== #
 def test_injected_control_candidate_is_refuted_not_certified():

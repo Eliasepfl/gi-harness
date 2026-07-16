@@ -1164,6 +1164,10 @@ def _run_stale(executor, game_source, engine, actions, report, *,
 # The candidates it surfaces are CONFIRMED by the SAME refute_prefix tree oracle (1c),
 # so a certified prefix is the same hard `softlock` finding. Gated STRICTLY on a model:
 # with no model artifact the tier is skipped and the ladder is byte-for-byte unchanged.
+# DETECT here is critic-guided AND critic-gated: with a competent critic in hand the
+# smart tiers ARM the motion-invariant value_death trigger (adversary.detect_value_death)
+# alongside frozen/cycle, so a body WIGGLING in a trap (which the motion tests miss) is
+# still caught; its candidates flow through the SAME CONFIRM (provenance kind="value_death").
 # ======================================================================== #
 def _load_iv_critic(model=None, model_path=None):
     """Resolve an inverse-value critic. ``model`` may already satisfy the critic
@@ -1279,7 +1283,8 @@ def _run_inverse_value(executor, game_source, engine, actions, report, *,
         try:
             res = adversary.search(
                 env, critic, seeds=list(range(iv_seeds)), eps=iv_eps, window=window,
-                witness_actions=witness_actions, max_ticks=iv_max_ticks)
+                witness_actions=witness_actions, max_ticks=iv_max_ticks,
+                value_death=True)     # a competent critic is in hand -> arm value-death DETECT
         finally:
             close = getattr(env, "close", None)
             if callable(close):
@@ -1415,7 +1420,8 @@ def _run_descent(executor, game_source, engine, actions, report, *,
             res = adversary.descent_search(
                 env, critic, witness_actions=witness_actions, eps=eps,
                 n_waypoints=n_waypoints, descent_ticks=descent_ticks,
-                window=window, max_ticks=horizon)
+                window=window, max_ticks=horizon,
+                value_death=True)     # a competent critic is in hand -> arm value-death DETECT
         finally:
             close = getattr(env, "close", None)
             if callable(close):
