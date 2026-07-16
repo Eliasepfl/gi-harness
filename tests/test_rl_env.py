@@ -156,6 +156,198 @@ def test_build_obs_vector_clips_extremes():
 
 
 # ======================================================================== #
+# 1b. Dimension-aware obs — 3D layout + 2D no-regression (no node)
+# ======================================================================== #
+def _legacy_2d_obs(obs_state, latched, body_order, cp_keys, world_size, tick, horizon):
+    """A FROZEN, independent transcription of the pre-3D 2D obs builder — the
+    reference the new dimension-aware builder must match byte-for-byte on a 2D state.
+    If this ever drifts from ``build_obs_vector(dim=2)`` a trained 2D model breaks."""
+    w, h = world_size
+    vel_scale, clip = rlenv.VEL_SCALE, rlenv.OBS_CLIP
+    vec = np.zeros(len(body_order) * 10 + len(cp_keys) + 1, dtype=np.float32)
+    i = 0
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is not None:
+            px, py = q.get("pos", (0.0, 0.0))
+            vx, vy = q.get("vel", (0.0, 0.0))
+            ang = float(q.get("angle", 0.0))
+            vec[i + 0] = 1.0
+            vec[i + 1] = px / w
+            vec[i + 2] = py / h
+            vec[i + 3] = vx / vel_scale
+            vec[i + 4] = vy / vel_scale
+            vec[i + 5] = math.sin(ang)
+            vec[i + 6] = math.cos(ang)
+            vec[i + 7] = 1.0 if q.get("static") else 0.0
+            vec[i + 8] = 1.0 if q.get("sensor") else 0.0
+            vec[i + 9] = 1.0 if q.get("controlled") else 0.0
+        i += 10
+    for key in cp_keys:
+        vec[i] = 1.0 if latched.get(key) is not None else 0.0
+        i += 1
+    vec[i] = min(1.0, tick / float(horizon))
+    np.clip(vec, -clip, clip, out=vec)
+    return vec
+
+
+def test_2d_obs_is_byte_for_byte_the_legacy_layout():
+    """NO REGRESSION on 2D: the new builder must reproduce the frozen legacy vector
+    exactly (a mix of a present body, a removed body, latched + unlatched cps)."""
+    body = ["ball", "gem", "goal"]
+    cp = ["halfway", "at_goal"]
+    ws = (800, 600)
+    s = {"ball": {"pos": [123.4, 55.1], "vel": [900, -1200], "angle": 1.3,
+                  "static": False, "sensor": False, "controlled": True},
+         "goal": {"pos": [740, 70], "vel": [0, 0], "angle": 0.0,
+                  "static": True, "sensor": True, "controlled": False}}  # 'gem' removed
+    lat = {"halfway": 5, "at_goal": None}
+    old = _legacy_2d_obs(s, lat, body, cp, ws, 42, 300)
+    auto = build_obs_vector(s, lat, body, cp, ws, 42, 300)             # auto-detect -> 2D
+    pinned = build_obs_vector(s, lat, body, cp, ws, 42, 300, dim=2)    # explicit dim
+    assert old.tobytes() == auto.tobytes() == pinned.tobytes()
+    assert rlenv.detect_dim(s) == 2
+
+
+def test_3d_layout_exact_vector():
+    """Documents the EXACT 3D per-body layout: [present, x/W, y/H, z/D, vx/VS, vy/VS,
+    vz/VS, qx, qy, qz, qw, static, sensor, controlled] (14 floats), then the egocentric
+    block, the checkpoint one-hot, and the normalized tick."""
+    body = ["glider", "ring_1"]
+    cp = ["threaded_ring_1"]
+    W, H = 800.0, 600.0
+    D = max(W, H)                                        # depth == max(W,H) (no wire depth)
+    s = {"glider": {"pos": [80, 60, 40], "vel": [100, -200, 300], "angle": 0.0,
+                    "controlled": True, "static": False},
+         "ring_1": {"pos": [80, 60, 240], "vel": [0, 0, 0], "angle": 0.0,
+                    "controlled": False, "static": True}}
+    lat = {"threaded_ring_1": None}
+    v = build_obs_vector(s, lat, body, cp, (W, H), tick=30, horizon=300, dim=3)
+    assert rlenv.detect_dim(s) == 3
+    assert v.shape == (2 * rlenv.PER_BODY_3D + rlenv.EGO_BLOCK_3D + 1 + 1,)
+    assert v.shape[0] == rlenv.obs_dim_for(2, 1, 3)
+    # glider slot 0: present, normalized pos (incl z/D), normalized vel (incl vz)
+    assert v[0] == 1.0
+    assert v[1] == pytest.approx(80 / W) and v[2] == pytest.approx(60 / H)
+    assert v[3] == pytest.approx(40 / D)                 # z normalized by depth
+    assert v[6] == pytest.approx(300 / rlenv.VEL_SCALE)  # vz present
+    # identity orientation (angle 0) -> quaternion (0,0,0,1)
+    assert (v[7], v[8], v[9], v[10]) == pytest.approx((0.0, 0.0, 0.0, 1.0))
+    assert v[13] == 1.0                                  # controlled flag
+    # ring_1 static flag (slot 1, offset 11)
+    assert v[rlenv.PER_BODY_3D + 11] == 1.0
+    # checkpoint one-hot + tick tail
+    assert v[-2] == 0.0                                  # threaded_ring_1 not latched
+    assert v[-1] == pytest.approx(30 / 300)
+
+
+def test_3d_orientation_quaternion_from_yaw_is_canonical():
+    """Absent a `quat` field, orientation is a yaw-about-Y quaternion derived from the
+    scalar `angle` games emit; unit-norm and sign-canonical (w>=0)."""
+    a = 1.2
+    s = {"b": {"pos": [1, 2, 3], "vel": [0, 0, 0], "angle": a, "controlled": True}}
+    v = build_obs_vector(s, {}, ["b"], [], (800, 600), 0, 300, dim=3)
+    qx, qy, qz, qw = v[7], v[8], v[9], v[10]
+    assert (qx, qy, qz, qw) == pytest.approx(
+        (0.0, math.sin(a / 2), 0.0, math.cos(a / 2)), abs=1e-6)
+    assert qx * qx + qy * qy + qz * qz + qw * qw == pytest.approx(1.0, abs=1e-5)
+    # A yaw past pi flips w negative pre-canonicalization -> canonical form keeps w>=0.
+    s2 = {"b": {"pos": [1, 2, 3], "vel": [0, 0, 0], "angle": 4.0, "controlled": True}}
+    v2 = build_obs_vector(s2, {}, ["b"], [], (800, 600), 0, 300, dim=3)
+    assert v2[10] >= 0.0
+
+
+def test_3d_orientation_prefers_explicit_quat_field():
+    """A body `quat` [x,y,z,w] (forward-compat wire field) is used directly, normalized
+    and sign-canonicalized — no layout change."""
+    s = {"b": {"pos": [1, 2, 3], "vel": [0, 0, 0], "quat": [0.0, 0.0, 0.0, -2.0],
+               "controlled": True}}
+    v = build_obs_vector(s, {}, ["b"], [], (800, 600), 0, 300, dim=3)
+    # (0,0,0,-2) -> normalized (0,0,0,-1) -> canonical (0,0,0,1)
+    assert (v[7], v[8], v[9], v[10]) == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+
+def test_dimension_pin_asserts_on_mid_run_arity_change():
+    """A game may not change dimension mid-run: a 3-vector pos under a pinned dim=2
+    (or vice versa) raises a CLEAR assertion rather than the old silent unpack crash."""
+    s3 = {"b": {"pos": [1, 2, 3], "vel": [0, 0, 0], "angle": 0.0, "controlled": True}}
+    with pytest.raises(AssertionError, match="may not change dimension"):
+        build_obs_vector(s3, {}, ["b"], [], (800, 600), 0, 300, dim=2)
+    s2 = {"b": {"pos": [1, 2], "vel": [0, 0], "angle": 0.0, "controlled": True}}
+    with pytest.raises(AssertionError, match="may not change dimension"):
+        build_obs_vector(s2, {}, ["b"], [], (800, 600), 0, 300, dim=3)
+
+
+def test_3d_obs_is_nan_safe():
+    """Non-finite pos/vel/angle (a mis-behaving physics tick) never leak into the obs —
+    coerced to 0, quaternion falls back to identity."""
+    s = {"b": {"pos": [float("nan"), 2.0, float("inf")],
+               "vel": [float("nan"), 0.0, 0.0], "angle": float("nan"),
+               "controlled": True}}
+    v = build_obs_vector(s, {}, ["b"], [], (800, 600), 0, 300, dim=3)
+    assert np.all(np.isfinite(v))
+    assert (v[7], v[8], v[9], v[10]) == pytest.approx((0.0, 0.0, 0.0, 1.0))  # identity
+
+
+def test_3d_egocentric_nearest_neighbours_sorted_and_padded():
+    """The K nearest non-controlled bodies contribute relative (dx,dy,dz) hints, nearest
+    first; fewer than K bodies -> zero-padded present bits."""
+    body = ["ctrl", "far", "near"]
+    s = {"ctrl": {"pos": [0, 0, 0], "vel": [0, 0, 0], "angle": 0, "controlled": True},
+         "near": {"pos": [0, 0, 10], "vel": [0, 0, 0], "angle": 0, "static": True},
+         "far": {"pos": [0, 0, 500], "vel": [0, 0, 0], "angle": 0, "static": True}}
+    v = build_obs_vector(s, {}, body, [], (800, 600), 0, 300, dim=3)
+    eb = 3 * rlenv.PER_BODY_3D                            # ego block base (3 body slots)
+    D = 800.0
+    # slot 0 == 'near' (nearest), slot 1 == 'far', slot 2 == pad (present 0)
+    assert v[eb + 0] == 1.0 and v[eb + 3] == pytest.approx(10 / D)
+    assert v[eb + rlenv.EGO_SLOT + 0] == 1.0 and v[eb + rlenv.EGO_SLOT + 3] == pytest.approx(500 / D)
+    assert v[eb + 2 * rlenv.EGO_SLOT + 0] == 0.0         # only 2 neighbours -> 3rd padded
+
+
+def test_3d_egocentric_checkpoint_hint_first_unlatched_then_fallbacks():
+    """The checkpoint hint points at the first UNLATCHED checkpoint's associated body
+    (name substring); falls back to the nearest sensor body; else stays zero."""
+    body = ["ctrl", "ring_1", "ring_2"]
+    cp = ["threaded_ring_1", "threaded_ring_2"]
+    s = {"ctrl": {"pos": [0, 0, 0], "vel": [0, 0, 0], "angle": 0, "controlled": True},
+         "ring_1": {"pos": [5, 0, 0], "vel": [0, 0, 0], "angle": 0, "static": True},
+         "ring_2": {"pos": [0, 0, 50], "vel": [0, 0, 0], "angle": 0, "static": True}}
+    hint_base = 3 * rlenv.PER_BODY_3D + rlenv.K_EGO_NEIGHBORS * rlenv.EGO_SLOT
+    D = 800.0
+    # ring_1 already latched -> hint points at ring_2 (name-matched to threaded_ring_2)
+    v = build_obs_vector(s, {"threaded_ring_1": 9, "threaded_ring_2": None},
+                         body, cp, (800, 600), 0, 300, dim=3)
+    assert v[hint_base + 0] == 1.0 and v[hint_base + 3] == pytest.approx(50 / D)
+    # nothing latched -> first unlatched is threaded_ring_1 -> points at ring_1
+    v0 = build_obs_vector(s, {"threaded_ring_1": None, "threaded_ring_2": None},
+                          body, cp, (800, 600), 0, 300, dim=3)
+    assert v0[hint_base + 1] == pytest.approx(5 / 800.0) and v0[hint_base + 3] == 0.0
+    # No name match + no sensor bodies -> hint is zero (honest: not inferable)
+    body2 = ["ctrl", "wall"]
+    s2 = {"ctrl": {"pos": [0, 0, 0], "vel": [0, 0, 0], "angle": 0, "controlled": True},
+          "wall": {"pos": [9, 0, 0], "vel": [0, 0, 0], "angle": 0, "static": True}}
+    hb2 = 2 * rlenv.PER_BODY_3D + rlenv.K_EGO_NEIGHBORS * rlenv.EGO_SLOT
+    vn = build_obs_vector(s2, {"reached_goal": None}, body2, ["reached_goal"],
+                          (800, 600), 0, 300, dim=3)
+    assert vn[hb2 + 0] == 0.0                             # present bit off -> zero hint
+    # Sensor fallback: an unlatched cp with no name match points at the nearest sensor.
+    body3 = ["ctrl", "pad"]
+    s3 = {"ctrl": {"pos": [0, 0, 0], "vel": [0, 0, 0], "angle": 0, "controlled": True},
+          "pad": {"pos": [0, 7, 0], "vel": [0, 0, 0], "angle": 0, "sensor": True}}
+    vs = build_obs_vector(s3, {"win": None}, body3, ["win"], (800, 600), 0, 300, dim=3)
+    assert vs[hb2 + 0] == 1.0 and vs[hb2 + 2] == pytest.approx(7 / 600.0)
+
+
+def test_obs_dim_for_and_detect_dim_helpers():
+    assert rlenv.obs_dim_for(3, 2, 2) == 3 * rlenv.PER_BODY_2D + 2 + 1
+    assert rlenv.obs_dim_for(3, 2, 3) == 3 * rlenv.PER_BODY_3D + rlenv.EGO_BLOCK_3D + 2 + 1
+    assert rlenv.detect_dim({"b": {"pos": [1, 2]}}) == 2
+    assert rlenv.detect_dim({"b": {"pos": [1, 2, 3]}}) == 3
+    assert rlenv.detect_dim({}) == 2                      # empty -> default 2
+
+
+# ======================================================================== #
 # 2. Serve-mode protocol tests (skipif node/planck absent)
 # ======================================================================== #
 @requires_serve

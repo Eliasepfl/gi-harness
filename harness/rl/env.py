@@ -8,19 +8,51 @@ batch `episodes` mode bit-for-bit, a greedy action sequence recorded here replay
 to success through `JsExecutor.run_batch` — the certificate bridge in certify.py.
 
 OBSERVATION (code-state, NOT pixels — the challenge's "code-defined truth"):
-a fixed-layout flat float32 vector, frozen at the first reset. Per body, sorted
-by name with the CONTROLLED body first, padded to the game's body count:
+a fixed-layout flat float32 vector, frozen at the first reset. The DIMENSION (2D
+vs true-3D) is detected from the first frame's ``pos`` arity and PINNED for the
+game's lifetime (a game may not flip dimension mid-run — asserted). Per body,
+sorted by name with the CONTROLLED body first, padded to the game's body count:
 
+  2D  (PER_BODY_2D = 10 floats/body) — UNCHANGED, byte-for-byte the legacy layout:
     [present, x/W, y/H, vx/VS, vy/VS, sin(angle), cos(angle),
-     is_static, is_sensor, is_controlled]                        (10 floats/body)
+     is_static, is_sensor, is_controlled]
+
+  3D  (PER_BODY_3D = 14 floats/body):
+    [present, x/W, y/H, z/D, vx/VS, vy/VS, vz/VS,
+     qx, qy, qz, qw,                              (unit quaternion, see below)
+     is_static, is_sensor, is_controlled]
 
 `present` is 1.0 while the body exists and 0.0 once a game removes it (gems,
 gates) or for pad slots — a clean, Markov-preserving way to encode disappearance
 (the raw serve frame simply omits removed bodies). Positions are normalized by
-world size, velocities by VEL_SCALE; everything is clipped to [-OBS_CLIP, OBS_CLIP].
-Appended once at the end: the latched-checkpoint one-hot (declared order) and the
-normalized tick — the stateful progress signal that makes gated multi-stage games
-(latched switches open doors) observable to a feed-forward policy.
+world size (depth ``D`` = world_size[2] if present, else max(W,H) — the wire only
+declares a 2D world box), velocities by VEL_SCALE; everything is clipped to
+[-OBS_CLIP, OBS_CLIP].
+
+3D ORIENTATION is a CANONICAL UNIT QUATERNION (qx,qy,qz,qw): the minimal complete
+rotation encoding (4 floats vs 6 for two basis vectors), already bounded in
+[-1,1] so it needs no extent scaling, NaN-safe (any non-finite -> identity), and
+sign-canonicalized (w>=0) so one orientation has exactly ONE encoding (kills the
+q/-q double cover -> a stable, learnable input). Source, in priority order and
+WITHOUT any new wire field: an explicit body ``quat`` [x,y,z,w] if the game emits
+one (forward-compatible — obs picks it up at zero layout change); else derived
+from the scalar ``angle`` games emit today as a yaw about the world up-axis Y
+(q = [0, sin(a/2), 0, cos(a/2)] — faithful to Godot ``rotation.y``/``euler().y``).
+
+3D EGOCENTRIC HINTS (fixed 16-float block, appended once after the per-body
+block; 3D ONLY so the 2D vector stays byte-identical): for the controlled body,
+the relative position (other - controlled, world-normalized) of the K_EGO_NEIGHBORS
+NEAREST non-controlled bodies (each slot: present, dx/W, dy/H, dz/D), then ONE
+next-unlatched-checkpoint relative vector (present, dx/W, dy/H, dz/D). The
+checkpoint target is INFERRED honestly from data already in the frame — a
+non-controlled body whose name is associated (case-insensitive substring) with the
+first unlatched checkpoint key (e.g. body ``ring_2`` <- cp ``threaded_ring_2``),
+else the nearest non-controlled sensor body; zero when nothing is inferable.
+
+Appended once at the end (both dims): the latched-checkpoint one-hot (declared
+order) and the normalized tick — the stateful progress signal that makes gated
+multi-stage games (latched switches open doors) observable to a feed-forward
+policy.
 
 REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1): `+1.0 per NEWLY latched
 checkpoint + 5.0 on success - 1.0 on failure`. `success` stays the unshaped binary
@@ -67,7 +99,12 @@ import numpy as np
 # --- Constants ([eng.] = engineering choice) ---------------------------------
 HORIZON = 300              # decision ticks per episode (matches PROBE_HORIZON) [eng.]
 K_STEPS = 6                # physics steps per decision tick (CONTRACTS §2)
-PER_BODY = 10             # obs features per body (see module docstring) [eng.]
+PER_BODY_2D = 10          # 2D obs features per body (see module docstring) [eng.]
+PER_BODY_3D = 14          # 3D obs features per body (+z,+vz, quat vs sin/cos) [eng.]
+PER_BODY = PER_BODY_2D    # backward-compat alias (importers pin the 2D width)
+K_EGO_NEIGHBORS = 3       # nearest non-controlled bodies to hint egocentrically (3D) [eng.]
+EGO_SLOT = 4              # floats per egocentric hint: present, dx/W, dy/H, dz/D
+EGO_BLOCK_3D = (K_EGO_NEIGHBORS + 1) * EGO_SLOT  # K neighbours + 1 checkpoint hint = 16
 VEL_SCALE = 1000.0        # px/s velocity normalizer [eng.]
 OBS_CLIP = 10.0           # clip normalized obs into [-OBS_CLIP, OBS_CLIP] [eng.]
 R_CHECKPOINT = 1.0        # reward per newly latched checkpoint [eng.]
@@ -98,13 +135,101 @@ class Box:
         return int(np.prod(self.shape))
 
 
+# --- dimension helpers (single source of truth for obs sizing) ---------------
+def _finite(x) -> float:
+    """Float, NaN/inf coerced to 0.0 (obs must never carry a non-finite value)."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    return x if math.isfinite(x) else 0.0
+
+
+def _vec3(v) -> tuple[float, float, float]:
+    """(x, y, z) from a 2- or 3-vector (or None), NaN-safe, missing axes -> 0.0."""
+    if not v:
+        return (0.0, 0.0, 0.0)
+    x = _finite(v[0]) if len(v) > 0 else 0.0
+    y = _finite(v[1]) if len(v) > 1 else 0.0
+    z = _finite(v[2]) if len(v) > 2 else 0.0
+    return (x, y, z)
+
+
+def _pos_arity(obs_state: dict, body_order) -> int | None:
+    """Arity (2 or 3) of the first present body's ``pos``; None if no body has one."""
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is None:
+            continue
+        pos = q.get("pos")
+        if pos is not None:
+            try:
+                return 3 if len(pos) >= 3 else 2
+            except TypeError:
+                return 2
+    return None
+
+
+def detect_dim(obs_state: dict) -> int:
+    """Pin 2 or 3 from the first frame's pos arity (the layout dimension). Default 2."""
+    arity = _pos_arity(obs_state or {}, list((obs_state or {}).keys()))
+    return 3 if arity == 3 else 2
+
+
+def per_body_width(dim: int) -> int:
+    return PER_BODY_3D if int(dim) == 3 else PER_BODY_2D
+
+
+def ego_block_width(dim: int) -> int:
+    return EGO_BLOCK_3D if int(dim) == 3 else 0
+
+
+def obs_dim_for(n_bodies: int, n_cp: int, dim: int) -> int:
+    """The frozen obs width for ``n_bodies`` bodies + ``n_cp`` checkpoints at ``dim``."""
+    return n_bodies * per_body_width(dim) + ego_block_width(dim) + n_cp + 1
+
+
+def _world_extents(world_size) -> tuple[float, float, float]:
+    ws = tuple(world_size) if world_size else ()
+    w = float(ws[0]) if len(ws) >= 1 else 800.0
+    h = float(ws[1]) if len(ws) >= 2 else 600.0
+    d = float(ws[2]) if len(ws) >= 3 else max(w, h)   # wire declares no depth -> isotropic
+    return w, h, d
+
+
 def build_obs_vector(obs_state: dict, latched: dict, body_order: list[str],
                      cp_keys: list[str], world_size, tick: int,
-                     horizon: int) -> np.ndarray:
+                     horizon: int, dim: int | None = None) -> np.ndarray:
     """Pure obs-vector builder (see the module docstring for the layout). Kept a
-    free function so the layout can be unit-tested without a node subprocess."""
-    w, h = world_size
-    obs_dim = len(body_order) * PER_BODY + len(cp_keys) + 1
+    free function so the layout can be unit-tested without a serve subprocess.
+
+    ``dim`` is the PINNED layout dimension (2 or 3). When None it is auto-detected
+    from ``obs_state`` (so a 2D state yields the byte-identical legacy vector); the
+    envs pass their frozen ``_dim`` explicitly. When ``dim`` is given, the first
+    present body's pos arity is asserted to match it — a game may not change
+    dimension mid-run."""
+    obs_state = obs_state or {}
+    latched = latched or {}
+    if dim is None:
+        dim = 3 if (_pos_arity(obs_state, body_order) == 3) else 2
+    else:
+        dim = int(dim)
+        arity = _pos_arity(obs_state, body_order)
+        if arity is not None:
+            expected = 3 if arity >= 3 else 2
+            assert expected == dim, (
+                f"obs pos arity {arity} != pinned dim {dim}: a game may not change "
+                f"dimension mid-run")
+    w, h, d = _world_extents(world_size)
+    if dim == 3:
+        return _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d,
+                             tick, horizon)
+    return _build_obs_2d(obs_state, latched, body_order, cp_keys, w, h, tick, horizon)
+
+
+def _build_obs_2d(obs_state, latched, body_order, cp_keys, w, h, tick, horizon):
+    """The legacy 2D layout — kept byte-for-byte identical (regression-pinned)."""
+    obs_dim = len(body_order) * PER_BODY_2D + len(cp_keys) + 1
     vec = np.zeros(obs_dim, dtype=np.float32)
     i = 0
     for name in body_order:
@@ -124,7 +249,137 @@ def build_obs_vector(obs_state: dict, latched: dict, body_order: list[str],
             vec[i + 8] = 1.0 if q.get("sensor") else 0.0
             vec[i + 9] = 1.0 if q.get("controlled") else 0.0
         # else: removed/pad slot stays all-zero (present == 0)
-        i += PER_BODY
+        i += PER_BODY_2D
+    for key in cp_keys:                                  # latched one-hot
+        vec[i] = 1.0 if latched.get(key) is not None else 0.0
+        i += 1
+    vec[i] = min(1.0, tick / float(horizon))             # normalized tick
+    np.clip(vec, -OBS_CLIP, OBS_CLIP, out=vec)
+    return vec
+
+
+def _orientation_quat(q) -> tuple[float, float, float, float]:
+    """Canonical unit quaternion (qx,qy,qz,qw) for a 3D body — see the module
+    docstring. Prefers an explicit ``quat`` field, else a yaw-about-Y quaternion
+    from the scalar ``angle``. NaN-safe (identity fallback); sign-canonical (w>=0)."""
+    quat = q.get("quat")
+    if quat is not None and len(quat) >= 4:
+        x, y, z, wq = (_finite(quat[0]), _finite(quat[1]),
+                       _finite(quat[2]), _finite(quat[3]))
+    else:
+        half = _finite(q.get("angle", 0.0)) * 0.5       # yaw about world up-axis Y
+        x, y, z, wq = 0.0, math.sin(half), 0.0, math.cos(half)
+    nrm = math.sqrt(x * x + y * y + z * z + wq * wq)
+    if nrm < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)                      # degenerate -> identity
+    x, y, z, wq = x / nrm, y / nrm, z / nrm, wq / nrm
+    if wq < 0.0:                                         # canonicalize the q/-q cover
+        x, y, z, wq = -x, -y, -z, -wq
+    return (x, y, z, wq)
+
+
+def _controlled_pos(obs_state, body_order) -> tuple[float, float, float]:
+    """3D position of the controlled body (first with the flag), else the first
+    present body, else the origin."""
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is not None and q.get("controlled"):
+            return _vec3(q.get("pos"))
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is not None:
+            return _vec3(q.get("pos"))
+    return (0.0, 0.0, 0.0)
+
+
+def _next_checkpoint_target(obs_state, body_order, cp_keys, latched):
+    """3D position of the next-checkpoint target, inferred WITHOUT any new wire
+    field, or None. (1) a non-controlled body whose name is associated
+    (case-insensitive substring, either direction) with the FIRST unlatched
+    checkpoint key; else (2) the nearest non-controlled sensor body (goal pad)."""
+    for key in cp_keys:                                  # first unlatched cp only
+        if latched.get(key) is not None:
+            continue
+        kl = str(key).lower()
+        for name in body_order:
+            q = obs_state.get(name)
+            if q is None or q.get("controlled"):
+                continue
+            nl = str(name).lower()
+            if nl and (nl in kl or kl in nl):
+                return _vec3(q.get("pos"))
+        break                                            # no match -> sensor fallback
+    cx, cy, cz = _controlled_pos(obs_state, body_order)
+    best = None
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is None or q.get("controlled") or not q.get("sensor"):
+            continue
+        px, py, pz = _vec3(q.get("pos"))
+        dist2 = (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2
+        if best is None or dist2 < best[0]:
+            best = (dist2, (px, py, pz))
+    return best[1] if best else None
+
+
+def _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d, tick, horizon):
+    """The 3D layout: per-body (z, vz, quaternion) block + a fixed egocentric-hint
+    block + the shared checkpoint one-hot and tick tail."""
+    n = len(body_order)
+    obs_dim = n * PER_BODY_3D + EGO_BLOCK_3D + len(cp_keys) + 1
+    vec = np.zeros(obs_dim, dtype=np.float32)
+    i = 0
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is not None:
+            px, py, pz = _vec3(q.get("pos"))
+            vx, vy, vz = _vec3(q.get("vel"))
+            qx, qy, qz, qw = _orientation_quat(q)
+            vec[i + 0] = 1.0                              # present
+            vec[i + 1] = px / w
+            vec[i + 2] = py / h
+            vec[i + 3] = pz / d
+            vec[i + 4] = vx / VEL_SCALE
+            vec[i + 5] = vy / VEL_SCALE
+            vec[i + 6] = vz / VEL_SCALE
+            vec[i + 7] = qx
+            vec[i + 8] = qy
+            vec[i + 9] = qz
+            vec[i + 10] = qw
+            vec[i + 11] = 1.0 if q.get("static") else 0.0
+            vec[i + 12] = 1.0 if q.get("sensor") else 0.0
+            vec[i + 13] = 1.0 if q.get("controlled") else 0.0
+        # else: removed/pad slot stays all-zero (present == 0)
+        i += PER_BODY_3D
+
+    # -- egocentric hints (fixed 16-float block) --------------------------
+    cx, cy, cz = _controlled_pos(obs_state, body_order)
+    neighbours = []
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is None or q.get("controlled"):
+            continue
+        px, py, pz = _vec3(q.get("pos"))
+        dx, dy, dz = px - cx, py - cy, pz - cz
+        neighbours.append((math.sqrt(dx * dx + dy * dy + dz * dz), str(name),
+                           dx, dy, dz))
+    neighbours.sort(key=lambda t: (t[0], t[1]))          # nearest first, name tie-break
+    for k in range(K_EGO_NEIGHBORS):
+        if k < len(neighbours):
+            _, _, dx, dy, dz = neighbours[k]
+            vec[i + 0] = 1.0
+            vec[i + 1] = dx / w
+            vec[i + 2] = dy / h
+            vec[i + 3] = dz / d
+        i += EGO_SLOT
+    tgt = _next_checkpoint_target(obs_state, body_order, cp_keys, latched)
+    if tgt is not None:
+        vec[i + 0] = 1.0
+        vec[i + 1] = (tgt[0] - cx) / w
+        vec[i + 2] = (tgt[1] - cy) / h
+        vec[i + 3] = (tgt[2] - cz) / d
+    i += EGO_SLOT
+
     for key in cp_keys:                                  # latched one-hot
         vec[i] = 1.0 if latched.get(key) is not None else 0.0
         i += 1
@@ -174,6 +429,7 @@ class PlanckEnv:
         # Layout is discovered on the FIRST reset and then frozen.
         self._body_order: list[str] | None = None
         self._cp_keys: list[str] | None = None
+        self._dim: int = 2                          # pinned in _freeze_layout (2 or 3)
         self.action_space = Discrete(len(self.actions))
         self.observation_space: Box | None = None  # set after first reset
 
@@ -217,14 +473,15 @@ class PlanckEnv:
         # Controlled body first (LLM_RL_SYSTEMS §4.1), then the rest sorted by name.
         self._body_order = list(controlled) + others
         self._cp_keys = list((frame.get("latched") or {}).keys())
-        obs_dim = len(self._body_order) * PER_BODY + len(self._cp_keys) + 1
+        self._dim = detect_dim(obs_state)               # 2D vs true-3D, then PINNED
+        obs_dim = obs_dim_for(len(self._body_order), len(self._cp_keys), self._dim)
         self.observation_space = Box(-OBS_CLIP, OBS_CLIP, (obs_dim,))
 
     def _observe(self, frame: dict) -> np.ndarray:
         return build_obs_vector(
             frame.get("obs_state", {}), frame.get("latched") or {},
             self._body_order, self._cp_keys, self.world_size, self._tick,
-            self.horizon)
+            self.horizon, dim=self._dim)
 
     @staticmethod
     def _latched_set(frame: dict) -> set[str]:

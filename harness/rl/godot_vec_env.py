@@ -43,8 +43,8 @@ import time
 import numpy as np
 
 from harness.rl.env import (
-    OBS_CLIP, PER_BODY, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
-    build_obs_vector,
+    OBS_CLIP, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
+    build_obs_vector, detect_dim, obs_dim_for,
 )
 from harness.rl.godot_env import (
     CONNECT_TIMEOUT_S, DEFAULT_PORT_BASE, SERVE_TIMEOUT_S, SPAWN_RETRIES,
@@ -249,12 +249,14 @@ def _batch_vec_env_cls():
             self._body_order = list(controlled) + others
             cp0 = (frame.get("checkpoints") or [{}])[0] or {}
             self._cp_keys = list(cp0.keys())
-            self._obs_dim = len(self._body_order) * PER_BODY + len(self._cp_keys) + 1
+            self._dim = detect_dim(obs_state0)          # 2D vs true-3D, then PINNED
+            self._obs_dim = obs_dim_for(len(self._body_order), len(self._cp_keys),
+                                        self._dim)
 
         def _obs_of(self, obs_state: dict, latched: dict, tick: int) -> np.ndarray:
             return build_obs_vector(obs_state or {}, latched or {}, self._body_order,
                                     self._cp_keys, self.world_size, int(tick),
-                                    self.horizon)
+                                    self.horizon, dim=self._dim)
 
         # -- wire ----------------------------------------------------------
         def _exchange(self, op: dict) -> dict:
