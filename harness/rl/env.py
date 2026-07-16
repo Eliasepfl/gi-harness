@@ -39,15 +39,19 @@ one (forward-compatible — obs picks it up at zero layout change); else derived
 from the scalar ``angle`` games emit today as a yaw about the world up-axis Y
 (q = [0, sin(a/2), 0, cos(a/2)] — faithful to Godot ``rotation.y``/``euler().y``).
 
-3D EGOCENTRIC HINTS (fixed 16-float block, appended once after the per-body
+3D EGOCENTRIC HINTS (fixed 12-float block, appended once after the per-body
 block; 3D ONLY so the 2D vector stays byte-identical): for the controlled body,
 the relative position (other - controlled, world-normalized) of the K_EGO_NEIGHBORS
-NEAREST non-controlled bodies (each slot: present, dx/W, dy/H, dz/D), then ONE
-next-unlatched-checkpoint relative vector (present, dx/W, dy/H, dz/D). The
-checkpoint target is INFERRED honestly from data already in the frame — a
-non-controlled body whose name is associated (case-insensitive substring) with the
-first unlatched checkpoint key (e.g. body ``ring_2`` <- cp ``threaded_ring_2``),
-else the nearest non-controlled sensor body; zero when nothing is inferable.
+NEAREST non-controlled bodies (each slot: present, dx/W, dy/H, dz/D). Pure geometry —
+"what is near me, and where" — with NO notion of which body is the goal.
+
+REMOVED (Elias 2026-07-16): the former next-unlatched-checkpoint direction hint (a
+13th..16th float pointing at a body inferred by case-insensitive NAME-MATCHING a body
+to a checkpoint key, e.g. ``ring_2`` <- ``threaded_ring_2``). It was cut from EVERY obs
+profile because (a) it is a CHEAT — the name-match hands the policy the target it is
+supposed to learn to find, and (b) it CLASS-FORCES games whose bodies happen to be named
+like their checkpoints. The K-nearest ego block stays; only the name-matched hint is gone,
+so the 3D ego block shrinks 16 -> 12 floats.
 
 Appended once at the end (both dims): the latched-checkpoint one-hot (declared
 order) and the normalized tick — the stateful progress signal that makes gated
@@ -80,10 +84,42 @@ Rays are DERIVED from body positions, so they are deliberately EXCLUDED from the
 softlock fingerprint (``fingerprint_from_obs`` stops before the tail; the pure profile falls
 back to the raw serve snapshot). See ``godotworld/serve_game.gd`` for the fan/grid layout.
 
-REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1): `+1.0 per NEWLY latched
-checkpoint + 5.0 on success - 1.0 on failure`. `success` stays the unshaped binary
-certificate — the "solved?" decision never reads this shaped reward. Episode ends
-on a terminal `result` or at HORIZON (300) decision ticks.
+REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1 — REALIGNED 2026-07-16 for
+terminal-success dominance + temporal pressure; see :func:`step_reward`). The old
+`+1.0/checkpoint + 5.0/success - 1.0/failure` converged to a NEVER-WINNING policy on
+mini_collect (a 400k-step probe: return plateaus at first-checkpoint shaping, farming
+shaping beats finishing). The realigned per-tick reward is the SUM of:
+
+  1. BOUNDED SHAPING (terminal dominance). Each NEWLY latched checkpoint pays
+     ``SHAPING_MASS / n_cp`` (``n_cp`` = number of declared checkpoints). Latch-once
+     (runner-enforced) means the TOTAL checkpoint shaping an episode can ever accrue is
+     capped at exactly ``SHAPING_MASS`` regardless of how many checkpoints a game has —
+     the "normalized-capped shaping mass" the terminal bonus is sized to dominate.
+
+  2. TEMPORAL PRESSURE — a time-DECAYED success bonus (Elias's explicit "decaying reward"
+     ask). On a ``success`` result the payoff is
+     ``R_SUCCESS * (SUCCESS_TIME_FLOOR + (1 - SUCCESS_TIME_FLOOR) * remaining_frac)`` where
+     ``remaining_frac = clip((horizon - tick)/horizon, 0, 1)``. So an instant win pays the
+     full ``R_SUCCESS`` and a win at the buzzer pays the FLOOR ``R_SUCCESS*SUCCESS_TIME_FLOOR``
+     — success earned EARLIER is strictly worth more, but even the latest win floors at 50%
+     of the bonus so late wins still dominate the shaping mass.
+
+  3. A small per-tick LIVING COST ``R_TICK = -LIVING_COST_TOTAL / horizon`` paid EVERY step
+     (restores the ``- λ·1`` term LLM_RL_SYSTEMS §4.1 always specified but env.py had dropped;
+     the reference FPS "anti-idle" lever). Over a full-horizon episode it totals
+     ``-LIVING_COST_TOTAL`` (> ``SHAPING_MASS``), so a never-finishing episode nets NEGATIVE
+     — dithering at a farmed checkpoint is strictly worse than pressing on to the goal.
+
+  4. A clearly-negative terminal ``R_FAILURE`` on ``failure``/``error``.
+
+Sizing (see the constants): ``R_SUCCESS*SUCCESS_TIME_FLOOR`` (the MINIMUM success payoff) >
+``SHAPING_MASS + LIVING_COST_TOTAL``, so the four reward invariants hold with margin:
+(a) the total farmable shaping (``SHAPING_MASS``) is < the success payoff at ANY tick;
+(b) an earlier success yields a strictly greater return than a later one;
+(c) any success return > any no-success return; (d) for equal progress a failure return <
+a timeout (no-success) return. ``success`` STAYS the unshaped binary certificate — the
+"solved?" decision never reads this shaped reward (hack-resistant by construction). Episode
+ends on a terminal ``result`` or at HORIZON (300) decision ticks.
 
 ======================================================================
 godot_rl_agents AIController mapping  (GODOT_RL_MERGE.md §2 — pin this)
@@ -130,7 +166,7 @@ PER_BODY_3D = 14          # 3D obs features per body (+z,+vz, quat vs sin/cos) [
 PER_BODY = PER_BODY_2D    # backward-compat alias (importers pin the 2D width)
 K_EGO_NEIGHBORS = 3       # nearest non-controlled bodies to hint egocentrically (3D) [eng.]
 EGO_SLOT = 4              # floats per egocentric hint: present, dx/W, dy/H, dz/D
-EGO_BLOCK_3D = (K_EGO_NEIGHBORS + 1) * EGO_SLOT  # K neighbours + 1 checkpoint hint = 16
+EGO_BLOCK_3D = K_EGO_NEIGHBORS * EGO_SLOT  # K nearest-body hints (name-match cp hint REMOVED) = 12
 # --- Obs profiles (Elias 2026-07-16): one knob, three exteroception regimes -------
 # "positions"       -> today's obs (global per-body block, +3D ego hints). DEFAULT, and
 #                      byte-for-byte the pre-rays vector.
@@ -158,10 +194,67 @@ DEFAULT_RAYS = {"n": 16, "fov_deg": 180.0,
 RAY_CLASS_BITS = 3        # {static, dynamic, sensor} one-hot per ray when class_bits on [eng.]
 VEL_SCALE = 1000.0        # px/s velocity normalizer [eng.]
 OBS_CLIP = 10.0           # clip normalized obs into [-OBS_CLIP, OBS_CLIP] [eng.]
-R_CHECKPOINT = 1.0        # reward per newly latched checkpoint [eng.]
-R_SUCCESS = 5.0           # terminal bonus on the unshaped success certificate [eng.]
-R_FAILURE = -1.0          # terminal penalty on failure/error [eng.]
+# --- Reward scheme (REALIGNED 2026-07-16; see the module docstring "REWARD") -----------
+# The magnitudes are sized so R_SUCCESS*SUCCESS_TIME_FLOOR (the MINIMUM success payoff)
+# strictly dominates SHAPING_MASS + LIVING_COST_TOTAL — the terminal-dominance guarantee
+# the reward-invariant tests (tests/test_rl_reward.py) pin.
+SHAPING_MASS = 1.0        # TOTAL farmable checkpoint-shaping budget across ALL checkpoints;
+                          # each newly-latched checkpoint pays SHAPING_MASS/n_cp (latch-once,
+                          # so cumulative shaping is capped at SHAPING_MASS) [eng.]
+R_SUCCESS = 10.0          # BASE terminal success bonus, before the time-decay below [eng.]
+SUCCESS_TIME_FLOOR = 0.5  # decayed success payoff never drops below this fraction of R_SUCCESS
+                          # (a buzzer-beater win still pays 0.5*R_SUCCESS >> shaping) [eng.]
+R_FAILURE = -2.0          # terminal penalty on failure/error (clearly negative) [eng.]
+LIVING_COST_TOTAL = 1.5   # total per-tick living cost over a full-horizon episode; the
+                          # per-step cost is R_TICK = -LIVING_COST_TOTAL/horizon. > SHAPING_MASS
+                          # so a never-finishing episode nets negative (anti-dither) [eng.]
+R_CHECKPOINT = SHAPING_MASS  # backward-compat alias: the shaping budget for a 1-checkpoint game
 SERVE_TIMEOUT_S = 60.0    # per-op read budget before declaring the node dead [eng.]
+
+
+# --- Reward function (single source of truth; the 3 env step() paths call this) ---------
+def checkpoint_shaping(n_new_latched: int, n_cp: int) -> float:
+    """Bounded (normalized-capped) checkpoint shaping: each newly-latched checkpoint pays
+    ``SHAPING_MASS / n_cp`` so an episode that latches ALL ``n_cp`` declared checkpoints
+    accrues exactly ``SHAPING_MASS`` — independent of how many checkpoints the game has.
+    ``n_cp <= 0`` (a game with no declared checkpoints) -> no shaping."""
+    if n_cp <= 0:
+        return 0.0
+    return (SHAPING_MASS / float(n_cp)) * float(n_new_latched)
+
+
+def success_payoff(tick: int, horizon: int) -> float:
+    """Time-DECAYED terminal success bonus (Elias's "decaying reward"): the earlier the win,
+    the larger the payoff, with a floor so late wins still dominate the shaping mass::
+
+        R_SUCCESS * (SUCCESS_TIME_FLOOR + (1 - SUCCESS_TIME_FLOOR) * remaining_frac)
+
+    ``remaining_frac = clip((horizon - tick)/horizon, 0, 1)`` — 1.0 at ``tick==0`` (instant
+    win, full ``R_SUCCESS``) down to 0.0 at ``tick==horizon`` (floor ``R_SUCCESS*FLOOR``)."""
+    h = float(horizon) if horizon and horizon > 0 else 1.0
+    remaining = (h - float(tick)) / h
+    remaining = min(1.0, max(0.0, remaining))
+    return R_SUCCESS * (SUCCESS_TIME_FLOOR + (1.0 - SUCCESS_TIME_FLOOR) * remaining)
+
+
+def tick_cost(horizon: int) -> float:
+    """The small per-tick living cost ``R_TICK = -LIVING_COST_TOTAL / horizon`` (a negative
+    number), applied EVERY step. Over a full-horizon episode it totals ``-LIVING_COST_TOTAL``."""
+    h = float(horizon) if horizon and horizon > 0 else 1.0
+    return -LIVING_COST_TOTAL / h
+
+
+def step_reward(n_new_latched: int, n_cp: int, result, tick: int, horizon: int) -> float:
+    """The realigned per-step reward (single source of truth for ALL env step() paths):
+    bounded checkpoint shaping + the per-tick living cost, plus the time-decayed terminal
+    on a ``success`` result or the flat negative ``R_FAILURE`` on ``failure``/``error``.
+    See the module docstring "REWARD" for the full scheme and invariants."""
+    r = checkpoint_shaping(n_new_latched, n_cp) + tick_cost(horizon)
+    if result == "success":
+        r += success_payoff(tick, horizon)
+    elif result in ("failure", "error"):
+        r += R_FAILURE
+    return float(r)
 
 
 # --- Minimal Gymnasium-compatible spaces (duck types; no gymnasium dep) ------
@@ -445,39 +538,10 @@ def _controlled_pos(obs_state, body_order) -> tuple[float, float, float]:
     return (0.0, 0.0, 0.0)
 
 
-def _next_checkpoint_target(obs_state, body_order, cp_keys, latched):
-    """3D position of the next-checkpoint target, inferred WITHOUT any new wire
-    field, or None. (1) a non-controlled body whose name is associated
-    (case-insensitive substring, either direction) with the FIRST unlatched
-    checkpoint key; else (2) the nearest non-controlled sensor body (goal pad)."""
-    for key in cp_keys:                                  # first unlatched cp only
-        if latched.get(key) is not None:
-            continue
-        kl = str(key).lower()
-        for name in body_order:
-            q = obs_state.get(name)
-            if q is None or q.get("controlled"):
-                continue
-            nl = str(name).lower()
-            if nl and (nl in kl or kl in nl):
-                return _vec3(q.get("pos"))
-        break                                            # no match -> sensor fallback
-    cx, cy, cz = _controlled_pos(obs_state, body_order)
-    best = None
-    for name in body_order:
-        q = obs_state.get(name)
-        if q is None or q.get("controlled") or not q.get("sensor"):
-            continue
-        px, py, pz = _vec3(q.get("pos"))
-        dist2 = (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2
-        if best is None or dist2 < best[0]:
-            best = (dist2, (px, py, pz))
-    return best[1] if best else None
-
-
 def _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d, tick, horizon):
-    """The 3D layout: per-body (z, vz, quaternion) block + a fixed egocentric-hint
-    block + the shared checkpoint one-hot and tick tail."""
+    """The 3D layout: per-body (z, vz, quaternion) block + a fixed K-nearest egocentric
+    block (relative positions only, no goal hint) + the shared checkpoint one-hot and tick
+    tail."""
     n = len(body_order)
     obs_dim = n * PER_BODY_3D + EGO_BLOCK_3D + len(cp_keys) + 1
     vec = np.zeros(obs_dim, dtype=np.float32)
@@ -525,13 +589,8 @@ def _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d, tick, horizo
             vec[i + 2] = dy / h
             vec[i + 3] = dz / d
         i += EGO_SLOT
-    tgt = _next_checkpoint_target(obs_state, body_order, cp_keys, latched)
-    if tgt is not None:
-        vec[i + 0] = 1.0
-        vec[i + 1] = (tgt[0] - cx) / w
-        vec[i + 2] = (tgt[1] - cy) / h
-        vec[i + 3] = (tgt[2] - cz) / d
-    i += EGO_SLOT
+    # (the name-matched next-checkpoint direction hint was REMOVED here — see the module
+    # docstring; the ego block is now the K-nearest-body slots only, no goal hint.)
 
     for key in cp_keys:                                  # latched one-hot
         vec[i] = 1.0 if latched.get(key) is not None else 0.0
@@ -697,19 +756,20 @@ class PlanckEnv:
         latched_now = self._latched_set(frame)
         new_latches = len(latched_now - self._prev_latched)
         self._prev_latched = latched_now
-        reward = R_CHECKPOINT * new_latches
 
         terminated = False
         truncated = False
         if result == "success":
-            reward += R_SUCCESS
             terminated = True
         elif result in ("failure", "error"):
-            reward += R_FAILURE
             terminated = True
         elif self._tick >= self.horizon:
             truncated = True
         self._done = terminated or truncated
+        # Realigned reward (single source of truth): bounded checkpoint shaping + the
+        # per-tick living cost + the time-decayed terminal. See step_reward / the docstring.
+        reward = step_reward(new_latches, len(self._cp_keys or []), result,
+                             self._tick, self.horizon)
 
         info = {
             "result": result,

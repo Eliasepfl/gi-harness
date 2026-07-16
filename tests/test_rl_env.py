@@ -305,38 +305,27 @@ def test_3d_egocentric_nearest_neighbours_sorted_and_padded():
     assert v[eb + 2 * rlenv.EGO_SLOT + 0] == 0.0         # only 2 neighbours -> 3rd padded
 
 
-def test_3d_egocentric_checkpoint_hint_first_unlatched_then_fallbacks():
-    """The checkpoint hint points at the first UNLATCHED checkpoint's associated body
-    (name substring); falls back to the nearest sensor body; else stays zero."""
+def test_3d_ego_block_has_no_checkpoint_hint_tail():
+    """REMOVED (Elias 2026-07-16): the name-matched next-checkpoint direction hint. The 3D
+    ego block is now the K-nearest-body slots ONLY (16 -> 12 floats); there is no goal-hint
+    slot, and the block is immediately followed by the checkpoint one-hot + tick tail."""
+    assert rlenv.EGO_BLOCK_3D == rlenv.K_EGO_NEIGHBORS * rlenv.EGO_SLOT   # no +1 hint slot
+    assert not hasattr(rlenv, "_next_checkpoint_target")                  # helper deleted
     body = ["ctrl", "ring_1", "ring_2"]
     cp = ["threaded_ring_1", "threaded_ring_2"]
     s = {"ctrl": {"pos": [0, 0, 0], "vel": [0, 0, 0], "angle": 0, "controlled": True},
          "ring_1": {"pos": [5, 0, 0], "vel": [0, 0, 0], "angle": 0, "static": True},
          "ring_2": {"pos": [0, 0, 50], "vel": [0, 0, 0], "angle": 0, "static": True}}
-    hint_base = 3 * rlenv.PER_BODY_3D + rlenv.K_EGO_NEIGHBORS * rlenv.EGO_SLOT
-    D = 800.0
-    # ring_1 already latched -> hint points at ring_2 (name-matched to threaded_ring_2)
     v = build_obs_vector(s, {"threaded_ring_1": 9, "threaded_ring_2": None},
                          body, cp, (800, 600), 0, 300, dim=3)
-    assert v[hint_base + 0] == 1.0 and v[hint_base + 3] == pytest.approx(50 / D)
-    # nothing latched -> first unlatched is threaded_ring_1 -> points at ring_1
-    v0 = build_obs_vector(s, {"threaded_ring_1": None, "threaded_ring_2": None},
-                          body, cp, (800, 600), 0, 300, dim=3)
-    assert v0[hint_base + 1] == pytest.approx(5 / 800.0) and v0[hint_base + 3] == 0.0
-    # No name match + no sensor bodies -> hint is zero (honest: not inferable)
-    body2 = ["ctrl", "wall"]
-    s2 = {"ctrl": {"pos": [0, 0, 0], "vel": [0, 0, 0], "angle": 0, "controlled": True},
-          "wall": {"pos": [9, 0, 0], "vel": [0, 0, 0], "angle": 0, "static": True}}
-    hb2 = 2 * rlenv.PER_BODY_3D + rlenv.K_EGO_NEIGHBORS * rlenv.EGO_SLOT
-    vn = build_obs_vector(s2, {"reached_goal": None}, body2, ["reached_goal"],
-                          (800, 600), 0, 300, dim=3)
-    assert vn[hb2 + 0] == 0.0                             # present bit off -> zero hint
-    # Sensor fallback: an unlatched cp with no name match points at the nearest sensor.
-    body3 = ["ctrl", "pad"]
-    s3 = {"ctrl": {"pos": [0, 0, 0], "vel": [0, 0, 0], "angle": 0, "controlled": True},
-          "pad": {"pos": [0, 7, 0], "vel": [0, 0, 0], "angle": 0, "sensor": True}}
-    vs = build_obs_vector(s3, {"win": None}, body3, ["win"], (800, 600), 0, 300, dim=3)
-    assert vs[hb2 + 0] == 1.0 and vs[hb2 + 2] == pytest.approx(7 / 600.0)
+    # width == per-body + K-nearest ego block (no hint) + cp one-hot + tick
+    assert v.shape[0] == 3 * rlenv.PER_BODY_3D + rlenv.EGO_BLOCK_3D + len(cp) + 1
+    assert v.shape[0] == rlenv.obs_dim_for(3, len(cp), 3)
+    # the slot right after the K ego neighbours is the FIRST checkpoint one-hot, NOT a hint.
+    cp_base = 3 * rlenv.PER_BODY_3D + rlenv.K_EGO_NEIGHBORS * rlenv.EGO_SLOT
+    assert v[cp_base + 0] == 1.0        # threaded_ring_1 latched -> one-hot 1.0 (not a hint dx)
+    assert v[cp_base + 1] == 0.0        # threaded_ring_2 unlatched
+    assert v[-1] == pytest.approx(0 / 300)   # tick tail directly after the cp one-hot
 
 
 def test_obs_dim_for_and_detect_dim_helpers():
@@ -580,20 +569,30 @@ def test_planckenv_reward_shaping(corridor):
     env = rlenv.PlanckEnv(corridor, horizon=200)
     try:
         env.reset(seed=0)
+        n_cp = len(env._cp_keys)
+        # Realigned reward: a single new checkpoint pays the normalized per-checkpoint
+        # shaping (SHAPING_MASS/n_cp) net of the tiny per-tick living cost; a success pays
+        # at least the decayed terminal FLOOR (R_SUCCESS*SUCCESS_TIME_FLOOR).
+        cp_step = rlenv.checkpoint_shaping(1, n_cp) + rlenv.tick_cost(env.horizon)
+        floor = rlenv.R_SUCCESS * rlenv.SUCCESS_TIME_FLOOR
         got_checkpoint_reward = False
         reached_goal = False
+        prev_halfway = None
         for _ in range(200):
             obs, r, term, trunc, info = env.step(0)  # action 0 == "right"
-            if info["latched"].get("halfway") is not None and r >= rlenv.R_CHECKPOINT - 1e-6:
+            halfway = info["latched"].get("halfway")
+            if halfway is not None and prev_halfway is None:
+                assert r >= cp_step - 1e-6, "latching a checkpoint must pay the shaping"
                 got_checkpoint_reward = True
+            prev_halfway = halfway
             if info["result"] == "success":
-                assert r >= rlenv.R_SUCCESS - 1e-6  # terminal bonus present
+                assert r >= floor - 1e-6  # decayed terminal bonus (>= floor) is present
                 assert term is True
                 reached_goal = True
                 break
             if term or trunc:
                 break
-        assert got_checkpoint_reward, "latching 'halfway' must pay +1"
+        assert got_checkpoint_reward, "latching 'halfway' must pay the normalized shaping"
         assert reached_goal, "rolling right must solve the corridor"
     finally:
         env.close()

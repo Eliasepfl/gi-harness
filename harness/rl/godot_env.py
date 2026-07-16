@@ -70,10 +70,10 @@ import time
 import numpy as np
 
 from harness.rl.env import (
-    OBS_CLIP, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
+    OBS_CLIP, HORIZON,
     DEFAULT_RAYS, OBS_PROFILES, RAYS_PROFILES,
     Box, Discrete, build_obs_vector, detect_dim, normalize_rays, obs_dim_for,
-    rays_obs_width,
+    rays_obs_width, step_reward,
 )
 from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
@@ -488,16 +488,14 @@ class GodotServeEnv:
         new_latches = len(latched_now - self._prev_latched)
         self._prev_latched = latched_now
         self.last_snapshot = self._snapshot_of(frame)
-        reward = R_CHECKPOINT * new_latches
 
-        # term/trunc split comes straight off the wire (INNER dialect); the reward
-        # bonus reads `result` (matching PlanckEnv's shaping exactly).
+        # term/trunc split comes straight off the wire (INNER dialect); the realigned
+        # reward reads `result`/`tick` (single source of truth: bounded shaping + per-tick
+        # living cost + time-decayed terminal — matching PlanckEnv exactly).
         terminated = bool(frame.get("done_term"))
         truncated = bool(frame.get("done_trunc"))
-        if result == "success":
-            reward += R_SUCCESS
-        elif result in ("failure", "error"):
-            reward += R_FAILURE
+        reward = step_reward(new_latches, len(self._cp_keys or []), result,
+                             self._tick, self.horizon)
         self._done = terminated or truncated
 
         info = {
