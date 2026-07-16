@@ -54,6 +54,32 @@ order) and the normalized tick — the stateful progress signal that makes gated
 multi-stage games (latched switches open doors) observable to a feed-forward
 policy.
 
+OBS PROFILES (Elias 2026-07-16 — one knob, ``obs_profile``):
+* ``"positions"`` (DEFAULT) — the vector above, byte-for-byte today's obs.
+* ``"positions+rays"`` — the vector above + the egocentric raycast tail.
+* ``"rays"`` (the PURE, honest profile) — PROPRIOCEPTION ONLY (the controlled body's
+  own velocity + own orientation — 2D: ``vx,vy,sin,cos``; 3D: ``vx,vy,vz,qx,qy,qz,qw``),
+  then the raycast tail, then the cp one-hot + tick. NO global positions of other
+  bodies, NO K-nearest ego block: the agent knows how it is moving/pointing and sees
+  the world ONLY through the rays.
+
+EGOCENTRIC RAYCAST TAIL (OPT-IN; the godot_rl_agents FPS reference sensor — a SEMANTIC
+retina, NO pixels/camera). When the serve host is asked for rays (init key ``rays``), each
+frame carries a flat ``rays`` array cast FROM the controlled body IN ITS LOCAL FRAME. Per
+ray: a normalized distance (``1.0`` = nothing within range, else ``hit_dist/range`` in
+``[0,1]``) PLUS, when ``class_bits`` is on (default), a ``{static, dynamic, sensor}``
+one-hot from the collider type (all-zero on no hit). So each ray is ``ray_stride`` floats
+(1, or 1+3=4 with class bits), and the tail is ``n_rays * ray_stride`` = ``rays_obs_width``.
+2D is a planar fan of ``n`` rays across ``fov_deg`` (the world IS a plane); 3D is the
+reference WIDE grid of ``n_h x n_v`` (25x5) rays across ``fov_h x fov_v`` (a single fan is
+vertically blind). The tail is appended at the very END of the vector, so the offsets ahead
+of it are byte-identical and the tail is absent (byte-for-byte the no-rays vector) when off.
+FIRST-FRAME NOTE: the reset frame's rays read all-clear (``1.0``) because the physics
+broadphase is only populated after the first step; every subsequent frame is faithful.
+Rays are DERIVED from body positions, so they are deliberately EXCLUDED from the stale-seek
+softlock fingerprint (``fingerprint_from_obs`` stops before the tail; the pure profile falls
+back to the raw serve snapshot). See ``godotworld/serve_game.gd`` for the fan/grid layout.
+
 REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1): `+1.0 per NEWLY latched
 checkpoint + 5.0 on success - 1.0 on failure`. `success` stays the unshaped binary
 certificate — the "solved?" decision never reads this shaped reward. Episode ends
@@ -105,6 +131,31 @@ PER_BODY = PER_BODY_2D    # backward-compat alias (importers pin the 2D width)
 K_EGO_NEIGHBORS = 3       # nearest non-controlled bodies to hint egocentrically (3D) [eng.]
 EGO_SLOT = 4              # floats per egocentric hint: present, dx/W, dy/H, dz/D
 EGO_BLOCK_3D = (K_EGO_NEIGHBORS + 1) * EGO_SLOT  # K neighbours + 1 checkpoint hint = 16
+# --- Obs profiles (Elias 2026-07-16): one knob, three exteroception regimes -------
+# "positions"       -> today's obs (global per-body block, +3D ego hints). DEFAULT, and
+#                      byte-for-byte the pre-rays vector.
+# "positions+rays"  -> today's obs + the egocentric raycast tail.
+# "rays"            -> the PURE, honest profile: PROPRIOCEPTION ONLY (own velocity + own
+#                      orientation) + the raycast grid + cp one-hot + tick. NO global
+#                      positions of other bodies, NO K-nearest ego block (the removed "cheat").
+OBS_PROFILES = ("positions", "positions+rays", "rays")
+RAYS_PROFILES = ("positions+rays", "rays")
+PROPRIO_2D = 4            # pure-profile proprioception width: vx,vy, sin,cos [eng.]
+PROPRIO_3D = 7            # pure-profile proprioception width: vx,vy,vz, qx,qy,qz,qw [eng.]
+# Default egocentric raycast config (opt-in; every field overridable) [eng.]. Standardized
+# on the godot_rl_agents FPS reference sensor (examples player.tscn WideRaycastSensor +
+# ExtendedRaycastSensor.gd): a RECTANGULAR grid with a per-ray HIT-CLASS channel, no camera.
+# 2D is a planar fan (n across fov_deg — the world IS a plane); 3D is the reference WIDE
+# DEPTH-RETINA grid (n_h x n_v = 25x5 across fov_h x fov_v — a single fan is vertically blind
+# to obstacles above/below). Each ray reports a normalized distance (1.0 = nothing within
+# range) PLUS, when class_bits is on, a {static, dynamic, sensor} one-hot from the collider
+# type (the reference's collision-layer class bits; ours are team-free) — the SEMANTIC retina.
+# range is WORLD units; default 80.0 is the reference ray_length (the 3D world box is not
+# wired, so per-world extent scaling is a follow-up — callers override range per game).
+DEFAULT_RAYS = {"n": 16, "fov_deg": 180.0,
+                "n_h": 25, "n_v": 5, "fov_h": 120.0, "fov_v": 60.0,
+                "range": 80.0, "class_bits": True}
+RAY_CLASS_BITS = 3        # {static, dynamic, sensor} one-hot per ray when class_bits on [eng.]
 VEL_SCALE = 1000.0        # px/s velocity normalizer [eng.]
 OBS_CLIP = 10.0           # clip normalized obs into [-OBS_CLIP, OBS_CLIP] [eng.]
 R_CHECKPOINT = 1.0        # reward per newly latched checkpoint [eng.]
@@ -184,9 +235,75 @@ def ego_block_width(dim: int) -> int:
     return EGO_BLOCK_3D if int(dim) == 3 else 0
 
 
-def obs_dim_for(n_bodies: int, n_cp: int, dim: int) -> int:
-    """The frozen obs width for ``n_bodies`` bodies + ``n_cp`` checkpoints at ``dim``."""
-    return n_bodies * per_body_width(dim) + ego_block_width(dim) + n_cp + 1
+def proprio_width(dim: int) -> int:
+    """Pure-profile proprioception width (own velocity + own orientation)."""
+    return PROPRIO_3D if int(dim) == 3 else PROPRIO_2D
+
+
+def obs_dim_for(n_bodies: int, n_cp: int, dim: int,
+                obs_profile: str = "positions", n_ray_floats: int = 0) -> int:
+    """The frozen obs width. ``positions``/``positions+rays`` carry the global per-body
+    block (+3D ego hints); the pure ``rays`` profile carries proprioception ONLY. The
+    raycast tail (``n_ray_floats`` = n_rays * :func:`ray_stride`) is added for both rays
+    profiles — use :func:`rays_obs_width` to compute it."""
+    if obs_profile == "rays":
+        base = proprio_width(dim) + n_cp + 1
+    else:
+        base = n_bodies * per_body_width(dim) + ego_block_width(dim) + n_cp + 1
+    if obs_profile in RAYS_PROFILES:
+        base += int(n_ray_floats)
+    return base
+
+
+def n_rays_of(rays, dim: int = 2) -> int:
+    """Number of RAYS the fan/grid casts for a ``dim``-D game (``0`` when off). A 2D game
+    is a planar fan of ``n`` rays; a 3D game is an ``n_h * n_v`` depth-retina grid. Missing
+    fields fall back to :data:`DEFAULT_RAYS`. (For the obs FLOAT width, which multiplies by
+    the per-ray stride, use :func:`rays_obs_width`.)"""
+    if not rays:
+        return 0
+    try:
+        if int(dim) == 3:
+            nh = max(0, int(rays.get("n_h", DEFAULT_RAYS["n_h"])))
+            nv = max(0, int(rays.get("n_v", DEFAULT_RAYS["n_v"])))
+            return nh * nv
+        return max(0, int(rays.get("n", DEFAULT_RAYS["n"])))
+    except (TypeError, ValueError, AttributeError):
+        return 0
+
+
+def ray_stride(rays) -> int:
+    """Floats a single ray contributes to the obs: the normalized distance, plus a
+    {static, dynamic, sensor} class one-hot (``RAY_CLASS_BITS``) when ``class_bits`` is on
+    (default, matching the FPS reference's class channel). ``1`` when class bits are off."""
+    if not rays:
+        return 1
+    try:
+        return 1 + (RAY_CLASS_BITS if rays.get("class_bits", DEFAULT_RAYS["class_bits"])
+                    else 0)
+    except (TypeError, AttributeError):
+        return 1
+
+
+def rays_obs_width(rays, dim: int = 2) -> int:
+    """Total raycast floats appended to the obs tail: ``n_rays * ray_stride`` (``0`` off)."""
+    return n_rays_of(rays, dim) * ray_stride(rays)
+
+
+def normalize_rays(rays) -> dict | None:
+    """Fill the opt-in raycast config with the :data:`DEFAULT_RAYS` [eng.] defaults (the
+    2D-fan params, the 3D-grid params, and range) so the serve host and the Python obs
+    sizer agree on every field. None/empty -> None (rays off)."""
+    if not rays:
+        return None
+    out = dict(DEFAULT_RAYS)
+    try:
+        for k in out:
+            if k in rays:
+                out[k] = rays[k]
+    except TypeError:
+        return None
+    return out
 
 
 def _world_extents(world_size) -> tuple[float, float, float]:
@@ -199,7 +316,8 @@ def _world_extents(world_size) -> tuple[float, float, float]:
 
 def build_obs_vector(obs_state: dict, latched: dict, body_order: list[str],
                      cp_keys: list[str], world_size, tick: int,
-                     horizon: int, dim: int | None = None) -> np.ndarray:
+                     horizon: int, dim: int | None = None,
+                     rays=None, obs_profile: str = "positions") -> np.ndarray:
     """Pure obs-vector builder (see the module docstring for the layout). Kept a
     free function so the layout can be unit-tested without a serve subprocess.
 
@@ -207,7 +325,19 @@ def build_obs_vector(obs_state: dict, latched: dict, body_order: list[str],
     from ``obs_state`` (so a 2D state yields the byte-identical legacy vector); the
     envs pass their frozen ``_dim`` explicitly. When ``dim`` is given, the first
     present body's pos arity is asserted to match it — a game may not change
-    dimension mid-run."""
+    dimension mid-run.
+
+    ``obs_profile`` selects the vector BODY: ``"positions"`` (default; the global
+    per-body block + 3D ego hints — byte-for-byte today's vector), or ``"rays"`` (the
+    PURE profile: proprioception ONLY — own velocity + own orientation — no global
+    positions of other bodies, no ego block). ``"positions+rays"`` is ``"positions"``
+    with the raycast tail.
+
+    ``rays`` (opt-in) is the frame's already-normalized egocentric raycast list. When
+    ``None`` the vector carries no tail; when a list, its floats are appended at the
+    VERY END (after the cp one-hot + tick), never disturbing the frozen offsets ahead of
+    them. Ray values are in ``[0,1]`` (``1.0`` = nothing within range) so the
+    ``[-OBS_CLIP, OBS_CLIP]`` clip is a no-op on them."""
     obs_state = obs_state or {}
     latched = latched or {}
     if dim is None:
@@ -221,10 +351,19 @@ def build_obs_vector(obs_state: dict, latched: dict, body_order: list[str],
                 f"obs pos arity {arity} != pinned dim {dim}: a game may not change "
                 f"dimension mid-run")
     w, h, d = _world_extents(world_size)
-    if dim == 3:
-        return _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d,
-                             tick, horizon)
-    return _build_obs_2d(obs_state, latched, body_order, cp_keys, w, h, tick, horizon)
+    if obs_profile == "rays":
+        vec = _build_obs_pure(obs_state, latched, body_order, cp_keys, tick, horizon, dim)
+    elif dim == 3:
+        vec = _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d,
+                            tick, horizon)
+    else:
+        vec = _build_obs_2d(obs_state, latched, body_order, cp_keys, w, h, tick,
+                            horizon)
+    if rays is not None:
+        rv = np.asarray(rays, dtype=np.float32).reshape(-1)
+        np.clip(rv, -OBS_CLIP, OBS_CLIP, out=rv)
+        vec = np.concatenate([vec, rv])
+    return vec
 
 
 def _build_obs_2d(obs_state, latched, body_order, cp_keys, w, h, tick, horizon):
@@ -276,6 +415,20 @@ def _orientation_quat(q) -> tuple[float, float, float, float]:
     if wq < 0.0:                                         # canonicalize the q/-q cover
         x, y, z, wq = -x, -y, -z, -wq
     return (x, y, z, wq)
+
+
+def _controlled_body(obs_state, body_order):
+    """The controlled body's dict (first with the ``controlled`` flag), else the first
+    present body, else None — the proprioception source for the pure ``rays`` profile."""
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is not None and q.get("controlled"):
+            return q
+    for name in body_order:
+        q = obs_state.get(name)
+        if q is not None:
+            return q
+    return None
 
 
 def _controlled_pos(obs_state, body_order) -> tuple[float, float, float]:
@@ -380,6 +533,42 @@ def _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d, tick, horizo
         vec[i + 3] = (tgt[2] - cz) / d
     i += EGO_SLOT
 
+    for key in cp_keys:                                  # latched one-hot
+        vec[i] = 1.0 if latched.get(key) is not None else 0.0
+        i += 1
+    vec[i] = min(1.0, tick / float(horizon))             # normalized tick
+    np.clip(vec, -OBS_CLIP, OBS_CLIP, out=vec)
+    return vec
+
+
+def _build_obs_pure(obs_state, latched, body_order, cp_keys, tick, horizon, dim):
+    """The PURE ``rays`` profile body: proprioception of the CONTROLLED body only (own
+    velocity + own orientation — NO global position, NO other bodies), then the shared cp
+    one-hot + tick tail. The raycast grid is appended by ``build_obs_vector`` after this.
+    Egocentric + honest: the agent knows how it is moving/pointing and sees the world only
+    through the rays (Elias' honest profile), never through absolute coordinates."""
+    pw = proprio_width(dim)
+    obs_dim = pw + len(cp_keys) + 1
+    vec = np.zeros(obs_dim, dtype=np.float32)
+    q = _controlled_body(obs_state, body_order)
+    if q is not None:
+        vx, vy, vz = _vec3(q.get("vel"))
+        if dim == 3:
+            qx, qy, qz, qw = _orientation_quat(q)
+            vec[0] = vx / VEL_SCALE
+            vec[1] = vy / VEL_SCALE
+            vec[2] = vz / VEL_SCALE
+            vec[3] = qx
+            vec[4] = qy
+            vec[5] = qz
+            vec[6] = qw
+        else:
+            ang = _finite(q.get("angle", 0.0))
+            vec[0] = vx / VEL_SCALE
+            vec[1] = vy / VEL_SCALE
+            vec[2] = math.sin(ang)
+            vec[3] = math.cos(ang)
+    i = pw
     for key in cp_keys:                                  # latched one-hot
         vec[i] = 1.0 if latched.get(key) is not None else 0.0
         i += 1

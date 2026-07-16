@@ -348,6 +348,135 @@ def test_obs_dim_for_and_detect_dim_helpers():
 
 
 # ======================================================================== #
+# 1c. Egocentric raycast obs TAIL (opt-in; appended AFTER the frozen blocks)
+# ======================================================================== #
+def test_rays_n_helper():
+    assert rlenv.n_rays_of(None) == 0
+    assert rlenv.n_rays_of({}) == 0
+    # 2D game -> planar fan of n rays
+    assert rlenv.n_rays_of({"n": 12, "fov_deg": 120, "range": 900}, 2) == 12
+    assert rlenv.n_rays_of({"n": 0}, 2) == 0
+    assert rlenv.n_rays_of({"n": -3}, 2) == 0              # clamped to >= 0
+    # 3D game -> n_h * n_v grid (the depth retina)
+    assert rlenv.n_rays_of({"n_h": 9, "n_v": 5}, 3) == 45
+    assert rlenv.n_rays_of({"n_h": 4, "n_v": 3}, 3) == 12
+    # missing grid fields fall back to DEFAULT_RAYS (25x5), non-empty config stays on
+    assert rlenv.n_rays_of({"range": 100}, 3) == rlenv.DEFAULT_RAYS["n_h"] * rlenv.DEFAULT_RAYS["n_v"]
+    assert rlenv.DEFAULT_RAYS["n_h"] == 25                 # reference wide sensor default
+
+
+def test_ray_stride_and_obs_width():
+    # class bits on (default) -> distance + {static,dynamic,sensor} one-hot = 4 floats/ray
+    assert rlenv.ray_stride({"class_bits": True}) == 1 + rlenv.RAY_CLASS_BITS == 4
+    assert rlenv.ray_stride({"class_bits": False}) == 1
+    assert rlenv.ray_stride(None) == 1
+    assert rlenv.ray_stride({}) == 1                        # empty -> off
+    # 3D grid 25x5 with class bits -> 125 rays * 4 = 500 obs floats
+    r = {"n_h": 25, "n_v": 5, "class_bits": True}
+    assert rlenv.n_rays_of(r, 3) == 125
+    assert rlenv.rays_obs_width(r, 3) == 500
+    # class off -> 1 float/ray
+    assert rlenv.rays_obs_width({"n_h": 25, "n_v": 5, "class_bits": False}, 3) == 125
+    # 2D fan n=16, class off -> 16 floats
+    assert rlenv.rays_obs_width({"n": 16, "class_bits": False}, 2) == 16
+
+
+def test_normalize_rays_fills_defaults():
+    assert rlenv.normalize_rays(None) is None
+    assert rlenv.normalize_rays({}) is None                # empty -> off
+    r = rlenv.normalize_rays({"n_h": 7})
+    assert r["n_h"] == 7 and r["n_v"] == rlenv.DEFAULT_RAYS["n_v"]
+    assert r["range"] == rlenv.DEFAULT_RAYS["range"]
+    assert r["class_bits"] is True                         # reference default carried in
+
+
+def test_obs_dim_for_profiles():
+    # positions (default) unchanged; positions+rays adds the ray-float tail; rays is
+    # proprio-only. The last arg is the tail FLOAT count (rays_obs_width), not ray count.
+    assert rlenv.obs_dim_for(3, 2, 3) == 3 * rlenv.PER_BODY_3D + rlenv.EGO_BLOCK_3D + 2 + 1
+    assert rlenv.obs_dim_for(3, 2, 3, "positions+rays", 500) == \
+        3 * rlenv.PER_BODY_3D + rlenv.EGO_BLOCK_3D + 2 + 1 + 500
+    assert rlenv.obs_dim_for(3, 2, 3, "rays", 500) == rlenv.PROPRIO_3D + 2 + 1 + 500
+    assert rlenv.obs_dim_for(3, 2, 2, "rays", 16) == rlenv.PROPRIO_2D + 2 + 1 + 16
+
+
+def test_pure_rays_profile_is_proprioception_only():
+    """The pure 'rays' profile carries own velocity + own orientation (+ cp + tick + ray
+    tail) and NO global positions of any body."""
+    body = ["glider", "ring_1"]
+    cp = ["threaded_ring_1"]
+    ws = (800, 600)
+    s = {"glider": {"pos": [123, 456, 789], "vel": [100, -200, 311], "angle": 0.0,
+                    "controlled": True},
+         "ring_1": {"pos": [701, 71, 555], "vel": [0, 0, 0], "static": True,
+                    "controlled": False}}
+    rays = [1.0, 0.5, 0.25]
+    v = build_obs_vector(s, {"threaded_ring_1": None}, body, cp, ws, 30, 300,
+                         dim=3, rays=rays, obs_profile="rays")
+    assert v.shape[0] == rlenv.obs_dim_for(2, 1, 3, "rays", len(rays))
+    # proprioception: own vel (normalized), then quaternion (identity here: qw=1)
+    assert v[0] == pytest.approx(100 / rlenv.VEL_SCALE)
+    assert v[2] == pytest.approx(311 / rlenv.VEL_SCALE)
+    assert v[6] == pytest.approx(1.0)                       # qw of identity yaw
+    # NO absolute position of ANY body leaks into the pure profile.
+    for bad in (123 / 800, 456 / 600, 789 / max(ws), 701 / 800, 71 / 600, 555 / max(ws)):
+        assert not np.any(np.isclose(v, bad)), f"leaked global position {bad}"
+    # cp one-hot + tick sit right after proprio, rays are the tail
+    assert v[rlenv.PROPRIO_3D] == 0.0                       # unlatched cp
+    assert v[rlenv.PROPRIO_3D + 1] == pytest.approx(30 / 300)  # tick
+    assert np.allclose(v[-len(rays):], rays)
+
+
+def test_rays_absent_is_byte_for_byte_the_no_rays_vector():
+    """rays=None must leave the obs byte-identical to today (2D AND 3D)."""
+    body = ["ball", "goal"]
+    cp = ["at_goal"]
+    ws = (800, 600)
+    s2 = {"ball": {"pos": [100, 200], "vel": [10, 20], "angle": 0.5,
+                   "controlled": True},
+          "goal": {"pos": [700, 70], "vel": [0, 0], "angle": 0.0,
+                   "static": True, "controlled": False}}
+    a = build_obs_vector(s2, {"at_goal": None}, body, cp, ws, 5, 300, dim=2)
+    b = build_obs_vector(s2, {"at_goal": None}, body, cp, ws, 5, 300, dim=2, rays=None)
+    assert a.tobytes() == b.tobytes()
+    s3 = {"ball": {"pos": [100, 200, 50], "vel": [10, 20, 5], "angle": 0.5,
+                   "controlled": True},
+          "goal": {"pos": [700, 70, 90], "vel": [0, 0, 0], "static": True,
+                   "controlled": False}}
+    c = build_obs_vector(s3, {"at_goal": None}, body, cp, ws, 5, 300, dim=3)
+    d = build_obs_vector(s3, {"at_goal": None}, body, cp, ws, 5, 300, dim=3, rays=None)
+    assert c.tobytes() == d.tobytes()
+
+
+def test_rays_appended_after_all_blocks_2d_and_3d():
+    """A rays list is appended at the VERY END (after the cp one-hot + tick), so the
+    per-body block and the cp/tick tail keep their frozen offsets."""
+    body = ["ball", "goal"]
+    cp = ["at_goal"]
+    ws = (800, 600)
+    rays = [1.0, 0.5, 0.25, 1.0]
+    s2 = {"ball": {"pos": [100, 200], "vel": [10, 20], "angle": 0.5,
+                   "controlled": True},
+          "goal": {"pos": [700, 70], "vel": [0, 0], "static": True,
+                   "controlled": False}}
+    base2 = build_obs_vector(s2, {"at_goal": None}, body, cp, ws, 5, 300, dim=2)
+    v2 = build_obs_vector(s2, {"at_goal": None}, body, cp, ws, 5, 300, dim=2, rays=rays)
+    assert v2.shape[0] == base2.shape[0] + len(rays)
+    assert np.array_equal(v2[:base2.shape[0]], base2)       # prefix untouched
+    assert np.allclose(v2[-len(rays):], rays)
+    s3 = {"ball": {"pos": [100, 200, 50], "vel": [10, 20, 5], "angle": 0.5,
+                   "controlled": True},
+          "goal": {"pos": [700, 70, 90], "vel": [0, 0, 0], "static": True,
+                   "controlled": False}}
+    base3 = build_obs_vector(s3, {"at_goal": None}, body, cp, ws, 5, 300, dim=3)
+    v3 = build_obs_vector(s3, {"at_goal": None}, body, cp, ws, 5, 300, dim=3, rays=rays)
+    assert v3.shape[0] == base3.shape[0] + len(rays)
+    assert np.array_equal(v3[:base3.shape[0]], base3)
+    assert np.allclose(v3[-len(rays):], rays)
+    assert v3.dtype == np.float32
+
+
+# ======================================================================== #
 # 2. Serve-mode protocol tests (skipif node/planck absent)
 # ======================================================================== #
 @requires_serve
