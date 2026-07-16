@@ -303,8 +303,13 @@ func _rebuild(world_seed: int) -> String:
 	# forbids the unseeded global randi/randf/randomize, so a self-seeded generator is
 	# the sanctioned path -- and its RigidBody2D children join the world's physics space
 	# by tree membership. The host hands it nothing but that membership + the seed.
-	# build() may raise inside generated code; a bad build surfaces as an error frame
-	# rather than crashing the host.
+	# RUNTIME ERRORS: GDScript has NO catchable exceptions, so a build() that hits a
+	# runtime fault (null deref, bad call) does NOT raise here -- the engine prints a
+	# `SCRIPT ERROR: ... at: build (gdscript://...:LINE)` block to stderr and the call
+	# just aborts, leaving a half-built world. We therefore CANNOT surface it as an
+	# error frame in-process; the Python spawner mines the tee'd stderr DELTA per op
+	# (harness/verify/gd_exec.parse_runtime_errors + read_stderr_delta) and attaches the
+	# real cause python-side (run_check overrides build.ok, run_batch sets rec.error).
 	inst.build(world_seed)
 	_game = inst
 	# Capture the declared action set + world size, and pre-register every checkpoint
@@ -952,6 +957,11 @@ func _frame_json(with_handshake: bool, margin: float, frames_json := "") -> Stri
 	var frames_part := ""
 	if frames_json != "":
 		frames_part = ',"frames":%s' % frames_json
+	# "error":null is hardcoded: a runtime SCRIPT ERROR inside the generated act()
+	# aborts the call without raising, so it is undetectable in-process. The Python
+	# executor attaches the real cause per-episode from the tee'd stderr delta
+	# (harness/verify/gd_exec: run_batch sets rec.error). Keeping the wire byte stable
+	# preserves single-instance byte-identity on clean runs.
 	return ('{%s"obs_state":%s,"checkpoints":%s,"tick":%d,"result":%s,'
 		+ '"done_term":%s,"done_trunc":%s,"world_size":[%s,%s],'
 		+ '"nan":%s,"oob":[%s]%s,"error":null}') % [
@@ -1070,6 +1080,11 @@ func _op_check(msg: Dictionary) -> String:
 
 	# 3. Build the scene (fresh, seed 0), then probe t=0. The game self-seeds from
 	# build()'s seed; the host only grants tree membership.
+	# NB: build.ok is reported optimistically here -- a runtime crash inside build()
+	# does not raise in GDScript, so this line runs regardless. The AUTHORITATIVE
+	# build-ok is set python-side: run_check reads the stderr delta for a `build`-scoped
+	# SCRIPT ERROR and overrides this to {ok:false} so a crashed build() stops
+	# masquerading as a downstream "no controlled body" symptom.
 	await process_frame
 	root.add_child(inst)
 	inst.build(0)

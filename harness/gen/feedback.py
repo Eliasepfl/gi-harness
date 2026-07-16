@@ -46,6 +46,16 @@ The taxonomy (one directive-producing row per defect; every other outcome yields
                               detector never triggers). Repair: make failure triggerable.
     * has_pressure / other -> NO directive (a reachable failure was witnessed; healthy).
 
+  RUNTIME ERROR (gdscript verify-lane stderr capture, gd_exec.parse_runtime_errors) —
+  read from ``oracle_results["runtime_error"]`` (extract from a verify report with
+  :func:`runtime_error_finding`):
+    * a SCRIPT ERROR record   -> `runtime_error`: names the exact crash site
+                                 (``<method>() crashes at line N: <message>``). DEFECT,
+                                 proof-carrying (file:line + message). Compiled FIRST —
+                                 a mid-episode crash is the root cause behind any
+                                 downstream G0/G1 symptom.
+    * no record / clean       -> NO directive (the game ran to completion).
+
 PURE and deterministic: identical oracle dicts -> identical directives (same order, same
 fingerprints). No I/O, no network, no torch — the whole taxonomy is offline-testable.
 """
@@ -385,20 +395,76 @@ def pressure_finding(verify_report: dict) -> dict:
 
 
 # ======================================================================== #
+# RUNTIME ERROR (verify-lane stderr capture) -> directive
+# ======================================================================== #
+# A generated game that PARSES but CRASHES AT RUNTIME (a null deref in act(), a
+# build() that raises) is the ROOT defect the funnel would otherwise misreport as a
+# downstream symptom ("no controlled body", "dead action"). The gdscript verify lane
+# mines the tee'd Godot stderr (harness/verify/gd_exec.parse_runtime_errors) and
+# stashes the first SCRIPT ERROR record on the report as ``runtime_error``. It is
+# DEFECT-severity and PROOF-CARRYING: a file:line + message reproducer the model can be
+# held to (like single_action_win / softlock, unlike the dropped heuristic `stuck`).
+def _compile_runtime_error(rte) -> list:
+    """Compile the ``runtime_error`` finding (a parsed SCRIPT ERROR record) into a repair
+    directive naming the exact crash site. Accepts a single record dict or a list; empty
+    / falsy -> no directive. Fingerprint keys on the crash LOCATION (method@line) so a
+    crash that MOVES after a fix is a distinct defect (progress), while the SAME crash
+    recompiling to the same fingerprint trips the convergence guard (REPAIR_STALLED)."""
+    if not rte:
+        return []
+    rec = rte[0] if isinstance(rte, (list, tuple)) else rte
+    if not rec:
+        return []
+    method = rec.get("method") or "a game method"
+    line = rec.get("line")
+    message = rec.get("message") or "runtime script error"
+    kind = rec.get("kind") or "runtime"
+    where = f"line {line}" if line is not None else "an unknown line"
+    verb = "hits a parse error" if kind == "parse" else "crashes"
+    text = (
+        f"RUNTIME CRASH — {method}() {verb} at {where}: {message}. The engine aborted "
+        f"the call mid-episode (GDScript has no exceptions, so the call silently did "
+        f"nothing and the game misreports downstream — a dead action or a missing body). "
+        f"Fix the null / uninitialised value at that line: guard it (check for null "
+        f"before use), initialise it in build(), or correct the call so {method}() runs "
+        f"to completion every tick. Keep the goal and the intended play intact.")
+    loc = f"{method}@{line}"
+    return [Directive(source="runtime_error", origin="runtime", checkpoint_keys=(),
+                      text=text, fingerprint=_fingerprint("runtime_error", [loc]),
+                      detail={"method": method, "line": line, "message": message,
+                              "kind": kind})]
+
+
+def runtime_error_finding(verify_report: dict) -> dict:
+    """Pull the machine-readable ``runtime_error`` record off a verify report (the
+    gdscript lane stashes it at ``report["runtime_error"]`` when a build/act crash was
+    captured from stderr). Returns ``{}`` when the game did not crash — a one-line bridge
+    for the harden driver (``oracle_results["runtime_error"] = runtime_error_finding(rep)``)
+    that keeps this compiler PURE."""
+    try:
+        return dict((verify_report or {}).get("runtime_error") or {})
+    except Exception:
+        return {}
+
+
+# ======================================================================== #
 # Public API
 # ======================================================================== #
 def compile_directives(oracle_results: dict) -> list:
     """Map post-cert oracle outcomes onto personalized repair :class:`Directive`s.
 
-    ``oracle_results`` carries optional ``"g4"`` (a `run_g4` report), ``"pressure"``
-    (a failure-witness finding — see :func:`pressure_finding`) and ``"g3_prime"`` (a
-    `g3_prime` result) dicts. Returns the directives to feed the revise loop — G4
-    (broken-game shapes) first, then PRESSURE (no stakes), then G3' (learnability) —
-    deduplicated by fingerprint. An empty list means either a CLEAN game or a
-    still-progressing G3' run (see :func:`continue_training`)."""
+    ``oracle_results`` carries optional ``"runtime_error"`` (a captured SCRIPT ERROR
+    record — see :func:`runtime_error_finding`), ``"g4"`` (a `run_g4` report),
+    ``"pressure"`` (a failure-witness finding — see :func:`pressure_finding`) and
+    ``"g3_prime"`` (a `g3_prime` result) dicts. Returns the directives to feed the revise
+    loop — RUNTIME CRASH (the root defect) first, then G4 (broken-game shapes), then
+    PRESSURE (no stakes), then G3' (learnability) — deduplicated by fingerprint. An empty
+    list means either a CLEAN game or a still-progressing G3' run (see
+    :func:`continue_training`)."""
     oracle_results = oracle_results or {}
     directives, seen = [], set()
-    for d in (_compile_g4(oracle_results.get("g4") or {})
+    for d in (_compile_runtime_error(oracle_results.get("runtime_error") or {})
+              + _compile_g4(oracle_results.get("g4") or {})
               + _compile_pressure(oracle_results.get("pressure") or {})
               + _compile_g3(oracle_results.get("g3_prime") or {})):
         if d.fingerprint in seen:
