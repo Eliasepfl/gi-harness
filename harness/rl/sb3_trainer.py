@@ -132,6 +132,8 @@ def _build_callback_cls():
             self.steps_to_first_success = None
             self.updates = 0
             self.best_return = -1e9
+            self.best_latched = -1e9        # plateau also tracks checkpoint + success progress
+            self.best_success_smoothed = -1e9  # (PBRS makes episodic RETURN flat — see below)
             self.best_success = 0.0
             self.updates_since_best = 0
             self.stopped_early = False
@@ -186,12 +188,31 @@ def _build_callback_cls():
             self.curve_success.append(round(succ, 3))
             self.best_success = max(self.best_success, succ)
 
-            # Plateau on the SMOOTHED mean return (rolling mean over plateau_window
-            # updates) — a single lucky update no longer freezes `best` (== ppo.py).
+            # Plateau on SMOOTHED PROGRESS (rolling mean over plateau_window updates). We treat
+            # a new best in the episodic RETURN, the mean LATCHED-checkpoint count, OR the
+            # success rate as "still improving" and reset the patience counter. Keying on return
+            # ALONE breaks under POTENTIAL-BASED shaping: PBRS is discounted-neutral, so a
+            # non-winning episode's return is ~0 and the return curve stays FLAT until a win —
+            # which would trip the plateau (and stop training) while the policy is still climbing
+            # the checkpoint ladder. Latched/success rise as the policy makes real progress, so
+            # the combined signal keeps a genuinely-improving run alive; a truly stuck run (no
+            # return, no new checkpoints, no wins) still plateaus and stops.
             window = self.hp["plateau_window"]
+            min_delta = self.hp["min_delta"]
             smoothed = float(np.mean(self.curve_return[-window:]))
-            if smoothed > self.best_return + self.hp["min_delta"]:
+            smoothed_lat = float(np.mean(self.curve_latched[-window:]))
+            smoothed_succ = float(np.mean(self.curve_success[-window:]))
+            improved = False
+            if smoothed > self.best_return + min_delta:
                 self.best_return = smoothed
+                improved = True
+            if smoothed_lat > self.best_latched + min_delta:
+                self.best_latched = smoothed_lat
+                improved = True
+            if smoothed_succ > self.best_success_smoothed + min_delta:
+                self.best_success_smoothed = smoothed_succ
+                improved = True
+            if improved:
                 self.updates_since_best = 0
             else:
                 self.updates_since_best += 1
@@ -202,23 +223,32 @@ def _build_callback_cls():
             # competence. A crash in eval must not kill training (skip, log).
             if self.best_model_path is not None and self._eval_fn is not None \
                     and self.updates % self._eval_freq_updates == 0:
+                # Save/restore the global torch RNG around the eval: sample_episode reseeds
+                # torch (for reproducible sampled rollouts), which would otherwise perturb the
+                # trainer's own action sampling and change the run. This keeps the eval a pure
+                # OBSERVER of training.
+                _rng = torch.get_rng_state()
                 try:
                     ev = self._eval_fn(self.model) or {}
                     g = float(ev.get("greedy_sr", 0.0))
                     s = float(ev.get("stochastic_sr", 0.0))
                 except Exception as exc:  # noqa: BLE001
+                    g = s = None
                     if self._log is not None:
                         self._log(f"  [best-ckpt] eval skipped: {type(exc).__name__}: {exc}")
-                else:
-                    if (g, s) > self.best_ckpt_score and (g > 0.0 or s > 0.0):
+                finally:
+                    torch.set_rng_state(_rng)
+                if g is not None:
+                    new_best = (g, s) > self.best_ckpt_score and (g > 0.0 or s > 0.0)
+                    if new_best:
                         self.best_ckpt_score = (g, s)
                         self.best_ckpt_greedy, self.best_ckpt_stochastic = g, s
                         self.best_ckpt_update = self.updates
                         self.model.save(self.best_model_path)   # SB3 .zip snapshot
                         self.best_ckpt_saved = True
-                        if self._log is not None:
-                            self._log(f"  [best-ckpt] upd {self.updates}: new best greedy={g:.2f} "
-                                      f"stochastic={s:.2f} -> saved")
+                    if self._log is not None:
+                        self._log(f"  [best-ckpt] upd {self.updates} eval greedy={g:.2f} "
+                                  f"stochastic={s:.2f}" + (" -> SAVED new best" if new_best else ""))
 
             if self._log is not None:
                 sps = int(self.num_timesteps / max(1e-6, time.time() - self._t0))
