@@ -179,6 +179,12 @@ def _run_oracles(game_path, source, *, engine, tiers, stale, run_g3, budget_step
     if run_g3 and isinstance(report, dict) and report.get("passed"):
         oracle["g3_prime"] = g3_fn(game_path, budget_steps=budget_steps,
                                    **(g3_kwargs or {}))
+    # WAVE 1 PRESSURE: lift the non-gating failure-witness finding stashed in the
+    # verify report into the oracle set so _compile_pressure can turn a no-stakes
+    # game into a repair directive (order in the compiler: G4 -> PRESSURE -> G3').
+    pressure = feedback.pressure_finding(report)
+    if pressure:
+        oracle["pressure"] = pressure
     oracle["_verify"] = report
     return oracle
 
