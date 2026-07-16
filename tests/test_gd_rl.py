@@ -34,6 +34,8 @@ from harness.verify.gd_exec import GdExecutor  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
+MINI_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect_3d.gd")
+TUMBLE_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "tumble_3d.gd")
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -207,6 +209,56 @@ def test_g3_prime_gdscript_sb3_smoke(monkeypatch):
     assert res["stochastic_success_rate"] is not None
     if res["rl_witness"] is not None:
         assert res["bridge_ok"] is True              # any witness must replay to success
+
+
+# ====================================================================== #
+# 4. TRUE-3D obs regression — the pos-unpack crash must be GONE
+# ====================================================================== #
+@requires_godot
+def test_gd_serve_env_true_3d_loads_and_steps():
+    """A true-3D `.gd` game (pos:[x,y,z]) loads through serve_game.gd and steps WITHOUT
+    the `px, py = q.get('pos')` ValueError that crashed every 3D game before the
+    dimension-aware obs. Pins env._dim == 3 and the 3D obs width."""
+    from harness.rl.env import obs_dim_for
+    env = GodotServeEnv(TUMBLE_3D, port_base=_free_port())
+    try:
+        assert env._dim == 3                             # pinned true-3D
+        obs_dim = env.observation_space.shape[0]
+        assert obs_dim == obs_dim_for(len(env._body_order), len(env._cp_keys), 3)
+        obs, info = env.reset(seed=0)
+        assert obs.shape == (obs_dim,) and obs.dtype == np.float32
+        assert np.all(np.isfinite(obs))                  # no NaN leaks from 3D physics
+        for _ in range(5):
+            o, r, term, trunc, i = env.step(0)
+            assert o.shape == (obs_dim,) and np.all(np.isfinite(o))
+            if term or trunc:
+                break
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_g3_prime_true_3d_trains_without_obs_crash(monkeypatch):
+    """The headline regression: g3_prime TRAINS a true-3D game end-to-end (the arm that
+    used to crash at the obs builder before the first learning step). A tiny budget —
+    we assert the pipeline RUNS and the dict is well-formed (not that it wins), which is
+    exactly what "the crash arm now trains" means."""
+    pytest.importorskip("stable_baselines3")
+    from harness.rl.certify import g3_prime
+
+    monkeypatch.setenv("GIP_PORT_BASE", str(_free_port()))
+    res = g3_prime(MINI_3D, budget_steps=4000, trainer="sb3", seed=0,
+                   n_eval=2, num_envs=2, num_steps=64, patience=999)
+
+    for key in ("learnable", "steps_to_first_success", "checkpoints_curve",
+                "final_success_rate", "rl_witness", "bridge_ok", "trained_steps"):
+        assert key in res, key
+    assert res["game_path"] == MINI_3D
+    assert isinstance(res["learnable"], bool)
+    assert res["trained_steps"] >= 4000 - 64 * 2
+    assert res["bridge_ok"] in (None, True)              # never a broken bridge
+    if res["rl_witness"] is not None:
+        assert res["bridge_ok"] is True
 
 
 if __name__ == "__main__":
