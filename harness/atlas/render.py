@@ -37,6 +37,8 @@ GHOST = "#d2a8ff"            # violet — GHOST reference games (hollow; geometr
 GHOST_WASH = "#1b1626"       # faint violet band behind the reference-geometry strip
 FRONTIER = "#f85149"         # red — OVER-BUDGET FRONTIER (hollow; unsolved-but-progressing)
 FRONTIER_WASH = "#2a1517"    # faint red band behind the frontier ring
+COMPLEXITY = "#e3b341"       # gold — the L1 STRUCTURAL-COMPLEXITY panel (opt-in, additive)
+COMPLEXITY_WASH = "#241d10"  # faint gold band behind the complexity strip
 
 # Candidate numeric axes, in a FIXED tie-break priority (most behaviourally meaningful
 # first). Discrimination is measured on the data; ties fall back to this order.
@@ -301,7 +303,25 @@ _AXIS_AREA = 56                   # x-ticks + x-axis label below the plot
 _LEGEND_W = 300                   # right-margin legend column
 _FRONTIER_BAND_W = 82             # width of the off-map frontier ring (right of the plot)
 _GHOST_STRIP_H = 140              # height of the reference-geometry strip (below the plot)
+_COMPLEXITY_STRIP_H = 158         # height of the opt-in L1 complexity strip (below the plot)
 _FONT = "'SFMono-Regular','Consolas','Liberation Mono',monospace"
+
+# The L1 complexity descriptors surfaced by the opt-in panel (measurement, not steering).
+_COMPLEXITY_KEYS = ("n_mechanics", "structural_sections", "gating_depth", "autonomous_bodies")
+_COMPLEXITY_SHORT = {"n_mechanics": "mech", "structural_sections": "sections",
+                     "gating_depth": "gating", "autonomous_bodies": "autonomous"}
+
+
+def _complexity_present(row):
+    """True when a row carries at least one non-null L1 complexity descriptor."""
+    d = _desc(row)
+    return any(_num(d.get(k)) is not None for k in _COMPLEXITY_KEYS)
+
+
+def _complexity_score(row):
+    """A simple additive richness score (nulls -> 0) used ONLY to rank the panel."""
+    d = _desc(row)
+    return sum((_num(d.get(k)) or 0) for k in _COMPLEXITY_KEYS)
 
 
 def _color_for_dim(dim):
@@ -437,7 +457,56 @@ def _draw_ghost_strip(S, rows, ghosts, px0, px1, pw, sy0, sh):
                  f'{max(gh_nodes) if gh_nodes else 0} authored scene nodes</text>')
 
 
-def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, frontier=None):
+def _draw_complexity_strip(S, rows, px0, px1, pw, sy0, sh):
+    """The opt-in L1 STRUCTURAL-COMPLEXITY panel: a compact table of the deterministic
+    complexity descriptors (interaction density, spatial partitions, gating depth,
+    autonomous bodies), certified games ranked richest-first. Pure MEASUREMENT — an
+    instrumentation read-out, never a steering surface. Additive: only drawn when
+    explicitly requested and at least one row carries a complexity descriptor."""
+    present = [r for r in rows if _complexity_present(r)]
+    S.append(f'<rect x="{px0}" y="{sy0:.1f}" width="{pw}" height="{sh:.1f}" '
+             f'fill="{COMPLEXITY_WASH}" stroke="{COMPLEXITY}" stroke-opacity="0.4" '
+             f'stroke-width="1" stroke-dasharray="4 3"/>')
+    S.append(f'<text x="{px0 + 10}" y="{sy0 + 15:.1f}" fill="{COMPLEXITY}" font-size="11" '
+             f'font-weight="bold">STRUCTURAL COMPLEXITY (L1) — deterministic measurement, '
+             f'not steering · richest first</text>')
+    # column x-anchors (monospace table)
+    cx_dia, cx_name = px0 + 18, px0 + 30
+    cx_mech, cx_sec, cx_gate, cx_auto = (px0 + 250, px0 + 340, px0 + 430, px0 + 540)
+    S.append(f'<text x="{cx_name}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold">game</text>'
+             f'<text x="{cx_mech + 20}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold" text-anchor="end">mechanics</text>'
+             f'<text x="{cx_sec + 20}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold" text-anchor="end">sections</text>'
+             f'<text x="{cx_gate + 20}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold" text-anchor="end">gating</text>'
+             f'<text x="{cx_auto + 20}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold" text-anchor="end">autonomous</text>')
+    ranked = sorted(present, key=lambda r: (-_complexity_score(r), r.get("slug") or ""))
+    ry = sy0 + 44
+    for r in ranked[:7]:
+        d = _desc(r)
+        S.append(_diamond(cx_dia, ry - 3, 4.5, COMPLEXITY, width=1.6))
+        S.append(f'<text x="{cx_name}" y="{ry:.1f}" fill="{TEXT}" font-size="9">'
+                 f'{_esc(_short_slug(r.get("slug"), 26))}</text>')
+        for cx, key in ((cx_mech, "n_mechanics"), (cx_sec, "structural_sections"),
+                        (cx_gate, "gating_depth"), (cx_auto, "autonomous_bodies")):
+            S.append(f'<text x="{cx + 20}" y="{ry:.1f}" fill="{MUTED}" font-size="9" '
+                     f'text-anchor="end">{_fmt_num(_num(d.get(key)))}</text>')
+        ry += 13
+    # footer: name the structurally richest & poorest certified games
+    if ranked:
+        rich = ranked[0].get("slug")
+        poor = ranked[-1].get("slug")
+        S.append(f'<text x="{px0 + 10}" y="{sy0 + sh - 8:.1f}" fill="{TEXT}" font-size="9" '
+                 f'fill-opacity="0.92">richest: {_esc(_short_slug(rich, 22))} · '
+                 f'poorest: {_esc(_short_slug(poor, 22))} · n={len(present)} certified '
+                 f'games carry L1 descriptors</text>')
+
+
+def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, frontier=None,
+               complexity_panel=False):
     ghosts = list(ghosts or [])
     frontier = list(frontier or [])
     has_gh, has_fr = bool(ghosts), bool(frontier)
@@ -456,7 +525,13 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     gs_h = _GHOST_STRIP_H if has_gh else 0
     legend_x = px1 + 26
     W = legend_x + _LEGEND_W + 20
-    H = (gs_y + gs_h + 24) if has_gh else int(py1 + _AXIS_AREA + 24)
+    # Opt-in L1 complexity strip: reserve space + grow the canvas ONLY when requested and
+    # some row actually carries a complexity descriptor (additive — never shifts the map).
+    has_cx = bool(complexity_panel) and any(_complexity_present(r) for r in rows)
+    _below = (gs_y + gs_h) if has_gh else (py1 + _AXIS_AREA)
+    cx_y = _below + 16
+    cx_h = _COMPLEXITY_STRIP_H if has_cx else 0
+    H = int((cx_y + cx_h + 24) if has_cx else (_below + 24))
 
     def sx(x):
         return px0 + (x - xb[0]) / (xb[1] - xb[0]) * pw
@@ -553,6 +628,9 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     # Optional reference-geometry strip (below the plot).
     if has_gh:
         _draw_ghost_strip(S, rows, ghosts, px0, px1, pw, gs_y, gs_h)
+    # Optional L1 complexity strip (below the ghost strip / axis area).
+    if has_cx:
+        _draw_complexity_strip(S, rows, px0, px1, pw, cx_y, cx_h)
 
     # Legend / stats panel (right margin), laid out top-down with a running cursor.
     lx = legend_x
@@ -624,12 +702,15 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     return "\n".join(S)
 
 
-def render_atlas(rows, out_svg_path=None, *, n_bins=6, ghosts=None, frontier=None):
+def render_atlas(rows, out_svg_path=None, *, n_bins=6, ghosts=None, frontier=None,
+                 complexity_panel=False):
     """The public entry point. Selects axes, computes the grid + coverage over the
     CERTIFIED ``rows``, renders the SVG (written to ``out_svg_path`` if given), and
     returns a summary dict. ``ghosts`` (geometry-only reference games) and ``frontier``
     (unsolved-but-progressing games) are OVERLAYS — they render as their own distinct
-    marker classes and never contribute to the coverage math.
+    marker classes and never contribute to the coverage math. ``complexity_panel``
+    (opt-in, default off) adds the additive L1 STRUCTURAL-COMPLEXITY strip below the
+    map WITHOUT touching axis selection or the existing layout.
 
     Returns ``{axes, size_axis, coverage, n_cells, n_colonized, n_placed, n_unplaced,
     n_ghosts, n_frontier, empty_cells, axis_scores, svg}``."""
@@ -638,7 +719,8 @@ def render_atlas(rows, out_svg_path=None, *, n_bins=6, ghosts=None, frontier=Non
     x_key, y_key, size_key, scores = select_axes(rows, n_bins=n_bins)
     grid_info = compute_grid(rows, x_key, y_key, n_bins=n_bins)
     svg = (render_svg(rows, x_key, y_key, size_key, grid_info, scores,
-                      ghosts=ghosts, frontier=frontier) if x_key and y_key else "")
+                      ghosts=ghosts, frontier=frontier,
+                      complexity_panel=complexity_panel) if x_key and y_key else "")
     if out_svg_path and svg:
         with open(out_svg_path, "w", encoding="utf-8") as fh:
             fh.write(svg)

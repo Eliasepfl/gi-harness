@@ -485,5 +485,202 @@ def test_render_includes_both_legend_classes(tmp_path):
     assert summary.get("n_frontier") == 1
 
 
+# ================================================================ L1 COMPLEXITY
+def _with_efficacy(rep, effect, dead=()):
+    """Attach a G1_rollout action-efficacy check (the real gate shape) to a report."""
+    rep.setdefault("layers", {})["G1_rollout"] = {
+        "passed": True,
+        "checks": {"efficacy": {"pass": not dead, "dead": list(dead),
+                                "effect": dict(effect), "contexts": 1}}}
+    return rep
+
+
+# ---- n_mechanics: distinct live world-effects from the G1 efficacy map ----
+def test_n_mechanics_counts_distinct_live_effects():
+    # left/right share a divergence signature (mirror controls -> ONE system); thrust is
+    # distinct; grab is an unbounded/body-set change (None) -> its own signature; idle is
+    # dead -> excluded. Distinct live signatures = {5.0, 10.0, None} = 3.
+    rep = _with_efficacy(fab_report(actions=["thrust"], witness_ticks=1),
+                         {"left": 5.0, "right": 5.0, "thrust": 10.0,
+                          "grab": None, "idle": 0.0}, dead=["idle"])
+    d = describe_game("scenes/games/x/x.gd", rep)
+    assert d["n_mechanics"] == 3
+
+
+def test_n_mechanics_none_without_g1_efficacy():
+    d = describe_game("scenes/games/x/x.gd", fab_report(actions=["a", "b"]))
+    assert d["n_mechanics"] is None
+
+
+def test_n_mechanics_deterministic():
+    rep = _with_efficacy(fab_report(actions=["a"]),
+                         {"a": 1.0, "b": 2.0, "c": 2.0}, dead=[])
+    a = describe_game("scenes/games/x/x.gd", rep)
+    b = describe_game("scenes/games/x/x.gd", rep)
+    assert a["n_mechanics"] == b["n_mechanics"] == 2   # {1.0, 2.0}
+
+
+# ---- structural_sections: connected static clusters + anti-gaming guard ----
+def _two_cluster_facts(extra_markers=0):
+    bodies = [
+        body("ship", (50, 50), controlled=True),
+        # cluster 1: two touching walls near (100,100)
+        body("wallA", (100, 100), static=True, half=(20, 100)),   # x:80..120
+        body("wallB", (130, 100), static=True, half=(20, 100)),   # x:110..150 -> touches A
+        # cluster 2: a lone wall far away
+        body("wallC", (700, 500), static=True, half=(20, 20)),
+    ]
+    # ANTI-GAMING bait: footprint-less static markers (zero extent) — must NOT count.
+    for i in range(extra_markers):
+        bodies.append(body(f"mark{i}", (300 + i, 300), static=True))   # no half_extents
+    return fab_facts(bodies, world_size=(800, 600))
+
+
+def test_structural_sections_counts_clusters_not_markers():
+    rep = fab_report(actions=["a"], world_size=(800, 600))
+    d = describe_game("scenes/games/x/x.gd", rep,
+                      {"facts": _two_cluster_facts(extra_markers=5)})
+    assert d["structural_sections"] == 2          # {wallA+wallB}, {wallC}
+    assert d["n_static_footprint"] == 3           # 3 real footprints (markers excluded)
+    assert d["n_static"] == 8                      # but 8 static bodies total (5 markers)
+
+
+def test_structural_sections_anti_gaming_rejects_inflation():
+    # Padding state() with 50 footprint-less marker bodies must not move the count.
+    rep = fab_report(actions=["a"], world_size=(800, 600))
+    honest = describe_game("scenes/games/x/x.gd", rep,
+                           {"facts": _two_cluster_facts(extra_markers=0)})
+    inflated = describe_game("scenes/games/x/x.gd", rep,
+                             {"facts": _two_cluster_facts(extra_markers=50)})
+    assert honest["structural_sections"] == inflated["structural_sections"] == 2
+    assert honest["n_static_footprint"] == inflated["n_static_footprint"] == 3
+
+
+def test_structural_sections_none_without_facts():
+    d = describe_game("scenes/games/x/x.gd", fab_report(actions=["a"]))   # no facts
+    assert d["structural_sections"] is None
+    assert d["n_static_footprint"] is None
+
+
+def test_structural_sections_zero_when_no_static_structure():
+    facts = fab_facts([body("ship", (50, 50), controlled=True),
+                       body("goal", (700, 500), sensor=True)])
+    d = describe_game("scenes/games/x/x.gd", fab_report(actions=["a"]), {"facts": facts})
+    assert d["structural_sections"] == 0
+
+
+def test_structural_sections_none_when_static_bodies_lack_extents():
+    # The REAL-library case: the serve host's t=0 run_check emits static bodies with only
+    # pos+flags (NO half_extents/aabb/radius). Extent is unmeasurable -> the count must be
+    # None (uncomputable), NEVER a misleading 0 for a world full of static bodies.
+    facts = fab_facts([body("ship", (50, 50), controlled=True),
+                       body("wall1", (100, 100), static=True),   # no half_extents
+                       body("wall2", (400, 300), static=True),   # no half_extents
+                       body("wall3", (700, 500), static=True)])
+    d = describe_game("scenes/games/x/x.gd", fab_report(actions=["a"]), {"facts": facts})
+    assert d["n_static"] == 3                    # the static bodies are counted
+    assert d["structural_sections"] is None      # but their partitioning is unmeasurable
+    assert d["n_static_footprint"] is None
+
+
+# ---- gating_depth: length of the ordered checkpoint chain ----
+def test_gating_depth_counts_distinct_latch_ticks():
+    rep = fab_report(actions=["a", "b", "c"], witness_ticks=30,
+                     witness_checkpoints={"cp1": 10, "cp2": 20, "cp3": 30})
+    d = describe_game("scenes/games/x/x.gd", rep)
+    assert d["gating_depth"] == 3
+
+
+def test_gating_depth_collapses_simultaneous_and_ignores_unlatched():
+    rep = fab_report(actions=["a"], witness_ticks=30,
+                     witness_checkpoints={"cp1": 10, "cp2": 10, "cp3": 30, "cp4": None})
+    d = describe_game("scenes/games/x/x.gd", rep)
+    assert d["gating_depth"] == 2                  # distinct ticks {10, 30}; None ignored
+
+
+def test_gating_depth_none_without_witness():
+    rep = fab_report(actions=None, episodes=10, passed=False)   # UNSOLVED, no witness
+    d = describe_game("scenes/games/x/x.gd", rep)
+    assert d["gating_depth"] is None
+
+
+# ---- autonomous_bodies: non-controlled movers across replay frames ----
+def _frames_two_ticks():
+    return [
+        {"tick": 0, "entities": {
+            "ship": {"pos": [100, 100], "controlled": True},
+            "rock": {"pos": [200, 200]},
+            "wall": {"pos": [400, 300], "static": True},
+            "goal": {"pos": [700, 500], "sensor": True}}},
+        {"tick": 5, "entities": {
+            "ship": {"pos": [150, 150], "controlled": True},
+            "rock": {"pos": [260, 200]},                 # moved
+            "wall": {"pos": [400, 300], "static": True}, # still
+            "goal": {"pos": [700, 500], "sensor": True}}},
+    ]
+
+
+def test_autonomous_bodies_counts_non_controlled_movers():
+    rep = fab_report(actions=["a"], witness_ticks=5)
+    d = describe_game("scenes/games/x/x.gd", rep,
+                      {"frames": _frames_two_ticks()})
+    # only 'rock' qualifies: ship is controlled, wall is static, goal is a sensor
+    assert d["autonomous_bodies"] == 1
+
+
+def test_autonomous_bodies_none_without_frames():
+    facts = fab_facts([body("ship", (100, 100), controlled=True),
+                       body("rock", (200, 200))])
+    d = describe_game("scenes/games/x/x.gd", fab_report(actions=["a"]), {"facts": facts})
+    assert d["autonomous_bodies"] is None
+
+
+def test_autonomous_bodies_zero_when_nothing_moves():
+    frames = [{"tick": 0, "entities": {"ship": {"pos": [100, 100], "controlled": True},
+                                       "rock": {"pos": [200, 200]}}},
+              {"tick": 5, "entities": {"ship": {"pos": [150, 150], "controlled": True},
+                                       "rock": {"pos": [200, 200]}}}]   # rock frozen
+    d = describe_game("scenes/games/x/x.gd", fab_report(actions=["a"]), {"frames": frames})
+    assert d["autonomous_bodies"] == 0
+
+
+# ---- render: opt-in complexity panel is additive (off by default) ----
+def _complexity_rows():
+    rows = []
+    for i in range(6):
+        rows.append(_row(f"g{i}", witness_entropy=float(i) / 3.0,
+                         space_util_linear_ratio=1.0 + i * 2, dimension="2D",
+                         n_mechanics=1 + i, structural_sections=i % 3,
+                         gating_depth=i, autonomous_bodies=i % 2))
+    return rows
+
+
+def test_complexity_panel_off_by_default(tmp_path):
+    out = tmp_path / "atlas.svg"
+    R.render_atlas(_complexity_rows(), str(out), n_bins=4)   # no complexity_panel
+    svg = out.read_text(encoding="utf-8")
+    assert "STRUCTURAL COMPLEXITY" not in svg               # additive: not drawn unless asked
+
+
+def test_complexity_panel_renders_when_enabled(tmp_path):
+    rows = _complexity_rows()
+    out = tmp_path / "atlas.svg"
+    summary = R.render_atlas(rows, str(out), n_bins=4, complexity_panel=True)
+    svg = out.read_text(encoding="utf-8")
+    assert svg.startswith("<svg") and svg.rstrip().endswith("</svg>")
+    assert "STRUCTURAL COMPLEXITY" in svg
+    # the richest game (g5: highest additive complexity) is named in the panel
+    assert "richest: g5" in svg
+    # the map axes/coverage are unchanged by the panel (additive)
+    assert summary["axes"][0] and summary["axes"][1]
+
+
+def test_l1_descriptors_all_none_with_no_artifacts():
+    d = describe_game("scenes/games/x/x.gd", None, None)
+    for k in ("n_mechanics", "structural_sections", "n_static_footprint",
+              "gating_depth", "autonomous_bodies"):
+        assert d[k] is None, f"{k} should be None with no artifacts"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

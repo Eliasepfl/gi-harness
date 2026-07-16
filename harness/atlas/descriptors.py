@@ -44,7 +44,23 @@ DESCRIPTOR_KEYS = (
     "n_static",              # static (non-sensor) bodies
     "n_sensor",              # sensor bodies
     "n_dynamic",             # remaining (dynamic, non-static, non-sensor, non-controlled)
+    # --- L1 COMPLEXITY descriptors (pure measurement; deterministic; None-safe) ---
+    "n_mechanics",           # distinct LIVE world-effects among declared actions (G1 efficacy)
+    "structural_sections",   # connected static-footprint clusters (spatial partitions)
+    "n_static_footprint",    # static bodies with a REAL footprint (anti-gaming companion)
+    "gating_depth",          # length of the ordered checkpoint chain (distinct latch ticks)
+    "autonomous_bodies",     # non-controlled bodies that MOVE across replay frames (else None)
 )
+
+# L1 tuning (all documented, deterministic; content-free by construction).
+# Two static footprints join one spatial partition when their AABBs are within this
+# fraction of the world's largest span on EVERY axis (touching/near-touching walls =
+# one structure; a wider gap = a separate region). Relative so it scales across 2D
+# (pixels, world ~800) and 3D (metres, world ~40).
+_SECTION_ADJ_FRAC = 0.01
+# A replay-frame position must shift by more than this (world units) to count a body
+# as moving (autonomous_bodies) — filters solver slop / float noise.
+_MOVE_EPS = 1e-3
 
 
 def slug_of(game_path) -> str:
@@ -327,6 +343,234 @@ def _dimension(report, facts, game_path, su_dims):
 
 
 # ======================================================================== #
+# L1 COMPLEXITY descriptors (pure measurement — instrumentation, NOT steering)
+# ======================================================================== #
+# Elias's binding frame (COMPOSITION_GAP.md §3 L1): these are cosmetic-blind by
+# MEASUREMENT CHOICE, computed from EXISTING certification artifacts, deterministic,
+# and None when uncomputable — a measurement axis, never a generation lever. The
+# anti-gaming guard is REQUIRED: the measurement channel derives geometry from the
+# game's self-reported state(), so it is inflatable by state()-padding with
+# footprint-less marker bodies. Where the cheap host-fact count and a self-declared
+# count would differ we PREFER the host facts, and we count footprint-carrying bodies
+# only — so padding the body list cannot move structural_sections.
+def _g1_efficacy(report):
+    eff = _layer_checks(report, "G1_rollout").get("efficacy")
+    return eff if isinstance(eff, dict) else None
+
+
+def _n_mechanics(report):
+    """Distinct LIVE world-effects among the declared action verbs (a proxy for how
+    many independently-effective, interacting mechanics the game exposes), read from
+    G1's action-efficacy ``effect`` map. An action is LIVE if it is not in the gate's
+    ``dead`` list; two live verbs with the SAME divergence signature collapse (mirror
+    controls = one system), and an unbounded / body-set-changing divergence (``None``)
+    is its own signature. ``None`` when there is no G1 efficacy artifact."""
+    eff = _g1_efficacy(report)
+    if eff is None:
+        return None
+    effect = eff.get("effect")
+    if not isinstance(effect, dict):
+        return None
+    dead = set(eff.get("dead") or [])
+    sigs = {v for a, v in effect.items() if a not in dead}
+    return len(sigs)
+
+
+def _static_footprint_info(facts):
+    """Inspect the static geometry ONCE, returning ``(boxes, n_candidates, n_extent)``
+    or ``None`` when there is no geometry to read.
+
+      * ``boxes``        — ``(min, max)`` AABBs of static, non-sensor, non-controlled
+                           bodies that carry a REAL footprint (``reachability._aabb_of``,
+                           which returns ``None`` for no/zero extent).
+      * ``n_candidates`` — how many static bodies were considered (footprint or not).
+      * ``n_extent``     — how many DECLARE an extent field (``half_extents``/``aabb``/
+                           ``radius``), present or zero.
+
+    The last count is the honesty hinge: it separates "no footprint because the body is
+    a zero-extent MARKER" (measurable — the anti-gaming zero) from "no footprint because
+    this facts channel never emits extents" (UNCOMPUTABLE — must be ``None``, not a
+    false 0). The serve host's t=0 ``run_check`` geometry currently carries only
+    ``pos``+flags, so ``n_extent`` is 0 across today's library and the partition count is
+    correctly ``None`` rather than a misleading 0."""
+    geom = _facts_geometry(facts)
+    if geom is None:
+        return None
+    try:
+        from harness.verify.reachability import _aabb_of
+    except Exception:
+        _aabb_of = None
+    boxes, n_candidates, n_extent = [], 0, 0
+    for b in geom:
+        if not isinstance(b, dict):
+            continue
+        if not b.get("static") or b.get("sensor") or b.get("controlled"):
+            continue
+        n_candidates += 1
+        if any(k in b for k in ("half_extents", "aabb", "radius")):
+            n_extent += 1
+        pos = b.get("pos")
+        if _aabb_of is None or not isinstance(pos, (list, tuple)) or len(pos) < 2:
+            continue
+        aabb = _aabb_of(b, tuple(float(v) for v in pos))
+        if aabb is not None:
+            boxes.append((tuple(float(c) for c in aabb[0]),
+                          tuple(float(c) for c in aabb[1])))
+    return boxes, n_candidates, n_extent
+
+
+def _n_static_footprint(info):
+    """Count of footprint-carrying static bodies (the anti-gaming guard's visible
+    companion). ``0`` when there are no static bodies at all; ``None`` when static
+    bodies exist but the facts channel omits their extents (unmeasurable)."""
+    if info is None:
+        return None
+    boxes, n_cand, n_extent = info
+    if n_cand == 0:
+        return 0
+    if n_extent == 0:
+        return None
+    return len(boxes)
+
+
+def _aabb_near(a, b, tol):
+    """True when AABBs ``a`` and ``b`` overlap or sit within ``tol`` on EVERY axis."""
+    (amin, amax), (bmin, bmax) = a, b
+    dims = min(len(amin), len(bmin))
+    for k in range(dims):
+        if amin[k] - bmax[k] > tol or bmin[k] - amax[k] > tol:
+            return False
+    return True
+
+
+def _structural_sections(info, facts, report):
+    """Count of distinct static-body clusters — the world's spatial partitions. Static
+    footprints that touch / nearly touch are one structure; a wider gap separates
+    regions. Union-find over the footprint AABBs (guarded to footprint-carrying bodies
+    only). ``0`` when there are no static bodies (no structure to partition) OR extents
+    are declared but all zero; ``None`` when static bodies exist yet the facts channel
+    omits their extents (unmeasurable — never a false 0)."""
+    if info is None:
+        return None
+    boxes, n_cand, n_extent = info
+    if n_cand == 0:
+        return 0                       # genuinely no static bodies -> no partitions
+    if n_extent == 0:
+        return None                    # static bodies exist but no extent data -> unknown
+    n = len(boxes)
+    if n == 0:
+        return 0                       # extents declared but all zero -> no real structure
+    ws = _world_size_list(facts, report) or [800, 600]
+    span = max((abs(float(v)) for v in ws), default=800.0)
+    tol = max(1.0, _SECTION_ADJ_FRAC * span)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _aabb_near(boxes[i], boxes[j], tol):
+                parent[find(i)] = find(j)
+    return len({find(i) for i in range(n)})
+
+
+def _gating_depth(report):
+    """Length of the ordered checkpoint chain: the number of DISTINCT latch ticks on
+    the winning witness. Checkpoints that latch at strictly increasing ticks are a
+    sequential gate of that depth; simultaneous latches count once (not sequential).
+    ``0`` for a witness that latched nothing; ``None`` when there is no witness."""
+    w = _witness(report)
+    if not w:
+        return None
+    cps = w.get("checkpoints")
+    if not isinstance(cps, dict):
+        return None
+    ticks = {t for t in cps.values()
+             if isinstance(t, (int, float)) and not isinstance(t, bool)}
+    return len(ticks)
+
+
+def _frames_from(report, extras):
+    """A replay-frames list (``[{tick, entities:{name:{pos|bbox, sensor, static}}}]``)
+    from ``extras['frames']`` or a report/witness that stored a trail, else ``None``.
+    Frames are NOT in a standard verify report, so this is usually ``None`` — honest
+    per the spec (``autonomous_bodies`` is inferable only when frames exist)."""
+    fr = (extras or {}).get("frames")
+    if isinstance(fr, list) and fr:
+        return fr
+    w = _witness(report) or {}
+    for src in (w.get("frames"), (report or {}).get("frames")):
+        if isinstance(src, list) and src:
+            return src
+    return None
+
+
+def _controlled_names(facts, report):
+    """The set of controlled-body names, from t=0 facts and/or the G0 static report."""
+    names = set()
+    geom = _facts_geometry(facts)
+    for b in (geom or []):
+        if isinstance(b, dict) and b.get("controlled") and b.get("name") is not None:
+            names.add(b["name"])
+    ctrl = _layer_checks(report, "G0_static").get("controlled")
+    if isinstance(ctrl, dict) and isinstance(ctrl.get("controlled"), list):
+        names.update(ctrl["controlled"])
+    return names
+
+
+def _entity_pos(q):
+    if not isinstance(q, dict):
+        return None
+    p = q.get("pos")
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        return tuple(float(v) for v in p[:3])
+    bb = q.get("bbox")
+    if isinstance(bb, (list, tuple)) and len(bb) >= 4:
+        return ((float(bb[0]) + float(bb[2])) / 2.0, (float(bb[1]) + float(bb[3])) / 2.0)
+    return None
+
+
+def _autonomous_bodies(report, facts, extras):
+    """Count of dynamic bodies that MOVE without being the controlled body — read from
+    a replay trail: non-controlled, non-sensor bodies whose position changes across the
+    frames. ``None`` when no frames are available (the common case; see ``_frames_from``);
+    ``0`` when frames exist but nothing autonomous moves."""
+    frames = _frames_from(report, extras)
+    if not frames:
+        return None
+    controlled = _controlled_names(facts, report)
+    first, last, meta = {}, {}, {}
+    for fr in frames:
+        ents = (fr or {}).get("entities")
+        if not isinstance(ents, dict):
+            continue
+        for name, q in ents.items():
+            pos = _entity_pos(q)
+            if pos is None:
+                continue
+            if name not in first:
+                first[name] = pos
+                meta[name] = q if isinstance(q, dict) else {}
+            last[name] = pos
+    moved = 0
+    for name in first:
+        if name in controlled:
+            continue
+        q = meta.get(name, {})
+        if q.get("sensor") or q.get("controlled") or q.get("static"):
+            continue
+        a, b = first[name], last[name]
+        dims = min(len(a), len(b))
+        if any(abs(a[k] - b[k]) > _MOVE_EPS for k in range(dims)):
+            moved += 1
+    return moved
+
+
+# ======================================================================== #
 # The public entry point
 # ======================================================================== #
 def describe_game(game_path, verify_report=None, extras=None) -> dict:
@@ -345,6 +589,7 @@ def describe_game(game_path, verify_report=None, extras=None) -> dict:
 
     lin, meas, dead, su_dims = _space_util(report, facts)
     counts = _body_counts(facts) or {}
+    _sf_info = _static_footprint_info(facts)   # static geometry inspected once (L1)
     # Engine-free fallback: when there are no t=0 facts to classify bodies, the G0 static
     # report still carries a total body count (and the controlled bodies) — enough for the
     # geometry comparison, with the per-class splits left None.
@@ -375,6 +620,12 @@ def describe_game(game_path, verify_report=None, extras=None) -> dict:
         "n_static": counts.get("n_static"),
         "n_sensor": counts.get("n_sensor"),
         "n_dynamic": counts.get("n_dynamic"),
+        # --- L1 complexity (measurement; anti-gaming guard on structural_sections) ---
+        "n_mechanics": _n_mechanics(report),
+        "structural_sections": _structural_sections(_sf_info, facts, report),
+        "n_static_footprint": _n_static_footprint(_sf_info),
+        "gating_depth": _gating_depth(report),
+        "autonomous_bodies": _autonomous_bodies(report, facts, extras),
     }
     # Guarantee the full, ordered key set (a robustness belt over the explicit dict above).
     return {k: row.get(k) for k in DESCRIPTOR_KEYS}
