@@ -197,6 +197,103 @@ def test_reward_core_is_deterministic():
 
 
 # ====================================================================== #
+# 1b. VALUE-DEATH low-V occupancy term — the motion-INVARIANT reward sibling.
+# ====================================================================== #
+def _vd_params(**kw):
+    base = dict(low_v_occupancy_coef=0.2, low_v_floor=-1.0)
+    base.update(kw)
+    return _params(**base)
+
+
+def test_low_v_occupancy_rewards_a_collapsed_v_while_WIGGLING():
+    # Motion-INVARIANT: the body MOVES every tick (never frozen) but V has COLLAPSED
+    # (-3 <= floor -1) -> the occupancy term pays (the freeze term is 0 the whole time),
+    # and a sustained window emits a value_death candidate for the harvest.
+    p = _vd_params(window=4)
+    rw = ss.StaleSeekReward(p)
+    prev, x = _prime_mobility(rw, _fp(0.0))
+    total, events = 0.0, []
+    for t in range(1, 7):
+        cur = _fp(x + 12.0 * t)                            # moving -> NOT frozen
+        r, ev = rw.step(prev, cur, new_latch=False, terminated=False, truncated=False,
+                        success=False, tick=t, action_applied=True, value=-3.0)
+        total += r
+        events.append(ev)
+        prev = cur
+    assert total > 0.0, "occupancy must pay for collapsed-V presence despite motion"
+    fired = [e for e in events if e is not None]
+    assert len(fired) == 1 and fired[0]["kind"] == "value_death"
+    assert fired[0]["streak"] == p.window
+
+
+def test_low_v_occupancy_only_pays_below_the_floor():
+    # V ABOVE the floor (0.0 > -1.0) while wiggling -> the region is not collapsed ->
+    # no occupancy reward, no event (a mediocre-V region cannot farm).
+    rw = ss.StaleSeekReward(_vd_params(low_v_occupancy_coef=0.5))
+    prev, x = _prime_mobility(rw, _fp(0.0))
+    r, ev = rw.step(prev, _fp(x + 10.0), new_latch=False, terminated=False,
+                    truncated=False, success=False, tick=3, action_applied=True, value=0.0)
+    assert r == 0.0 and ev is None
+
+
+def test_low_v_occupancy_respects_the_mobility_gate():
+    # Collapsed V but the body NEVER moved (mobility 0 < min) -> occupancy earns nothing
+    # ("going into a corner and waiting is not a softlock" — anti-idle #1b, preserved).
+    rw = ss.StaleSeekReward(_vd_params(low_v_occupancy_coef=0.5, mobility_min=20.0))
+    prev = _fp(0.0)
+    total = 0.0
+    for t in range(1, 12):
+        r, ev = rw.step(prev, _fp(0.0), new_latch=False, terminated=False, truncated=False,
+                        success=False, tick=t, action_applied=True, value=-5.0)
+        total += r
+        assert ev is None
+    assert total == 0.0
+
+
+def test_low_v_occupancy_respects_the_no_checkpoint_guard():
+    # A NEW checkpoint latching this tick == progress, not a softlock -> no occupancy.
+    rw = ss.StaleSeekReward(_vd_params(low_v_occupancy_coef=0.5))
+    prev, x = _prime_mobility(rw, _fp(0.0))
+    r, ev = rw.step(prev, _fp(x + 10.0), new_latch=True, terminated=False, truncated=False,
+                    success=False, tick=3, action_applied=True, value=-5.0)
+    assert r == 0.0 and ev is None
+
+
+def test_low_v_occupancy_is_byte_identical_without_a_critic():
+    # Arming the term but passing NO critic value == today's behavior (the term is a pure
+    # no-op when no value flows). Pins the mission's "no critic supplied -> byte-identical".
+    def run(params):
+        rw = ss.StaleSeekReward(params)
+        prev, x = _prime_mobility(rw, _fp(0.0))
+        frozen = _fp(x)
+        out = []
+        for t in range(1, 9):
+            r, ev = rw.step(prev, frozen, new_latch=False, terminated=False,
+                            truncated=False, success=False, tick=t, action_applied=True)
+            out.append((round(r, 9), ev))
+        return out
+
+    base = run(_params(window=4))                                  # today: term absent
+    armed = run(_vd_params(window=4))                              # term ARMED but no value
+    assert armed == base
+
+
+def test_low_v_occupancy_and_freeze_terms_coexist():
+    # Body FROZEN and V collapsed -> BOTH terms contribute (occupancy is ALONGSIDE, never
+    # replacing, the freeze term); paying more than the freeze term alone.
+    prev0 = _fp(0.0)
+    freeze_only = ss.StaleSeekReward(_params(window=4))
+    both = ss.StaleSeekReward(_vd_params(window=4))
+    pf, xf = _prime_mobility(freeze_only, prev0)
+    pb, xb = _prime_mobility(both, prev0)
+    rf, _ = freeze_only.step(pf, _fp(xf), new_latch=False, terminated=False, truncated=False,
+                             success=False, tick=3, action_applied=True, value=-5.0)
+    rb, _ = both.step(pb, _fp(xb), new_latch=False, terminated=False, truncated=False,
+                      success=False, tick=3, action_applied=True, value=-5.0)
+    assert rb > rf > 0.0
+
+
+# ====================================================================== #
 # 2. fingerprint_from_obs — faithful reconstruction from the obs vector.
 # ====================================================================== #
 def test_fingerprint_from_obs_matches_and_detects_freeze_and_motion():

@@ -21,7 +21,13 @@ sb3_trainer) — never a new stack:
      the window-completion mechanism plus a pre-CONFIRM escapability probe keep
      "walk into a corner and wait" from being profitable. A LOSS (terminal, not
      success) and a WIN are BOTH strongly penalised — a loss is not a softlock
-     (Elias's original distinction) and a win defeats the adversary.
+     (Elias's original distinction) and a win defeats the adversary. ALONGSIDE the
+     freeze term (never replacing it) an OPTIONAL, flag-gated, motion-INVARIANT low-V
+     OCCUPANCY term rewards sustained presence in a COLLAPSED-V state (V <= a relative
+     floor) when a critic is supplied — the value-death sibling that catches a body
+     WIGGLING in a trap the fingerprint-freeze term structurally misses; it inherits the
+     SAME time-decay + mobility gate (anti-camping unchanged) and is OFF by default, so
+     with no critic the reward is byte-identical.
 
   2. HARVEST — ``train_stale_seeker`` trains the seeker over the batched serve env
      and logs every window-complete candidate; ``harvest_candidates`` then rolls the
@@ -85,6 +91,16 @@ class SeekParams:
     time_decay: bool = True                 # freeze reward decays over episode time (anti-idle #1a)
     mobility_gate: bool = True              # freeze scores only after demonstrated mobility (#1b)
     low_v_coef: float = 0.0                 # optional low-V shaping coef (needs a critic; off by default)
+    # --- VALUE-DEATH occupancy term (motion-INVARIANT, critic+flag-gated, off by default) ---
+    # Reward sustained presence in a COLLAPSED-V state (V <= low_v_floor), the reward-side
+    # sibling of adversary.detect_value_death: it fires whether the body is FROZEN or
+    # WIGGLING, so the seeker learns to drive into value-death pockets the fingerprint-
+    # freeze term structurally misses. The floor is RELATIVE but supplied by the caller
+    # (computed once from a witness/calibration V range so the reward stays Markov +
+    # online-safe — a fraction of the witness-trajectory V range, the same relative-band
+    # idea as the DETECT floor) [eng.]. With no floor/coef/critic -> byte-identical.
+    low_v_occupancy_coef: float = 0.0       # per-step low-V occupancy reward (0 == off) [eng.]
+    low_v_floor: Optional[float] = None     # relative collapse floor (V <= this == collapsed) [eng.]
 
     def decay(self, tick: int) -> float:
         """Linear anti-idle ramp: an early freeze is worth full, a late one ~nothing.
@@ -101,12 +117,18 @@ class _SeekState:
     mobility: float = 0.0           # cumulative travelled distance this episode
     window_start_tick: int = 0      # tick the current frozen run opened
     emitted: bool = False           # window already emitted for the current frozen run
+    low_v_streak: int = 0           # consecutive collapsed-V (value-death) ticks
+    low_v_start_tick: int = 0       # tick the current low-V run opened
+    low_v_emitted: bool = False     # value-death window already emitted this low-V run
 
     def reset(self) -> None:
         self.streak = 0
         self.mobility = 0.0
         self.window_start_tick = 0
         self.emitted = False
+        self.low_v_streak = 0
+        self.low_v_start_tick = 0
+        self.low_v_emitted = False
 
 
 class StaleSeekReward:
@@ -158,6 +180,14 @@ class StaleSeekReward:
         moved = fp_delta(prev_fp, cur_fp)
         shaping = 0.0 if (value is None or not p.low_v_coef) else -float(p.low_v_coef) * float(value)
 
+        # -- Motion-INVARIANT low-V occupancy (additive, critic+flag-gated). Reward
+        #    sustained presence in a COLLAPSED-V state (V <= the relative floor) whether
+        #    the body is FROZEN or WIGGLING — the value-death sibling of the freeze term,
+        #    kept ALONGSIDE it. Anti-camping preserved (SAME mobility gate + time decay);
+        #    a full window emits a value_death candidate for the harvest. OFF by default
+        #    (coef 0 / floor None / value None) -> byte-identical to today.
+        occ, vd_event = self._low_v_occupancy(value, new_latch, tick, st)
+
         frozen = action_applied and (not new_latch) and (moved < p.eps)
         if not frozen:
             # The body moved (or progressed) — accumulate mobility, break the streak.
@@ -169,12 +199,12 @@ class StaleSeekReward:
                 st.mobility += p.mobility_min
             st.streak = 0
             st.emitted = False
-            return shaping, None
+            return shaping + occ, vd_event
 
         # -- Frozen. Gate on demonstrated mobility (anti-idle #1b): a body that never
         #    moved is idling in a corner, not stuck — it does not score or accumulate.
         if p.mobility_gate and st.mobility < p.mobility_min:
-            return 0.0, None
+            return 0.0, None                     # occ is mobility-gated too -> 0 here
 
         st.streak += 1
         if st.streak == 1:
@@ -195,6 +225,36 @@ class StaleSeekReward:
             reward += p.r_window_bonus * p.decay(st.window_start_tick)
             st.emitted = True
             event = {"freeze_start_tick": int(st.window_start_tick), "streak": int(st.streak)}
+        # A freeze window takes priority; else surface a value-death window event.
+        return float(reward + occ), (event or vd_event)
+
+    def _low_v_occupancy(self, value, new_latch, tick, st: _SeekState):
+        """The motion-INVARIANT low-V occupancy term. Returns ``(reward, event)``. ALL
+        gated: a critic value must be supplied, the coef + floor set, no new checkpoint
+        this tick (progress is not a softlock), and the SAME mobility gate as the freeze
+        term satisfied (a never-moved idler cannot farm — anti-camping #1b). A sustained
+        ``window`` of collapsed-V occupancy emits ONE ``value_death`` candidate (for the
+        harvest); the per-step reward is decayed + streak-capped like the freeze term, so
+        a mediocre-V region cannot farm. OFF (returns ``0.0, None``, no state touched
+        beyond a reset) unless armed -> byte-identical default."""
+        p = self.p
+        if (not p.low_v_occupancy_coef or value is None or p.low_v_floor is None
+                or new_latch or float(value) > float(p.low_v_floor)
+                or (p.mobility_gate and st.mobility < p.mobility_min)):
+            st.low_v_streak = 0
+            st.low_v_emitted = False
+            return 0.0, None
+        st.low_v_streak += 1
+        if st.low_v_streak == 1:
+            st.low_v_start_tick = int(tick)
+        decay = p.decay(int(tick))
+        reward = p.low_v_occupancy_coef * min(st.low_v_streak, p.window) * decay
+        event = None
+        if st.low_v_streak >= p.window and not st.low_v_emitted:
+            reward += p.r_window_bonus * p.decay(st.low_v_start_tick)
+            st.low_v_emitted = True
+            event = {"freeze_start_tick": int(st.low_v_start_tick),
+                     "streak": int(st.low_v_streak), "kind": "value_death"}
         return float(reward), event
 
 
@@ -244,7 +304,7 @@ class StaleSeekEnv:
     point CONFIRM plants) — exactly the shape ``confirm_candidates`` consumes."""
 
     def __init__(self, env, params: Optional[SeekParams] = None, *,
-                 end_on_window: bool = True):
+                 end_on_window: bool = True, critic=None):
         self.env = env
         self.actions = list(env.actions)
         self.horizon = int(getattr(env, "horizon", PROBE_HORIZON))
@@ -257,6 +317,10 @@ class StaleSeekEnv:
         if params is None:
             p.horizon = self.horizon
         self.p = p
+        # Optional critic (duck-typed ``value(obs) -> float``) — threads V(s) into the
+        # reward so the motion-invariant low-V occupancy term can fire. None -> value is
+        # never supplied -> byte-identical to the value-less path (pinned by the tests).
+        self.critic = critic
         self.reward = StaleSeekReward(p)
         self.end_on_window = bool(end_on_window)
         self.candidates: list[dict] = []
@@ -287,20 +351,31 @@ class StaleSeekEnv:
 
         reward, event = self.reward.step(
             self._prev_fp, cur_fp, new_latch=new_latch, terminated=terminated,
-            truncated=truncated, success=success, tick=self._tick, action_applied=True)
+            truncated=truncated, success=success, tick=self._tick, action_applied=True,
+            value=self._value(obs))
 
         if event is not None:
             prefix = list(self._hist[:event["freeze_start_tick"]])
+            kind = event.get("kind", "frozen")
             self.candidates.append({"seed": self._seed, "prefix": prefix,
-                                    "freeze_tick": event["freeze_start_tick"]})
+                                    "freeze_tick": event["freeze_start_tick"], "kind": kind})
             info = dict(info)
-            info["stale_candidate"] = {"seed": self._seed, "prefix": prefix}
+            info["stale_candidate"] = {"seed": self._seed, "prefix": prefix, "kind": kind}
             if self.end_on_window:
                 truncated = True                    # candidate emitted -> end the episode
 
         self._prev_fp = cur_fp
         self._prev_nlatched = n_latched
         return obs, float(reward), terminated, truncated, info
+
+    def _value(self, obs):
+        """V(s) from the optional critic (None when no critic -> value-less path)."""
+        if self.critic is None:
+            return None
+        try:
+            return float(self.critic.value(obs))
+        except Exception:      # noqa: BLE001 - a degenerate critic must not sink the rollout
+            return None
 
     def close(self):
         close = getattr(self.env, "close", None)
@@ -485,7 +560,7 @@ def _as_predict_fn(policy) -> Callable:
 
 def harvest_candidates(make_env: Callable, policy, *, seeds=(0,), witness=None,
                        waypoints=(0,), params: Optional[SeekParams] = None,
-                       max_candidates: int = 64) -> list[dict]:
+                       max_candidates: int = 64, critic=None) -> list[dict]:
     """Greedy-rollout the trained seeker for more candidates, with witness-waypoint
     seeding (addendum #2): for each ``waypoints`` cut of the WINNING trajectory, replay
     that winning prefix (the working policy's competent navigation to a deep waypoint),
@@ -493,7 +568,9 @@ def harvest_candidates(make_env: Callable, policy, *, seeds=(0,), witness=None,
 
     ``make_env`` is a 0-arg factory (fresh serve env per rollout); ``witness`` is a
     winning ``{"actions": [...]}`` (or a bare action list). ``waypoints`` are prefix
-    LENGTHS to branch from (``0`` == seek from the start). Deterministic: greedy policy,
+    LENGTHS to branch from (``0`` == seek from the start). An optional ``critic`` threads
+    V(s) into the reward so a WIGGLING value-death pocket (which the freeze term misses)
+    is also harvested (motion-invariant low-V occupancy). Deterministic: greedy policy,
     fixed seeds. Returns de-duplicated ``{seed, prefix}`` candidates."""
     predict = _as_predict_fn(policy)
     witness_actions = list(witness.get("actions") if isinstance(witness, dict) else (witness or []))
@@ -506,7 +583,7 @@ def harvest_candidates(make_env: Callable, policy, *, seeds=(0,), witness=None,
             if out and len(out) >= max_candidates:
                 return out
             env = make_env()
-            wrapped = StaleSeekEnv(env, p, end_on_window=True)
+            wrapped = StaleSeekEnv(env, p, end_on_window=True, critic=critic)
             try:
                 obs, _ = wrapped.reset(seed=int(seed))
                 cut = min(int(wp), len(witness_actions))

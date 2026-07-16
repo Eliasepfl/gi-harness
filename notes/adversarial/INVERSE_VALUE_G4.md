@@ -262,3 +262,85 @@ certifier), so none require rework to stay sound:
   episode on window-complete. Candidate discovery is identical.
 - Determinism: seeded policy + fixed seeds + imported fixed thresholds; CONFIRM is the
   sound backstop against every false positive, unchanged.
+---
+
+# VALUE-DEATH — the motion-INVARIANT third DETECT trigger (Elias, 2026-07-15)
+
+> Code: `harness/rl/adversary.py` (`detect_value_death`, `value_collapse_floor`; threaded
+> into `_candidate_from_rollout`/`search`/`descent_search` as an OPT-IN fallback armed by
+> the g4 smart tiers) + `harness/rl/stale_seek.py` (the reward-side low-V occupancy term)
+> + `harness/verify/g4.py` (trigger wiring: the smart tiers pass `value_death=True`).
+> Fixture: `tests/fixtures/gd_games/softlock_wiggle.gd`. Tests: `test_adversary.py`
+> (value-death unit + wiggle-miss), `test_stale_seek.py` (occupancy term),
+> `test_g4_inverse_value.py` (wiring), `test_gd_wiggle.py` (in-image end-to-end).
+
+## The wiggle-evasion hole (named honestly)
+The DETECT motion tests have an IRREDUCIBLE hole. `detect_softlock_window` fires on
+`frozen` (state within EFFICACY_EPS for a whole window) or `cycle` (a later state recurs
+AND the window holds `<= window//2` distinct eps-clustered states — tight periodic churn).
+A body trapped in a pocket but WIGGLING aperiodically — moving over MANY distinct positions
+with fingerprint deltas > EFFICACY_EPS and no short recurrence — evades BOTH: it never
+freezes (always moving) and never closes a short cycle (too many distinct states). Any
+motion-based heuristic has this hole; Mawhorter & Smith's "wiggle-room" example (a Mario
+alive and moving in an inescapable pit) is the canonical instance. Fingerprint-freeze is
+neither necessary nor sufficient for a softlock.
+
+## The fix — value, not motion
+The wiggle-proof signal is VALUE. A trained G3' critic's `V(s)` stays COLLAPSED in a true
+trap no matter how the body jiggles (a trap has no path to the goal). `detect_value_death`
+fires when `V(s)` sits at or below a RELATIVE collapse floor for a FULL window, no new
+checkpoint latched, non-terminal — REGARDLESS of fingerprint deltas. It runs as a FALLBACK
+after frozen/cycle (the motion tests are the critic-free floor and lead), so the wiggle a
+motion test misses is still caught. Candidates flow into the SAME escapability probe +
+`refute_prefix` CONFIRM — soundness is unchanged; value_death only widens DETECT recall.
+
+## The relative collapse floor (`[eng.]`)
+`floor = Vmin + BAND·(Vmax − Vmin)`, BAND = 0.25 — the bottom quarter of the run's OWN
+observed V range. RELATIVE, not absolute, because V scales vary per game (a competent
+critic's range is game-specific), so the floor is derived from each rollout's own stats.
+Keying off the RANGE (not a distribution quantile) makes it INSENSITIVE to how much of the
+rollout is trapped vs. approaching — only states within BAND of the minimum count as
+collapsed, so the cut lands at the pocket ENTRY, not the healthy approach (a quantile floor
+drifts up into the high values when the trap dominates the trajectory, mis-cutting the
+prefix; CONFIRM would refute the mis-cut, but the range-band avoids the wasted candidate).
+CRITIC-GATED: a flat / degenerate critic (`Vmax − Vmin <= 1e-9`) yields NO floor and never
+fires — the 'weak critic is useless' A/B lesson made mechanical, reinforcing the g4 model
+gate (g3_prime SUCCESS, not mere artifact existence).
+
+## Seeker reward sibling
+`StaleSeekReward` gains an OPTIONAL, flag-gated, motion-invariant low-V OCCUPANCY term
+(`low_v_occupancy_coef`, `low_v_floor`): it rewards sustained presence in a collapsed-V
+state whether the body is FROZEN or WIGGLING, ALONGSIDE (never replacing) the fingerprint-
+freeze term, and a full window emits a `value_death` candidate for the harvest. It inherits
+the SAME time-decay + mobility gate (anti-camping unchanged: a mediocre-V region or a
+never-moved idler cannot farm), and the terminal penalty is untouched (a loss is not a
+softlock). The floor is supplied by the caller (computed once from a witness/calibration V
+range — the same relative-band idea, kept a parameter so the online reward stays Markov).
+OFF by default: with no critic / floor / coef the reward is byte-identical to today.
+
+## The proof fixture — `softlock_wiggle.gd`
+Certifies G0-G3 via an intended up-and-over route (identical funnel story to
+`softlock_pit.gd`: the pocket is a LOGIC trap with no collision footprint, invisible to the
+geometric flood-fill; the milestone-guided solver skirts it) yet hides a reachable POCKET
+that is genuinely UNWINNABLE from inside. Where the pit PINS the body (state freezes ->
+`frozen` catches it), this pocket CONFINES the body but keeps it MOVING: once trapped
+(latched, airtight) the body is driven onto an aperiodic 2-D ROSETTE (a golden-angle stir,
+radius wobbled by a second incommensurate frequency) DEEP inside the box, so it visits many
+distinct positions with a distinct velocity every tick — never freezing, never cycling —
+while the goal outside stays unreachable (tree-refutable). The tests DEMONSTRATE: (i) a
+scripted pocket trajectory is MISSED by frozen+cycle, (ii) CAUGHT by value_death (a stub
+critic whose V collapses in the pocket for the unit tier; one real in-image run for the
+integration tier), (iii) CONFIRM certifies it (replayable witness, grade `open`,
+provenance `kind="value_death"`), (iv) mini_collect + losable produce ZERO value_death
+candidates (the critic V never collapses there -> no floor / no sub-floor window), (v) the
+no-critic path is byte-identical.
+
+## Honest boundary (the layered contract, restated)
+- `value_death` INHERITS THE CRITIC'S QUALITY: a weak critic steers and collapses poorly,
+  so it widens recall only with a competent (g3_prime-SUCCESS) critic. It is a heuristic
+  trigger, never a certifier.
+- The FINGERPRINT modes (`frozen`/`cycle`) remain the CRITIC-FREE floor: they run first and
+  need no model, so a game with no trained critic still gets motion-based DETECT.
+- `terminal_reachable` / CONFIRM (`refute_prefix`) remains the ONLY SOUND layer: every
+  value_death candidate — like every frozen/cycle one — is only a SUSPECT until the tree
+  solver refutes reachability from its prefix. Zero false certifications, unchanged.
