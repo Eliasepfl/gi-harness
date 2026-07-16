@@ -343,6 +343,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     engine = detect_engine(game_path, game_source)
 
     make_batch_venv = None
+    make_shard_venv = None
     if engine in ("godot", "gdscript"):
         import itertools
         from harness.rl.godot_env import GodotServeEnv
@@ -369,6 +370,21 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
                 return GodotBatchVecEnv(game_path, n_instances,
                                         port_offset=next(_port_seq), seed=seed,
                                         rays=rays, obs_profile=obs_profile)
+
+            # SHARDING (Elias, 2026-07-16: "32 cores per run"): M INDEPENDENT batch
+            # shards stepped concurrently = M*K logical envs, so ONE learner saturates
+            # many cores. The trainer uses THIS factory only when num_shards>1; the
+            # cluster owns a strided sub-band [base_off, base_off+(M-1)*PORT_STRIDE] off
+            # the SAME _port_seq (one offset consumed for the whole cluster). Shard i is
+            # seeded base_seed+i*K — the per-slot fixed-seed scheme, extended across M*K.
+            # Rays/obs_profile flow to every shard via env_kwargs (same obs everywhere).
+            def make_shard_venv(num_shards, n_instances):
+                from harness.rl.godot_shard_env import GodotShardVecEnv
+                return GodotShardVecEnv(game_path, num_shards, n_instances,
+                                        base_seed=seed,
+                                        port_offset_base=next(_port_seq),
+                                        env_kwargs={"rays": rays,
+                                                    "obs_profile": obs_profile})
     else:
         def make_env():
             return PlanckEnv(game_path)
@@ -392,6 +408,12 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # HARNESS_VECENV=dummy) — a None factory keeps the sequential DummyVecEnv path.
     if trainer != "vendored" and make_batch_venv is not None:
         method_kw["make_batch_venv"] = make_batch_venv
+    # The sharded (M concurrent batch shards) vec env is likewise an SB3-lane seam; the
+    # trainer engages it only when a caller passes num_shards>1 (a None factory or the
+    # default num_shards=1 keeps the single-process batch path byte-identical). num_shards
+    # itself rides in via **train_kwargs -> sb3_trainer.train's explicit num_shards param.
+    if trainer != "vendored" and make_shard_venv is not None:
+        method_kw["make_shard_venv"] = make_shard_venv
     train_res = trainer_mod.train(make_env, obs_dim, n_actions,
                                   total_steps=budget_steps, seed=seed, log=log,
                                   wall_clock_budget_s=wall_clock_budget_s,
@@ -546,7 +568,15 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
 # plain verify path (a PPO per game) — it is an explicit second pass (CLI verb / harden flag).
 # ======================================================================== #
 RESCUE_BUDGET = 500_000          # bounded RL budget for ONE rescue attempt [eng.]
-RESCUE_NUM_ENVS = 8              # batched in-scene vec width for a rescue train [eng.]
+RESCUE_NUM_ENVS = 8              # batched in-scene vec width (K) for a rescue train [eng.]
+# SHARD COUNT (Elias, 2026-07-16: "32 cores per run"). Default 1 = today's single-process
+# batch (byte-identical). M INDEPENDENT batch shards stepped concurrently give M*K logical
+# envs, so ONE rescue train can saturate a 16/32-core allocation. The bounded RESCUE_BUDGET
+# is intentionally NOT bumped here (that would silently change every caller); the recommended
+# WALL-TIME-matched FARM presets live in notes/rl_agent/SHARDED_VEC_ENV.md — e.g. 1x8 @ -c 8
+# (500k), 2x8 @ -c 16, 4x8 @ -c 32 (~1-2M budget at similar wall time). Opt in per call via
+# `rescue_certify(num_shards=..., budget_steps=...)` / the `game rescue --shards/--budget` CLI.
+RESCUE_NUM_SHARDS = 1            # concurrent batch shards (M); M*K logical envs [eng.]
 
 
 def _bridge_replay_for_engine(engine: str, game_source: str, witness: dict) -> dict:
@@ -578,7 +608,8 @@ def _rescue_candidacy(report: dict):
 
 def rescue_certify(game_path: str, verify_report: dict | None = None, *,
                    budget_steps: int = RESCUE_BUDGET, n_eval: int = N_EVAL,
-                   num_envs: int = RESCUE_NUM_ENVS, seed: int = 0, trainer: str = "sb3",
+                   num_envs: int = RESCUE_NUM_ENVS, num_shards: int = RESCUE_NUM_SHARDS,
+                   seed: int = 0, trainer: str = "sb3",
                    method: str = "ppo", demo_sr_min: float = DEMO_SR_MIN,
                    demo_stochastic_floor: float = DEMO_STOCHASTIC_FLOOR,
                    save_model: str | None = None, demo_out: str | None = None,
@@ -621,6 +652,7 @@ def rescue_certify(game_path: str, verify_report: dict | None = None, *,
     try:
         g3 = train(game_path, budget_steps=budget_steps, n_eval=n_eval, seed=seed,
                    trainer=trainer, method=method, num_envs=num_envs,
+                   num_shards=num_shards,
                    save_model=save_model, demo_out=demo_out, demo_sr_min=demo_sr_min,
                    demo_stochastic_floor=demo_stochastic_floor,
                    wall_clock_budget_s=wall_clock_budget_s, log=log, **train_kwargs)
@@ -634,6 +666,7 @@ def rescue_certify(game_path: str, verify_report: dict | None = None, *,
         "greedy_sr": g3.get("greedy_sr"), "stochastic_sr": g3.get("stochastic_sr"),
         "n_eval": g3.get("n_eval"), "demo_ready": bool(g3.get("demo_ready")),
         "trainer": g3.get("trainer"), "method": g3.get("method"),
+        "num_envs": num_envs, "num_shards": num_shards,   # M*K logical env provenance
         "saved_model_path": g3.get("saved_model_path"),
     }
 

@@ -274,9 +274,20 @@ def _build_dqn(algo_cls, venv, hp: dict, seed: int):
     )
 
 
+# When sharding, the M Godot processes own the cores for COLLECTION and the CPU learner is a
+# tiny 2x64 MLP whose backward pass is FASTER on few threads. PyTorch otherwise defaults its
+# intra-op pool to the whole `-c` cgroup (e.g. 32 threads), which both wastes cycles on the
+# small net AND fights the Godot shard procs for cores — instrumented: torch=32 collapsed 4x8
+# to 503 sps, torch=2 gave 10502 (20x), while the sharded ENV itself scaled 4868->15202 sps
+# (M=1->4). So the sharded path caps torch to this small default (overridable). [eng.]
+SHARD_TORCH_THREADS = 2
+
+
 def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           seed: int = 0, device: str = "cpu", log=None, wall_clock_budget_s=None,
-          method: str = DEFAULT_METHOD, make_batch_venv=None, **overrides) -> dict:
+          method: str = DEFAULT_METHOD, make_batch_venv=None, num_shards: int = 1,
+          make_shard_venv=None, torch_num_threads: int | None = None,
+          **overrides) -> dict:
     """Train an SB3 learner on `make_env` (a 0-arg PlanckEnv factory) for
     ~`total_steps` env-steps and return the same dict shape as `ppo.train` (agent +
     curves + steps_to_first_success + bookkeeping, plus the resolved `method`).
@@ -287,7 +298,20 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     default / ``a2c`` / ``dqn``). ppo/a2c share the mirrored on-policy net-arch and
     rollout knobs; dqn is off-policy and gets its own `DQN_DEFAULTS` — the PPO
     rollout knobs are never forced onto it. The callback (curves + plateau/wall-clock
-    early stop) and the greedy/sampled eval surface are identical for every method."""
+    early stop) and the greedy/sampled eval surface are identical for every method.
+
+    SHARDING (Elias, 2026-07-16: "32 cores per run"). `num_shards` (default 1 =
+    today's behavior, byte-identical) fans the rollout across M INDEPENDENT
+    `GodotBatchVecEnv` shards stepped concurrently — total logical envs =
+    ``num_shards * num_envs`` (M*K). It engages ONLY when a `make_shard_venv(M, K)`
+    factory is supplied (the sb3/gdscript lane, `certify.g3_prime`) AND
+    ``num_shards > 1`` AND ``HARNESS_VECENV != "dummy"``; otherwise the single-shard
+    batch (or DummyVecEnv) path is untouched. When it engages the PPO minibatch is
+    sized off the TRUE rollout width (M*K) so `num_minibatches` still divides the
+    batch exactly as on the single-shard path, and torch intra-op threads are capped
+    (``SHARD_TORCH_THREADS``) so the tiny-MLP learner does not starve the M Godot
+    collectors — the instrumented single-game-throughput fix (torch=32 -> 503 sps,
+    torch=2 -> 10502 sps at 4x8). ``torch_num_threads`` overrides the cap on any path."""
     algo_cls = _resolve_algo(method)   # validates method (+ lazily imports SB3)
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
@@ -319,12 +343,35 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     # JS/PlanckEnv lane and num_envs==1 keep DummyVecEnv; HARNESS_VECENV=dummy forces
     # the old path everywhere (debug). Farm-level parallelism (1 game/array task) is
     # orthogonal and still live.
-    use_batch = (make_batch_venv is not None and num_envs > 1
-                 and os.environ.get("HARNESS_VECENV") != "dummy")
-    if use_batch:
+    num_shards = int(num_shards)
+    force_dummy = os.environ.get("HARNESS_VECENV") == "dummy"
+    # SHARDING first (M*K logical envs over M concurrent Godot processes), then the
+    # single-process batch, then the sequential DummyVecEnv. num_shards==1 never takes
+    # the shard path -> the batch/dummy behavior stays byte-identical to before.
+    use_shard = (num_shards > 1 and make_shard_venv is not None and num_envs > 1
+                 and not force_dummy)
+    use_batch = (not use_shard and make_batch_venv is not None and num_envs > 1
+                 and not force_dummy)
+    if use_shard:
+        venv = make_shard_venv(num_shards, num_envs)
+        # M*K logical envs now feed ONE rollout; size the PPO minibatch off the TRUE
+        # rollout width so num_minibatches divides the batch exactly as on the single
+        # batch path (SB3 reads the buffer width from venv.num_envs itself).
+        hp["num_envs"] = venv.num_envs
+    elif use_batch:
         venv = make_batch_venv(num_envs)
     else:
         venv = DummyVecEnv([_make_init() for _ in range(num_envs)])
+
+    # CPU-learner thread policy (the sharded single-game-throughput fix — see
+    # SHARD_TORCH_THREADS). Explicit `torch_num_threads` always wins; else the SHARDED path
+    # caps torch to the small default so the tiny MLP's threads do not starve the M Godot
+    # collectors; the non-shard path is left exactly as before (byte/behaviour-identical).
+    if torch_num_threads is not None:
+        torch.set_num_threads(max(1, int(torch_num_threads)))
+    elif use_shard:
+        torch.set_num_threads(max(1, min(torch.get_num_threads(), SHARD_TORCH_THREADS)))
+
     # Seed each vec slot with base_seed+i, latched by the adapter and reused on
     # autoreset — the exact per-env fixed-seed scheme of the vendored VecEnv.
     venv.seed(seed)
