@@ -1,0 +1,145 @@
+# ARCH_3D_ANALYSIS — should the agent's internal architecture change for harder 3D games?
+
+Date: 2026-07-16 · Author: analysis agent (READ-ONLY: no repo code changed; scratch driver + sbatch under `~/orcd/scratch/gi/`)
+Question (Elias, FR): *"vu qu'on va essayer des jeux plus durs en 3D, est-ce qu'on devrait changer l'architecture interne de notre agent pour quelque chose de plus performant ?"*
+
+## TL;DR — CHANGE THE OBS, NOT THE NET (yet)
+The binding constraint for 3D is **not** the policy network — it is the **observation vector**, which is
+**2D-only and literally crashes on a true-3D game**. No architecture change can matter until the agent can
+*see* the third axis. Concretely:
+
+1. **Obs is the cheapest + necessary win.** `build_obs_vector` (`harness/rl/env.py`) reads `px, py = q.get("pos")`
+   — a 2-element unpack. A true-3D game reports `pos:[x,y,z]`, so the obs builder raises
+   `ValueError: too many values to unpack` **before the first learning step**. Fix the obs (add z, vz, real
+   3-axis orientation; ideally relative-to-target + next-checkpoint direction hints). ~10-line change, but it
+   touches obs sizing + the fingerprint reconstruct — see "Adoption cost".
+2. **Architecture: don't change it — confirmed by bench.** On a valid-obs, hard-but-learnable drone, **256×256 was
+   statistically identical to 2×64** (steps-to-first-success 8360 vs 8336; greedy success 0.25 = 0.25) — ~16× the
+   params bought nothing. Our obs is tiny, low-dim, and (near-)Markov, so the net is not the bottleneck. Wider MLP
+   stays a *free hyperparameter* (`hidden=256`, no code change) to keep in the toolbox, but it is not the lever.
+   **LSTM is unjustified** (obs is full code-state, not pixels — minimal partial observability) **and unavailable
+   in-image** (RecurrentPPO is `sb3-contrib`, gated on an image rebuild — `sb3_trainer.py:54`). Frame-stacking is
+   pointless (velocity is already in the obs).
+3. **The drone is DESIGN-broken, not RL-hard.** The `0/2088` was the **tree solver** (`treesolve.py` /
+   `gameverify.py`), which searches checkpoints off the wire and uses **zero** `build_obs_vector` — dimension-agnostic,
+   which is why it ran on a true-3D game at all. Its own verdict string is *"make the first stage easier."* That is
+   the **difficulty auto-tuner** (piste E), not a better net.
+
+**Answer to Elias in one line: change the OBS, not the architecture.**
+Confidence: **high** on (1) and (3) (deterministic crash + ledger/tree-solver evidence); **high** on (2) now that
+the bounded bench shows 256×256 = 2×64 on a valid-obs game (single game, small n — call it high-not-certain).
+
+---
+
+## 1. OBS AUDIT (`harness/rl/env.py::build_obs_vector`)
+
+Layout, frozen at first reset — per body (sorted, controlled first), padded to body count:
+```
+[present, x/W, y/H, vx/VS, vy/VS, sin(angle), cos(angle), is_static, is_sensor, is_controlled]   # 10 floats/body
+... then appended once: latched-checkpoint one-hot (declared order) + normalized tick (min(1, tick/horizon))
+```
+Normalization: pos by world_size `(W,H)`, vel by `VEL_SCALE=1000`, clip `[-10,10]`. `PER_BODY=10`.
+
+| Property | Finding | 3D verdict |
+|---|---|---|
+| **z position** | absent — only `px,py`. `world_size` is a 2-tuple; no depth scale. | **MISSING** |
+| **z velocity** | absent — only `vx,vy`. | **MISSING** |
+| **orientation** | a single scalar 2D `angle` → `sin/cos`. No roll/pitch/yaw, no quaternion. | **INSUFFICIENT for 3D** |
+| **frame of reference** | **absolute** (world-normalized), not egocentric. | recoverable but not free |
+| **relative-to-target** | none. Target bodies (rings/beacons) appear as *other bodies'* absolute pos → the net must subtract. | no hint |
+| **checkpoint direction/distance hint** | none — latched is a single bit; no "where is next cp". | no hint |
+| **hidden game state** (fuel, lifetime, wind phase, crash flag) | NOT in obs; only `tick` as a clock proxy. | mild partial-obs |
+
+**The crash is real and deterministic** (verified in-process, pure Python — no subprocess):
+- `px, py = [1.0, 2.0, 3.0]` → `ValueError: too many values to unpack (expected 2)`.
+- `build_obs_vector({'craft':{'pos':[1,5,30],...}}, ...)` → **CRASH**; the same call with a 2-vector pos → OK (dim 11).
+- The Godot serve side already emits full 3D: `_vec_json` is "dimension-agnostic" and true-3D games return
+  `"pos":[p.x,p.y,p.z]` (`tumble_3d.gd:128`, `a_3d_game_fly...gd:331`, +16 such games in `scenes/games/`).
+  Only the **Python obs consumer** is 2D-locked. `godot_env.py` even documents that bounds use "the FIRST TWO
+  position components" — the z-drop is baked in.
+- **Both** RL lanes hit this: `GodotServeEnv._observe` and `stale_seek.fingerprint_from_obs` call `build_obs_vector`.
+  The tree solver (`treesolve.run_batch`) does not → it is the only lane that has ever "run" a true-3D game.
+- **Why `a_3d_game_fly` certified anyway:** RL/`g3_prime` is a **post-cert probe** (called from `harden.py --g3`
+  and `g4.py`), *not* the COMPLETED gate (that is `gameverify` G0–G3 tree-solve + witness bridge, which is
+  dimension-agnostic). So true-3D games certify fine while the RL lane would crash on them.
+- **Concrete near-term hit:** the queued `harden --g3` on the recent 3D certifieds (`RESUME_TONIGHT.md`) will crash
+  at this exact line the moment it points G3′ at a true-3D game. The obs fix unblocks that work too.
+
+Two failure modes for 3D, depending on how the generated game reports pose:
+- **true-3D `[x,y,z]`** (e.g. `a_3d_game_fly`, `tumble_3d`, `a_3d_drone_course`) → RL/G3' **crashes at probe** (`certify.g3_prime:272`).
+- **2D-projected `[x,y]`** (e.g. `pilot_a_drone_through_a_canyon` reports `[position.x, position.y]`) → runs, but the
+  agent is **blind on the dropped axis** (for a canyon flythrough the forward/depth axis can literally be the one omitted).
+
+## 2. ARCHITECTURE OPTIONS — cost/benefit for OUR small-obs setting
+
+Current learner (`ppo.py::DEFAULTS`, mirrored in `sb3_trainer.py`): PPO, **separate 2×64 tanh** actor/critic,
+ortho-init, CPU, `num_envs=8`, `num_steps=128`, γ0.99, plateau patience 40 / window 10 / min_delta 0.05.
+
+| Option | Cost | Expected benefit here | Verdict |
+|---|---|---|---|
+| **Wider MLP 256×256** | **zero code** — `hidden=256` kwarg | low-dim Markov obs rarely needs width; may help once obs carries real 3D geometry | **Screen it** (benched below); adopt only if it moves steps-to-first-latch |
+| **Separate value/policy net** | already the default (`net_arch dict(pi,vf)`) | n/a | already on |
+| **Observation normalization (VecNormalize)** | ~15 lines venv wrapper (not a kwarg) | obs already hand-normalized+clipped; could help **value-fn scale** only. Rewards already O(1–5). | Low priority; redundant with hand-norm |
+| **Frame-stacking** | wrapper | **none** — velocity already in obs; obs is Markov for point-mass dynamics | Skip |
+| **LSTM / RecurrentPPO** | **image rebuild** (`sb3-contrib`, `sb3_trainer.py:54`) + real cost | partial-obs is *mild* (only fuel/timers hidden; `tick` is a clock). Weak justification. | **Skip** until a game proves true partial-obs |
+| **Reward scale vs plateau-patience** | tune | on a game that never latches, return is flat → plateau trips at 40 updates = "UNSOLVABLE-BY-RL, move on". Correct behavior; not a 3D lever. | Leave as-is |
+
+Takeaway: for a fully-observed, low-dim obs the **network is almost never the bottleneck**; representation
+(what's in the vector) and task difficulty are. This is textbook for these agents.
+
+## 3. BENCH (bounded, honest) — separate sbatch jobs, `mit_preemptable --requeue`, in-image, num_envs=8, speedup=8
+
+Driver `~/orcd/scratch/gi/rl_probe_arch.py` (wraps `g3_prime`, captures crashes as data); jobs `arch_bench.sbatch`.
+Requested arms `tumble_3d` + `a_3d_game_fly` are **true-3D → they crash at the obs probe** (proven deterministically
+above), so burning full jobs on them adds nothing; one fast `tumble_3d` job is included purely to capture the
+in-image crash artifact. The real architecture comparison runs on the **valid-obs, hard-but-solvable** 2D-projected
+drone (`pilot_a_drone_through_a_canyon`, ledger: COMPLETED; tree solver stuck at milestone 2 → headroom).
+
+| Arm | Game | Net | Budget | steps→1st success | greedy succ | stoch succ | cp1 / cp2 / beacon latch | notes |
+|---|---|---|---|---|---|---|---|---|
+| base | drone (2D-proj) | 2×64 | 120k (118 upd) | **8336** | **0.25** | 0.188 | 0.969 / 0.406 / 0.219 | still_improving; bridge_ok |
+| wide | drone (2D-proj) | 256×256 | 120k (118 upd) | **8360** | **0.25** | 0.250 | 0.969 / 0.438 / 0.250 | still_improving; bridge_ok |
+| crash3d | tumble_3d (true-3D) | 2×64 | 6k | **CRASH 5.2s** | — | — | — | `ValueError` @ `env.py:113`, in-image |
+
+**Result — width is NOT the lever.** The two valid-obs arms are **statistically identical**: steps-to-first-success
+8336 vs 8360 (Δ0.3%), greedy success 0.25 = 0.25, and the cp2/beacon latch-rate deltas (+0.03) sit inside eval
+noise (n≈32). ~16× more policy parameters bought **nothing measurable**. Both curves were **still improving** at
+the 120k budget cut (not converged) — so headroom here is unlocked by **more budget / better obs / easier design**,
+not a bigger net. The arms did **not** flatline (they latch cp1 ~97%, reach beacon ~22–25%), so this 2D-projected
+drone is a legitimately **RL-learnable** game, not a broken one.
+
+**crash3d (job 18068681): obs blocker CONFIRMED in-image.** `ValueError: too many values to unpack (expected 2)`
+at `harness/rl/env.py:113` (`px, py = q.get("pos", (0.0, 0.0))`) — the true-3D crash reproduces inside
+`gi-certifier.sif`, before any training, in 5.2s.
+
+## 4. DRONE: RL-hard or DESIGN-broken?  → **two different drones, two answers**
+- **`a_3d_drone_course` (the `0/2088` one) = DESIGN-broken.** The `0/2088` (and `1935/2616 → final_stretch`,
+  `2466/3360 → spire_field`, determinism deltas 0.001276/5.9e-5, repeated load errors) are all the **tree solver /
+  G3 verifier** (`gameverify.py`), an optimizing checkpoint search — a learned PPO net will not beat a search that
+  already explored thousands of episodes and never reached milestone 1. The verifier's own remedy is *"make the first
+  stage easier"* and the run also shows **non-determinism** (a G1 gate). **Fix = difficulty auto-tuner (piste E) +
+  the 3D determinism pin** (`RESUME_TONIGHT.md`), not an agent-architecture change. It is *also* true-3D, so it would
+  crash the RL obs path regardless.
+- **`pilot_a_drone_through_a_canyon` (the benched, 2D-projected one) = fine + RL-learnable.** Both arms reach ~25%
+  greedy success and latch cp1 at 97% — not flatline. So this game is neither broken nor net-limited; it just needs
+  more budget (still improving) and would benefit from the obs/geometry hints in §5.
+- **Net verdict on the drone question:** where a 3D game "won't solve," look first at **obs (crash / dropped axis)**
+  and **design/difficulty**, not the network. A flatline-at-0 (as the `0/2088` case) is the difficulty tuner's job.
+
+## 5. RECOMMENDATION
+1. **CHANGE OBS FIRST (blocker + cheapest win).** Make the obs 3D-aware: add `z`, `vz`, a real 3-axis orientation
+   (forward+up vectors or quaternion), and a depth scale in `world_size`. Strongly consider **egocentric +
+   next-checkpoint direction/distance** features — the single highest-leverage learnability change for harder
+   nav games, independent of dimension.
+2. **Keep the 2×64 PPO** as the default — the bench already screened `hidden=256` and it matched 2×64 exactly, so
+   there is nothing to adopt. Hold LSTM/VecNormalize/frame-stack unless a specific game demonstrates true
+   partial-observability. If a hard game stalls with *good* obs, spend **budget** (curves were still improving), not width.
+3. **Route "unsolved-but-not-a-crash" 3D games to the difficulty tuner**, not to a bigger net.
+
+### Adoption cost
+- **Obs 3D fix:** `build_obs_vector` layout + `PER_BODY` (10→~14–16), the `obs_dim` sizing in
+  `env.py::_freeze_layout` **and** `godot_env.py::_freeze_layout`, the `world_size` depth, and
+  `stale_seek.fingerprint_from_obs` (reconstructs a fingerprint from the same vector). Retraining is required but
+  cheap (fresh policies; budgets are 100k–2M). Tests: `test_gd_wiggle`, obs-layout unit tests. ~½ day incl. tests.
+- **`hidden=256`:** zero code — one kwarg; a screen job. Adopt/revert on the bench number.
+- **LSTM:** image rebuild (`sb3-contrib`) — do **not** pay this without a partial-observability game that needs it.
