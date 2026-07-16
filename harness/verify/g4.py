@@ -111,6 +111,14 @@ IV_MAX_TICKS = PROBE_HORIZON  # per-rollout decision-tick cap
 # The oracle budget defaults to treesolve.TICK_BUDGET (one full G3 solve) — read at
 # call time so a test can shrink it; see _stale_oracle_budget().
 
+# Policy-guided descent tier (S1.5, harness/rl/adversary.descent_search) defaults ([eng.]).
+# Elias's return-then-descend: navigate the working policy to a low-V waypoint, THEN
+# alpha-ramp into the freeze pocket. CHEAP (no training) so it runs in the standard smart
+# path, slotted BETWEEN the greedy inverse-value tier (S1) and the deep seeker (S2). Same
+# model gate as S1. Design: notes/adversarial/STALE_SEEKING_PLAN.md §3.1.
+DESCENT_WAYPOINTS = 6      # low-V waypoints selected per descent search
+DESCENT_TICKS = 30        # descent-phase length; alpha ramps 0->1 over this
+
 # Deep seeker tier (the TRAINED stale-seeker, harness/rl/stale_seek.py) defaults ([eng.]).
 # This tier costs ONE PPO training per game, so it is OFF unless the caller asks for the
 # DEEP grade (`deep=True`) AND the cheap tiers above certified NO softlock — it is a
@@ -1348,6 +1356,141 @@ def _run_inverse_value(executor, game_source, engine, actions, report, *,
 
 
 # ======================================================================== #
+# S1.5 — POLICY-GUIDED DESCENT TIER (Elias's return-then-descend, gdscript lane).
+# Design: notes/adversarial/STALE_SEEKING_PLAN.md §3.1 (BUILD-FIRST). Slots in the
+# ladder BETWEEN the greedy inverse-value tier (S1) and the deep trained seeker (S2):
+# use the COMPETENT working policy to NAVIGATE into a low-V basin, THEN alpha-ramp to
+# the freeze-seeking anti-policy. CHEAP (policy rollouts only, no training) so it runs
+# in the standard smart path, not only deep=True. SEARCH+DETECT = adversary.descent_search;
+# CONFIRM = the SAME refute_prefix oracle (soundness unchanged). Model-gated like S1:
+# with no model artifact / injected critic the tier is a no-op and the ladder is
+# byte-for-byte unchanged.
+# ======================================================================== #
+def _run_descent(executor, game_source, engine, actions, report, *,
+                 requested, game_path=None, model=None, model_path=None,
+                 critic=None, candidates=None, env_factory=None, horizon,
+                 seed, stale_H, stale_budget, top_m, window,
+                 n_waypoints, descent_ticks, eps):
+    """The policy-guided descent tier: SEARCH+DETECT (adversary.descent_search) surfaces
+    softlock candidates by navigating the working policy to a low-V waypoint then alpha-
+    ramping into the freeze pocket; CONFIRM (refute_prefix) certifies them. A certified
+    prefix -> a hard `softlock` finding tagged ``policy_descent+tree_refute`` with a
+    repair hint naming the last latched checkpoint before the freeze.
+
+    Runs ONLY when a model artifact (or an injected critic/candidates/env_factory) is
+    available; otherwise skipped (contributes nothing — ladder unchanged)."""
+    block = {"status": "skipped_no_model", "reason": "", "candidates": [],
+             "waypoints": [], "detected": 0, "certified": 0, "findings": [],
+             "passed": True, "critic_source": None}
+    if not requested:
+        block["reason"] = "no trained model artifact (descent tier is model-gated)"
+        return block
+    if not actions:
+        block["status"] = "skipped"
+        block["reason"] = "no ACTIONS to steer"
+        return block
+
+    from harness.rl import adversary
+
+    block["status"] = "run"
+    witness = _witness(report) or {}
+    witness_actions = list(witness.get("actions") or [])
+    source = "injected"
+
+    # --- SEARCH + DETECT (skip when candidates are injected for a py/unit run) ---
+    if candidates is None:
+        critic = critic if critic is not None else _load_iv_critic(model, model_path)
+        if critic is None:
+            block["status"] = "skipped_no_model"
+            block["reason"] = "model/critic could not be resolved"
+            return block
+        factory = env_factory or _default_iv_env_factory(game_path)
+        if factory is None:
+            block["status"] = "skipped"
+            block["reason"] = ("descent search needs a steppable env "
+                               "(gdscript game_path or an injected env_factory)")
+            return block
+        env = factory()
+        try:
+            res = adversary.descent_search(
+                env, critic, witness_actions=witness_actions, eps=eps,
+                n_waypoints=n_waypoints, descent_ticks=descent_ticks,
+                window=window, max_ticks=horizon)
+        finally:
+            close = getattr(env, "close", None)
+            if callable(close):
+                close()
+        cand_list = res["candidates"]
+        source = res["source"]
+        block["waypoints"] = res.get("waypoints", [])
+    else:
+        cand_list = [c if isinstance(c, dict) else {"prefix": list(c),
+                     "provenance": {"source": "injected"}, "value": None}
+                     for c in candidates]
+
+    block["critic_source"] = source
+    block["detected"] = len(cand_list)
+    block["candidates"] = [{"prefix": list(c["prefix"]), "value": c.get("value"),
+                            "provenance": c.get("provenance", {})} for c in cand_list]
+
+    # --- CONFIRM: refute each candidate (lowest-V first, capped top-M) ---
+    findings = []
+    for cand in cand_list[:top_m]:
+        prefix = list(cand["prefix"])
+        if not prefix:
+            continue
+        try:
+            res = refute_prefix(executor, game_source, actions, prefix,
+                                H=stale_H, budget=stale_budget, engine=engine, seed=seed)
+        except VerifyError:
+            continue                           # a dead refutation must not sink the tier
+        if not res["certified"]:
+            continue
+        try:
+            prefix_ep = executor.run_batch(
+                game_source, [{"seed": seed, "actions": prefix}], len(prefix),
+                escape_margin=ESCAPE_MARGIN)[0]
+        except VerifyError:
+            prefix_ep = {"result": "budget", "ticks": len(prefix), "checkpoints": {}}
+        last_cp = _last_latched_checkpoint(prefix_ep.get("checkpoints"))
+        block["certified"] += 1
+        prov = dict(cand.get("provenance") or {})
+        prov.update({"oracle": "policy_descent+tree_refute", "critic_source": source,
+                     "H": res["H"], "budget": res["budget"], "engine": engine,
+                     "seed": seed, "subtree_status": res["subtree_status"],
+                     "last_checkpoint": last_cp})
+        findings.append({
+            "outcome": "softlock", "tier": "descent",
+            "family": "policy_descent+tree_refute", "hard": True,
+            "detail": (f"policy-guided descent navigated the game into a frozen pocket "
+                       f"(len {len(prefix)} prefix: a competent return to a low-value "
+                       f"waypoint then an alpha-ramped anti-policy descent); the G3 solver "
+                       f"found no win in {res['budget']} ticks under it (subtree "
+                       f"{res['subtree_status']})"),
+            "repair_hint": (
+                f"a policy-guided descent attack soft-locks the game after the "
+                f"'{last_cp}' checkpoint — competent navigation reaches a pocket from "
+                f"which no continuation can win. Ensure every reachable state past "
+                f"'{last_cp}' can still reach the goal, or add an escape/reset from the "
+                f"dead end."
+                if last_cp else
+                "a policy-guided descent attack soft-locks the game before any checkpoint "
+                "latches — competent navigation reaches an inescapable early pocket; add "
+                "an escape/reset or make the dead-end region unreachable."),
+            "reproducer": {
+                "engine": engine, "seed": seed,
+                "action_plan": {"kind": "sequence", "sequence": list(prefix)},
+                "provenance": prov,
+            },
+            "evidence": _evidence(prefix_ep, engine),
+        })
+
+    block["findings"] = findings
+    block["passed"] = not findings
+    return block
+
+
+# ======================================================================== #
 # DEEP SEEKER TIER — the TRAINED stale-seeker (escalation above the greedy search)
 # Design: harness/rl/stale_seek.py + notes/adversarial/INVERSE_VALUE_G4.md. A PPO
 # adversary LEARNS to drive the game into a softlock; its candidates flow into the
@@ -1459,6 +1602,8 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
            game_path=None, model=None, model_path=None, iv_critic=None,
            iv_candidates=None, iv_env_factory=None, iv_seeds=IV_SEEDS,
            iv_eps=IV_EPS, iv_window=IV_WINDOW, iv_max_ticks=IV_MAX_TICKS,
+           descent_critic=None, descent_candidates=None, descent_env_factory=None,
+           descent_waypoints=DESCENT_WAYPOINTS, descent_ticks=DESCENT_TICKS,
            deep=False, seeker_budget=SEEKER_BUDGET,
            seeker_num_envs=SEEKER_NUM_ENVS, seeker_seeds=SEEKER_SEEDS,
            seeker_waypoints=SEEKER_WAYPOINTS, seeker_top_m=SEEKER_TOP_M):
@@ -1472,6 +1617,13 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
     `stale=True` also runs the stale-state tier (softlock triggers 1a/1b + the
     bounded tree-refutation oracle 1c); a certified prefix is a hard `softlock`
     finding -> grade `open`. It rides the SAME executor + treesolve solver.
+
+    A trained `model`/`model_path` (or the injected `iv_*`/`descent_*` seams) arms the
+    two SMART tiers that LEAD the ladder: S1 the greedy inverse-value hunt (harness.rl.
+    adversary.search) and S1.5 policy-guided descent (adversary.descent_search — navigate
+    the working policy to a low-V waypoint, then alpha-ramp into the freeze pocket). Both
+    are CHEAP (policy rollouts, no training) and both confirm through the SAME
+    refute_prefix oracle. With no model the ladder is byte-for-byte unchanged.
 
     `deep=True` additionally arms the DEEP SEEKER tier — a TRAINED PPO stale-seeker
     (harness/rl/stale_seek.py). It is COSTLY (one PPO training per game) so it runs
@@ -1535,31 +1687,48 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
             stale_budget=stale_budget, top_m=top_m, window=iv_window,
             iv_seeds=iv_seeds, iv_eps=iv_eps, iv_max_ticks=iv_max_ticks)
 
+        # S1.5 SMART TIER — policy-guided descent, slotted BETWEEN S1 (greedy) and the
+        # deep seeker (S2). Same model gate as S1 (a real `model`/`model_path` arms both);
+        # dedicated `descent_*` seams inject a critic/candidates/env for tests WITHOUT
+        # perturbing the S1 (inverse-value) tests. CHEAP (policy rollouts) — standard path.
+        descent_requested = any(x is not None for x in
+                                (model, model_path, descent_critic,
+                                 descent_candidates, descent_env_factory))
+        descent_block = _run_descent(
+            executor, game_source, engine, actions, report,
+            requested=descent_requested, game_path=game_path, model=model,
+            model_path=model_path, critic=descent_critic, candidates=descent_candidates,
+            env_factory=descent_env_factory, horizon=horizon, seed=seed, stale_H=stale_H,
+            stale_budget=stale_budget, top_m=top_m, window=iv_window,
+            n_waypoints=descent_waypoints, descent_ticks=descent_ticks, eps=iv_eps)
+
         stale_block = _run_stale(executor, game_source, engine, actions, report,
                                  controlled=controlled, initial=initial, horizon=horizon,
                                  seed=seed, requested=bool(stale), stale_H=stale_H,
                                  stale_budget=stale_budget,
                                  stale_cand_budget=stale_cand_budget, top_m=top_m)
 
+        # The smart tiers (S1 + S1.5) lead the ladder; the mechanical/stale tiers follow.
+        smart_findings = list(iv_block["findings"]) + list(descent_block["findings"])
         cheap_findings = (list(tier0["findings"]) + list(tier1["findings"])
                           + list(stale_block["findings"]))
-        # Deep seeker tier — armed by deep=True, but only escalated when the cheap
-        # tiers certified nothing (gate lives in _run_seeker). Uses the cheap stale
-        # tier's oracle budgets so CONFIRM stays consistent across tiers.
+        # Deep seeker tier — armed by deep=True, but only escalated when NOTHING above
+        # certified a softlock (gate lives in _run_seeker; the CHEAP descent tier counts
+        # as an "above" tier, so a descent-certified softlock skips the deep escalation).
         seeker_block = _run_seeker(
             game_source, engine, actions, report, game_path=game_path,
-            requested=bool(deep), cheap_findings=cheap_findings, seed=seed,
-            budget=seeker_budget, num_envs=seeker_num_envs, seeds=seeker_seeds,
-            waypoints=seeker_waypoints, top_m=seeker_top_m, stale_H=stale_H,
-            stale_budget=stale_budget)
+            requested=bool(deep), cheap_findings=smart_findings + cheap_findings,
+            seed=seed, budget=seeker_budget, num_envs=seeker_num_envs,
+            seeds=seeker_seeds, waypoints=seeker_waypoints, top_m=seeker_top_m,
+            stale_H=stale_H, stale_budget=stale_budget)
 
-        findings = (list(iv_block["findings"]) + cheap_findings
-                    + list(seeker_block["findings"]))
+        findings = smart_findings + cheap_findings + list(seeker_block["findings"])
         grade = _grade(findings, tier1, tiers)
         out.update({
             "grade": grade,
             "passed": grade != "open",
             "inverse_value": iv_block,
+            "descent": descent_block,
             "tier0": tier0,
             "tier1": tier1,
             "stale": stale_block,
