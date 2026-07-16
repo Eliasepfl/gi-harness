@@ -1,5 +1,16 @@
 # MORNING REPORT — nuit du 2026-07-16
 
+## 🏆 VERDICT FINAL (fix3db, funnel entièrement réparé)
+- **PREMIER JEU 3D CERTIFIÉ**: `a_3d_game_fly_a_small_craft_through_a_se` —
+  COMPLETED, witness 239 ticks, 4 corrections. Capture GIF en cours
+  (~/orcd/scratch/gi/demos/first3d/). Toute la chaîne de la nuit y mène.
+- parking 3D: ENV_ERROR — dead actions steer_left/right (5 contextes probés):
+  candidat n°1 du difficulty/liveness travail 3D (le steering d'une voiture
+  3D immobile ne fait rien: même classe que 'brake', peut-être probe à
+  étendre OU vraie voiture cassée — à trancher).
+- drone 3D: UNSOLVED — 0/2088 épisodes au premier milestone: design trop dur,
+  le difficulty auto-tuner (piste E) est maintenant LE chantier.
+
 ## 🎯 L'histoire de la nuit en une ligne
 Le biais 2D était NOTRE bug (un "2D" hardcodé dans le premier message) ; une
 fois tué, le modèle écrit du 3D immédiatement — et la 3D a révélé deux couches
