@@ -64,21 +64,39 @@ def _default_verify(game_path: str) -> dict:
 
 
 def _default_attack(game_path: str, source: str, report: dict, *, engine: str,
-                    tiers=(0,), stale: bool = True, seed: int = 0) -> dict:
+                    tiers=(0,), stale: bool = True, seed: int = 0,
+                    model_path=None, g3_result=None) -> dict:
     """Run G4 on the CURRENT game. Uses the lower-level ``run_g4`` (not ``attack_game``)
     so broken shapes are surfaced even when the game trips a verify gate (e.g. the
     single-action anti-triviality gate flips an otherwise-certified game to GOAL_ERROR):
-    tier 0's single-action lens still fires and compiles to a repair directive."""
+    tier 0's single-action lens still fires and compiles to a repair directive.
+
+    CRITIC HANDOFF: ``model_path`` (G3's trained artifact) + ``g3_result`` (its verdict) are
+    handed to run_g4's model-gate; a COMPETENT critic (demo_ready) arms the smart tiers, an
+    unconverged one is DOWNGRADED to the critic-free ladder with an honest note in the g4
+    block (the shared `certify.critic_competent` predicate decides). ``game_path`` is passed
+    so the gdscript smart tiers can spawn their steppable serve env."""
     from harness.verify.g4 import run_g4
     rep = dict(report) if isinstance(report, dict) else {}
     rep.setdefault("engine", engine)
     return run_g4(source, rep, engine=engine, slug=_slug_of(game_path),
-                  tiers=tuple(tiers), stale=bool(stale), seed=seed)
+                  tiers=tuple(tiers), stale=bool(stale), seed=seed,
+                  game_path=game_path, model_path=model_path, g3_result=g3_result)
 
 
 def _default_g3(game_path: str, *, budget_steps: int, **kwargs) -> dict:
     from harness.rl.certify import g3_prime
     return g3_prime(game_path, budget_steps=budget_steps, **kwargs)
+
+
+def _default_rescue(game_path: str, verify_report: dict, *, budget_steps: int,
+                    **kwargs) -> dict:
+    """RL-witness second-path certification (behind harden's `rl_rescue` flag). Delegates to
+    `certify.rescue_certify`, which itself no-ops (an honest block, no PPO) unless the report
+    is UNSOLVED-with-progress. Returns the (possibly upgraded) report."""
+    from harness.rl.certify import rescue_certify
+    return rescue_certify(game_path, verify_report=verify_report,
+                          budget_steps=budget_steps, **kwargs)
 
 
 def _default_revise(source: str, directive: str, *, out_dir: str, backend: str,
@@ -110,6 +128,7 @@ def _default_render_skills(directive_text: str, *, root=None, use_llm: bool = Tr
 verify_fn = _default_verify
 attack_fn = _default_attack
 g3_fn = _default_g3
+rescue_fn = _default_rescue
 revise_fn = _default_revise
 render_skills_fn = _default_render_skills
 
@@ -176,15 +195,49 @@ def revise_with_directives(game_path: str, directives, *, out_dir: str,
 # The guarded harden loop
 # ======================================================================== #
 def _run_oracles(game_path, source, *, engine, tiers, stale, run_g3, budget_steps,
-                 g3_kwargs, seed) -> dict:
+                 g3_kwargs, seed, g3_save_dir=None, rl_rescue=False,
+                 rescue_kwargs=None) -> dict:
     report = verify_fn(game_path)
-    oracle = {"g4": attack_fn(game_path, source, report, engine=engine, tiers=tiers,
-                              stale=stale, seed=seed)}
-    # G3' is the RL learnability pre-filter: only run it on a game that CERTIFIES
-    # (G0-G3), never spend PPO on an unsolvable game.
+    oracle = {}
+
+    # RL-WITNESS RESCUE (opt-in, `rl_rescue`): for a game the tree funnel left UNSOLVED, try
+    # the second certification path BEFORE the oracles run — a rescued game then flows through
+    # the rest as a first-class CERTIFIED game. `rescue_fn` no-ops (honest block, no PPO)
+    # unless the report is UNSOLVED-with-progress, so this is cheap on non-candidates.
+    if rl_rescue and isinstance(report, dict) and not report.get("passed"):
+        report = rescue_fn(game_path, report, budget_steps=budget_steps,
+                           **(rescue_kwargs or {}))
+        oracle["_rescue"] = report.get("rescue")
+
+    # G3' FIRST (before G4) so its TRAINED CRITIC can be HANDED to G4's smart tiers. G3' is
+    # the RL learnability pre-filter: only run it on a game that CERTIFIES (G0-G3), never
+    # spend PPO on an unsolvable game. When a save dir is available, persist the model +
+    # demo trajectory beside the round sandbox so the artifact is real (and the demo is
+    # replayable via `game capture --actions`).
+    g3r = None
     if run_g3 and isinstance(report, dict) and report.get("passed"):
-        oracle["g3_prime"] = g3_fn(game_path, budget_steps=budget_steps,
-                                   **(g3_kwargs or {}))
+        g3kw = dict(g3_kwargs or {})
+        if g3_save_dir and "save_model" not in g3kw:
+            os.makedirs(g3_save_dir, exist_ok=True)   # so the .zip + demo json can land
+            g3kw["save_model"] = os.path.join(g3_save_dir, "policy.zip")
+        g3r = g3_fn(game_path, budget_steps=budget_steps, **g3kw)
+        oracle["g3_prime"] = g3r
+
+    # CRITIC HANDOFF: hand G3's artifact + result to G4's model-gate. We pass them through
+    # UNCONDITIONALLY; the shared `certify.critic_competent` predicate (consumed by G4's gate
+    # AND recorded below) arms the smart tiers on a COMPETENT (demo_ready) critic and
+    # DOWNGRADES an unconverged one to the critic-free ladder with an honest note in the g4
+    # block — never silently. No saved model -> model_path None -> the smart tiers stay
+    # dormant, and the ladder is byte-for-byte the critic-free path.
+    from harness.rl.certify import critic_competent
+    g3_model_path = g3r.get("saved_model_path") if isinstance(g3r, dict) else None
+    oracle["g4"] = attack_fn(game_path, source, report, engine=engine, tiers=tiers,
+                             stale=stale, seed=seed, model_path=g3_model_path,
+                             g3_result=g3r)
+    # The harden-side read of the SAME gate (surfaced in the report, alongside G4's block).
+    oracle["_critic"] = {"handed_off": g3_model_path is not None,
+                         "competent": (None if g3r is None else critic_competent(g3r)),
+                         "model_path": g3_model_path}
     # WAVE 1 PRESSURE: lift the non-gating failure-witness finding stashed in the
     # verify report into the oracle set so _compile_pressure can turn a no-stakes
     # game into a repair directive (order in the compiler: G4 -> PRESSURE -> G3').
@@ -199,6 +252,40 @@ def _run_oracles(game_path, source, *, engine, tiers, stale, run_g3, budget_step
         oracle["runtime_error"] = runtime_err
     oracle["_verify"] = report
     return oracle
+
+
+def _g3_summary(oracle: dict) -> dict | None:
+    """Surface the G3' reliability read for the report (Elias's demo/critic gate). ``None``
+    when G3' did not run this round. Records demo_ready + its two rates, whether the trained
+    critic was handed to G4, and the DIFFICULTY SIGNAL:
+
+        difficulty_signal == learnable AND not demo_ready AND not still_improving
+
+    i.e. the game is valid and solvable but the agent CONVERGED without mastering it — a
+    HARD-TO-MASTER signal, NOT a defect (the loop leaves it HARDENED; no repair grind). This
+    is the honest annotation on the 'not demo_ready & not still_improving & learnable-ish'
+    flow, respecting the existing severity tiers (feedback.severity_of stays authoritative)."""
+    from harness.rl.certify import critic_competent
+    g3 = oracle.get("g3_prime")
+    if not isinstance(g3, dict) or not g3:
+        return None
+    learnable = bool(g3.get("learnable"))
+    demo_ready = bool(g3.get("demo_ready"))
+    still_improving = bool(g3.get("still_improving"))
+    crit = oracle.get("_critic") or {}
+    return {
+        "ran": True,
+        "demo_ready": demo_ready,
+        "greedy_sr": g3.get("greedy_sr", g3.get("final_success_rate")),
+        "stochastic_sr": g3.get("stochastic_sr", g3.get("stochastic_success_rate")),
+        "learnable": learnable,
+        "still_improving": still_improving,
+        "critic_competent": critic_competent(g3),
+        "critic_handed_off": bool(crit.get("handed_off")),
+        "demo_trajectory_path": g3.get("demo_trajectory_path"),
+        # valid + solvable but converged without mastery -> difficulty, not a defect.
+        "difficulty_signal": bool(learnable and not demo_ready and not still_improving),
+    }
 
 
 def _clean_verdict(oracle: dict) -> str:
@@ -223,7 +310,8 @@ def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
                 max_rounds: int = MAX_ROUNDS_PER_FINDING,
                 difficulty_budget: int = DIFFICULTY_BUDGET,
                 ledger_path: str | None = None, skill_root=None,
-                skill_use_llm: bool = True, seed: int = 0) -> dict:
+                skill_use_llm: bool = True, seed: int = 0,
+                rl_rescue: bool = False, rescue_kwargs: dict | None = None) -> dict:
     """Run the guarded feedback-repair loop on the game at `game_path`.
 
     Each round: oracles (G4 always; G3' when `run_g3` and the game certifies) ->
@@ -248,10 +336,17 @@ def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
     The ORIGINAL `game_path` file is NEVER written by this loop (revise attempts land in the
     sandbox; a re-certified DEFECT revision is adopted as the working copy).
 
+    `rl_rescue` (opt-in, default off): before the oracles each round, an UNSOLVED game gets
+    the RL-witness SECOND certification pass (`certify.rescue_certify`) — a rescued game then
+    flows on as a first-class CERTIFIED game. It costs a PPO training PER rescue attempt, so
+    it is off by default; `rescue_kwargs` forwards budget/num_envs/thresholds. The rescue
+    verdict is surfaced under the report's ``rescue`` key.
+
     Returns::
 
-        {"schema", "game", "game_path", "directives_issued", "rounds",
-         "round_records", "final_verdict", "final_game_path", "original_untouched"}
+        {"schema", "game", "game_path", "directives_issued", "rounds", "round_records",
+         "final_verdict", "final_game_path", "original_untouched", "g3_summary",
+         "demo_ready", "critic_gate", "rescue"}
 
     `final_verdict` in {HARDENED, BULLETPROOF, HARDENED_HARD, CONTINUE_TRAINING,
     REPAIR_STALLED, REPAIR_FAILED, MAX_ROUNDS, OPEN_UNMAPPED, G4_ERROR}.
@@ -271,15 +366,28 @@ def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
 
     defect_rounds = 0       # DEFECT revise rounds spent (bounded by max_rounds)
     difficulty_used = 0     # DIFFICULTY nudge rounds spent (bounded by difficulty_budget)
+    last_g3_summary = None  # the most-recent G3' reliability read (demo_ready / difficulty)
+    last_critic_gate = None  # the most-recent G4 model-gate decision (arm / downgrade)
+    last_rescue = None      # the most-recent RL-witness rescue block (when rl_rescue)
     r = 0
 
     while True:
         r += 1
         source = _read(current_path)
         engine_r = engine or _engine_of(current_path, source)
+        g3_save_dir = os.path.join(out_dir, slug, f"round_{r}", "g3")
         oracle = _run_oracles(current_path, source, engine=engine_r, tiers=tiers,
                               stale=stale, run_g3=run_g3, budget_steps=budget_steps,
-                              g3_kwargs=g3_kwargs, seed=seed)
+                              g3_kwargs=g3_kwargs, seed=seed, g3_save_dir=g3_save_dir,
+                              rl_rescue=rl_rescue, rescue_kwargs=rescue_kwargs)
+        if oracle.get("_rescue") is not None:
+            last_rescue = oracle["_rescue"]
+        g3_sum = _g3_summary(oracle)
+        if g3_sum is not None:
+            last_g3_summary = g3_sum
+        _cg = (oracle.get("g4") or {}).get("critic_gate")
+        if _cg is not None:
+            last_critic_gate = _cg
         directives = feedback.compile_directives(oracle)
 
         if not directives:
@@ -398,5 +506,16 @@ def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
         "final_verdict": verdict,
         "final_game_path": final_path,
         "original_untouched": _read(game_path) == original_source,
+        # G3' reliability read (demo_ready + the two rates, the difficulty signal, the
+        # trained-policy demo path) and the G4 model-gate decision (critic armed vs
+        # downgraded). None when G3' did not run (run_g3=False). `demo_ready` is a top-level
+        # convenience; a learnable-but-not-demo-ready convergence is a HARD-TO-MASTER signal,
+        # not a defect (final_verdict stays HARDENED — see `_g3_summary`).
+        "g3_summary": last_g3_summary,
+        "demo_ready": (None if last_g3_summary is None else last_g3_summary["demo_ready"]),
+        "critic_gate": last_critic_gate,
+        # RL-witness rescue block (when rl_rescue): None if never attempted; else the
+        # certify.rescue_certify verdict (rescued/reason + rl provenance).
+        "rescue": last_rescue,
         "wall_s": round(time.time() - t0, 2),
     }

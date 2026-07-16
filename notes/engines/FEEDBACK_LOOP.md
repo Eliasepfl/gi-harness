@@ -150,6 +150,56 @@ good game chasing a phantom fix. Fix — tier the directives by severity and bud
 not a "hardened" terminal). The key change vs the old vocabulary: a difficulty-only remainder
 now reads `HARDENED_HARD` (exit 0), not `MAX_ROUNDS`/`REPAIR_STALLED` (exit 1).
 
+## Demo-readiness + critic-competence gate (Elias reliability rule, 2026-07-16)
+
+Do **not** ship a demo (or hand a critic to the value-inverse attacker) off the FIRST lucky
+witness — a single win can be chance. ONE shared reliability notion, `demo_ready`, gates both.
+
+- **`certify.is_demo_ready(greedy_sr, stochastic_sr)`** — `greedy_sr >= DEMO_SR_MIN` (0.9)
+  **AND** `stochastic_sr >= DEMO_STOCHASTIC_FLOOR` (0.6). Both floors: the greedy floor proves
+  the deterministic demo replays reliably; the stochastic floor is the "not luck" guard (on
+  deterministic games greedy collapses to 0/1, so robustness under sampling is the graded
+  evidence of a real basin). Strictly stronger than `learnable` (OR at 0.5). All `[eng.]`.
+- **`g3_prime` result** now carries `demo_ready`, `greedy_sr`, `stochastic_sr`,
+  `demo_trajectory` ({seed, actions, ticks, greedy} | None), `demo_trajectory_path`.
+- **Trained-policy demo**: when demo_ready, the trained agent's OWN shortest winning **greedy**
+  rollout is exported (`export_demo_trajectory`) BESIDE the model artifact as
+  `demo_trajectory.json` — replay it deterministically with
+  `harness game capture <game.gd> --actions <demo_trajectory.json>`. The demo IS the reliable
+  trained agent playing, not the first tree-solver witness.
+- **`certify.critic_competent(g3_result) == demo_ready`** — ONE predicate, consumed by:
+  - **g4's model-gate** (`run_g4(..., g3_result=)`): a model artifact arms the smart tiers
+    (inverse-value / descent / value_death) ONLY when its critic converged. An unconverged
+    critic (weak-critic == 0 in the A/B) is **DOWNGRADED** to the critic-free ladder with an
+    honest note on each smart block + a top-level `critic_gate` summary — never silent.
+    Injected test/handoff seams bypass it; no `g3_result` == backward-compatible.
+  - **harden's oracle step**: G3' runs FIRST, its artifact + result are handed to the g4
+    attack; harden surfaces `demo_ready` / `g3_summary` (incl. `difficulty_signal =
+    learnable & not demo_ready & not still_improving` — a HARD-TO-MASTER signal, **not** a
+    defect; verdict stays HARDENED) + the `critic_gate` in the report.
+
+## RL-witness SECOND certification path — `rescue_certify` (scope extension, 2026-07-16)
+
+A game the G3 **tree** solver leaves `UNSOLVED` but **with progress** (some milestone reached)
+is solvable-but-hard, not broken. `certify.rescue_certify(game_path, verify_report=)` trains a
+policy (batched `num_envs=8`, bounded `RESCUE_BUDGET`=500k) and, if it converges to a
+demo-ready policy whose greedy rollout **replays bit-exactly** through the serve host (the SAME
+bar as a tree witness), UPGRADES the report to a first-class certified game:
+`passed=True, witness_source="rl"`, RL witness `{seed, actions, ticks, checkpoints}` (identical
+shape → G4/atlas/demos consume it unchanged), the UNSOLVED diagnosis PRESERVED under
+`unsolved_diagnosis`, and an `rl_steps`/SR provenance block (for the Atlas prover-effort axis).
+No convergence / replay mismatch → stays UNSOLVED with an honest `rescue={attempted:True,...}`.
+
+- **Guards**: never PPO a hopeless game (needs `reach_counts > 0`) nor a broken one
+  (ENV/GOAL error). Never inside the plain `verify_game` path (byte-identical, tree-only).
+- **Surfaces**: `harness game rescue <game.gd> --json`; `gameverify.verify_game_rescue`
+  (additive); `harden_game(rl_rescue=True)` (opt-in, one PPO per attempt).
+- **Witness source**: `witness_source` is additive — absent == `tree`; set explicitly to
+  `tree` on tree-certified pass-through and `rl` on a rescue.
+- **PENDING**: the drone-course acceptance (the first true-3D RL-certified game) is gated on
+  the dimension-aware obs fix (`ARCH_3D_ANALYSIS.md` — `build_obs_vector` is 2D-only); enable
+  with `HARNESS_RL_3D_OBS_READY=1` once the sibling env.py branch lands. 2D smokes unaffected.
+
 ## Status
 
 - EXISTS: multi-turn repair w/ current code in context; tree-lane checkpoint-pair
