@@ -48,6 +48,22 @@ const COL_OUTLINE := Color(0, 0, 0, 0.35)
 const CIRCLE_SEGMENTS := 24
 const ASSET_POS_TOL := 30.0         # t=0 body<->state position match tolerance (asset routing)
 const ELEV_3D := 38.0               # 3D overview elevation above the play plane (deg; not top-down)
+
+# ---- 3D follow-cam rig ----------------------------------------------------- #
+# A chase cam trailing the controlled body along its TRAVEL direction, modelled on the
+# godot_rl HovercraftRacing car.tscn rig (Camera3D at y=0.94 up, z=-3.37 back, pitch 12.6deg):
+# ~1 body-height up, ~2.5-3.5 body-lengths back, ~12-15deg pitch down. Every distance scales
+# off the CONTROLLED body's AABB, but a MINIMUM ABSOLUTE distance keeps a tiny body from
+# gluing the camera to itself (the "on ne la voit pas trop" bug). The offset points BEHIND
+# the travel direction -- the old rig sat on local +Z and faced backwards, hiding the path
+# ahead entirely on a +Z-moving craft.
+const FOLLOW_CAM_DIST := 3.0        # default chase multiplier (body-lengths back); --cam-dist overrides
+const FOLLOW_MIN_BACK := 8.0        # absolute floor on the back distance (tiny-body guard)
+const FOLLOW_MIN_UP := 3.0          # absolute floor on the rise
+const FOLLOW_UP_FRAC := 0.30        # rise as a fraction of the back distance (keeps the pitch sane)
+const FOLLOW_PITCH_DEG := 14.0      # aim pitched down (12-15deg band, per the car rig)
+const FOLLOW_FOV := 65.0            # wider than the overview so the craft AND the path ahead read
+const FOLLOW_CLAMP_MARGIN := 0.75   # keep the cam this far inside the flyable box (anti-ceiling-pop)
 const WALL_LINE_WIDTH := 6.0
 const MARGIN_FRAC := 0.12           # fit-to-scene padding (fraction of extent)
 const SENSOR_ALPHA := 0.28
@@ -75,6 +91,14 @@ var _max := Vector3(-INF, -INF, -INF)
 var _base_zoom := 1.0
 var _view_w := 960.0
 var _view_h := 540.0
+# camera-framing hints (opts, else capture.py's pre-scanned-trajectory env) -- render-only
+var _cam_dist := FOLLOW_CAM_DIST
+var _has_traj := false
+var _traj_min := Vector3.ZERO
+var _traj_max := Vector3.ZERO
+var _has_fwd := false
+var _traj_fwd := Vector3(0.0, 0.0, 1.0)   # controlled body's travel direction (fallback: +Z)
+var _follow_offset := Vector3.ZERO        # world-space body->camera chase offset
 
 
 # =========================================================================== #
@@ -89,6 +113,7 @@ func dress(game_root: Node, opts := {}) -> void:
 	# ignores these -- it is always presented flat.
 	_manifest_path = str(opts.get("manifest_path", ""))
 	_build_assets_norm(opts.get("assets", {}))
+	_read_cam_opts(opts)
 
 	# 1. Discover every collision shape in the game tree (READ-ONLY walk).
 	var shapes: Array = []
@@ -127,9 +152,12 @@ func sync() -> void:
 		proxy.global_transform = src.global_transform
 	if _follow and _camera != null and is_instance_valid(_camera) \
 			and _controlled_body != null and is_instance_valid(_controlled_body):
-		# 3D follow tracks for free -- the camera is parented to the controlled proxy, which
-		# this loop already re-posed. Only the 2D overlay needs an explicit camera move.
-		if not _is_3d:
+		# The chase camera trails the controlled body at a FIXED WORLD offset (its orientation
+		# was baked at setup). Reading global_position is read-only on the game tree, so the
+		# zero-contact contract holds exactly as when the 3D cam was parented to the proxy.
+		if _is_3d:
+			_camera.global_position = _follow_pose()
+		else:
 			_camera.global_position = _controlled_body.global_position
 
 
@@ -724,12 +752,31 @@ func _setup_camera_2d() -> void:
 
 
 func _setup_camera_3d() -> void:
-	# --follow rides a pivot on the controlled body's proxy (chase cam); default is an
-	# elevated, TILTED overview of the whole scene (godot_rl-examples arena look).
-	if _follow and _controlled_proxy != null and is_instance_valid(_controlled_proxy):
+	# --follow = a chase cam trailing the controlled body along its travel direction; default
+	# is an elevated, TILTED overview framed on the whole scene UNION the witness trajectory
+	# (godot_rl-examples arena look, but never losing a fly-through craft off-frame).
+	if _follow and _controlled_body != null and is_instance_valid(_controlled_body):
 		_setup_follow_cam_3d()
 	else:
 		_setup_overview_cam_3d()
+
+
+func _overview_box() -> Array:
+	# The framing box for the elevated overview: the t=0 static AABB UNION the witness
+	# trajectory's box, so a craft that flies well past its start frame stays on screen (the
+	# fly-through fix -- the old t=0-only box lost the craft after ~2 frames). No trajectory
+	# supplied (e.g. the desktop player) -> the t=0 box, unchanged.
+	var lo := _min
+	var hi := _max
+	if _traj_valid():
+		lo = Vector3(minf(lo.x, _traj_min.x), minf(lo.y, _traj_min.y), minf(lo.z, _traj_min.z))
+		hi = Vector3(maxf(hi.x, _traj_max.x), maxf(hi.y, _traj_max.y), maxf(hi.z, _traj_max.z))
+	return [lo, hi]
+
+
+func _traj_valid() -> bool:
+	return _has_traj and _traj_min.x <= _traj_max.x \
+		and is_finite(_traj_min.x) and is_finite(_traj_max.x)
 
 
 func _setup_overview_cam_3d() -> void:
@@ -738,8 +785,11 @@ func _setup_overview_cam_3d() -> void:
 	# like ScoreTheGoal's arena shots. All distances scale off the AABB (no absolute values).
 	var cam := Camera3D.new()
 	cam.name = "DemoCamera3D"
-	var center := (_min + _max) * 0.5
-	var span := _max - _min
+	var box := _overview_box()
+	var bmin: Vector3 = box[0]
+	var bmax: Vector3 = box[1]
+	var center := (bmin + bmax) * 0.5
+	var span := bmax - bmin
 	var radius: float = max(span.length() * 0.5, 1.0)
 	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
 	cam.fov = 50.0
@@ -760,27 +810,97 @@ func _setup_overview_cam_3d() -> void:
 
 
 func _setup_follow_cam_3d() -> void:
-	# A chase camera hung off a PIVOT parented to the controlled body's proxy (which already
-	# mirrors the body read-only -> tracking is free and the zero-contact contract is intact).
-	# Offset ~1 body-height up + ~3 body-lengths behind, pitched ~13 deg down (car.tscn rig).
-	var ext := _controlled_ext
-	var bh: float = max(ext.y * 2.0, 1.0)
-	var bl: float = max(max(ext.x, ext.z) * 2.0, 1.0)
-	var pivot := Node3D.new()
-	pivot.name = "CamPivot"
-	_controlled_proxy.add_child(pivot)
+	# A chase camera trailing the controlled body along its TRAVEL direction (from the
+	# pre-scanned witness trajectory; falls back to the body's facing). Its world offset +
+	# orientation are baked here from the AABB-scaled rig; sync() re-poses the position each
+	# frame (read-only -> the zero-contact contract holds, as when it was proxy-parented).
+	var fwd := _traj_fwd
+	if not _has_fwd:
+		var bf: Vector3 = -_controlled_body.global_transform.basis.z
+		if Vector3(bf.x, 0.0, bf.z).length() > 1.0e-3:
+			fwd = bf
+	_follow_offset = follow_offset(_controlled_ext, _cam_dist, fwd)
 	var cam := Camera3D.new()
 	cam.name = "DemoFollowCam3D"
 	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
-	cam.fov = 50.0
-	# Godot forward is -Z, so "behind" is +Z; rise by one body-height, look ~13 deg down.
-	cam.position = Vector3(0.0, bh * 1.0, bl * 3.2)
-	cam.rotation = Vector3(deg_to_rad(-13.0), 0.0, 0.0)
+	cam.fov = FOLLOW_FOV
 	cam.near = 0.5
-	cam.far = (bl * 3.2 + bh) * 8.0 + 2000.0
-	pivot.add_child(cam)
+	var span_len: float = (_overview_box()[1] - _overview_box()[0]).length()
+	cam.far = maxf(span_len * 2.0 + _follow_offset.length() * 2.0, 2000.0)
+	_stage3d.add_child(cam)              # in-tree BEFORE global_transform (needs a scenario)
+	cam.global_transform = Transform3D(
+		Basis.looking_at(follow_look_dir(fwd), Vector3.UP), _follow_pose())
 	cam.make_current()
 	_camera = cam
+
+
+# ---- follow-rig math (PURE: reads no member state -> unit-testable in isolation) ---- #
+func follow_back_dist(ext: Vector3, cam_dist: float) -> float:
+	# Chase distance = a generous body-length (the largest full AABB extent) * the multiplier,
+	# floored by an ABSOLUTE minimum so a tiny body never glues the camera to itself.
+	var body_len: float = 2.0 * maxf(ext.x, maxf(ext.y, ext.z))
+	return maxf(body_len * cam_dist, FOLLOW_MIN_BACK)
+
+
+func follow_up_dist(ext: Vector3, back: float) -> float:
+	# Rise ~1 body-height, but tied to the back distance (stable framing) and floored.
+	return maxf(2.0 * ext.y, maxf(back * FOLLOW_UP_FRAC, FOLLOW_MIN_UP))
+
+
+func _horiz_fwd(fwd: Vector3) -> Vector3:
+	# Travel direction flattened onto the play plane; a safe default when degenerate.
+	var f := Vector3(fwd.x, 0.0, fwd.z)
+	if f.length() < 1.0e-4:
+		return Vector3(0.0, 0.0, 1.0)
+	return f.normalized()
+
+
+func follow_offset(ext: Vector3, cam_dist: float, fwd: Vector3) -> Vector3:
+	# World-space body->camera offset: BEHIND the travel direction + risen.
+	var f := _horiz_fwd(fwd)
+	var back := follow_back_dist(ext, cam_dist)
+	var up := follow_up_dist(ext, back)
+	return -f * back + Vector3(0.0, up, 0.0)
+
+
+func follow_look_dir(fwd: Vector3) -> Vector3:
+	# Camera aim: along travel, pitched down FOLLOW_PITCH_DEG so the craft sits low in frame
+	# and the path ahead (the rings!) fills the rest.
+	var f := _horiz_fwd(fwd)
+	var pitch := deg_to_rad(FOLLOW_PITCH_DEG)
+	return (f * cos(pitch) - Vector3.UP * sin(pitch)).normalized()
+
+
+func clamp_follow_pos(pos: Vector3, lo: Vector3, hi: Vector3) -> Vector3:
+	# Keep the chase camera INSIDE the flyable volume (lo..hi + a margin) on the lateral +
+	# vertical axes, so it never pops out through the ceiling/side walls when the craft hugs a
+	# boundary -- the craft then rides high/wide in-frame instead of vanishing into empty sky.
+	# The chase (depth) axis is deliberately NOT clamped: the camera MUST sit behind the craft,
+	# often past the box's near face. PURE -> unit-testable.
+	var m := FOLLOW_CLAMP_MARGIN
+	var f := _horiz_fwd(_traj_fwd)
+	var out := pos
+	# clamp only the axes ACROSS travel (|component| small); leave the along-travel axis free.
+	if absf(f.x) < 0.5:
+		out.x = clampf(pos.x, lo.x - m, hi.x + m)
+	if absf(f.z) < 0.5:
+		out.z = clampf(pos.z, lo.z - m, hi.z + m)
+	out.y = clampf(pos.y, lo.y - m, hi.y + m)   # vertical: always (the ceiling-pop fix)
+	return out
+
+
+func _clamp_box() -> Array:
+	# The volume the follow camera is kept within: the WITNESS TRAJECTORY box (where the craft
+	# actually flew -- guaranteed inside the course) when known, else the t=0 static AABB.
+	if _traj_valid():
+		return [_traj_min, _traj_max]
+	return [_min, _max]
+
+
+func _follow_pose() -> Vector3:
+	# The chase camera's world position for the controlled body's current pose, clamped.
+	var box := _clamp_box()
+	return clamp_follow_pos(_controlled_body.global_position + _follow_offset, box[0], box[1])
 
 
 func _thin_axis_dir(span: Vector3) -> Vector3:
@@ -853,3 +973,39 @@ func _bounds_valid() -> bool:
 func bounds() -> Dictionary:
 	# Exposed for the host's logging/framing sanity.
 	return {"min": _min, "max": _max, "is_3d": _is_3d}
+
+
+func _read_cam_opts(opts: Dictionary) -> void:
+	# Camera-framing hints, from opts (unit tests / desktop player) or the capture driver's
+	# env (capture.py pre-scans the witness trajectory headless and exports these). ALL are
+	# render-only: they move the camera and never touch the game tree or physics, so the
+	# capture host stays untouched and the dressed==undressed state trail is unaffected.
+	_cam_dist = float(opts.get("cam_dist", _env_float("HARNESS_CAM_DIST", FOLLOW_CAM_DIST)))
+	if _cam_dist <= 0.0:
+		_cam_dist = FOLLOW_CAM_DIST
+	var tmin = opts.get("traj_min", _env_vec3("HARNESS_CAM_TRAJ_MIN"))
+	var tmax = opts.get("traj_max", _env_vec3("HARNESS_CAM_TRAJ_MAX"))
+	if tmin != null and tmax != null:
+		_traj_min = tmin
+		_traj_max = tmax
+		_has_traj = true
+	var fwd = opts.get("cam_fwd", _env_vec3("HARNESS_CAM_FWD"))
+	if fwd != null:
+		_traj_fwd = fwd
+		_has_fwd = true
+
+
+func _env_float(name: String, dflt: float) -> float:
+	var s := OS.get_environment(name)
+	return s.to_float() if s != "" else dflt
+
+
+func _env_vec3(name: String):
+	# Parse "x,y,z" -> Vector3, else null (so an unset var falls back to the t=0 defaults).
+	var s := OS.get_environment(name)
+	if s == "":
+		return null
+	var parts := s.split(",", false)
+	if parts.size() < 3:
+		return null
+	return Vector3(parts[0].to_float(), parts[1].to_float(), parts[2].to_float())

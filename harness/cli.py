@@ -407,7 +407,8 @@ def cmd_game_capture(args) -> int:
         res = capture_gif(args.game_path, out_gif, actions=actions, seed=seed,
                           follow=args.follow, width=args.width, height=args.height,
                           fps=args.fps, max_frames=getattr(args, "max_frames", 300),
-                          frames_dir=getattr(args, "frames_dir", None))
+                          frames_dir=getattr(args, "frames_dir", None),
+                          cam_dist=getattr(args, "cam_dist", None))
     except CaptureError as exc:
         return _call_error("game capture", exc, args.json)
     except Exception as exc:  # noqa: BLE001
@@ -1050,7 +1051,11 @@ def build_parser() -> argparse.ArgumentParser:
     gc.add_argument("game_path")
     gc.add_argument("--out", default=None, help="output GIF path (default: <game>.gif)")
     gc.add_argument("--follow", action="store_true",
-                    help="follow-cam on the controlled body (default: fit-to-scene overview)")
+                    help="chase-cam trailing the controlled body (default: trajectory-aware "
+                         "fit-to-scene overview)")
+    gc.add_argument("--cam-dist", type=float, default=None,
+                    help="3D chase-cam distance multiplier (body-lengths back; default ~3.0, "
+                         "floored by an absolute minimum). Only affects --follow.")
     gc.add_argument("--actions", default=None,
                     help="witness JSON ({seed,actions}) to replay; default: a fresh verify")
     gc.add_argument("--frames-dir", default=None,

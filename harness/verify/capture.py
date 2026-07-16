@@ -195,6 +195,101 @@ def _route_assets_for_game(exe: str, project: str, game_path: str,
     return cache
 
 
+# --------------------------------------------------------------------------- #
+# Trajectory pre-scan (3D framing): replay the witness ONCE headless (no display/GL, no
+# dressing) to fingerprint every tick's body positions, then hand the dresser the whole
+# trajectory's bounding box + the controlled body's travel direction. This is what makes
+# fit-to-scene framing work for a FLY-THROUGH game (the craft leaves the t=0 static frame)
+# and orients the chase cam to trail the craft along its path. Camera-only, physics-inert:
+# it feeds the render overlay via env, never the capture host's stepping.
+# --------------------------------------------------------------------------- #
+def _traj_from_fingerprint(text: str):
+    """Parse capture_host.gd's --fingerprint ('tick|name:pos:vel:angle;...' at %.17f) into
+    a 3D framing hint {min, max, fwd}. Returns None for a 2D game (pos has <3 comps) or on
+    any parse miss -- the dresser then falls back to its t=0 box (2D framing untouched)."""
+    positions: dict = {}
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        _ts, body_str = line.split("|", 1)
+        if not body_str:
+            continue
+        for part in body_str.split(";"):
+            if not part:
+                continue
+            f = part.split(":")
+            if len(f) < 2:
+                continue
+            coords = [c for c in f[1].split(",") if c != ""]
+            if len(coords) < 3:          # 2D (or malformed) -> not a 3D trajectory
+                return None
+            try:
+                p = (float(coords[0]), float(coords[1]), float(coords[2]))
+            except ValueError:
+                continue
+            positions.setdefault(f[0], []).append(p)
+    if not positions:
+        return None
+    xs = [p[0] for pts in positions.values() for p in pts]
+    ys = [p[1] for pts in positions.values() for p in pts]
+    zs = [p[2] for pts in positions.values() for p in pts]
+    tmin = (min(xs), min(ys), min(zs))
+    tmax = (max(xs), max(ys), max(zs))
+    # Travel direction = the largest first->last horizontal displacement (the mover is the
+    # controlled craft; static bodies don't move). None if nothing meaningfully travels.
+    fwd = None
+    best = 1.0e-3
+    for pts in positions.values():
+        if len(pts) < 2:
+            continue
+        a, b = pts[0], pts[-1]
+        d = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        mag = (d[0] * d[0] + d[2] * d[2]) ** 0.5
+        if mag > best:
+            best, fwd = mag, d
+    return {"min": tmin, "max": tmax, "fwd": fwd}
+
+
+def _scan_trajectory(exe: str, project: str, game_path: str, actions, seed: int,
+                     timeout_s: float = 180.0):
+    """Headless fingerprint pre-scan (no display/GL, --no-dress) -> {min,max,fwd} or None.
+    Best-effort: any failure returns None and the render pass frames on the t=0 box."""
+    work = tempfile.mkdtemp(prefix="giscan_")
+    try:
+        witness = os.path.join(work, "w.json")
+        Path(witness).write_text(
+            json.dumps({"seed": int(seed), "actions": [str(a) for a in actions]}),
+            encoding="utf-8")
+        fp = os.path.join(work, "fp.txt")
+        argv = [exe, "--headless", "--path", project, "-s", "res://capture_host.gd", "--",
+                "--capture", "--game-file=%s" % os.path.abspath(game_path),
+                "--actions-file=%s" % witness, "--out=%s" % os.path.join(work, "frames"),
+                "--fingerprint=%s" % fp, "--no-frames", "--no-dress", "--speedup=1"]
+        subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       stdin=subprocess.DEVNULL, env=_child_env(), timeout=timeout_s)
+        if not os.path.isfile(fp):
+            return None
+        return _traj_from_fingerprint(Path(fp).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - framing is best-effort; the t=0 box is the fallback
+        return None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _cam_env(cam_dist, scan) -> dict:
+    """The render overlay's camera-framing env (read by visual_dress.gd). Empty keys are
+    simply absent -> the dresser uses its built-in defaults / t=0 box."""
+    env: dict = {}
+    if cam_dist is not None:
+        env["HARNESS_CAM_DIST"] = repr(float(cam_dist))
+    if scan is not None:
+        env["HARNESS_CAM_TRAJ_MIN"] = "%r,%r,%r" % scan["min"]
+        env["HARNESS_CAM_TRAJ_MAX"] = "%r,%r,%r" % scan["max"]
+        if scan.get("fwd") is not None:
+            env["HARNESS_CAM_FWD"] = "%r,%r,%r" % scan["fwd"]
+    return env
+
+
 def _capture_argv(exe: str, project: str, user_args: list[str], width: int,
                   height: int) -> list[str]:
     """A physics-STEPPING but NON-headless invocation of the capture host. Pins
@@ -220,7 +315,8 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
                 downscale_to: int | None = 640, timeout_s: float = 300.0,
                 exe: str | None = None, project: str | None = None,
                 dress_assets: bool = True, game_context: str | None = None,
-                assets_manifest: str | None = None) -> dict:
+                assets_manifest: str | None = None, cam_dist: float | None = None,
+                trajectory_overview: bool = True) -> dict:
     """Render a certified ``.gd`` game's witness replay to a GIF. ``actions`` is the
     winning plan (from a fresh verify). Returns ``{result, ticks, n_frames, out_path,
     frames_dir?}``. Raises ``CaptureError`` on an infra failure.
@@ -255,6 +351,13 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
         json.dumps({"seed": int(seed), "actions": [str(a) for a in actions]}),
         encoding="utf-8")
 
+    # Trajectory-aware framing (3D): pre-scan the witness once headless so the render overlay
+    # can frame the whole flight path, not the t=0 static box, and trail the craft along it.
+    # Returns None for a 2D game (2D framing then stays byte-identical) or on any failure.
+    scan = _scan_trajectory(exe, project, game_path, actions, seed) \
+        if trajectory_overview else None
+    cam_env = _cam_env(cam_dist, scan)
+
     # Replay at the SAME game-tick speedup certification ran at (HARNESS_GODOT_SPEEDUP), so
     # the capture host's paired physics-rate/time-scale scaling matches the serve host that
     # produced the witness. The stepping is designed tick-identical across speedups, so this
@@ -283,6 +386,7 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     try:
         with _Xvfb(int(width), int(height)):
             env = _child_env()
+            env.update(cam_env)          # render-only camera framing hints (see _cam_env)
             log = tempfile.TemporaryFile(mode="w+b")
             try:
                 proc = subprocess.run(argv, stdout=log, stderr=log,
