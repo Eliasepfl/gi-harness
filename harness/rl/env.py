@@ -102,18 +102,23 @@ shaping beats finishing). The realigned per-tick reward is the SUM of:
      ``remaining_frac = clip((horizon - tick)/horizon, 0, 1)``. So an instant win pays the
      full ``R_SUCCESS`` and a win at the buzzer pays the FLOOR ``R_SUCCESS*SUCCESS_TIME_FLOOR``
      — success earned EARLIER is strictly worth more, but even the latest win floors at 50%
-     of the bonus so late wins still dominate the shaping mass.
+     of the bonus so late wins still dominate the shaping mass. This decaying bonus is the
+     SOLE temporal-pressure mechanism (see 3).
 
-  3. A small per-tick LIVING COST ``R_TICK = -LIVING_COST_TOTAL / horizon`` paid EVERY step
-     (restores the ``- λ·1`` term LLM_RL_SYSTEMS §4.1 always specified but env.py had dropped;
-     the reference FPS "anti-idle" lever). Over a full-horizon episode it totals
-     ``-LIVING_COST_TOTAL`` (> ``SHAPING_MASS``), so a never-finishing episode nets NEGATIVE
-     — dithering at a farmed checkpoint is strictly worse than pressing on to the goal.
+  3. A per-tick LIVING COST ``R_TICK = -LIVING_COST_TOTAL / horizon`` — AVAILABLE but
+     DISABLED by default (``LIVING_COST_TOTAL = 0.0``). It is the ``- λ·1`` anti-idle term
+     LLM_RL_SYSTEMS §4.1 sketched, but the convergence probe showed an UNCONDITIONAL living
+     cost is COUNTERPRODUCTIVE here: sized to make dithering net-negative it also makes the
+     first-checkpoint "stepping stone" net-negative, so the policy FLEES it to a do-nothing
+     basin and never re-finds the win (design 1: stochastic SR collapsed to 0.0). With the
+     cost OFF, the same run is LEARNABLE (stochastic SR 0.69, still improving at 400k). The
+     decaying success bonus (2) already supplies the "earlier is better" pressure, so the
+     knob stays at 0.0; a game that genuinely needs anti-idle can raise it per-call.
 
   4. A clearly-negative terminal ``R_FAILURE`` on ``failure``/``error``.
 
-Sizing (see the constants): ``R_SUCCESS*SUCCESS_TIME_FLOOR`` (the MINIMUM success payoff) >
-``SHAPING_MASS + LIVING_COST_TOTAL``, so the four reward invariants hold with margin:
+Sizing (see the constants): ``R_SUCCESS*SUCCESS_TIME_FLOOR`` (the MINIMUM success payoff, 5.0)
+> ``SHAPING_MASS + LIVING_COST_TOTAL`` (1.0), so the four reward invariants hold with margin:
 (a) the total farmable shaping (``SHAPING_MASS``) is < the success payoff at ANY tick;
 (b) an earlier success yields a strictly greater return than a later one;
 (c) any success return > any no-success return; (d) for equal progress a failure return <
@@ -205,9 +210,12 @@ R_SUCCESS = 10.0          # BASE terminal success bonus, before the time-decay b
 SUCCESS_TIME_FLOOR = 0.5  # decayed success payoff never drops below this fraction of R_SUCCESS
                           # (a buzzer-beater win still pays 0.5*R_SUCCESS >> shaping) [eng.]
 R_FAILURE = -2.0          # terminal penalty on failure/error (clearly negative) [eng.]
-LIVING_COST_TOTAL = 1.5   # total per-tick living cost over a full-horizon episode; the
-                          # per-step cost is R_TICK = -LIVING_COST_TOTAL/horizon. > SHAPING_MASS
-                          # so a never-finishing episode nets negative (anti-dither) [eng.]
+LIVING_COST_TOTAL = 0.0   # per-tick living cost over a full-horizon episode (R_TICK =
+                          # -LIVING_COST_TOTAL/horizon). DISABLED (0.0): the 400k probe showed
+                          # an unconditional living cost destabilizes convergence — it makes the
+                          # first-checkpoint stepping stone net-negative and the policy flees to
+                          # a do-nothing basin. Temporal pressure rides on the decaying success
+                          # bonus instead. Raise per-call for a game that needs anti-idle. [eng.]
 R_CHECKPOINT = SHAPING_MASS  # backward-compat alias: the shaping budget for a 1-checkpoint game
 SERVE_TIMEOUT_S = 60.0    # per-op read budget before declaring the node dead [eng.]
 

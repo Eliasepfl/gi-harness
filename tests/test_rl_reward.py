@@ -48,15 +48,17 @@ def _episode_return(latch_ticks, n_cp, terminal, term_tick, horizon=H):
 # 0. Constant sizing — the terminal-dominance inequality the design rests on
 # ====================================================================== #
 def test_constant_sizing_gives_terminal_dominance():
-    # the MINIMUM success payoff (floor) strictly dominates the MAXIMUM no-win return
-    # (all farmable shaping accrued, minus at least... well, plus zero cost) — this single
-    # inequality is what makes invariants (a) and (c) hold with margin.
+    # the MINIMUM success payoff (the decay floor) strictly dominates the MAXIMUM farmable
+    # shaping mass PLUS whatever living cost is configured — this single inequality is what
+    # makes invariants (a) and (c) hold with margin, independent of the living-cost knob.
     assert E.R_SUCCESS * E.SUCCESS_TIME_FLOOR > E.SHAPING_MASS + E.LIVING_COST_TOTAL
     assert 0.0 < E.SUCCESS_TIME_FLOOR < 1.0
     assert E.R_SUCCESS > 0.0
     assert E.R_FAILURE < 0.0
-    assert E.LIVING_COST_TOTAL > E.SHAPING_MASS   # a never-finishing episode nets negative
     assert E.SHAPING_MASS > 0.0
+    # the per-tick living cost is DISABLED by default (the 400k probe: an unconditional cost
+    # destabilized convergence); temporal pressure rides on the decaying success bonus.
+    assert E.LIVING_COST_TOTAL >= 0.0
 
 
 # ====================================================================== #
@@ -86,8 +88,11 @@ def test_success_payoff_decays_with_floor():
 
 
 def test_tick_cost_totals_living_cost_over_horizon():
-    assert E.tick_cost(H) < 0.0
+    # non-positive (a cost), and over a full horizon it totals -LIVING_COST_TOTAL. With the
+    # knob at its default 0.0 the cost is a no-op; raising LIVING_COST_TOTAL re-arms it.
+    assert E.tick_cost(H) <= 0.0
     assert E.tick_cost(H) * H == pytest.approx(-E.LIVING_COST_TOTAL)
+    assert E.tick_cost(H) == pytest.approx(-E.LIVING_COST_TOTAL / H)
 
 
 def test_step_reward_composition():
@@ -166,16 +171,20 @@ def test_invariant_d_failure_below_timeout_at_equal_progress(n_latched, fail_tic
 
 
 # ====================================================================== #
-# The DIAGNOSIS, encoded: on mini_collect (n_cp=2) farming the first checkpoint and
-# dithering must be a NET-NEGATIVE trap that finishing crushes — the exact failure the
-# realignment fixes (a 400k-step probe found the old reward converged to never-winning).
+# The DIAGNOSIS, encoded: on mini_collect (n_cp=2) FINISHING must crush farming the first
+# checkpoint — the terminal payoff strictly dominates the whole farmable shaping mass, so no
+# amount of camping on shaping can rival a win (the exact failure the realignment fixes; the
+# old reward's flat +5 did not dominate cumulative shaping and PPO converged to never-winning).
 # ====================================================================== #
-def test_mini_collect_farming_is_a_net_negative_trap():
+def test_mini_collect_finishing_dominates_farming():
     n_cp = 2                                             # got_first, got_both
-    # Never-win policy: latch got_first @ tick 10, then dither to the horizon.
+    # Camp policy: latch got_first @ tick 10, then dither to the horizon (never wins).
     farm = _episode_return([10], n_cp, None, H)
     # Winning policy: got_first @ 10, got_both+success @ 30.
     win = _episode_return([10, 30], n_cp, "success", 30)
-    assert farm < 0.0, "farming the first checkpoint then dithering must net NEGATIVE"
-    assert win > 0.0
-    assert win > farm + 5.0, "finishing must crush farming by a wide margin"
+    # the BEST possible camp (both checkpoints somehow farmed without success) still loses.
+    best_farm = _episode_return([10, 20], n_cp, None, H)
+    assert win > farm + 5.0, "finishing must crush single-checkpoint camping by a wide margin"
+    assert win > best_farm, "finishing beats farming EVERY checkpoint (terminal dominance)"
+    # the terminal success payoff ALONE (at any tick) exceeds the entire farmable shaping mass.
+    assert E.success_payoff(H, H) > E.SHAPING_MASS
