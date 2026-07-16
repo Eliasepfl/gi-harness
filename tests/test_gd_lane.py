@@ -28,6 +28,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GD = os.path.join(_ROOT, "tests", "fixtures", "gd_games")
 _MINI = os.path.join(_GD, "mini_collect.gd")
 _MINI_3D = os.path.join(_GD, "mini_collect_3d.gd")
+_TUMBLE_3D = os.path.join(_GD, "tumble_3d.gd")
 _SINGLE_ACTION = os.path.join(_GD, "single_action_win.gd")
 _WALLED = os.path.join(_GD, "walled_goal.gd")
 _FLYOFF = os.path.join(_GD, "flyoff.gd")
@@ -360,6 +361,80 @@ def test_gd_serve_two_run_drift_is_zero():
         finally:
             ex.close()
     assert snaps[0] == snaps[1], (snaps[0], snaps[1])
+
+
+# ====================================================================== #
+# 2b. 3D reset-determinism — the WITHIN-session two-run gate (the leak G1 caught)
+#
+# G1's determinism check runs two seeded episodes back-to-back on ONE serve host (init,
+# reset, reset) and compares final snapshots. For 3D games the single-instance reset path
+# reused root's World3D across episodes, leaking GodotPhysics3D solver/broadphase residual
+# so episode 2 (built over episode 1's stepped space) diverged from episode 1 (built over
+# the unstepped init) -- the class of failure the fix3d wave hit on real drone/car games.
+# The host now hands every 3D episode a FRESH World3D; these pin that, at both speedups.
+# Note: CROSS-session (separate processes) was already byte-identical even WITHOUT the fix
+# (each builds over a clean space), so only a WITHIN-session twin exercises the leak.
+# ====================================================================== #
+def _reset_twin_snapshots(src, actions, ticks, speedup=None):
+    """Two seeded episodes back-to-back on ONE serve host -> (snap1, snap2, result1,
+    ticks1). This is exactly G1's repeated-reset determinism probe: init(seed 0), then
+    reset(seed 0) twice, each stepped over `actions`. `speedup` overrides
+    HARNESS_GODOT_SPEEDUP for the spawned host (restored afterwards)."""
+    old = os.environ.get("HARNESS_GODOT_SPEEDUP")
+    if speedup is not None:
+        os.environ["HARNESS_GODOT_SPEEDUP"] = str(speedup)
+    try:
+        ex = GdExecutor(port_base=_free_port())
+        try:
+            spec = {"seed": 0, "actions": list(actions)}
+            r1, r2 = ex.run_batch(src, [dict(spec), dict(spec)], ticks)
+            return r1["final_snapshot"], r2["final_snapshot"], r1["result"], r1["ticks"]
+        finally:
+            ex.close()
+    finally:
+        if speedup is not None:
+            if old is None:
+                os.environ.pop("HARNESS_GODOT_SPEEDUP", None)
+            else:
+                os.environ["HARNESS_GODOT_SPEEDUP"] = old
+
+
+@requires_godot
+@pytest.mark.parametrize("speedup", [1, 8])
+def test_tumble_3d_reset_determinism_is_byte_identical(speedup):
+    """REGRESSION (notes/engines/DETERMINISM_3D.md): tumble_3d is a force-driven 3D
+    RigidBody3D that drops into an enclosed canyon and ENDS at its floor contact -- the
+    shape that exposes the reused-World3D leak. Two back-to-back seeded resets on ONE serve
+    host diverged by ~9e-5 in the body's contact-tick velocity BEFORE the host pinned a
+    fresh World3D per 3D episode (the wild drone diverged ~5.9e-5, the car ~0.046). This
+    MUST be byte-identical now, at both speedups; reverting the fresh-World3D pin re-fails
+    it. A within-session twin is required -- cross-session was clean even unfixed."""
+    s1, s2, result, nticks = _reset_twin_snapshots(_src(_TUMBLE_3D), [None] * 40, 40, speedup)
+    assert s1 == s2, (speedup, s1, s2)
+    # the fixture actually drives a contact-terminated episode (not a trivial no-op that
+    # would pass the twin vacuously) -- guards the reproducer from silently going inert.
+    assert result == "failure" and nticks <= 20, (result, nticks)
+
+
+@requires_godot
+@pytest.mark.parametrize("speedup", [1, 8])
+def test_mini_collect_3d_reset_determinism_is_byte_identical(speedup):
+    """The mandated 3D determinism pin: mini_collect_3d stays byte-identical across two
+    back-to-back seeded resets on one serve host, at both speedups (a broad 3D-determinism
+    guard alongside the sharper tumble_3d reproducer)."""
+    s1, s2, _, _ = _reset_twin_snapshots(_src(_MINI_3D), ["right"] * 30, 30, speedup)
+    assert s1 == s2, (speedup, s1, s2)
+
+
+@requires_godot
+def test_2d_reset_determinism_unchanged_within_session():
+    """The fresh-World3D pin touches ONLY World3D; a 2D game's back-to-back resets on one
+    serve host stay byte-identical (root.world_2d is never refreshed) -> 2D replays are
+    unchanged. Covered on the certified mini_collect + walled_goal fixtures."""
+    for path, plan in ((_MINI, ["up"] * 12 + ["right"] * 16),
+                       (_WALLED, ["right"] * 20 + ["up"] * 10)):
+        s1, s2, _, _ = _reset_twin_snapshots(_src(path), plan, len(plan))
+        assert s1 == s2, (path, s1, s2)
 
 
 @requires_godot
