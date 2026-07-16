@@ -59,6 +59,7 @@ const PLAY_MARGIN := 400.0              # px padding past the level extent -> pl
 # body itself), computed at the SAME point in the tick as state() so replay parity holds.
 const RAYS_MAX := 4096                  # sanity cap on total ray count (protocol guard) [eng.]
 const RAYS_DIM_MAX := 128               # per-axis cap (n, n_h, n_v) [eng.]
+const RAYS_HEADING_EPS := 1.0e-2        # speed below which heading holds its last value [eng.]
 
 # The GameAPI contract methods a generated game MUST implement (GAME_API.md).
 const REQUIRED_METHODS := ["build", "act", "state", "checkpoints",
@@ -95,6 +96,15 @@ var _rays_fov_h := 120.0
 var _rays_fov_v := 60.0
 var _rays_range := 80.0                 # world units; reference ray_length
 var _rays_class_bits := true            # per-ray {static,dynamic,sensor} one-hot (semantic)
+# Ray FRAME: "auto" (default) casts in the body's local frame while its rotation is LIVE,
+# but switches to a HEADING frame (forward = velocity direction) once rotation is LOCKED --
+# a lock_rotation body never turns to face its travel, so a body-local retina would stare at
+# a FIXED world direction. "body" forces the body-local frame always. Fully sensor-side.
+var _ray_frame := "auto"
+# Per-instance last heading (instance index -> Vector2/Vector3), so a below-eps-speed frame
+# holds its last direction. Reset on rebuild -> derived purely from the deterministic
+# trajectory, so twin rollouts stay bit-exact.
+var _ray_heading := {}
 # Play-bounds (x,y) computed at (re)build from the world box + t=0 body positions +
 # PLAY_MARGIN; the controlled body leaving it truncates the episode (Elias directive 2).
 var _play_min_x := -PLAY_MARGIN
@@ -362,6 +372,7 @@ func _rebuild(world_seed: int) -> String:
 	_done_trunc = false
 	_frozen = false
 	_nan = false
+	_ray_heading.erase(0)               # fresh heading for the (single-instance) episode
 	return ""
 
 
@@ -758,6 +769,7 @@ func _batch_rebuild_instance(i: int, inst_seed: int) -> String:
 	_done_trunc_arr[i] = false
 	_frozen_arr[i] = false
 	_nan_arr[i] = false
+	_ray_heading.erase(i)               # fresh heading for the reset instance
 	_play_bounds_arr[i] = _play_bounds_from_state(_safe_state_of(r.game))
 	var latches := {}
 	for k in _safe_checkpoints_of(r.game).keys():
@@ -971,7 +983,7 @@ func _batch_frame_json(with_handshake: bool) -> String:
 		nan_parts.append(_b(bool(_nan_arr[i])))
 		oob_parts.append("[%s]" % _oob_json_of(_games[i], 0.0))
 		if _rays_on:
-			rays_parts.append(_rays_json_of(_games[i]))
+			rays_parts.append(_rays_json_of(_games[i], i))
 	var head := ""
 	if with_handshake:
 		head = '"ok":true,"actions":%s,' % _actions_json()
@@ -1012,6 +1024,14 @@ func _batch_frame_json(with_handshake: bool) -> String:
 # Areas ARE hit (collide_with_areas=true) so goal/sensor pads read as the sensor class -- the
 # SEMANTIC retina. FIRST-FRAME NOTE: the reset/init frame reads all-clear because the physics
 # broadphase is only populated after the first step; every stepped frame is faithful.
+# FRAME (ray_frame, default "auto"): while the body's rotation is LIVE the fan/grid is cast in
+# its LOCAL frame (correct FPS facing). Once rotation is LOCKED (lock_rotation / all angular
+# axis locks) the body never turns to face its travel, so a body-local retina would stare at a
+# FIXED world direction -- "auto" then casts in a HEADING frame (forward = velocity direction,
+# holding its last value below RAYS_HEADING_EPS speed, initialized to the body's facing; 3D up =
+# world up, right = orthonormal cross, degenerate forward|up -> keep body-local). Per-instance
+# last-heading is derived purely from the deterministic trajectory (twin rollouts stay bit-exact)
+# and reset on rebuild. "body" forces the body-local frame. Sensor-side only -- no game change.
 # NARROW/FOVEA second tier (a denser tighter-fov grid, reference NarrowRaycastSensor 25x25):
 # a documented FOLLOW-UP -- the same machinery casts a second grid and concatenates; deferred
 # to keep this change bounded (it threads a second config block through host + obs sizing).
@@ -1032,14 +1052,16 @@ func _parse_rays(r) -> void:
 	_rays_fov_v = clampf(float(r.get("fov_v", 60.0)), 1.0, 179.0)
 	_rays_range = maxf(1.0, float(r.get("range", 80.0)))
 	_rays_class_bits = bool(r.get("class_bits", true))
+	_ray_frame = "body" if str(r.get("ray_frame", "auto")) == "body" else "auto"
+	_ray_heading = {}                       # fresh sensor state per init
 	# On only if SOME axis yields rays (2D fan n>0 OR 3D grid nh*nv>0).
 	_rays_on = _rays_n > 0 or (_rays_nh > 0 and _rays_nv > 0)
 
 
-func _rays_json_of(game) -> String:
-	# JSON array of N normalized hit distances at the obs %.17f precision.
+func _rays_json_of(game, inst_idx: int) -> String:
+	# JSON array of the flat per-ray floats (distance [+ class]) at the obs %.17f precision.
 	var parts := PackedStringArray()
-	for v in _cast_rays_of(game):
+	for v in _cast_rays_of(game, inst_idx):
 		parts.append(_f(float(v)))
 	return "[%s]" % ",".join(parts)
 
@@ -1089,9 +1111,10 @@ func _expected_ray_count(game) -> int:
 	return (_rays_nh * _rays_nv) if _game_dim_of(game) == 3 else _rays_n
 
 
-func _cast_rays_of(game) -> Array:
+func _cast_rays_of(game, inst_idx: int) -> Array:
 	# The deterministic fan/grid -> Array[float] in [0,1]. Length: 2D fan _rays_n, 3D grid
 	# _rays_nh*_rays_nv (the depth retina). A missing body -> all-1.0 at the right count.
+	# inst_idx keys the per-instance heading state (single-instance path uses 0).
 	if not _rays_on:
 		return []
 	if game == null or not is_instance_valid(game):
@@ -1101,10 +1124,47 @@ func _cast_rays_of(game) -> Array:
 	if node == null or not is_instance_valid(node):
 		return _all_clear_rays(_expected_ray_count(game))   # no body to cast from -> clear
 	if node is CollisionObject3D:
-		return _cast_rays_3d(node)
+		return _cast_rays_3d(node, inst_idx)
 	if node is CollisionObject2D:
-		return _cast_rays_2d(node)
+		return _cast_rays_2d(node, inst_idx)
 	return _all_clear_rays(_expected_ray_count(game))
+
+
+func _rotation_locked(node) -> bool:
+	# True when the body's rotation is LOCKED (so its facing is fixed and a body-local retina
+	# would stare at a fixed world direction). 3D: RigidBody3D.lock_rotation OR all three
+	# axis_lock_angular_* set. 2D: RigidBody2D.lock_rotation. Missing props (CharacterBody,
+	# etc.) -> not locked (rotation is game-driven, so body-local facing is meaningful).
+	var lr = node.get("lock_rotation")
+	if typeof(lr) == TYPE_BOOL and lr:
+		return true
+	if node is CollisionObject3D:
+		var ax = node.get("axis_lock_angular_x")
+		var ay = node.get("axis_lock_angular_y")
+		var az = node.get("axis_lock_angular_z")
+		if typeof(ax) == TYPE_BOOL and typeof(ay) == TYPE_BOOL and typeof(az) == TYPE_BOOL:
+			return ax and ay and az
+	return false
+
+
+func _body_velocity_3d(node) -> Vector3:
+	var v = node.get("linear_velocity")     # RigidBody3D
+	if typeof(v) == TYPE_VECTOR3:
+		return v
+	v = node.get("velocity")                # CharacterBody3D
+	if typeof(v) == TYPE_VECTOR3:
+		return v
+	return Vector3.ZERO
+
+
+func _body_velocity_2d(node) -> Vector2:
+	var v = node.get("linear_velocity")     # RigidBody2D
+	if typeof(v) == TYPE_VECTOR2:
+		return v
+	v = node.get("velocity")                # CharacterBody2D
+	if typeof(v) == TYPE_VECTOR2:
+		return v
+	return Vector2.ZERO
 
 
 func _controlled_name_of_game(game) -> String:
@@ -1204,7 +1264,7 @@ func _fan_dirs_3d() -> Array:
 	return out
 
 
-func _cast_rays_3d(node) -> Array:
+func _cast_rays_3d(node, inst_idx: int) -> Array:
 	var n_grid := _rays_nh * _rays_nv
 	var vp: Viewport = node.get_viewport()
 	if vp == null:
@@ -1218,9 +1278,25 @@ func _cast_rays_3d(node) -> Array:
 	var xform: Transform3D = node.global_transform
 	var basis := xform.basis.orthonormalized()
 	var origin: Vector3 = xform.origin
-	var fwd: Vector3 = -basis.z            # Godot's forward
+	# Body-local frame (Godot forward = -Z). In "auto" mode a LOCKED-rotation body switches
+	# to a HEADING frame (forward = velocity), so its retina looks down-travel, not at a fixed
+	# world axis its non-rotating basis happens to point at.
+	var fwd: Vector3 = -basis.z
 	var up: Vector3 = basis.y
 	var right: Vector3 = basis.x
+	if _ray_frame == "auto" and _rotation_locked(node):
+		var last: Vector3 = _ray_heading.get(inst_idx, fwd)     # init to body facing
+		var vel := _body_velocity_3d(node)
+		var hf := last
+		if vel.length() > RAYS_HEADING_EPS:
+			hf = vel.normalized()
+		_ray_heading[inst_idx] = hf
+		# Orthonormal frame about world up; degenerate (hf ~parallel to up) -> keep body-local.
+		var r := hf.cross(Vector3.UP)
+		if r.length() > 1.0e-4:
+			right = r.normalized()
+			fwd = hf
+			up = right.cross(fwd).normalized()
 	var exclude: Array[RID] = [node.get_rid()]
 	var out := []
 	for pd in _fan_dirs_3d():
@@ -1238,7 +1314,7 @@ func _cast_rays_3d(node) -> Array:
 	return out
 
 
-func _cast_rays_2d(node) -> Array:
+func _cast_rays_2d(node, inst_idx: int) -> Array:
 	var vp: Viewport = node.get_viewport()
 	if vp == null:
 		return _all_clear_rays(_rays_n)
@@ -1253,6 +1329,16 @@ func _cast_rays_2d(node) -> Array:
 	var fwd: Vector2 = xform.x.normalized()   # local +X (the direction `angle` points)
 	if fwd.length() < 0.5:
 		fwd = Vector2.RIGHT
+	# "auto" + LOCKED rotation -> heading frame (forward = velocity), so a non-rotating 2D
+	# mover's retina looks down-travel rather than at its fixed facing.
+	if _ray_frame == "auto" and _rotation_locked(node):
+		var last: Vector2 = _ray_heading.get(inst_idx, fwd)     # init to body facing
+		var vel := _body_velocity_2d(node)
+		if vel.length() > RAYS_HEADING_EPS:
+			fwd = vel.normalized()
+		else:
+			fwd = last
+		_ray_heading[inst_idx] = fwd
 	var exclude: Array[RID] = [node.get_rid()]
 	var out := []
 	for az in _fan_azimuths_2d():
@@ -1294,7 +1380,7 @@ func _frame_json(with_handshake: bool, margin: float, frames_json := "") -> Stri
 	# state() sampling instant as obs, so a twin rollout is byte-identical WITH rays on.
 	var rays_part := ""
 	if _rays_on:
-		rays_part = ',"rays":%s' % _rays_json_of(_game)
+		rays_part = ',"rays":%s' % _rays_json_of(_game, 0)
 	# "error":null is hardcoded: a runtime SCRIPT ERROR inside the generated act()
 	# aborts the call without raising, so it is undetectable in-process. The Python
 	# executor attaches the real cause per-episode from the tee'd stderr delta

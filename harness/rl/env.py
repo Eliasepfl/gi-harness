@@ -154,7 +154,7 @@ PROPRIO_3D = 7            # pure-profile proprioception width: vx,vy,vz, qx,qy,q
 # wired, so per-world extent scaling is a follow-up — callers override range per game).
 DEFAULT_RAYS = {"n": 16, "fov_deg": 180.0,
                 "n_h": 25, "n_v": 5, "fov_h": 120.0, "fov_v": 60.0,
-                "range": 80.0, "class_bits": True}
+                "range": 80.0, "class_bits": True, "ray_frame": "auto"}
 RAY_CLASS_BITS = 3        # {static, dynamic, sensor} one-hot per ray when class_bits on [eng.]
 VEL_SCALE = 1000.0        # px/s velocity normalizer [eng.]
 OBS_CLIP = 10.0           # clip normalized obs into [-OBS_CLIP, OBS_CLIP] [eng.]
