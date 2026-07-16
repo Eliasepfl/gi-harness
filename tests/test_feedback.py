@@ -136,6 +136,77 @@ def test_g4_softlock_quotes_reproducer():
     assert "length 3" in ds[0].text            # the frozen-state reproducer summary
 
 
+def frozen_state(pos, *, vel=(0.0, 0.0), name="player", nearby=None, enclosing=None,
+                 ticks=42, last_cp="lip", dim=2):
+    """A fabricated frozen_state block (the ENGINE-TRUTH pocket a certified-softlock
+    finding now carries) for exercising the directive renderer without an engine."""
+    return {
+        "controlled": {"name": name, "pos": list(pos), "vel": list(vel)},
+        "nearby": (nearby if nearby is not None
+                   else [{"name": "goal", "pos": [620.0, 260.0], "dist": 260.0}]),
+        "ticks_elapsed": ticks,
+        "last_latched_checkpoint": last_cp,
+        "dimension": dim,
+        "enclosing": enclosing or [],
+    }
+
+
+def test_g4_softlock_renders_engine_frozen_state():
+    """The certified-softlock directive raises the ENGINE FACTS (Elias): the frozen
+    position + velocity, the named nearby/enclosing bodies, the ticks after the last
+    checkpoint, and that the solver PROVED no continuation wins under budget."""
+    repro = {"seed": 3, "action_plan": {"kind": "sequence", "sequence": ["up", "up", "left"]},
+             "provenance": {"oracle": "inverse_value+tree_refute",
+                            "subtree_status": "all_terminal", "budget": 4000}}
+    fs = frozen_state([380.0, 400.0], vel=[0.0, 0.0],
+                      nearby=[{"name": "goal", "pos": [620.0, 260.0], "dist": 260.0}],
+                      enclosing=[{"name": "wall_left",
+                                  "aabb": [[260.0, 240.0], [280.0, 560.0]]}],
+                      ticks=57, last_cp="over_pit")
+    ds = F.compile_directives({"g4": g4(
+        g4_finding("softlock", detail="prefix soft-locks the game",
+                   reproducer=repro, frozen_state=fs))})
+    assert sources(ds) == ["softlock"]
+    text = ds[0].text
+    assert "SOFTLOCK" in text.upper()
+    assert "380" in text and "400" in text                 # the frozen position
+    assert "goal" in text                                  # a nearby body name
+    assert "wall_left" in text                             # the enclosing geometry name
+    assert "over_pit" in text                              # the last checkpoint before the freeze
+    assert "57" in text                                    # ticks after that checkpoint
+    assert "4000" in text                                  # the solver budget
+    assert "PROVED" in text.upper() or "no continuation" in text.lower()
+    # the block is carried through on the directive detail (for downstream consumers).
+    assert ds[0].detail.get("frozen_state") == fs
+
+
+def test_g4_softlock_fingerprint_ignores_frozen_coordinates():
+    """The dedup fingerprint keys on the DEFECT identity only — two softlocks with
+    DIFFERENT frozen coordinates collapse to the SAME fingerprint (the convergence guard
+    must not be defeated by volatile positions), yet the rendered text still differs."""
+    repro = {"seed": 1, "action_plan": {"kind": "sequence", "sequence": ["right"] * 4},
+             "provenance": {"oracle": "tree_refute", "subtree_status": "all_terminal"}}
+    d1 = F.compile_directives({"g4": g4(g4_finding(
+        "softlock", detail="prefix soft-locks", reproducer=repro,
+        frozen_state=frozen_state([120.0, 340.0])))})[0]
+    d2 = F.compile_directives({"g4": g4(g4_finding(
+        "softlock", detail="prefix soft-locks", reproducer=repro,
+        frozen_state=frozen_state([500.0, 120.0], last_cp="crossed")))})[0]
+    assert d1.fingerprint == d2.fingerprint                 # same defect -> same id
+    assert d1.text != d2.text                               # but the engine facts differ
+
+
+def test_g4_softlock_without_frozen_state_still_renders():
+    # An un-enriched softlock finding (older tier / degraded snapshot) still compiles —
+    # the engine-facts clause is simply omitted, never a crash.
+    repro = {"seed": 3, "action_plan": {"kind": "sequence", "sequence": ["up", "up", "left"]},
+             "provenance": {"oracle": "tree_refute", "subtree_status": "all_terminal"}}
+    ds = F.compile_directives({"g4": g4(
+        g4_finding("softlock", detail="prefix soft-locks the game", reproducer=repro))})
+    assert sources(ds) == ["softlock"]
+    assert "SOFTLOCK" in ds[0].text.upper() and "length 3" in ds[0].text
+
+
 def test_g4_stuck_is_informational():
     """Unconfirmed heuristic 'stuck' compiles NO directive (first harden wave:
     fuzz-idleness looks identical in any game — an unfixable accusation). Only

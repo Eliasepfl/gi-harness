@@ -344,3 +344,76 @@ no-critic path is byte-identical.
 - `terminal_reachable` / CONFIRM (`refute_prefix`) remains the ONLY SOUND layer: every
   value_death candidate — like every frozen/cycle one — is only a SUSPECT until the tree
   solver refutes reachability from its prefix. Zero false certifications, unchanged.
+
+
+# FROZEN-STATE ENRICHMENT — the engine truth on the finding (Elias, 2026-07-16)
+
+> Elias: *"give the feedback of the position and state of the game FROM THE GAME ENGINE, to
+> be more precise of the softlock, and maybe help the LLM that wrote the game be more aware
+> of it."*
+
+Before this, a certified-softlock directive named only the last latched checkpoint — the
+model was told *"there is a dead end past `<cp>`"* with no idea WHERE. The CONFIRM path
+already replays the frozen prefix (its `prefix_ep`), so the engine truth was in hand; it
+just never reached the finding or the directive. Now every certified-softlock producer
+(inverse-value, descent, stale, deep seeker — and therefore value_death, which flows through
+the SAME finding-construction) attaches a compact `frozen_state` block, and the softlock
+directive row RAISES those facts.
+
+## The `frozen_state` shape (on the finding)
+Derived from the ALREADY-replayed prefix episode — ZERO extra engine runs on the certify
+path (the deep seeker builds findings without a snapshot, so it pays ONE bounded replay per
+finding — negligible next to its PPO training). JSON-safe, bounded, best-effort (any missing
+body/field degrades to `None`, never an error):
+
+```
+finding["frozen_state"] = {
+  "controlled": {"name": "player", "pos": [380.0, 400.0], "vel": [0.0, 0.0]},
+  "nearby": [                      # the <=5 nearest OTHER bodies, by name+pos+dist
+     {"name": "goal", "pos": [620.0, 260.0], "dist": 260.0}],
+  "ticks_elapsed": 57,             # ticks of the replayed episode ending in the pocket
+  "last_latched_checkpoint": "over_pit",   # the milestone before the freeze (already there)
+  "dimension": 2,                  # 2D / 3D, read off the position vector
+  "enclosing": [                   # BEST-EFFORT pocket walls (G0.5 check-op geometry)
+     {"name": "wall_left", "aabb": [[260.0, 240.0], [280.0, 560.0]]}],
+}
+```
+
+- **Enclosure** (`enclosing`) reuses the G0.5 machinery: a cheap t=0 `check` op that emits
+  each static body's AABB / half-extents, fetched on a FRESH short-lived serve executor (its
+  own ephemeral port — check-after-batch on the shared CONFIRM host is untested) ONLY when a
+  finding exists. A static body whose padded footprint bounds the frozen position is a pocket
+  wall. Best-effort: engines with no check surface (py/js), or a logic-trap pocket with no
+  footprinted walls (e.g. `softlock_pit.gd`), yield `[]` — it omits gracefully, never errors.
+- **Fingerprint UNCHANGED**: positions live in the finding detail + directive TEXT only. The
+  dedup fingerprint still keys on the DEFECT identity (`_fingerprint("softlock", [])`) — two
+  softlocks at DIFFERENT coordinates collapse to the SAME id, so the convergence guard is not
+  defeated by volatile coordinates.
+
+## Example rendered directive (softlock row, feedback.py)
+```
+SOFTLOCK (dead-end state): the inverse-value attacker steered the game into a frozen pocket
+(len 22 prefix); the G3 solver found no win in 4000 ticks under it (subtree all_terminal).
+Reproducer: seed 0, action prefix of length 22 (subtree all_terminal). Engine state at the
+softlock: the engine holds player at pos [380.0, 400.0] (velocity [0.0, 0.0]); nearest
+bodies: goal at [620.0, 260.0]; 57 ticks in, 'over_pit' was the last checkpoint reached. The
+solver PROVED no continuation wins from this state (searched 4000 ticks). Ensure EVERY
+reachable state can still reach the goal — remove the one-way trap, or add an escape/reset
+from the dead end — WITHOUT changing the goal or the intended path.
+```
+(For a value_death wiggle pocket the velocity is NON-zero — the body still moves; the facts
+are reported verbatim, no "frozen" claim, because the softlock is PROVEN, not motion-based.)
+
+## GLOSSARY — three states Elias kept conflating (resolved, permanently)
+- **softlock** — still RUNNING, still ACTING, but PROVEN unwinnable from here. The body may be
+  pinned (frozen), oscillating (cycle), or wiggling (value_death) — motion is irrelevant. This
+  is the CERTIFIED class (a tree-refutation witness: no continuation reaches the goal under
+  budget). It is the ONLY class that earns a repair directive — it is proof-carrying and
+  fixable-by-construction (make the pocket escapable, or the dead-end region unreachable).
+- **agent-refusal** — the agent COULD still win but idles / wiggles / declines to try. NOT a
+  defect of the game: any mostly-idle fuzzer looks stuck in ANY game. Always REFUTED by CONFIRM
+  (a winning continuation exists), so it NEVER becomes a finding or a directive. (This is the
+  unconfirmed heuristic `stuck` class — informational only.)
+- **hardlock / frozen** — cannot MOVE AT ALL from here (one detector: state within EFFICACY_EPS
+  for a whole window). It is a SPECIAL CASE of softlock once CONFIRM refutes it — same certified
+  class, same directive. "Frozen" names the DETECT kind; "softlock" names the certified verdict.

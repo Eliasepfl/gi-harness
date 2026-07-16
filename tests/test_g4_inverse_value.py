@@ -146,3 +146,103 @@ def test_to_repair_report_uses_inverse_value_hint():
     assert rr["failure_class"] == "G4_FINDING" and rr["outcome"] == "softlock"
     assert rr["hint"] == f["repair_hint"]      # specific hint wins over the generic map
     assert "lip" in rr["hint"]
+
+
+# ====================================================================== #
+# FROZEN-STATE ENRICHMENT — the ENGINE-TRUTH frozen pocket rides on the finding
+# (Elias directive: give the position + state of the game from the engine, so the LLM
+# that wrote the game is made aware of the softlock). Derived from the ALREADY-replayed
+# prefix episode — zero extra engine runs on the certify path.
+# ====================================================================== #
+def test_inverse_value_finding_carries_frozen_state():
+    out = g4.run_g4(SOFTLOCK, _softlock_report(), engine="py",
+                    world_factory=factory(), tiers=(0,),
+                    iv_candidates=[["run", "run", "run", "run"]], **IV, **SMALL)
+    f = [f for f in out["findings"] if f["tier"] == "inverse_value"][0]
+    fs = f["frozen_state"]
+    # controlled body: the engine-truth frozen pose (name/pos/vel), read from the replay.
+    assert fs["controlled"]["name"] == "player"
+    assert fs["controlled"]["pos"] is not None and len(fs["controlled"]["pos"]) == 2
+    assert fs["controlled"]["vel"] is not None
+    assert fs["dimension"] == 2
+    assert isinstance(fs["ticks_elapsed"], int) and fs["ticks_elapsed"] >= 1
+    # the last milestone before the freeze (already named on the repair hint) rides along.
+    assert fs["last_latched_checkpoint"] == "lip"
+    # the N nearest OTHER bodies (the static "ground" box), bounded and named+placed.
+    names = [b["name"] for b in fs["nearby"]]
+    assert "ground" in names and "player" not in names
+    assert len(fs["nearby"]) <= g4.FROZEN_NEARBY
+    assert all("pos" in b and "name" in b for b in fs["nearby"])
+    # py lane has no G0.5 check-op geometry -> enclosure omits gracefully (empty list).
+    assert fs["enclosing"] == []
+
+
+def test_value_death_candidate_finding_carries_frozen_state():
+    # The motion-invariant value_death path reuses the SAME finding-construction, so its
+    # certified softlocks carry the identical frozen_state shape (coordinator ADOPT).
+    out = g4.run_g4(
+        SOFTLOCK, _softlock_report(), engine="py", world_factory=factory(), tiers=(0,),
+        iv_candidates=[{"prefix": ["run", "run", "run", "run"],
+                        "provenance": {"kind": "value_death", "source": "injected"},
+                        "value": -9.0}],
+        **IV, **SMALL)
+    f = [f for f in out["findings"] if f["tier"] == "inverse_value"][0]
+    assert f["reproducer"]["provenance"]["kind"] == "value_death"
+    fs = f["frozen_state"]
+    assert fs["controlled"]["name"] == "player" and fs["controlled"]["pos"] is not None
+    assert fs["dimension"] == 2 and fs["last_latched_checkpoint"] == "lip"
+    assert "ground" in [b["name"] for b in fs["nearby"]]
+    assert fs["enclosing"] == []
+
+
+# -- frozen_state helper (pure over a replayed episode dict) -------------- #
+def test_frozen_state_helper_bounds_and_orders_nearby():
+    ep = {"ticks": 12, "checkpoints": {"lip": 2},
+          "final_snapshot": {
+              "player": {"pos": [100.0, 100.0], "vel": [0.0, 0.0]},
+              "far": {"pos": [900.0, 900.0], "vel": [0.0, 0.0]},
+              "near": {"pos": [110.0, 100.0], "vel": [0.0, 0.0]},
+          }}
+    fs = g4._frozen_state(ep, "player", "lip", n_nearby=1)
+    assert fs["controlled"] == {"name": "player", "pos": [100.0, 100.0], "vel": [0.0, 0.0]}
+    assert fs["ticks_elapsed"] == 12 and fs["dimension"] == 2
+    assert fs["last_latched_checkpoint"] == "lip"
+    # nearest-first, capped at n_nearby (the "near" body wins over "far").
+    assert [b["name"] for b in fs["nearby"]] == ["near"]
+    assert fs["nearby"][0]["dist"] == 10.0
+    assert fs["enclosing"] == []
+
+
+def test_frozen_state_helper_is_snapshot_missing_safe():
+    # A weird/missing snapshot must degrade to None, never raise (certify must not break).
+    fs = g4._frozen_state({"ticks": 0, "final_snapshot": {}}, "player", None)
+    assert fs["controlled"] == {"name": "player", "pos": None, "vel": None}
+    assert fs["nearby"] == [] and fs["dimension"] is None and fs["enclosing"] == []
+    assert fs["last_latched_checkpoint"] is None
+
+
+# -- enclosure facts (pure over G0.5 geometry body facts) ---------------- #
+def test_enclosing_facts_names_the_pocket_walls():
+    geometry = [
+        {"name": "wall", "pos": [100.0, 100.0], "static": True,
+         "half_extents": [40.0, 40.0]},                  # a real footprint near the point
+        {"name": "player", "pos": [100.0, 100.0], "controlled": True},   # never a wall
+        {"name": "gem", "pos": [100.0, 100.0], "static": True},          # bare marker (no footprint)
+        {"name": "faraway", "pos": [900.0, 900.0], "static": True,
+         "half_extents": [10.0, 10.0]},                  # too far to bound the point
+    ]
+    enc = g4._enclosing_facts([120.0, 100.0], geometry)   # just outside the wall, within pad
+    assert [e["name"] for e in enc] == ["wall"]
+    assert enc[0]["aabb"] == [[60.0, 60.0], [140.0, 140.0]]
+
+
+def test_enclosing_facts_empty_without_geometry_or_position():
+    assert g4._enclosing_facts([120.0, 100.0], []) == []
+    assert g4._enclosing_facts(None, [{"name": "w", "static": True, "pos": [1, 1],
+                                       "half_extents": [1, 1]}]) == []
+
+
+def test_geometry_facts_empty_off_the_gdscript_lane():
+    # py/js have no serve check-op geometry -> [] (best-effort omit, no engine spawn).
+    assert g4._geometry_facts("py", SOFTLOCK) == []
+    assert g4._geometry_facts("gdscript", "") == []

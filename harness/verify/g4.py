@@ -1113,7 +1113,13 @@ def _run_stale(executor, game_source, engine, actions, report, *,
         seen_fp.add(fp)
         suspects.append({"prefix": prefix, "trigger_1a": fired_a,
                          "trigger_1b": fired_b, "info_1a": info_a,
-                         "info_1b": info_b, "evidence": _evidence(ep, engine)})
+                         "info_1b": info_b, "evidence": _evidence(ep, engine),
+                         # the frozen pocket the body ends in (the body is pinned from the
+                         # cycle-start on, so the episode's final snapshot IS the freeze) —
+                         # kept so a certified suspect carries frozen_state with NO extra run.
+                         "final_ep": {"final_snapshot": ep.get("final_snapshot", {}) or {},
+                                      "ticks": int(ep.get("ticks", 0) or 0),
+                                      "checkpoints": ep.get("checkpoints", {}) or {}}})
         if len(suspects) >= top_m:
             break
 
@@ -1134,6 +1140,8 @@ def _run_stale(executor, game_source, engine, actions, report, *,
             continue
         block["certified"] += 1
         prefix = s["prefix"]
+        final_ep = s.get("final_ep") or {}
+        last_cp = _last_latched_checkpoint(final_ep.get("checkpoints"))
         findings.append({
             "outcome": "softlock", "tier": "stale", "family": "tree_refute",
             "hard": True,
@@ -1148,8 +1156,10 @@ def _run_stale(executor, game_source, engine, actions, report, *,
                                "seed": seed, "subtree_status": res["subtree_status"]},
             },
             "evidence": s["evidence"],
+            "frozen_state": _frozen_state(final_ep, controlled, last_cp),
         })
 
+    _attach_enclosure(engine, game_source, findings)
     block["findings"] = findings
     block["passed"] = not findings
     return block
@@ -1236,10 +1246,159 @@ def _last_latched_checkpoint(checkpoints):
     return max(latched)[1]
 
 
+# ======================================================================== #
+# FROZEN-STATE ENRICHMENT (Elias directive: "give the feedback of the position and state
+# of the game FROM THE GAME ENGINE ... of the softlock, to help the LLM that wrote the game
+# be more aware of it"). The certified-softlock finding now carries the ENGINE-TRUTH frozen
+# pocket — controlled body {name,pos,vel}, the nearest OTHER bodies, ticks, the last latched
+# checkpoint, dimension — DERIVED from the ALREADY-replayed prefix episode (zero extra engine
+# runs on the certify path). Best-effort ENCLOSURE names the pocket walls from the SAME G0.5
+# check-op geometry (a cheap t=0 fetch, gdscript only, ONLY when a finding exists). Positions
+# ride in the finding DETAIL / directive TEXT ONLY — NEVER in the dedup fingerprint (that keys
+# on the defect identity; folding volatile coordinates in would break the convergence guard).
+# ======================================================================== #
+FROZEN_NEARBY = 5          # cap on the nearest OTHER bodies named in a frozen_state [eng.]
+ENCLOSE_PAD = 24.0         # px: inflate a wall's footprint when testing "bounds the pocket" [eng.]
+
+
+def _coords(v):
+    """A snapshot pos/vel field -> a list of rounded floats, or None if unusable. Tolerant:
+    a weird/missing field degrades to None (the certify path must never break on a snapshot)."""
+    if not isinstance(v, (list, tuple)):
+        return None
+    try:
+        out = [round(float(x), 2) for x in v]
+    except (TypeError, ValueError):
+        return None
+    return out or None
+
+
+def _frozen_state(prefix_ep, controlled, last_cp, *, n_nearby=FROZEN_NEARBY):
+    """The ENGINE-TRUTH frozen pocket, read from an ALREADY-replayed episode's final
+    snapshot (NO new engine run). Compact + JSON-safe: the controlled body's frozen
+    {name,pos,vel}, the <=N nearest OTHER bodies by name+pos+dist, ticks elapsed, the last
+    latched checkpoint, and the world dimension. ``enclosing`` starts empty and is filled
+    best-effort by :func:`_attach_enclosure`. Every field is best-effort — a missing body /
+    field degrades to None, never an error."""
+    snap = prefix_ep.get("final_snapshot") or {}
+    ticks = int(prefix_ep.get("ticks", 0) or 0)
+    ctrl_body = snap.get(controlled) or {}
+    pos = _coords(ctrl_body.get("pos"))
+    vel = _coords(ctrl_body.get("vel"))
+    others = []
+    for name, body in snap.items():
+        if name == controlled or not isinstance(body, dict):
+            continue
+        opos = _coords(body.get("pos"))
+        if opos is None:
+            continue
+        dist = _displacement(pos, opos) if pos else None
+        others.append((dist if dist is not None else float("inf"), name, opos))
+    others.sort(key=lambda t: t[0])
+    nearby = [{"name": n, "pos": p,
+               "dist": (round(d, 2) if d != float("inf") else None)}
+              for d, n, p in others[:max(0, int(n_nearby))]]
+    return {
+        "controlled": {"name": controlled, "pos": pos, "vel": vel},
+        "nearby": nearby,
+        "ticks_elapsed": ticks,
+        "last_latched_checkpoint": last_cp,
+        "dimension": (len(pos) if pos else None),
+        "enclosing": [],
+    }
+
+
+def _geometry_facts(engine, game_source):
+    """The serve host's t=0 GEOMETRY facts (static bodies + AABBs/half-extents) via the SAME
+    G0.5 check op the reachability pre-filter uses. Best-effort + cheap: gdscript only, on a
+    FRESH short-lived executor bound to its OWN ephemeral port (so it never disturbs the
+    suite's long-lived CONFIRM serve host — check-after-batch on the shared handle is untested),
+    ONE t=0 exchange, no physics batch. [] for other engines or on ANY failure -> enclosure
+    then omits gracefully."""
+    if engine != "gdscript" or not game_source:
+        return []
+    try:
+        from harness.verify.gd_exec import GdExecutor
+        ex = GdExecutor(port_base=_iv_free_port())
+        try:
+            facts = ex.run_check(game_source)
+        finally:
+            close = getattr(ex, "close", None)
+            if callable(close):
+                close()
+        return list((facts or {}).get("geometry") or [])
+    except Exception:  # noqa: BLE001 - enclosure is best-effort; never sink the tier
+        return []
+
+
+def _enclosing_facts(pos, geometry, *, pad=ENCLOSE_PAD):
+    """The STATIC bodies whose (padded) footprint BOUNDS the frozen position — the pocket
+    walls, named for the directive. Reuses reachability._aabb_of to read each body's
+    aabb/half_extents/radius footprint. Best-effort: footprint-less bodies (bare markers),
+    the controlled body, and non-static bodies are skipped; [] when nothing bounds the point."""
+    if not pos:
+        return []
+    from harness.verify.reachability import _aabb_of
+    out = []
+    for b in geometry or []:
+        if not isinstance(b, dict) or not b.get("static") or b.get("controlled"):
+            continue
+        bpos = _coords(b.get("pos"))
+        if bpos is None:
+            continue
+        aabb = _aabb_of(b, bpos)
+        if aabb is None:
+            continue
+        mn, mx = aabb
+        dims = min(len(pos), len(mn), len(mx))
+        if dims and all((mn[i] - pad) <= pos[i] <= (mx[i] + pad) for i in range(dims)):
+            out.append({"name": b.get("name") or "",
+                        "aabb": [[round(float(x), 2) for x in mn],
+                                 [round(float(x), 2) for x in mx]]})
+    return out
+
+
+def _attach_enclosure(engine, game_source, findings):
+    """Best-effort ADD: name the pocket walls (enclosing static bodies) on each finding's
+    frozen_state, from the G0.5 check-op geometry. ONE cheap t=0 fetch, only when there is a
+    finding to enrich; a graceful no-op (enclosing stays []) when geometry is unavailable."""
+    if not findings:
+        return
+    geometry = _geometry_facts(engine, game_source)
+    if not geometry:
+        return
+    for f in findings:
+        fs = f.get("frozen_state")
+        if fs and fs.get("controlled"):
+            fs["enclosing"] = _enclosing_facts(fs["controlled"].get("pos"), geometry)
+
+
+def _enrich_certified_softlocks(executor, game_source, findings, controlled, engine, *,
+                                seed_default=WORLD_SEED):
+    """Attach a frozen_state to certified-softlock findings that LACK one (the deep-seeker
+    path builds findings in ``stale_seek.confirm_candidates`` without a snapshot). ONE bounded
+    replay per finding (len(prefix) ticks) — acceptable on the DEEP lane, where a single PPO
+    training already dominates cost. Then names the pocket walls (best-effort enclosure)."""
+    for f in findings:
+        if f.get("frozen_state"):
+            continue
+        repro = f.get("reproducer") or {}
+        prefix = list((repro.get("action_plan") or {}).get("sequence") or [])
+        seed = int(repro.get("seed", seed_default))
+        try:
+            ep = executor.run_batch(game_source, [{"seed": seed, "actions": prefix}],
+                                    len(prefix), escape_margin=ESCAPE_MARGIN)[0]
+        except VerifyError:
+            ep = {"result": "budget", "ticks": len(prefix), "checkpoints": {}}
+        last_cp = _last_latched_checkpoint(ep.get("checkpoints"))
+        f["frozen_state"] = _frozen_state(ep, controlled, last_cp)
+    _attach_enclosure(engine, game_source, findings)
+
+
 def _run_inverse_value(executor, game_source, engine, actions, report, *,
-                       requested, game_path=None, model=None, model_path=None,
-                       critic=None, candidates=None, env_factory=None, horizon,
-                       seed, stale_H, stale_budget, top_m, window,
+                       requested, controlled=None, game_path=None, model=None,
+                       model_path=None, critic=None, candidates=None, env_factory=None,
+                       horizon, seed, stale_H, stale_budget, top_m, window,
                        iv_seeds, iv_eps, iv_max_ticks):
     """The inverse-value smart tier: SEARCH+DETECT (harness.rl.adversary) surfaces
     softlock candidates, CONFIRM (refute_prefix) certifies them. A certified prefix ->
@@ -1353,8 +1512,10 @@ def _run_inverse_value(executor, game_source, engine, actions, report, *,
                 "provenance": prov,
             },
             "evidence": _evidence(prefix_ep, engine),
+            "frozen_state": _frozen_state(prefix_ep, controlled, last_cp),
         })
 
+    _attach_enclosure(engine, game_source, findings)
     block["findings"] = findings
     block["passed"] = not findings
     return block
@@ -1372,7 +1533,7 @@ def _run_inverse_value(executor, game_source, engine, actions, report, *,
 # byte-for-byte unchanged.
 # ======================================================================== #
 def _run_descent(executor, game_source, engine, actions, report, *,
-                 requested, game_path=None, model=None, model_path=None,
+                 requested, controlled=None, game_path=None, model=None, model_path=None,
                  critic=None, candidates=None, env_factory=None, horizon,
                  seed, stale_H, stale_budget, top_m, window,
                  n_waypoints, descent_ticks, eps):
@@ -1489,8 +1650,10 @@ def _run_descent(executor, game_source, engine, actions, report, *,
                 "provenance": prov,
             },
             "evidence": _evidence(prefix_ep, engine),
+            "frozen_state": _frozen_state(prefix_ep, controlled, last_cp),
         })
 
+    _attach_enclosure(engine, game_source, findings)
     block["findings"] = findings
     block["passed"] = not findings
     return block
@@ -1510,7 +1673,7 @@ def _has_hard_softlock(findings) -> bool:
 
 def _seeker_discover_and_confirm(game_path, game_source, engine, actions, *, seed,
                                  budget, num_envs, seeds, waypoints, top_m,
-                                 stale_H, stale_budget, witness):
+                                 stale_H, stale_budget, witness, controlled=None):
     """The heavy lane, isolated behind one seam so the ladder GATE (deep flag + cheap
     tiers empty + engine/path availability) is unit-testable by monkeypatching this.
 
@@ -1531,9 +1694,15 @@ def _seeker_discover_and_confirm(game_path, game_source, engine, actions, *, see
 
     executor = _make_executor(engine, None)
     try:
-        return stale_seek.confirm_candidates(
+        res = stale_seek.confirm_candidates(
             executor, game_source, actions, candidates, H=stale_H, budget=stale_budget,
             engine=engine, top_m=top_m)
+        # The seeker's confirm path builds findings WITHOUT a snapshot; attach the
+        # engine-truth frozen_state (one bounded replay per finding — negligible next to
+        # the PPO training) + the best-effort enclosure, on the SAME executor, pre-close.
+        _enrich_certified_softlocks(executor, game_source, res.get("findings", []),
+                                    controlled, engine)
+        return res
     finally:
         close = getattr(executor, "close", None)
         if callable(close):
@@ -1541,8 +1710,8 @@ def _seeker_discover_and_confirm(game_path, game_source, engine, actions, *, see
 
 
 def _run_seeker(game_source, engine, actions, report, *, game_path, requested,
-                cheap_findings, seed, budget, num_envs, seeds, waypoints, top_m,
-                stale_H, stale_budget):
+                cheap_findings, controlled=None, seed, budget, num_envs, seeds,
+                waypoints, top_m, stale_H, stale_budget):
     """The deep seeker tier. Gated: runs ONLY when `requested` (deep=True) AND the cheap
     tiers certified NO softlock AND the lane can train (gdscript + a game_path). Findings
     are the CONFIRM-certified softlocks — identical shape to the cheap stale tier's."""
@@ -1569,7 +1738,8 @@ def _run_seeker(game_source, engine, actions, report, *, game_path, requested,
         res = _seeker_discover_and_confirm(
             game_path, game_source, engine, actions, seed=seed, budget=budget,
             num_envs=num_envs, seeds=seeds, waypoints=waypoints, top_m=top_m,
-            stale_H=stale_H, stale_budget=stale_budget, witness=_witness(report))
+            stale_H=stale_H, stale_budget=stale_budget, witness=_witness(report),
+            controlled=controlled)
     except Exception as exc:                       # training/Godot failure must not sink the suite
         block["status"] = "error"
         block["reason"] = f"deep seeker failed: {exc}"
@@ -1687,7 +1857,7 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
                            (model, model_path, iv_critic, iv_candidates, iv_env_factory))
         iv_block = _run_inverse_value(
             executor, game_source, engine, actions, report,
-            requested=iv_requested, game_path=game_path, model=model,
+            requested=iv_requested, controlled=controlled, game_path=game_path, model=model,
             model_path=model_path, critic=iv_critic, candidates=iv_candidates,
             env_factory=iv_env_factory, horizon=horizon, seed=seed, stale_H=stale_H,
             stale_budget=stale_budget, top_m=top_m, window=iv_window,
@@ -1702,11 +1872,12 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
                                  descent_candidates, descent_env_factory))
         descent_block = _run_descent(
             executor, game_source, engine, actions, report,
-            requested=descent_requested, game_path=game_path, model=model,
-            model_path=model_path, critic=descent_critic, candidates=descent_candidates,
-            env_factory=descent_env_factory, horizon=horizon, seed=seed, stale_H=stale_H,
-            stale_budget=stale_budget, top_m=top_m, window=iv_window,
-            n_waypoints=descent_waypoints, descent_ticks=descent_ticks, eps=iv_eps)
+            requested=descent_requested, controlled=controlled, game_path=game_path,
+            model=model, model_path=model_path, critic=descent_critic,
+            candidates=descent_candidates, env_factory=descent_env_factory, horizon=horizon,
+            seed=seed, stale_H=stale_H, stale_budget=stale_budget, top_m=top_m,
+            window=iv_window, n_waypoints=descent_waypoints, descent_ticks=descent_ticks,
+            eps=iv_eps)
 
         stale_block = _run_stale(executor, game_source, engine, actions, report,
                                  controlled=controlled, initial=initial, horizon=horizon,
@@ -1724,9 +1895,9 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
         seeker_block = _run_seeker(
             game_source, engine, actions, report, game_path=game_path,
             requested=bool(deep), cheap_findings=smart_findings + cheap_findings,
-            seed=seed, budget=seeker_budget, num_envs=seeker_num_envs,
-            seeds=seeker_seeds, waypoints=seeker_waypoints, top_m=seeker_top_m,
-            stale_H=stale_H, stale_budget=stale_budget)
+            controlled=controlled, seed=seed, budget=seeker_budget,
+            num_envs=seeker_num_envs, seeds=seeker_seeds, waypoints=seeker_waypoints,
+            top_m=seeker_top_m, stale_H=stale_H, stale_budget=stale_budget)
 
         findings = smart_findings + cheap_findings + list(seeker_block["findings"])
         grade = _grade(findings, tier1, tiers)

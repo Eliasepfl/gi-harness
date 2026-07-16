@@ -207,3 +207,40 @@ def test_prefix_seeding_handoff_is_deterministic_and_lands_in_pocket():
     fired, _cut, info = adversary.detect_softlock_window(
         roll1["fps"], roll1["latched"], roll1["terminal_tick"], window=6)
     assert fired is True and info["kind"] == "frozen"
+
+
+# ====================================================================== #
+# 4. The certified finding carries the ENGINE-TRUTH frozen state (Elias directive):
+#    the real serve host reports the player pinned inside the pit box, the goal named
+#    among the nearest bodies, and the enrichment feeds the repair directive.
+# ====================================================================== #
+@requires_godot
+def test_softlock_pit_finding_carries_frozen_state(monkeypatch):
+    monkeypatch.setenv("GIP_PORT_BASE", str(_free_port()))
+    src = _src(SOFTLOCK_PIT)
+    out = g4.run_g4(src, _gd_report(ACTIONS, WITNESS), engine="gdscript",
+                    slug="softlock_pit", game_path=SOFTLOCK_PIT,
+                    iv_critic=PitCritic(), tiers=(0,), **IV, **SMALL_FUZZ)
+
+    soft = [f for f in out["findings"] if f["outcome"] == "softlock"
+            and f["tier"] == "inverse_value"]
+    assert soft, "a certified inverse-value softlock finding must be present"
+    fs = soft[0]["frozen_state"]
+    # The engine froze the player INSIDE the central pit box (PIT_MIN..PIT_MAX in the fixture).
+    assert fs["controlled"]["name"] == "player"
+    px, py = fs["controlled"]["pos"]
+    assert 280.0 <= px <= 480.0 and 240.0 <= py <= 560.0, fs["controlled"]
+    assert fs["controlled"]["vel"] is not None
+    assert fs["dimension"] == 2
+    assert isinstance(fs["ticks_elapsed"], int) and fs["ticks_elapsed"] >= 1
+    # The goal marker is named among the nearest OTHER bodies.
+    assert "goal" in [b["name"] for b in fs["nearby"]]
+    # The pit is a LOGIC trap with no collision footprint -> no enclosing geometry (graceful).
+    assert fs["enclosing"] == []
+
+    # The repair directive rendered from this finding RAISES the engine facts.
+    from harness.gen import feedback as F
+    d = [x for x in F.compile_directives({"g4": out}) if x.source == "softlock"][0]
+    assert str(int(px)) in d.text and "goal" in d.text
+    assert "PROVED" in d.text.upper() or "no continuation" in d.text.lower()
+    assert d.detail.get("frozen_state") == fs
