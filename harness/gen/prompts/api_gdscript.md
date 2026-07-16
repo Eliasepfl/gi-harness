@@ -30,12 +30,16 @@ Implement these seven methods on your node (exact names + arities; the contract 
 - `func state() -> Dictionary:` - a TYPED, PURE snapshot the host reads without touching the scene: a `"bodies"` list of named entries `{name, pos, vel, angle, controlled, static}` (report `pos`/`vel` as your dimension's vector - a `Vector2` as `[x, y]`, a `Vector3` as `[x, y, z]`), optional `"flags"` and custom scalars. Exactly one body is controlled; there are at least two bodies.
 - `func checkpoints() -> Dictionary:` - ordered snake_case milestones -> `bool`, ALL false at t=0. PURE (latch progress in `_physics_process`, never mutate here).
 - `func is_success() -> bool:` - the win predicate; PURE, false at t=0.
-- `func is_failure() -> bool:` - the lose predicate (return `false` if none); PURE, false at t=0.
+- `func is_failure() -> bool:` - the lose predicate; PURE, false at t=0. Make it a condition a real player could actually trigger from a reachable state (see STAKES below) - a hardcoded `return false` declares a game that cannot be lost.
 - `func actions() -> Array:` - distinct verb strings, the whole move set.
 
 `state()`, `checkpoints()`, `is_success()`, `is_failure()` are called REPEATEDLY and MUST NOT mutate the scene (G2 checks a two-call + snapshot invariance).
 
 How it runs: `build(world_seed)` runs once, then each decision tick the host calls `act(action)` once, advances the physics a fixed number of steps, reads `checkpoints()`, then `is_failure()` then `is_success()`. The action is the player's/solver's; there is no built-in idle move.
+
+# STAKES - a game must be losable
+
+A game where doing nothing forever is indistinguishable from playing is not a game. Give every game a source of PRESSURE - something INSIDE the game that punishes or ends a stalled episode - and make `is_failure()` a condition a real player could actually trigger from a reachable state. What the pressure IS is yours to invent from the fiction; there is no prescribed mechanism, no fixed list of hazards, and no numbers. Without stakes the run has no urgency, idling is free, and the verifier will flag the game as having no way to lose.
 
 # Visuals - WELCOME but never required (render-only, verification-blind)
 

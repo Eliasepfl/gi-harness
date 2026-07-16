@@ -168,3 +168,60 @@ def scan_violations(source: str) -> list[str]:
     """The scan as a flat list of one-line strings (the ``violations`` payload the
     shared G0 ``sandbox_scan`` check carries, mirroring ``sandbox.scan_source``)."""
     return [str(f) for f in scan_gd_source(source)]
+
+
+# ======================================================================== #
+# WAVE 1 — PRESSURE: static 'is_failure is hardcoded false' detector.
+# ======================================================================== #
+# A GameAPI game must implement ``is_failure()``, but the contract lets it
+# ``return false`` when there is no lose condition — which is exactly the
+# DEMO_GAP_ANALYSIS §Gap-1 defect: a game that cannot be lost has no stakes, idling
+# is free, and Elias's ANTI-IDLING principle has no in-game meaning. The dynamic
+# failure-witness gate (gameverify) catches an UNREACHABLE failure empirically; this
+# STATIC check catches the sharpest, most-certain subcase — a literal constant-false
+# body — so the compiled directive can say "you wrote no lose condition at all"
+# instead of the weaker "no rollout lost". Conservative by design: it flags ONLY a
+# body that is exactly ``return false`` (optionally ``return false`` on the def line),
+# so a real predicate — even a trivial-looking one — is never mis-flagged.
+
+_IS_FAILURE_DEF = re.compile(r"^(\s*)func\s+is_failure\s*\([^)]*\)\s*"
+                             r"(?:->\s*[A-Za-z_][A-Za-z0-9_]*\s*)?:")
+_RETURN_FALSE = re.compile(r"^return\s+false$")
+
+
+def is_failure_constant_false(source: str) -> bool:
+    """True IFF ``is_failure()`` is DEFINITELY constant-false — its whole body is a
+    single ``return false`` (inline on the def line, or the only statement of an
+    indented block; comments and blank lines ignored). Any variable read, branch, or
+    extra statement makes it 'has real logic' -> not flagged here (the dynamic gate
+    still judges whether that logic can ever fire). A cheap, high-precision static
+    pre-read for the pressure directive; no compile, no run."""
+    lines = str(source).splitlines()
+    for i, raw in enumerate(lines):
+        m = _IS_FAILURE_DEF.match(raw)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        # (a) Inline body on the def line: ``func is_failure() -> bool: return false``.
+        inline = _strip_noncode(raw[m.end():]).strip()
+        if inline:
+            return bool(_RETURN_FALSE.match(_norm_ws(inline)))
+        # (b) Indented block: gather the real statements below, up to the next line
+        # at or below the def's indentation.
+        body: list[str] = []
+        for nxt in lines[i + 1:]:
+            code = _strip_noncode(nxt)
+            if not code.strip():
+                continue                                   # blank / comment-only
+            n_indent = len(code) - len(code.lstrip())
+            if n_indent <= indent:
+                break                                      # dedent -> end of body
+            body.append(_norm_ws(code.strip()))
+        return body == ["return false"]
+    return False                                           # no is_failure found here
+
+
+def _norm_ws(s: str) -> str:
+    """Collapse internal whitespace runs to single spaces (so ``return   false``
+    and ``return false`` compare equal)."""
+    return " ".join(s.split())

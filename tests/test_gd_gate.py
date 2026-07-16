@@ -25,12 +25,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.verify.gameverify import detect_engine, run_g0_gd, verify_game  # noqa: E402
 from harness.verify.gd_gate import (  # noqa: E402
-    GD_REQUIRED_METHODS, scan_gd_source, scan_violations,
+    GD_REQUIRED_METHODS, is_failure_constant_false, scan_gd_source, scan_violations,
 )
 from harness.verify.godot_exec import scrubbed_env  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
+_GD_DIR = os.path.join(_ROOT, "tests", "fixtures", "gd_games")
+_MINI = os.path.join(_GD_DIR, "mini_collect.gd")
 
 
 # ====================================================================== #
@@ -259,6 +260,49 @@ def test_scrubbed_env_allow_extra():
     out = scrubbed_env({"OPENROUTER_API_KEY": "x", "PROBE_MARKER": "1"},
                        allow_extra=("PROBE_MARKER",))
     assert out == {"PROBE_MARKER": "1"}
+
+
+# ====================================================================== #
+# 6. Static 'is_failure is hardcoded false' detector (WAVE 1 PRESSURE)
+# ====================================================================== #
+def _read(name):
+    with open(os.path.join(_GD_DIR, name), "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_is_failure_constant_false_flags_no_pressure_fixture():
+    # The canonical UNFAILABLE fixture: is_failure() is a literal `return false`.
+    assert is_failure_constant_false(_read("no_pressure.gd")) is True
+    # mini_collect / softlock_pit / single_action_win / walled_goal are all constant-false.
+    for name in ("mini_collect.gd", "softlock_pit.gd", "single_action_win.gd",
+                 "walled_goal.gd", "flyoff.gd"):
+        assert is_failure_constant_false(_read(name)) is True, name
+
+
+def test_is_failure_not_constant_false_for_losable_fixture():
+    # losable.gd returns `_sunk` (real logic) -> NOT flagged; the dynamic gate decides.
+    assert is_failure_constant_false(_read("losable.gd")) is False
+
+
+@pytest.mark.parametrize("body,const", [
+    ("func is_failure() -> bool:\n\treturn false\n", True),
+    ("func is_failure() -> bool: return false\n", True),              # inline body
+    ("func is_failure():\n\treturn false\n", True),                   # no type hint
+    ("func is_failure() -> bool:\n\t# no lose condition\n\treturn false\n", True),
+    ("func is_failure() -> bool:\n\treturn   false\n", True),         # extra whitespace
+    ("func is_failure() -> bool:\n\treturn _sunk\n", False),          # reads a var
+    ("func is_failure() -> bool:\n\treturn _t > 600\n", False),       # a real predicate
+    ("func is_failure() -> bool:\n\tif dead: return true\n\treturn false\n", False),
+    ("func is_failure() -> bool:\n\treturn true\n", False),           # (degenerate, but not const-FALSE)
+])
+def test_is_failure_constant_false_cases(body, const):
+    src = "extends Node2D\n" + body + "func actions(): return [\"a\", \"b\"]\n"
+    assert is_failure_constant_false(src) is const, body
+
+
+def test_is_failure_constant_false_absent_method_is_false():
+    # No is_failure at all -> not 'constant false' (the contract probe handles absence).
+    assert is_failure_constant_false("extends Node2D\nfunc build(s): pass\n") is False
 
 
 def test_gd_executor_spawns_with_scrubbed_env(monkeypatch, tmp_path):

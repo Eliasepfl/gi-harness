@@ -34,6 +34,9 @@ Two entry modes, both already exist:
 | G3' RL **zero progress** (full budget) | "Unsolvable by a trained agent: no checkpoint ever latched — the first objective is unreachable or the controls cannot produce progress." (Payoff run confirmed this class is real: drive-cart/hop latched 0.) |
 | G4 `single_action_win` | **Broken game** directive: "winnable by repeating one action — add a real obstacle/choice." (Cheap probe runs in-loop, pre-cert.) |
 | G4 shortcut w/ **broken gating** | "success reachable WITHOUT checkpoint '<key>' — gate the win on it or remove the checkpoint." Informational shortcuts (merely easier than witness) do NOT re-enter the loop. |
+| PRESSURE gate **`no_pressure`** (WAVE 1) | **No stakes** (static proof): "the game cannot be lost — is_failure() is hardcoded false; add a real failure condition (hazard, timeout, out-of-bounds, resource depletion) so play has stakes." ADVISORY — warn + directive, never a hard cert-block (see below). |
+| PRESSURE gate **`failure_unreachable`** (WAVE 1) | "is_failure() never fires from any reachable state under a broad adversarial rollout — the win always resolves first (the race), or the detector never triggers. Make failure a condition a real player could actually trigger." ADVISORY; a bounded reproducer-ABSENCE. Distinct from `no_pressure`. |
+| PRESSURE gate **`has_pressure`** | NO directive — a reachable failure was WITNESSED; the game has stakes. |
 | body leaves play bounds | NOT a defect — episode truncation in serve (bounds termination). Never fed back. |
 
 ## Dimension-awareness (Elias)
@@ -54,6 +57,44 @@ fresh generation is the ROUTING QUERY: the domain-skill layer is selected on the
 `render_skill_context(<directive text>, orchestrator=True)` — and the message
 carries (a) the directive and (b) the CURRENT game source. Route on the error,
 keep the current state authoritative, avoid drifting into a from-scratch rebuild.
+
+## WAVE 1 — PRESSURE: the failure-witness gate + terminal reachability
+
+Built per `notes/engines/DEMO_GAP_ANALYSIS.md` (the #1 ranked gap: 4/6 games are
+unfailable, so idling is free and ANTI-IDLING has no in-game meaning).
+
+- **Failure-witness gate** (`gameverify._failure_witness_gate`, gdscript funnel, after
+  the single-action gate). Confirms `is_failure()` can fire from a REACHABLE state — a
+  failure witness, dual to the G3 success witness. Two no-stakes verdicts:
+  `no_pressure` (static: `gd_gate.is_failure_constant_false` — a literal `return false`)
+  and `failure_unreachable` (dynamic: `reachability.failure_reachable` — a broad
+  adversarial sweep, coverage + random + inverted-objective tree, that never loses).
+- **Gate decision — ADVISORY, not a hard block** (the documented choice). Rationale:
+  (1) false-reject discipline — the sweep is a BOUNDED negative, so a genuinely
+  hard-to-trigger failure must never be wrongly rejected (the same "err toward passing"
+  stance G0.5 takes); (2) it must not preempt the blocking gates (single-action, G0.5)
+  that own a broken fixture's real defect; (3) Wave-1 acceptance ("0 constant-false
+  is_failure in the CERTIFIED set") is delivered by the REVISE loop, not a reject — the
+  finding is proof-carrying and ALWAYS compiles a directive, driving the final set to
+  have stakes. Recorded as a NON-GATING `failure_witness` sub-check under G3_solve
+  (always pass=True; the signal is `has_failure_witness`) + a report warning, so
+  `report["passed"]`/`failure_class` and the top-level report key set are untouched.
+  All existing certifying fixtures are constant-false, so the static check
+  short-circuits BEFORE any extra rollout — the gate adds ZERO Godot cost to them.
+- **`terminal_reachable(state)`** (`reachability.terminal_reachable`, via the certified
+  Go-Explore tree solver over a prefix-wrapped executor). The principled
+  stuck-vs-refusal separator: from a non-terminal state, can play still reach EITHER
+  success OR failure? `reachable` is PROVEN (a replayable witness); `env_softlock`
+  (neither reachable in budget) is a real environment softlock. A state that IS
+  terminal-reachable but whose own trajectory idles is AGENT-refusal, not a game defect.
+  Exposed for BOTH the adversary CONFIRM layer and this feedback loop to read.
+- **Wiring**: the gate stashes a machine-readable finding under
+  `layers.G3_solve.checks.failure_witness.finding`; `feedback.pressure_finding(report)`
+  lifts it into `oracle_results["pressure"]`, which `feedback._compile_pressure` maps to
+  the directive row above (order: G4 → PRESSURE → G3'). The report→oracle_results bridge
+  is a one-liner for the harden driver (out of this wave's scope).
+- **LLM surfaces** (anti-anchoring: principle only, no hazard list, no values): a STAKES
+  principle in `api_gdscript.md` and a `Pressure:` field in `design_block_gdscript.md`.
 
 ## Convergence guard
 

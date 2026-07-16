@@ -886,6 +886,104 @@ def test_single_action_gate_flips_report_to_goal_error():
 
 
 # ====================================================================== #
+# Failure-witness / PRESSURE gate (WAVE 1) — advisory, engine-agnostic
+# ====================================================================== #
+class _GateExecutor:
+    """A tiny executor for the pressure gate's failure sweep: any plan CONTAINING
+    ``fail_on`` ends in a ``failure`` terminal, everything else runs to budget. Enough
+    to drive the failure_reachable sweep (coverage / random / inverted tree) without a
+    physics engine — the gate's constant-false path reads only the source string."""
+
+    def __init__(self, fail_on=None, batched=False):
+        self.batched = batched
+        self.fail_on = fail_on
+
+    def run_batch(self, src, episodes, max_ticks, frames_every=0, escape_margin=None):
+        out = []
+        for ep in episodes:
+            acts = list(ep.get("actions", []))
+            if self.fail_on is not None and self.fail_on in acts:
+                res, applied = "failure", acts.index(self.fail_on) + 1
+            else:
+                res = "budget"
+                applied = len(acts) if max_ticks is None else min(len(acts), max_ticks)
+            out.append({"result": res, "ticks": applied, "checkpoints": {},
+                        "final_snapshot": {}, "actions": acts[:applied]})
+        return out
+
+
+_CONST_FALSE_SRC = "extends Node2D\nfunc is_failure() -> bool:\n\treturn false\n"
+_HAS_LOGIC_SRC = "extends Node2D\nfunc is_failure() -> bool:\n\treturn _dead\n"
+
+
+@pytest.fixture()
+def small_pressure(monkeypatch):
+    monkeypatch.setattr(gv, "PROBE_HORIZON", 30)
+    monkeypatch.setattr(gv, "MACRO_MAX", 3)
+    import harness.verify.treesolve as _ts
+    monkeypatch.setattr(_ts, "TICK_BUDGET", 400)
+
+
+def _certified_report():
+    rep = gv.make_report()
+    rep["passed"] = True
+    rep["failure_class"] = None
+    rep["layers"]["G3_solve"] = {"passed": True, "checks": {}}
+    return rep
+
+
+def test_failure_witness_gate_flags_constant_false(small_pressure):
+    """is_failure() hardcoded false -> advisory `no_pressure`: a warning + a machine-
+    readable finding, but certification is NOT blocked (passed stays True)."""
+    rep = gv._failure_witness_gate(_GateExecutor(), _CONST_FALSE_SRC, ["go", "stay"],
+                                   _certified_report())
+    fw = rep["layers"]["G3_solve"]["checks"]["failure_witness"]
+    assert fw["has_failure_witness"] is False
+    assert fw["outcome"] == "no_pressure" and fw["constant_false"] is True
+    assert fw["finding"]["outcome"] == "no_pressure"
+    assert any("PRESSURE" in w for w in rep["warnings"])
+    # ADVISORY: never blocks certification.
+    assert rep["passed"] is True and rep["failure_class"] is None
+    assert fw["pass"] is True                         # the sub-check is non-gating
+
+
+def test_failure_witness_gate_passes_with_reachable_failure(small_pressure):
+    """is_failure() has real logic AND a reachable loss -> `has_pressure`: the gate
+    records the failure witness, no warning, certification intact."""
+    ex = _GateExecutor(fail_on="sink")
+    rep = gv._failure_witness_gate(ex, _HAS_LOGIC_SRC, ["go", "sink"],
+                                   _certified_report())
+    fw = rep["layers"]["G3_solve"]["checks"]["failure_witness"]
+    assert fw["has_failure_witness"] is True and fw["outcome"] == "has_pressure"
+    assert fw["witness"] is not None
+    assert not any("PRESSURE" in w for w in rep["warnings"])
+    assert rep["passed"] is True and rep["failure_class"] is None
+
+
+def test_failure_witness_gate_flags_unreachable_failure(small_pressure):
+    """is_failure() has logic but NO adversarial rollout ever loses (the race case) ->
+    advisory `failure_unreachable`, distinct from the constant-false `no_pressure`."""
+    ex = _GateExecutor(fail_on=None)                  # nothing ever fails
+    rep = gv._failure_witness_gate(ex, _HAS_LOGIC_SRC, ["go", "stay"],
+                                   _certified_report())
+    fw = rep["layers"]["G3_solve"]["checks"]["failure_witness"]
+    assert fw["has_failure_witness"] is False
+    assert fw["outcome"] == "failure_unreachable" and fw["constant_false"] is False
+    assert any("PRESSURE" in w for w in rep["warnings"])
+    assert rep["passed"] is True and rep["failure_class"] is None
+
+
+def test_failure_witness_gate_finding_compiles_to_directive(small_pressure):
+    """The gate's finding is proof-carrying: it feeds the feedback compiler's pressure
+    row (end-to-end, the revise-loop path)."""
+    from harness.gen import feedback as F
+    rep = gv._failure_witness_gate(_GateExecutor(), _CONST_FALSE_SRC, ["go", "stay"],
+                                   _certified_report())
+    ds = F.compile_directives({"pressure": F.pressure_finding(rep)})
+    assert [d.source for d in ds] == ["no_pressure"]
+
+
+# ====================================================================== #
 # G0.5 geometric reachability pre-filter wiring (Elias directive 1)
 # ====================================================================== #
 def _walled_geometry_facts():

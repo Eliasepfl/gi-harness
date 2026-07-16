@@ -25,11 +25,20 @@ from harness.verify.gameverify import verify_game  # noqa: E402
 from harness.verify.gd_exec import GdExecutor  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
-_MINI_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect_3d.gd")
-_SINGLE_ACTION = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "single_action_win.gd")
-_WALLED = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "walled_goal.gd")
-_FLYOFF = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "flyoff.gd")
+_GD = os.path.join(_ROOT, "tests", "fixtures", "gd_games")
+_MINI = os.path.join(_GD, "mini_collect.gd")
+_MINI_3D = os.path.join(_GD, "mini_collect_3d.gd")
+_SINGLE_ACTION = os.path.join(_GD, "single_action_win.gd")
+_WALLED = os.path.join(_GD, "walled_goal.gd")
+_FLYOFF = os.path.join(_GD, "flyoff.gd")
+_NO_PRESSURE = os.path.join(_GD, "no_pressure.gd")
+_LOSABLE = os.path.join(_GD, "losable.gd")
+_SOFTLOCK_PIT = os.path.join(_GD, "softlock_pit.gd")
+
+
+def _src(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -134,6 +143,76 @@ def test_reachable_fixtures_pass_reachability_prefilter():
         rep = verify_game(path, sandboxed=False)
         assert rep["passed"] is True, (path, rep)
         assert rep["layers"]["G0_5_reach"]["passed"] is True, (path, rep)
+
+
+# ====================================================================== #
+# 1e. Failure-witness / PRESSURE gate (WAVE 1, DEMO_GAP_ANALYSIS §Gap 1+2)
+# ====================================================================== #
+@requires_godot
+def test_no_pressure_fixture_certifies_but_gate_flags_no_stakes():
+    """The canonical UNFAILABLE fixture certifies G0-G3 (the gate is ADVISORY, not a
+    block) yet the pressure gate flags it `no_pressure` with a warning, and the finding
+    compiles to a repair directive (the revise-loop hook — Wave-1 acceptance b)."""
+    rep = verify_game(_NO_PRESSURE, sandboxed=False)
+    assert rep["passed"] is True, rep                    # ADVISORY: still certifies
+    assert rep["engine"] == "gdscript"
+    fw = rep["layers"]["G3_solve"]["checks"]["failure_witness"]
+    assert fw["has_failure_witness"] is False
+    assert fw["outcome"] == "no_pressure" and fw["constant_false"] is True
+    assert any("PRESSURE" in w for w in rep["warnings"]), rep["warnings"]
+    from harness.gen import feedback as F
+    ds = F.compile_directives({"pressure": F.pressure_finding(rep)})
+    assert [d.source for d in ds] == ["no_pressure"]
+    assert "cannot be lost" in ds[0].text.lower()
+
+
+@requires_godot
+def test_losable_fixture_certifies_and_gate_witnesses_a_failure():
+    """A game WITH real stakes (a lethal hazard) certifies AND the pressure gate finds
+    a reachable failure -> outcome `has_pressure`, no warning, no directive."""
+    rep = verify_game(_LOSABLE, sandboxed=False)
+    assert rep["passed"] is True, rep
+    fw = rep["layers"]["G3_solve"]["checks"]["failure_witness"]
+    assert fw["has_failure_witness"] is True and fw["outcome"] == "has_pressure"
+    assert fw["witness"] is not None
+    assert not any("PRESSURE" in w for w in rep["warnings"]), rep["warnings"]
+    from harness.gen import feedback as F
+    assert F.compile_directives({"pressure": F.pressure_finding(rep)}) == []
+
+
+# ====================================================================== #
+# 1f. terminal_reachable — the stuck-vs-refusal separator (Elias)
+# ====================================================================== #
+_MOVES = ["up", "down", "left", "right"]
+
+
+@requires_godot
+def test_terminal_reachable_env_softlock_in_softlock_pit_pocket():
+    """Drive the body INTO softlock_pit's frozen pocket: from there NO terminal
+    (success OR failure) is reachable -> a real ENVIRONMENT-softlock verdict."""
+    from harness.verify.reachability import terminal_reachable
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        v = terminal_reachable(ex, _src(_SOFTLOCK_PIT), _MOVES,
+                               prefix=["right"] * 40, horizon=60, budget=3000)
+    finally:
+        ex.close()
+    assert v["reachable"] is False and v["verdict"] == "env_softlock", v
+    assert v["prefix_len"] == 40
+
+
+@requires_godot
+def test_terminal_reachable_reachable_is_agent_refusal_not_stuck():
+    """From losable.gd's start a terminal IS reachable (a diligent player can win, or
+    lose in the hazard) -> reachable. An idle agent here is REFUSING, not softlocked —
+    the separator the ANTI-IDLING decay grounds on."""
+    from harness.verify.reachability import terminal_reachable
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        v = terminal_reachable(ex, _src(_LOSABLE), _MOVES, horizon=60, budget=3000)
+    finally:
+        ex.close()
+    assert v["reachable"] is True and v["verdict"] == "reachable", v
 
 
 # ====================================================================== #

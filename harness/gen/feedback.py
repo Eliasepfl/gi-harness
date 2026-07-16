@@ -35,6 +35,17 @@ The taxonomy (one directive-producing row per defect; every other outcome yields
     * stuck, shortcut_beats_witness, escape, nan, unintended_success, ... -> NO directive
       (informational).
 
+  PRESSURE (WAVE 1 failure-witness gate, gameverify._failure_witness_gate) — read from
+  ``oracle_results["pressure"]`` (extract from a verify report with
+  :func:`pressure_finding`):
+    * no_pressure          -> `no_pressure`: is_failure() is hardcoded constant-false —
+                              the game declares NO lose condition, so idling is free
+                              (static proof). Repair: add a real failure condition.
+    * failure_unreachable  -> `failure_unreachable`: is_failure() has logic but NO
+                              adversarial rollout ever loses (the win races ahead, or the
+                              detector never triggers). Repair: make failure triggerable.
+    * has_pressure / other -> NO directive (a reachable failure was witnessed; healthy).
+
 PURE and deterministic: identical oracle dicts -> identical directives (same order, same
 fingerprints). No I/O, no network, no torch — the whole taxonomy is offline-testable.
 """
@@ -292,19 +303,75 @@ def _compile_g4(g4: dict) -> list:
 
 
 # ======================================================================== #
+# PRESSURE (WAVE 1 failure-witness gate) -> directives
+# ======================================================================== #
+# Outcomes that COMPILE to a directive. ``has_pressure`` (a reachable failure was
+# witnessed) and anything else are informational -> NO directive. Proof-carrying:
+# ``no_pressure`` carries a STATIC proof (is_failure literally returns false);
+# ``failure_unreachable`` carries the broad-sweep reproducer-ABSENCE (n_plans lost 0)
+# — both are fixable-by-construction (add / repair a reachable lose condition), unlike
+# the unconfirmed `stuck` heuristic the taxonomy deliberately drops.
+PRESSURE_DIRECTIVE_OUTCOMES = ("no_pressure", "failure_unreachable")
+
+
+def _compile_pressure(pressure: dict) -> list:
+    if not pressure:
+        return []
+    outcome = pressure.get("outcome")
+    if outcome not in PRESSURE_DIRECTIVE_OUTCOMES:
+        return []                              # has_pressure / other -> healthy, no directive
+    detail = pressure.get("detail") or ""
+    constant_false = bool(pressure.get("constant_false"))
+    if outcome == "no_pressure":
+        head = "NO STAKES — THE GAME CANNOT BE LOST"
+        fallback = ("is_failure() is hardcoded false; add a real failure condition "
+                    "(hazard, timeout, out-of-bounds, resource depletion) so a stalled "
+                    "episode is punished. Keep the goal reachable.")
+    else:
+        head = "UNREACHABLE FAILURE — THE GAME CANNOT BE LOST IN PRACTICE"
+        fallback = ("is_failure() never fires from any reachable state; make failure a "
+                    "condition a real player could actually trigger (the win may resolve "
+                    "first, or the detector never triggers). Keep the goal reachable.")
+    text = f"{head}: {detail or fallback}"
+    return [_mk(outcome, "pressure", [], text,
+                {"constant_false": constant_false,
+                 "evidence": dict(pressure.get("evidence") or {}),
+                 "reproducer": dict(pressure.get("reproducer") or {})})]
+
+
+def pressure_finding(verify_report: dict) -> dict:
+    """Pull the machine-readable PRESSURE finding out of a verify report — the
+    failure-witness gate stashes it under
+    ``layers.G3_solve.checks.failure_witness.finding`` (gameverify). Returns ``{}``
+    when the gate did not run (non-gdscript engine, or a game rejected earlier).
+
+    Convenience so the harden driver can wire it in one line —
+    ``oracle_results["pressure"] = pressure_finding(report)`` — while this compiler
+    stays PURE (it only ever reads the ``oracle_results`` dict it is handed)."""
+    try:
+        fw = (((verify_report or {}).get("layers") or {}).get("G3_solve") or {}) \
+            .get("checks", {}).get("failure_witness") or {}
+        return dict(fw.get("finding") or {})
+    except Exception:
+        return {}
+
+
+# ======================================================================== #
 # Public API
 # ======================================================================== #
 def compile_directives(oracle_results: dict) -> list:
     """Map post-cert oracle outcomes onto personalized repair :class:`Directive`s.
 
-    ``oracle_results`` carries optional ``"g4"`` (a `run_g4` report) and ``"g3_prime"``
-    (a `g3_prime` result) dicts. Returns the directives to feed the revise loop, G4
-    (broken-game shapes) first then G3' (learnability), deduplicated by fingerprint. An
-    empty list means either a CLEAN game or a still-progressing G3' run (see
-    :func:`continue_training`)."""
+    ``oracle_results`` carries optional ``"g4"`` (a `run_g4` report), ``"pressure"``
+    (a failure-witness finding — see :func:`pressure_finding`) and ``"g3_prime"`` (a
+    `g3_prime` result) dicts. Returns the directives to feed the revise loop — G4
+    (broken-game shapes) first, then PRESSURE (no stakes), then G3' (learnability) —
+    deduplicated by fingerprint. An empty list means either a CLEAN game or a
+    still-progressing G3' run (see :func:`continue_training`)."""
     oracle_results = oracle_results or {}
     directives, seen = [], set()
     for d in (_compile_g4(oracle_results.get("g4") or {})
+              + _compile_pressure(oracle_results.get("pressure") or {})
               + _compile_g3(oracle_results.get("g3_prime") or {})):
         if d.fingerprint in seen:
             continue

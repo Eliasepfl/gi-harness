@@ -1550,6 +1550,13 @@ def _verify_gdscript(source: str, report: dict) -> dict:
         # generation loop consumes. Only worth running on an otherwise-certified game.
         if report.get("passed"):
             report = _single_action_gate(executor, source, actions, report)
+
+        # --- G3.6: failure-witness / PRESSURE gate (WAVE 1, DEMO_GAP_ANALYSIS §Gap 1+2)
+        # ADVISORY: confirms is_failure() can fire from a reachable state (real stakes).
+        # A game that cannot be lost records a warning + a repair directive but is NOT
+        # blocked (see _failure_witness_gate). Runs LAST, only on a still-certified game.
+        if report.get("passed"):
+            report = _failure_witness_gate(executor, source, actions, report)
         return report
     except VerifyError as exc:
         # Godot missing / spawn stale / crash / unparseable -> VERIFY_ERROR shape.
@@ -1667,4 +1674,105 @@ def _single_action_gate(executor, game_source, actions, report):
         report["passed"] = False
         report["failure_class"] = "GOAL_ERROR"
         report["hint"] = _single_action_hint(a, t)
+    return report
+
+
+# ======================================================================== #
+# Failure-witness gate — WAVE 1 PRESSURE (DEMO_GAP_ANALYSIS §Gap 1 + 2)
+# ======================================================================== #
+# A certified game must have STAKES: a REACHABLE failure. ``is_failure()`` is
+# syntactically mandatory but semantically OPTIONAL — nothing in G0-G3 exercises it,
+# so a constant-false body certifies clean, idling is free, and Elias's ANTI-IDLING
+# softlock principle has no in-game meaning (4/6 of our games are unfailable — the #1
+# ranked demo gap). This gate confirms is_failure can actually fire from a reachable
+# state (a FAILURE witness, dual to the G3 success witness) and, when it cannot,
+# records the finding + a repair directive.
+#
+# WHY ADVISORY — a WARNING that compiles to a repair directive, never a hard
+# cert-block (the documented decision the mission asks for):
+#   1. FALSE-REJECT DISCIPLINE. The failure sweep is a BOUNDED negative (necessary-
+#      not-sufficient for unfailability); a genuine but hard-to-trigger failure — a
+#      slow timeout, a resource that depletes late — must never be wrongly rejected,
+#      the same "err toward passing" stance G0.5 already takes.
+#   2. COMPOSES WITH THE BLOCKING GATES. single_action / G0.5 own their hard verdicts;
+#      pressure is orthogonal and must not preempt a broken fixture's real defect
+#      (which is why it runs LAST and only on an otherwise-certified game).
+#   3. THE LOOP DELIVERS THE BAR. Wave-1 acceptance ("0 constant-false is_failure in
+#      the CERTIFIED set") is met by the REVISE loop, not a reject: the finding is
+#      proof-carrying (a static constant-false proof, or the broad-sweep reproducer-
+#      absence) and ALWAYS compiles a directive (feedback._compile_pressure), driving
+#      the final set to have stakes — Elias's "looped approach" (FEEDBACK_LOOP.md).
+# It is stored as a NON-GATING sub-check under G3_solve (``failure_witness``, always
+# pass=True; the real signal is ``has_failure_witness``) plus a report warning, so no
+# top-level report key changes and report["passed"] / failure_class are untouched.
+
+def _pressure_hint(*, constant_false: bool) -> str:
+    if constant_false:
+        return ("the game cannot be lost — is_failure() is hardcoded to return false, "
+                "so a stalled or idle episode is indistinguishable from real play. Add "
+                "a real failure condition (a hazard that ends the run, a timeout / step "
+                "budget, an out-of-bounds, or a depletable resource) and read it in "
+                "is_failure() so play has stakes. Keep the goal reachable.")
+    return ("the game cannot be lost — is_failure() never fires from ANY reachable "
+            "state under a broad adversarial rollout, so idling is free. Either the "
+            "lose condition is unreachable (a threshold no trajectory crosses, or the "
+            "win always resolves first) or the detector never triggers. Make failure a "
+            "condition a real player could actually trigger. Keep the goal reachable.")
+
+
+def _pressure_finding(*, outcome: str, constant_false: bool, hint: str,
+                      reproducer: dict, evidence: dict) -> dict:
+    """The machine-readable pressure finding the feedback compiler's pressure row
+    consumes. ``outcome`` in {no_pressure, failure_unreachable, has_pressure}; only
+    the first two compile to a directive (feedback._compile_pressure)."""
+    return {"outcome": outcome, "constant_false": bool(constant_false),
+            "detail": hint, "reproducer": dict(reproducer or {}),
+            "evidence": dict(evidence or {})}
+
+
+def _failure_witness_gate(executor, game_source, actions, report):
+    """The failure-witness (PRESSURE) gate. ADVISORY: records whether is_failure can
+    fire from a reachable state; never blocks certification (see the section header).
+
+    Two paths to 'no stakes', distinguished for the directive (mission item 2):
+      * CONSTANT-FALSE (static proof) — is_failure() is literally ``return false``:
+        outcome ``no_pressure`` (the game declares no lose condition at all).
+      * FAILURE-UNREACHABLE (dynamic) — is_failure() has logic but no adversarial
+        rollout ever loses (the race where success always resolves first, or a
+        detector that never triggers): outcome ``failure_unreachable``.
+    A reachable failure records outcome ``has_pressure`` with the witness (no directive).
+    Engine trouble leaves the verdict untouched."""
+    from harness.verify.gd_gate import is_failure_constant_false
+    from harness.verify.reachability import failure_reachable
+
+    constant_false = is_failure_constant_false(game_source)
+    fr = None
+    if not constant_false:
+        try:
+            fr = failure_reachable(executor, game_source, actions)
+        except VerifyError:
+            return report                          # engine trouble -> no verdict change
+
+    if constant_false:
+        outcome, has_failure = "no_pressure", False
+        hint, reproducer, evidence = _pressure_hint(constant_false=True), {}, {}
+    elif fr and fr.get("reachable"):
+        outcome, has_failure = "has_pressure", True
+        hint, reproducer = "", (fr.get("witness") or {})
+        evidence = {"n_plans": fr.get("n_plans"), "n_failed": fr.get("n_failed")}
+    else:
+        outcome, has_failure = "failure_unreachable", False
+        hint, reproducer = _pressure_hint(constant_false=False), {}
+        evidence = {"n_plans": (fr or {}).get("n_plans"), "n_failed": 0}
+
+    finding = _pressure_finding(outcome=outcome, constant_false=constant_false,
+                                hint=hint, reproducer=reproducer, evidence=evidence)
+    layer = report.setdefault("layers", {}).setdefault(
+        "G3_solve", {"passed": True, "checks": {}})
+    layer.setdefault("checks", {})["failure_witness"] = check(
+        True, advisory=True, has_failure_witness=has_failure,
+        outcome=outcome, constant_false=constant_false,
+        witness=(reproducer or None), finding=finding)
+    if not has_failure:
+        report.setdefault("warnings", []).append("PRESSURE: " + hint)
     return report

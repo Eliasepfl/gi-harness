@@ -159,6 +159,62 @@ def test_g4_duplicate_findings_dedup_to_one_directive():
 
 
 # ======================================================================== #
+# PRESSURE (WAVE 1 failure-witness gate) taxonomy rows
+# ======================================================================== #
+def pressure(outcome, *, constant_false=False, detail="", evidence=None, reproducer=None):
+    return {"outcome": outcome, "constant_false": constant_false, "detail": detail,
+            "evidence": evidence or {}, "reproducer": reproducer or {}}
+
+
+def test_pressure_no_pressure_directive():
+    ds = F.compile_directives({"pressure": pressure(
+        "no_pressure", constant_false=True, detail="is_failure() is hardcoded false")})
+    assert sources(ds) == ["no_pressure"]
+    assert ds[0].origin == "pressure"
+    assert "CANNOT BE LOST" in ds[0].text.upper()
+    assert ds[0].detail["constant_false"] is True
+
+
+def test_pressure_failure_unreachable_directive():
+    ds = F.compile_directives({"pressure": pressure(
+        "failure_unreachable", detail="no rollout ever lost",
+        evidence={"n_plans": 28, "n_failed": 0})})
+    assert sources(ds) == ["failure_unreachable"]
+    assert "UNREACHABLE FAILURE" in ds[0].text.upper()
+
+
+def test_pressure_has_pressure_yields_no_directive():
+    # A reachable failure was witnessed -> healthy, no repair directive.
+    assert F.compile_directives({"pressure": pressure(
+        "has_pressure", reproducer={"seed": 0, "actions": ["down"], "ticks": 4})}) == []
+
+
+def test_pressure_empty_yields_no_directive():
+    assert F.compile_directives({"pressure": {}}) == []
+    assert F.compile_directives({}) == []            # no pressure key at all
+
+
+def test_pressure_fingerprint_stable_and_distinct():
+    a = F.compile_directives({"pressure": pressure("no_pressure", constant_false=True)})[0]
+    b = F.compile_directives({"pressure": pressure("no_pressure", constant_false=True)})[0]
+    assert a.fingerprint == b.fingerprint                 # same defect -> same id
+    c = F.compile_directives({"pressure": pressure("failure_unreachable")})[0]
+    assert c.fingerprint != a.fingerprint                 # distinct row -> distinct id
+
+
+def test_pressure_finding_extracts_from_verify_report():
+    finding = pressure("no_pressure", constant_false=True, detail="hardcoded false")
+    report = {"layers": {"G3_solve": {"checks": {
+        "failure_witness": {"pass": True, "finding": finding}}}}}
+    assert F.pressure_finding(report) == finding
+    # No gate ran (non-gdscript / rejected earlier) -> {}.
+    assert F.pressure_finding({"layers": {"G3_solve": {"checks": {}}}}) == {}
+    assert F.pressure_finding({}) == {}
+    # End-to-end: extracted finding compiles to the directive.
+    assert F.compile_directives({"pressure": F.pressure_finding(report)})[0].source == "no_pressure"
+
+
+# ======================================================================== #
 # Combined + fingerprints
 # ======================================================================== #
 def test_combined_g4_first_then_g3():
@@ -166,6 +222,14 @@ def test_combined_g4_first_then_g3():
          "g3_prime": g3(latch={"m1": 1.0, "m2": 0.9, "m3": 0.0})}
     ds = F.compile_directives(o)
     assert sources(ds) == ["broken_gating", "g3_plateau"]   # G4 defects first
+
+
+def test_combined_g4_pressure_then_g3_order():
+    o = {"g4": g4(g4_finding("broken_gating", evidence={"skipped_checkpoints": ["k"]})),
+         "pressure": pressure("no_pressure", constant_false=True),
+         "g3_prime": g3(latch={"m1": 1.0, "m2": 0.9, "m3": 0.0})}
+    ds = F.compile_directives(o)
+    assert sources(ds) == ["broken_gating", "no_pressure", "g3_plateau"]  # G4 -> pressure -> G3'
 
 
 def test_empty_oracle_results():

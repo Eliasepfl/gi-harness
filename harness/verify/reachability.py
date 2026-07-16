@@ -245,3 +245,176 @@ def _aabb_of(body, pos):
         return ([pos[i] - float(r) for i in range(dims)],
                 [pos[i] + float(r) for i in range(dims)])
     return None
+
+
+# ======================================================================== #
+# WAVE 1 — PRESSURE: terminal reachability via the certified tree solver.
+# ======================================================================== #
+# The G0.5 flood above answers a STATIC GEOMETRIC question — can the controlled
+# body get NEAR a target through the walls. Wave 1 (notes/engines/DEMO_GAP_ANALYSIS.md,
+# the #1 ranked gap) needs a DYNAMIC one: from a given state, can play still reach a
+# TERMINAL — success OR failure? Two things the analysis wants ride on that answer:
+#
+#   * the FAILURE-WITNESS gate — is ``is_failure()`` reachable from ANY reachable
+#     state at all? A game whose failure never fires has no stakes: idling is free,
+#     Elias's ANTI-IDLING softlock principle has no in-game meaning.
+#   * Elias's stuck-vs-refusal separator — a non-terminal state from which NO terminal
+#     is reachable is a real ENVIRONMENT-softlock; a state from which a terminal IS
+#     reachable but whose own trajectory idles is AGENT-refusal, NOT a game defect.
+#
+# Both ride the executor seam and reuse the SAME Go-Explore solver that certifies G3
+# (``harness.verify.treesolve``), so a "reachable" verdict is a REPLAYABLE witness,
+# never a guess. NOT finding a terminal within the budget is a BOUNDED negative
+# (necessary-not-sufficient for unreachability) — the honest read for a softlock
+# signal, exactly as ``g4.refute_prefix`` (oracle 1c) treats a no-success budget
+# exhaustion. Engine-agnostic: py / js / gdscript all speak ``run_batch``.
+
+
+class _PrefixExecutor:
+    """Wrap an executor so every episode is REPLAYED after a fixed action ``prefix``
+    — i.e. the "state under test" is expressed as 'replay this prefix from spawn',
+    the only portable, engine-agnostic handle on a reached state we have (the same
+    convention ``g4``'s private prefix wrapper and the softlock CONFIRM oracle use).
+    Ticks/checkpoints/actions are re-based so continuations look like they started at
+    the prefix. Kept local (a ~20-line mirror) so this module never imports an
+    adversary-owned private symbol."""
+
+    def __init__(self, inner, prefix):
+        self._inner = inner
+        self._prefix = list(prefix or [])
+        self.batched = getattr(inner, "batched", False)
+
+    def run_batch(self, game_source, episodes, max_ticks, frames_every=0,
+                  escape_margin=None):
+        p, plen = self._prefix, len(self._prefix)
+        specs = [{"seed": e.get("seed", 0), "actions": p + list(e.get("actions", []))}
+                 for e in episodes]
+        recs = self._inner.run_batch(game_source, specs, int(max_ticks) + plen,
+                                     frames_every=frames_every,
+                                     escape_margin=escape_margin)
+        out = []
+        for rec in recs:
+            local = dict(rec)
+            local["ticks"] = max(0, int(rec.get("ticks", 0)) - plen)
+            cps = {}
+            for k, t in (rec.get("checkpoints") or {}).items():
+                cps[k] = None if t is None else (0 if t <= plen else t - plen)
+            local["checkpoints"] = cps
+            if "actions" in rec:
+                local["actions"] = list(rec["actions"])[plen:]
+            out.append(local)
+        return out
+
+
+def _first_failure(episodes):
+    """The first rollout dict that ended in a ``failure`` terminal, or None."""
+    return next((ep for ep in (episodes or []) if ep.get("result") == "failure"),
+                None)
+
+
+def _failure_witness(ep, world_seed):
+    return {"seed": world_seed, "actions": list(ep.get("actions") or []),
+            "ticks": int(ep.get("ticks", 0) or 0)}
+
+
+def terminal_reachable(executor, game_source, actions, *, prefix=(),
+                       horizon=None, budget=None):
+    """Can play reach a TERMINAL — success OR failure — from the state reached by
+    ``prefix`` (empty prefix = spawn)?  Runs the certified Go-Explore G3 solver on
+    continuations of the prefix and reads BOTH terminal kinds off the rollouts.
+
+    Returns::
+
+        {"reachable": bool,
+         "kind":     "success" | "failure" | None,
+         "verdict":  "reachable" | "env_softlock",
+         "witness":  {"seed", "actions", "ticks"} | None,
+         "replays":  int, "prefix_len": int}
+
+    ``reachable == True`` is PROVEN — a replayable continuation hits a terminal.
+    ``verdict == "env_softlock"`` (``reachable == False``) is a BOUNDED negative: no
+    terminal was found within ``budget`` — the honest signal for a real environment
+    softlock. This is the principled stuck-vs-refusal separator the plan references:
+    the adversary CONFIRM layer and the feedback loop both read it to tell a stuck
+    ENVIRONMENT (this) from an idle AGENT (a state that IS terminal-reachable but
+    whose own trajectory refuses to advance — not a game defect)."""
+    from harness.verify import gameverify as gv
+    from harness.verify import treesolve as ts
+    actions = list(actions or [])
+    horizon = gv.PROBE_HORIZON if horizon is None else int(horizon)
+    prefix = tuple(prefix or ())
+    ex = _PrefixExecutor(executor, prefix) if prefix else executor
+
+    witness, episodes, replays, _tree = ts._tree_search(
+        ex, game_source, actions, horizon, budget=budget)
+    if witness is not None:
+        return {"reachable": True, "kind": "success", "verdict": "reachable",
+                "witness": witness, "replays": replays, "prefix_len": len(prefix)}
+
+    # No success within budget — did any rollout LOSE (a failure terminal)?  A
+    # failure ends the episode just as a win does, so it too proves the state can
+    # still leave non-terminal limbo.
+    fail = _first_failure(episodes)
+    if fail is not None:
+        return {"reachable": True, "kind": "failure", "verdict": "reachable",
+                "witness": _failure_witness(fail, gv.WORLD_SEED),
+                "replays": replays, "prefix_len": len(prefix)}
+
+    return {"reachable": False, "kind": None, "verdict": "env_softlock",
+            "witness": None, "replays": replays, "prefix_len": len(prefix)}
+
+
+# Broad adversarial failure-seeking defaults ([eng.]).
+FAILURE_RANDOM_PLANS = 24     # seeded random macro rollouts in the failure sweep [eng.]
+
+
+def failure_reachable(executor, game_source, actions, *, horizon=None,
+                      budget=None, n_random=FAILURE_RANDOM_PLANS):
+    """Does ANY reachable state trigger ``is_failure()``?  Drives a broad ADVERSARIAL
+    sweep — every action SPAMMED to the horizon (coverage: drift into a wall / hazard
+    / out-of-bounds), a batch of seeded RANDOM macro plans, and, only if those find
+    nothing, a bounded INVERTED-objective tree search that steers toward stale/losing
+    regions — and scans for a rollout that ends in ``failure``.
+
+    Success-agnostic BY DESIGN: unlike :func:`terminal_reachable`, it never treats a
+    win as the goal, so it still surfaces a losable condition even when success is
+    trivial (the demo 'success always wins the race' pattern this gate must catch).
+
+    Returns ``{"reachable": bool, "witness": {...}|None, "n_plans": int,
+    "n_failed": int}``. NECESSARY-not-SUFFICIENT for UNfailability: ``reachable ==
+    False`` means no adversarial rollout in the budget ever lost — the failure
+    detector is (empirically) unreachable, or the game truly cannot be lost."""
+    from harness.verify import gameverify as gv
+    import random as _random
+    actions = list(actions or [])
+    horizon = gv.PROBE_HORIZON if horizon is None else int(horizon)
+    if not actions:
+        return {"reachable": False, "witness": None, "n_plans": 0, "n_failed": 0}
+
+    # Pass 1 — cheap, deterministic: spam-each-action coverage + seeded random macros.
+    specs = [{"seed": gv.WORLD_SEED, "actions": [a] * horizon} for a in actions]
+    specs += [{"seed": gv.WORLD_SEED,
+               "actions": gv._macro_plan(_random.Random(i), actions, horizon)}
+              for i in range(int(n_random))]
+    recs = executor.run_batch(game_source, specs, horizon)
+    failed = [ep for ep in recs if ep.get("result") == "failure"]
+    n_plans, n_failed = len(specs), len(failed)
+    if failed:
+        return {"reachable": True, "witness": _failure_witness(failed[0], gv.WORLD_SEED),
+                "n_plans": n_plans, "n_failed": n_failed}
+
+    # Pass 2 — steer: an inverted-objective tree search hunts the stale/losing
+    # regions the flat sweep may miss (subtle timeouts, resource depletion).
+    from harness.verify import treesolve as ts
+    try:
+        _w, episodes, _r, _t = ts._tree_search(
+            executor, game_source, actions, horizon,
+            select=ts._select_leaves_inverted, budget=budget)
+    except Exception:
+        episodes = []
+    fail = _first_failure(episodes)
+    n_plans += len(episodes)
+    if fail is not None:
+        return {"reachable": True, "witness": _failure_witness(fail, gv.WORLD_SEED),
+                "n_plans": n_plans, "n_failed": n_failed + 1}
+    return {"reachable": False, "witness": None, "n_plans": n_plans, "n_failed": n_failed}
