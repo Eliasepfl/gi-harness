@@ -16,8 +16,8 @@ across N worlds, so throughput scales far past the sequential DummyVecEnv (see
 ``tests/test_gd_rl.py::test_batch_vec_env_faster_than_dummy``).
 
 CONTRACT PARITY. The obs vector (``build_obs_vector``), the discrete action indexing
-(``actions[i]``), and the reward (``step_reward``: bounded checkpoint shaping + per-tick
-living cost + time-decayed terminal) are byte-for-byte those of ``GodotServeEnv.step`` — so the
+(``actions[i]``), and the reward (``step_reward``: PBRS checkpoint shaping + per-tick living
+cost + time-decayed terminal) are byte-for-byte those of ``GodotServeEnv.step`` — so the
 trainer, its callback (``info["episode"]`` with ``success`` + ``n_latched``), and the
 witness ORACLE are unchanged. SB3 autoreset is done per-instance in ``step_wait``: when
 instance i's done fires, it is rebuilt in-engine at its FIXED seed ``base_seed + i`` (the
@@ -401,14 +401,15 @@ def _batch_vec_env_cls():
             for i in range(n):
                 latched = cps[i] or {}
                 latched_now = {k for k, v in latched.items() if v is not None}
-                new_latches = len(latched_now - self._prev_latched[i])
+                c_before = len(self._prev_latched[i])
+                c_after = len(latched_now)
                 self._prev_latched[i] = latched_now
                 result = results[i]
                 terminated = bool(dterm[i])
                 truncated = bool(dtrunc[i])
                 # Realigned reward (single source of truth, byte-for-byte GodotServeEnv/
-                # PlanckEnv): bounded shaping + per-tick living cost + time-decayed terminal.
-                reward = step_reward(new_latches, len(self._cp_keys or []), result,
+                # PlanckEnv): PBRS shaping + per-tick living cost + time-decayed terminal.
+                reward = step_reward(c_before, c_after, len(self._cp_keys or []), result,
                                      int(ticks[i]), self.horizon)
                 rewards[i] = reward
                 done = terminated or truncated

@@ -570,11 +570,12 @@ def test_planckenv_reward_shaping(corridor):
     try:
         env.reset(seed=0)
         n_cp = len(env._cp_keys)
-        # Realigned reward: a single new checkpoint pays the normalized per-checkpoint
-        # shaping (SHAPING_MASS/n_cp) net of the tiny per-tick living cost; a success pays
-        # at least the decayed terminal FLOOR (R_SUCCESS*SUCCESS_TIME_FLOOR).
-        cp_step = rlenv.checkpoint_shaping(1, n_cp) + rlenv.tick_cost(env.horizon)
-        floor = rlenv.R_SUCCESS * rlenv.SUCCESS_TIME_FLOOR
+        # PBRS reward: latching the FIRST checkpoint (c 0->1, non-terminal) pays
+        # shaping_reward(0, 1, n_cp)=γ·Φ(1) net of the (off-by-default) living cost. A success
+        # pays the decayed terminal bonus MINUS the absorbing PBRS potential-zeroing (bounded by
+        # the whole shaping mass), so it clears (floor − SHAPING_MASS).
+        cp_step = rlenv.shaping_reward(0, 1, n_cp, False) + rlenv.tick_cost(env.horizon)
+        min_success_r = rlenv.R_SUCCESS * rlenv.SUCCESS_TIME_FLOOR - rlenv.SHAPING_MASS
         got_checkpoint_reward = False
         reached_goal = False
         prev_halfway = None
@@ -582,17 +583,17 @@ def test_planckenv_reward_shaping(corridor):
             obs, r, term, trunc, info = env.step(0)  # action 0 == "right"
             halfway = info["latched"].get("halfway")
             if halfway is not None and prev_halfway is None:
-                assert r >= cp_step - 1e-6, "latching a checkpoint must pay the shaping"
+                assert r >= cp_step - 1e-6, "latching a checkpoint must pay the PBRS shaping"
                 got_checkpoint_reward = True
             prev_halfway = halfway
             if info["result"] == "success":
-                assert r >= floor - 1e-6  # decayed terminal bonus (>= floor) is present
+                assert r >= min_success_r - 1e-6  # decayed terminal bonus present (net of Φ-zero)
                 assert term is True
                 reached_goal = True
                 break
             if term or trunc:
                 break
-        assert got_checkpoint_reward, "latching 'halfway' must pay the normalized shaping"
+        assert got_checkpoint_reward, "latching 'halfway' must pay the PBRS shaping"
         assert reached_goal, "rolling right must solve the corridor"
     finally:
         env.close()

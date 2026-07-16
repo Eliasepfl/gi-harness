@@ -115,7 +115,7 @@ def _build_callback_cls():
         (SB3 ignores ``_on_rollout_end``'s return), so a plateau trip sets a flag
         that the next ``_on_step`` observes to return False."""
 
-        def __init__(self, hp, log=None, wall_clock_budget_s=None):
+        def __init__(self, hp, log=None, wall_clock_budget_s=None, best_model_path=None):
             super().__init__()
             self.hp = hp
             self._log = log
@@ -133,6 +133,18 @@ def _build_callback_cls():
             self._pending: list[dict] = []   # episodes finished since last rollout end
             self._stop = False
             self._t0 = 0.0
+            # BEST-CHECKPOINT (Elias, 2026-07-16). Training on the Godot serve envs is high
+            # variance / non-deterministic (a run that solves at update 61 can DEGRADE to a
+            # do-nothing policy by the end), so evaluating the LAST policy under-reports what
+            # was learned. When `best_model_path` is set we snapshot the policy whenever its
+            # SMOOTHED rollout success reaches a new best, and the certifier evaluates THAT
+            # snapshot. Keyed on the windowed success (not a single lucky update); a raw spike
+            # that does not lift the window never triggers a save. Default None -> no snapshot,
+            # byte-identical to before.
+            self.best_model_path = best_model_path
+            self.best_ckpt_success = -1.0
+            self.best_ckpt_update = None
+            self.best_ckpt_saved = False
 
         def _on_training_start(self) -> None:
             self._t0 = time.time()
@@ -172,6 +184,17 @@ def _build_callback_cls():
                 self.updates_since_best = 0
             else:
                 self.updates_since_best += 1
+
+            # BEST-CHECKPOINT snapshot: keep the policy with the best SMOOTHED rollout success
+            # (windowed over the SAME plateau_window), so the certifier evaluates the best
+            # policy the run ever reached — not whatever it happened to converge/collapse to.
+            if self.best_model_path is not None:
+                smoothed_succ = float(np.mean(self.curve_success[-window:]))
+                if smoothed_succ > self.best_ckpt_success and smoothed_succ > 0.0:
+                    self.best_ckpt_success = smoothed_succ
+                    self.best_ckpt_update = self.updates
+                    self.model.save(self.best_model_path)   # SB3 .zip snapshot of the policy
+                    self.best_ckpt_saved = True
 
             if self._log is not None:
                 sps = int(self.num_timesteps / max(1e-6, time.time() - self._t0))
@@ -287,7 +310,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           seed: int = 0, device: str = "cpu", log=None, wall_clock_budget_s=None,
           method: str = DEFAULT_METHOD, make_batch_venv=None, num_shards: int = 1,
           make_shard_venv=None, torch_num_threads: int | None = None,
-          **overrides) -> dict:
+          best_model_path: str | None = None, **overrides) -> dict:
     """Train an SB3 learner on `make_env` (a 0-arg PlanckEnv factory) for
     ~`total_steps` env-steps and return the same dict shape as `ppo.train` (agent +
     curves + steps_to_first_success + bookkeeping, plus the resolved `method`).
@@ -380,7 +403,8 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
              else _build_onpolicy(method, algo_cls, venv, hp, seed))
 
     callback = _build_callback_cls()(hp, log=log,
-                                     wall_clock_budget_s=wall_clock_budget_s)
+                                     wall_clock_budget_s=wall_clock_budget_s,
+                                     best_model_path=best_model_path)
     start = time.time()
     model.learn(total_timesteps=total_steps, callback=callback, progress_bar=False)
     train_wall = time.time() - start
@@ -398,6 +422,10 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
         "stopped_early": callback.stopped_early,
         "plateau_stopped": callback.plateau_stopped,
         "best_success_rate_train": round(callback.best_success, 3),
+        # BEST-CHECKPOINT provenance (None-safe when best_model_path was not requested).
+        "best_model_path": (best_model_path if callback.best_ckpt_saved else None),
+        "best_ckpt_success": round(callback.best_ckpt_success, 3) if callback.best_ckpt_saved else None,
+        "best_ckpt_update": callback.best_ckpt_update,
         "train_wall_s": round(train_wall, 1),
         "hp": hp,
     }

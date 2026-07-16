@@ -485,16 +485,17 @@ class GodotServeEnv:
         result = frame.get("result")
 
         latched_now = self._latched_set(frame)
-        new_latches = len(latched_now - self._prev_latched)
+        c_before = len(self._prev_latched)
+        c_after = len(latched_now)
         self._prev_latched = latched_now
         self.last_snapshot = self._snapshot_of(frame)
 
         # term/trunc split comes straight off the wire (INNER dialect); the realigned
-        # reward reads `result`/`tick` (single source of truth: bounded shaping + per-tick
-        # living cost + time-decayed terminal — matching PlanckEnv exactly).
+        # reward reads `result`/`tick` (single source of truth: PBRS shaping + per-tick living
+        # cost + time-decayed terminal — matching PlanckEnv exactly).
         terminated = bool(frame.get("done_term"))
         truncated = bool(frame.get("done_trunc"))
-        reward = step_reward(new_latches, len(self._cp_keys or []), result,
+        reward = step_reward(c_before, c_after, len(self._cp_keys or []), result,
                              self._tick, self.horizon)
         self._done = terminated or truncated
 

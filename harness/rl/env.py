@@ -84,47 +84,46 @@ Rays are DERIVED from body positions, so they are deliberately EXCLUDED from the
 softlock fingerprint (``fingerprint_from_obs`` stops before the tail; the pure profile falls
 back to the raw serve snapshot). See ``godotworld/serve_game.gd`` for the fan/grid layout.
 
-REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1 — REALIGNED 2026-07-16 for
-terminal-success dominance + temporal pressure; see :func:`step_reward`). The old
-`+1.0/checkpoint + 5.0/success - 1.0/failure` converged to a NEVER-WINNING policy on
-mini_collect (a 400k-step probe: return plateaus at first-checkpoint shaping, farming
-shaping beats finishing). The realigned per-tick reward is the SUM of:
+REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1 — REALIGNED 2026-07-16 to POTENTIAL-BASED
+shaping; see :func:`step_reward`). The old `+1.0/checkpoint + 5.0/success - 1.0/failure`
+converged to a NEVER-WINNING policy on mini_collect (a 400k probe: return plateaus at
+first-checkpoint shaping, farming beats finishing). A first realignment ADDED a per-tick
+living cost — a NON-potential term — which just relocated the trap (the policy fled the
+stepping stone to a do-nothing basin). The reward is now the SUM of:
 
-  1. BOUNDED SHAPING (terminal dominance). Each NEWLY latched checkpoint pays
-     ``SHAPING_MASS / n_cp`` (``n_cp`` = number of declared checkpoints). Latch-once
-     (runner-enforced) means the TOTAL checkpoint shaping an episode can ever accrue is
-     capped at exactly ``SHAPING_MASS`` regardless of how many checkpoints a game has —
-     the "normalized-capped shaping mass" the terminal bonus is sized to dominate.
+  1. POTENTIAL-BASED CHECKPOINT SHAPING (Ng, Harada & Russell 1999). Define the potential
+     ``Φ(s) = SHAPING_MASS · (latched_count / n_cp)`` (``n_cp`` = declared checkpoints), and pay
+     ``F = γ·Φ(s') − Φ(s)`` each step, with ``Φ ≡ 0`` at an ABSORBING terminal. The PBRS theorem
+     guarantees the OPTIMAL POLICY IS UNCHANGED by this shaping: its discounted sum over any
+     episode TELESCOPES to ``γ^T·Φ_end − Φ_0`` (0 for a full success episode), so it adds no
+     net return to ANY policy. Consequences that matter here: (i) a shaping-farming attractor
+     is IMPOSSIBLE (you cannot accumulate discounted shaping by revisiting checkpoints);
+     (ii) a do-nothing basin has no advantage (its shaping is 0, same as everyone's); (iii) the
+     shaping is a DENSE per-step gradient toward the next checkpoint (the γΦ' − Φ "pull") that
+     accelerates learning without biasing the objective. ``γ = PBRS_GAMMA`` matches the trainer.
 
-  2. TEMPORAL PRESSURE — a time-DECAYED success bonus (Elias's explicit "decaying reward"
-     ask). On a ``success`` result the payoff is
-     ``R_SUCCESS * (SUCCESS_TIME_FLOOR + (1 - SUCCESS_TIME_FLOOR) * remaining_frac)`` where
-     ``remaining_frac = clip((horizon - tick)/horizon, 0, 1)``. So an instant win pays the
-     full ``R_SUCCESS`` and a win at the buzzer pays the FLOOR ``R_SUCCESS*SUCCESS_TIME_FLOOR``
-     — success earned EARLIER is strictly worth more, but even the latest win floors at 50%
-     of the bonus so late wins still dominate the shaping mass. This decaying bonus is the
-     SOLE temporal-pressure mechanism (see 3).
+  2. TEMPORAL PRESSURE — a time-DECAYED success bonus (Elias's explicit "decaying reward" ask),
+     kept OUTSIDE Φ (it is part of the true objective, not shaping). On a ``success`` result the
+     payoff is ``R_SUCCESS * (SUCCESS_TIME_FLOOR + (1 - SUCCESS_TIME_FLOOR) * remaining_frac)``,
+     ``remaining_frac = clip((horizon - tick)/horizon, 0, 1)`` — full ``R_SUCCESS`` for an instant
+     win down to the FLOOR ``R_SUCCESS*SUCCESS_TIME_FLOOR`` at the buzzer. Being terminal, it
+     biases toward FASTER wins without creating any mid-trajectory trap.
 
-  3. A per-tick LIVING COST ``R_TICK = -LIVING_COST_TOTAL / horizon`` — AVAILABLE but
-     DISABLED by default (``LIVING_COST_TOTAL = 0.0``). It is the ``- λ·1`` anti-idle term
-     LLM_RL_SYSTEMS §4.1 sketched, but the convergence probe showed an UNCONDITIONAL living
-     cost is COUNTERPRODUCTIVE here: sized to make dithering net-negative it also makes the
-     first-checkpoint "stepping stone" net-negative, so the policy FLEES it to a do-nothing
-     basin and never re-finds the win (design 1: stochastic SR collapsed to 0.0). With the
-     cost OFF, the same run is LEARNABLE (stochastic SR 0.69, still improving at 400k). The
-     decaying success bonus (2) already supplies the "earlier is better" pressure, so the
-     knob stays at 0.0; a game that genuinely needs anti-idle can raise it per-call.
+  3. A per-tick LIVING COST ``R_TICK = -LIVING_COST_TOTAL / horizon`` — AVAILABLE but DISABLED by
+     default (``LIVING_COST_TOTAL = 0.0``). It is a NON-potential term (it changes the optimal
+     policy), and the probe showed an unconditional cost is counterproductive; PBRS (1) provides
+     the anti-dither pressure in a policy-NEUTRAL way, so the knob stays at 0.0.
 
-  4. A clearly-negative terminal ``R_FAILURE`` on ``failure``/``error``.
+  4. A clearly-negative terminal ``R_FAILURE`` on ``failure``/``error`` (also outside Φ).
 
-Sizing (see the constants): ``R_SUCCESS*SUCCESS_TIME_FLOOR`` (the MINIMUM success payoff, 5.0)
-> ``SHAPING_MASS + LIVING_COST_TOTAL`` (1.0), so the four reward invariants hold with margin:
-(a) the total farmable shaping (``SHAPING_MASS``) is < the success payoff at ANY tick;
-(b) an earlier success yields a strictly greater return than a later one;
-(c) any success return > any no-success return; (d) for equal progress a failure return <
-a timeout (no-success) return. ``success`` STAYS the unshaped binary certificate — the
-"solved?" decision never reads this shaped reward (hack-resistant by construction). Episode
-ends on a terminal ``result`` or at HORIZON (300) decision ticks.
+Sizing (see the constants): the PBRS shaping mass is BOUNDED by ``SHAPING_MASS`` (= max Φ), and
+``R_SUCCESS*SUCCESS_TIME_FLOOR`` (the MINIMUM success payoff, 5.0) > ``SHAPING_MASS`` (1.0), so the
+reward invariants hold with margin: (a) the whole farmable shaping mass < the success payoff at
+ANY tick; (b) an earlier success yields a strictly greater return than a later one; (c) any
+success return > any no-success return; (d) for equal progress a failure return < a timeout
+(no-success) return; PLUS the PBRS telescoping identity ``Σ γ^t F_t = γ^T·Φ_end − Φ_0``. ``success``
+STAYS the unshaped binary certificate — the "solved?" decision never reads this shaped reward
+(hack-resistant by construction). Episode ends on a terminal ``result`` or at HORIZON (300) ticks.
 
 ======================================================================
 godot_rl_agents AIController mapping  (GODOT_RL_MERGE.md §2 — pin this)
@@ -199,36 +198,55 @@ DEFAULT_RAYS = {"n": 16, "fov_deg": 180.0,
 RAY_CLASS_BITS = 3        # {static, dynamic, sensor} one-hot per ray when class_bits on [eng.]
 VEL_SCALE = 1000.0        # px/s velocity normalizer [eng.]
 OBS_CLIP = 10.0           # clip normalized obs into [-OBS_CLIP, OBS_CLIP] [eng.]
-# --- Reward scheme (REALIGNED 2026-07-16; see the module docstring "REWARD") -----------
-# The magnitudes are sized so R_SUCCESS*SUCCESS_TIME_FLOOR (the MINIMUM success payoff)
-# strictly dominates SHAPING_MASS + LIVING_COST_TOTAL — the terminal-dominance guarantee
-# the reward-invariant tests (tests/test_rl_reward.py) pin.
-SHAPING_MASS = 1.0        # TOTAL farmable checkpoint-shaping budget across ALL checkpoints;
-                          # each newly-latched checkpoint pays SHAPING_MASS/n_cp (latch-once,
-                          # so cumulative shaping is capped at SHAPING_MASS) [eng.]
+# --- Reward scheme (PBRS, 2026-07-16; see the module docstring "REWARD") ----------------
+# Checkpoint shaping is POTENTIAL-BASED (Ng, Harada & Russell 1999): F = γ·Φ(s') − Φ(s) with
+# Φ(s) = SHAPING_MASS·(latched/n_cp). PBRS leaves the optimal policy UNCHANGED (its discounted
+# sum telescopes to γ^T·Φ_end − Φ_0), so shaping-farming and do-nothing basins are impossible
+# BY CONSTRUCTION — unlike the earlier non-potential living cost, whose unconditional term
+# created exactly such a basin. The terminal success/failure payoffs stay OUTSIDE Φ.
+SHAPING_MASS = 1.0        # POTENTIAL SCALE: max Φ (all n_cp checkpoints latched) = SHAPING_MASS;
+                          # Φ(s) = SHAPING_MASS·(latched_count/n_cp). Bounded, so the PBRS shaping
+                          # mass can never rival the terminal payoff (terminal dominance) [eng.]
+PBRS_GAMMA = 0.99         # discount for the PBRS shaping term γ·Φ(s')−Φ(s); MUST match the
+                          # trainer's gamma (ppo.DEFAULTS["gamma"]) for exact policy invariance —
+                          # a guard test pins the equality (tests/test_rl_reward.py) [eng.]
 R_SUCCESS = 10.0          # BASE terminal success bonus, before the time-decay below [eng.]
 SUCCESS_TIME_FLOOR = 0.5  # decayed success payoff never drops below this fraction of R_SUCCESS
-                          # (a buzzer-beater win still pays 0.5*R_SUCCESS >> shaping) [eng.]
+                          # (a buzzer-beater win still pays 0.5*R_SUCCESS >> the shaping mass) [eng.]
 R_FAILURE = -2.0          # terminal penalty on failure/error (clearly negative) [eng.]
-LIVING_COST_TOTAL = 0.0   # per-tick living cost over a full-horizon episode (R_TICK =
-                          # -LIVING_COST_TOTAL/horizon). DISABLED (0.0): the 400k probe showed
-                          # an unconditional living cost destabilizes convergence — it makes the
-                          # first-checkpoint stepping stone net-negative and the policy flees to
-                          # a do-nothing basin. Temporal pressure rides on the decaying success
-                          # bonus instead. Raise per-call for a game that needs anti-idle. [eng.]
-R_CHECKPOINT = SHAPING_MASS  # backward-compat alias: the shaping budget for a 1-checkpoint game
+LIVING_COST_TOTAL = 0.0   # per-tick living cost R_TICK = -LIVING_COST_TOTAL/horizon. DISABLED
+                          # (0.0): a non-potential unconditional cost destabilized convergence
+                          # (the 400k probe: policy fled the stepping stone to a do-nothing basin).
+                          # PBRS supplies the built-in, policy-neutral anti-dither instead; the
+                          # decaying success bonus supplies the temporal pressure [eng.]
+R_CHECKPOINT = SHAPING_MASS  # backward-compat alias (the potential scale for a 1-checkpoint game)
 SERVE_TIMEOUT_S = 60.0    # per-op read budget before declaring the node dead [eng.]
 
 
 # --- Reward function (single source of truth; the 3 env step() paths call this) ---------
-def checkpoint_shaping(n_new_latched: int, n_cp: int) -> float:
-    """Bounded (normalized-capped) checkpoint shaping: each newly-latched checkpoint pays
-    ``SHAPING_MASS / n_cp`` so an episode that latches ALL ``n_cp`` declared checkpoints
-    accrues exactly ``SHAPING_MASS`` — independent of how many checkpoints the game has.
-    ``n_cp <= 0`` (a game with no declared checkpoints) -> no shaping."""
+def potential(n_latched: int, n_cp: int) -> float:
+    """PBRS potential ``Φ(s) = SHAPING_MASS · (n_latched / n_cp)`` — the shaping's "height" at
+    a state, proportional to the fraction of declared checkpoints latched. Bounded in
+    ``[0, SHAPING_MASS]``: 0 at episode start (nothing latched), SHAPING_MASS with all latched.
+    ``n_cp <= 0`` (no declared checkpoints) -> 0.0 (no shaping)."""
     if n_cp <= 0:
         return 0.0
-    return (SHAPING_MASS / float(n_cp)) * float(n_new_latched)
+    return SHAPING_MASS * (float(n_latched) / float(n_cp))
+
+
+def shaping_reward(c_before: int, c_after: int, n_cp: int, terminal: bool,
+                   gamma: float = PBRS_GAMMA) -> float:
+    """POTENTIAL-BASED shaping ``F = γ·Φ(s') − Φ(s)`` (Ng, Harada & Russell 1999).
+
+    ``c_before``/``c_after`` = latched-checkpoint count BEFORE/AFTER the step. At an ABSORBING
+    terminal (``terminal=True``: success/failure/error) ``Φ(s')`` is 0 — the PBRS convention
+    under which the discounted shaping over a whole episode telescopes to ``γ^T·Φ_end − Φ_0``
+    and the optimal policy is provably UNCHANGED. A truncation (time limit) is NOT absorbing,
+    so it keeps ``Φ(s') = Φ(c_after)`` (SB3 bootstraps its value). Because the discounted
+    shaping is policy-neutral, no shaping-farming or do-nothing basin can exist."""
+    phi_before = potential(c_before, n_cp)
+    phi_after = 0.0 if terminal else potential(c_after, n_cp)
+    return float(gamma) * phi_after - phi_before
 
 
 def success_payoff(tick: int, horizon: int) -> float:
@@ -252,12 +270,16 @@ def tick_cost(horizon: int) -> float:
     return -LIVING_COST_TOTAL / h
 
 
-def step_reward(n_new_latched: int, n_cp: int, result, tick: int, horizon: int) -> float:
-    """The realigned per-step reward (single source of truth for ALL env step() paths):
-    bounded checkpoint shaping + the per-tick living cost, plus the time-decayed terminal
-    on a ``success`` result or the flat negative ``R_FAILURE`` on ``failure``/``error``.
-    See the module docstring "REWARD" for the full scheme and invariants."""
-    r = checkpoint_shaping(n_new_latched, n_cp) + tick_cost(horizon)
+def step_reward(c_before: int, c_after: int, n_cp: int, result, tick: int, horizon: int,
+                gamma: float = PBRS_GAMMA) -> float:
+    """The per-step reward (single source of truth for ALL env step() paths): PBRS checkpoint
+    shaping ``γ·Φ(s') − Φ(s)`` + the (default-off) per-tick living cost, PLUS the terminal
+    payoff kept OUTSIDE the potential — the time-decayed :func:`success_payoff` on ``success``
+    or the flat negative ``R_FAILURE`` on ``failure``/``error``. ``c_before``/``c_after`` =
+    latched count before/after the step. See the module docstring "REWARD" for the scheme,
+    the PBRS invariance argument, and the reward invariants."""
+    terminal = result in ("success", "failure", "error")
+    r = shaping_reward(c_before, c_after, n_cp, terminal, gamma) + tick_cost(horizon)
     if result == "success":
         r += success_payoff(tick, horizon)
     elif result in ("failure", "error"):
@@ -762,7 +784,8 @@ class PlanckEnv:
         result = frame.get("result")
 
         latched_now = self._latched_set(frame)
-        new_latches = len(latched_now - self._prev_latched)
+        c_before = len(self._prev_latched)
+        c_after = len(latched_now)
         self._prev_latched = latched_now
 
         terminated = False
@@ -774,9 +797,9 @@ class PlanckEnv:
         elif self._tick >= self.horizon:
             truncated = True
         self._done = terminated or truncated
-        # Realigned reward (single source of truth): bounded checkpoint shaping + the
-        # per-tick living cost + the time-decayed terminal. See step_reward / the docstring.
-        reward = step_reward(new_latches, len(self._cp_keys or []), result,
+        # Realigned reward (single source of truth): PBRS checkpoint shaping + the (off-by-
+        # default) living cost + the time-decayed terminal. See step_reward / the docstring.
+        reward = step_reward(c_before, c_after, len(self._cp_keys or []), result,
                              self._tick, self.horizon)
 
         info = {

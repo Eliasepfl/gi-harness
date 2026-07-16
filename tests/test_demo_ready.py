@@ -101,6 +101,39 @@ def test_export_demo_trajectory_witness_shape(tmp_path):
 
 
 # ====================================================================== #
+# 2b. Eval action histogram (Elias: does a 3D policy actually use altitude?)
+# ====================================================================== #
+def test_action_histogram_sums_to_ticks_and_serializes():
+    eps = [{"actions": ["up", "up", "forward", "left", "brake"]},
+           {"actions": ["down", "up", "right"]}]
+    actions = ["up", "down", "left", "right", "forward", "brake"]
+    hist = C.action_histogram(eps, actions, with_axes=True)
+    total = sum(len(e["actions"]) for e in eps)                 # 8 ticks
+    # per_action seeds EVERY declared action and sums to the tick total.
+    assert set(hist["per_action"]) == set(actions)
+    assert hist["total_ticks"] == total
+    assert sum(hist["per_action"].values()) == total
+    # 3D axis aggregates are EXCLUSIVE and also sum to the tick total.
+    ax = hist["per_axis"]
+    assert ax["vertical"] == 4        # up×3 + down×1
+    assert ax["lateral"] == 2         # left + right
+    assert ax["forward_brake"] == 2   # forward + brake
+    assert ax["other"] == 0
+    assert sum(ax.values()) == total
+    assert hist["per_axis_frac"]["vertical"] == pytest.approx(4 / total)
+    # JSON round-trips (the eval artifact persists it verbatim).
+    assert json.loads(json.dumps(hist)) == hist
+
+
+def test_action_histogram_no_axes_when_2d_and_empty_safe():
+    hist = C.action_histogram([{"actions": ["up", "left"]}], ["up", "down", "left", "right"])
+    assert "per_axis" not in hist                               # with_axes defaults off (2D)
+    assert hist["total_ticks"] == 2 and hist["per_action"]["down"] == 0
+    empty = C.action_histogram([], ["a", "b"], with_axes=True)
+    assert empty["total_ticks"] == 0 and sum(empty["per_axis"].values()) == 0
+
+
+# ====================================================================== #
 # 3. g3_prime end-to-end with a STUB trainer/env/bridge (offline)
 # ====================================================================== #
 class _StubAgent:
