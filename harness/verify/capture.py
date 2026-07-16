@@ -229,7 +229,9 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     (``asset_bank.route_assets``, cached to ``<game>.assets.json``) and feed the mapping to
     the capture host; only 3D games' proxies are actually dressed (2D games stay flat). Asset
     dressing is purely cosmetic -- the certified physics/state trail is unaffected."""
-    from harness.verify.godot_exec import default_godot_project, find_godot_exe
+    from harness.verify.godot_exec import (
+        default_godot_project, find_godot_exe, speedup_from_env, speedup_user_args,
+    )
 
     exe = exe or find_godot_exe()
     project = project or default_godot_project()
@@ -253,6 +255,13 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
         json.dumps({"seed": int(seed), "actions": [str(a) for a in actions]}),
         encoding="utf-8")
 
+    # Replay at the SAME game-tick speedup certification ran at (HARNESS_GODOT_SPEEDUP), so
+    # the capture host's paired physics-rate/time-scale scaling matches the serve host that
+    # produced the witness. The stepping is designed tick-identical across speedups, so this
+    # never changes the certified trajectory -- it keeps the capture host byte-faithful to the
+    # exact env that certified the game (and defends against any future non-tick-identical
+    # game). N==1 appends nothing, so the default invocation stays byte-identical to before.
+    speedup = speedup_from_env()
     user_args = [
         "--capture",
         "--game-file=%s" % os.path.abspath(game_path),
@@ -261,6 +270,7 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
         "--width=%d" % int(width),
         "--height=%d" % int(height),
         "--max-frames=%d" % int(max_frames),
+        *speedup_user_args(speedup),
     ]
     if follow:
         user_args.append("--follow")

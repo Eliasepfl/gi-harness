@@ -140,11 +140,37 @@ func _run() -> void:
 	# Window/viewport size -> the captured image size.
 	root.size = Vector2i(_width, _height)
 
-	# Build the game under root (its bodies join root's physics space -- same as serve).
+	# TICK-PARITY WITH serve_game.gd -- two pins, both mirroring serve_game.gd::_rebuild, so a
+	# witness replayed here is BYTE-FOR-BYTE the certified serve trajectory (see
+	# notes/engines/DETERMINISM_3D.md, "Capture-lane tick parity").
+	#
+	# 1. SETTLE BEFORE BUILD, with an IDLE frame, never a physics frame -- THE fix. serve steps
+	#    ZERO physics between build() and the first act: its _rebuild awaits ONE `process_frame`
+	#    with NO live game in the tree (it flushes the prior episode's deferred free), builds,
+	#    and then its wire read busy-waits with the world FROZEN until `act` -- so act()'s
+	#    K-frame burst is the ONLY physics that ever runs. This host must match. A settle AFTER
+	#    build (of either kind) integrates the just-built RigidBodies ONE extra step the
+	#    certified trajectory never saw, putting the whole replay a frame ahead of the witness
+	#    (measured on the first certified 3D game: the glider led serve by exactly one v*dt step
+	#    from tick 1, flipping the episode from SUCCESS@239 to FAILURE@18). Awaiting here --
+	#    BEFORE add_child, when no dynamic body exists -- warms the tree/RenderingServer for the
+	#    t=0 draw while advancing NOTHING, so the t=0 fingerprint/frame is the raw post-build
+	#    state, exactly as serve reports it.
+	await process_frame
+	# 2. SAME WORLD CONTEXT as serve: hand a 3D game a FRESH World3D. Physics-wise this is a
+	#    no-op for a single-episode capture (measured: it leaves the trail byte-for-byte
+	#    unchanged -- the settle above is what actually fixes parity); it is kept so the capture
+	#    host's physics-space context matches serve's exactly, and defends a future multi-episode
+	#    capture from the reused-space leak serve's own pin exists for. It is assigned BEFORE any
+	#    proxy/camera exists, so the render scenario the dresser draws into is this fresh world
+	#    (the follow-cam capture confirms per-frame render updates through it). 2D untouched.
+	if inst is Node3D:
+		root.world_3d = World3D.new()
+	# Build the game under root (its bodies join root's physics space -- same as serve). NO
+	# `await` between here and the t=0 fingerprint/grab: physics stays frozen until _replay.
 	root.add_child(inst)
 	inst.build(_seed)
 	_game = inst
-	await physics_frame  # settle t=0
 
 	# ROUTING PRE-PASS: emit the t=0 state() body list (name + controlled) and quit. The Python
 	# capture driver reads this, calls asset_bank.route_assets, and feeds the cache back in via
