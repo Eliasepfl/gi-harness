@@ -13,8 +13,12 @@ Driven through ``serve_game.gd`` + ``GdExecutor``:
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -23,6 +27,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from harness.verify.executors import find_godot_exe  # noqa: E402
 from harness.verify.gameverify import verify_game  # noqa: E402
 from harness.verify.gd_exec import GdExecutor  # noqa: E402
+from harness.verify.godot_exec import (  # noqa: E402
+    default_godot_project, scrubbed_env,
+)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GD = os.path.join(_ROOT, "tests", "fixtures", "gd_games")
@@ -435,6 +442,163 @@ def test_2d_reset_determinism_unchanged_within_session():
                        (_WALLED, ["right"] * 20 + ["up"] * 10)):
         s1, s2, _, _ = _reset_twin_snapshots(_src(path), plan, len(plan))
         assert s1 == s2, (path, s1, s2)
+
+
+# ====================================================================== #
+# 2c. Capture-lane tick parity -- the NEW invariant (notes/engines/DETERMINISM_3D.md,
+#     "Capture-lane tick parity"). A witness replayed through the CAPTURE host
+#     (godotworld/capture_host.gd) produces the SAME per-tick state trail as through the
+#     SERVE host (serve_game.gd) -- so "the demo IS the certified witness", byte-for-byte.
+#     Guards the two capture-host pins (settle with an IDLE frame BEFORE build so ZERO
+#     physics steps run before the first act; fresh World3D for the 3D context).
+# ====================================================================== #
+def _canon_serve_frames(frames) -> dict:
+    """A serve frames trail ({tick, entities:{name:{pos,vel,angle}}}) -> a comparable
+    {tick: {name: (pos_tuple, vel_tuple, angle)}} at parsed-double precision."""
+    out = {}
+    for fr in frames:
+        ents = {}
+        for name, q in fr["entities"].items():
+            ents[name] = (tuple(float(x) for x in q.get("pos", [])),
+                          tuple(float(x) for x in q.get("vel", [])),
+                          float(q.get("angle", 0.0)))
+        out[int(fr["tick"])] = ents
+    return out
+
+
+def _parse_capture_fingerprint(path: str) -> dict:
+    """capture_host.gd's --fingerprint file ('tick|name:pos_csv:vel_csv:angle;...', all at
+    %.17f) -> the SAME {tick: {name: (pos, vel, angle)}} shape as _canon_serve_frames."""
+    out = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        ts, bs = line.split("|", 1)
+        ents = {}
+        for part in (bs.split(";") if bs else []):
+            if not part:
+                continue
+            f = part.split(":")
+            ents[f[0]] = (tuple(float(x) for x in f[1].split(",") if x != ""),
+                          tuple(float(x) for x in f[2].split(",") if x != ""),
+                          float(f[3]))
+        out[int(ts)] = ents
+    return out
+
+
+def _serve_trail(src, seed, actions, speedup):
+    """The serve per-tick trail for (seed, actions) at `speedup`."""
+    old = os.environ.get("HARNESS_GODOT_SPEEDUP")
+    os.environ["HARNESS_GODOT_SPEEDUP"] = str(speedup)
+    try:
+        ex = GdExecutor(port_base=_free_port())
+        try:
+            rec = ex.run_batch(src, [{"seed": int(seed), "actions": list(actions)}],
+                               len(actions), frames_every=1)[0]
+        finally:
+            ex.close()
+    finally:
+        if old is None:
+            os.environ.pop("HARNESS_GODOT_SPEEDUP", None)
+        else:
+            os.environ["HARNESS_GODOT_SPEEDUP"] = old
+    return _canon_serve_frames(rec["frames"]), rec["result"], rec["ticks"]
+
+
+def _capture_trail(game_path, seed, actions, speedup, dress=False):
+    """The capture-host per-tick trail: run capture_host.gd HEADLESS in fingerprint-only mode
+    (--no-frames, so no display/GL needed), stepping the SAME act+K discipline serve uses, and
+    parse its fingerprint. `--speedup=N` pins the same paired physics scaling."""
+    project = default_godot_project()
+    work = tempfile.mkdtemp(prefix="parity_")
+    try:
+        witness = os.path.join(work, "witness.json")
+        with open(witness, "w", encoding="utf-8") as fh:
+            json.dump({"seed": int(seed), "actions": [str(a) for a in actions]}, fh)
+        fp = os.path.join(work, "fp.txt")
+        argv = [GODOT_EXE, "--headless", "--path", project, "-s",
+                "res://capture_host.gd", "--",
+                "--capture", "--game-file=%s" % os.path.abspath(game_path),
+                "--actions-file=%s" % witness,
+                "--out=%s" % os.path.join(work, "frames"),
+                "--fingerprint=%s" % fp, "--no-frames",
+                "--speedup=%d" % int(speedup)]
+        if not dress:
+            argv.append("--no-dress")
+        env = scrubbed_env()
+        env["HARNESS_GODOT_EXE"] = GODOT_EXE
+        subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       stdin=subprocess.DEVNULL, env=env, timeout=240)
+        assert os.path.isfile(fp), "capture host wrote no fingerprint"
+        meta = {}
+        mp = os.path.join(work, "frames", "meta.json")
+        if os.path.isfile(mp):
+            meta = json.loads(open(mp, encoding="utf-8").read())
+        return _parse_capture_fingerprint(fp), meta
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _first_divergent(serve, cap, speedup):
+    for t in sorted(serve):
+        if cap.get(t) != serve.get(t):
+            return "speedup=%d first divergent tick=%d:\n  serve=%r\n  cap  =%r" % (
+                speedup, t, serve.get(t), cap.get(t))
+    return "trails differ (serve %d ticks, capture %d ticks)" % (
+        len(serve), len(cap))
+
+
+@requires_godot
+@pytest.mark.parametrize("speedup", [1, 8])
+def test_capture_replay_matches_serve_tumble_3d(speedup):
+    """CAPTURE-LANE PARITY on the force-driven contact fixture: a witness replayed through
+    capture_host.gd is byte-for-byte the serve_game.gd trail. tumble_3d falls under gravity
+    from tick 1, so a capture host that steps ONE extra physics frame before the first act
+    (the pre-fix `await physics_frame` settle) led serve by exactly one v*dt step and diverged
+    from tick 1 -- this re-fails if that regresses. Held at both speedups."""
+    src = _src(_TUMBLE_3D)
+    actions = ["push"] * 30                      # act() is a no-op; the body free-falls
+    serve, result, nticks = _serve_trail(src, 0, actions, speedup)
+    cap, _meta = _capture_trail(_TUMBLE_3D, 0, actions, speedup)
+    # not a vacuous no-op: the fixture drives a real contact-terminated episode
+    assert result == "failure" and 0 < nticks <= 25, (result, nticks)
+    assert cap == serve, _first_divergent(serve, cap, speedup)
+
+
+@requires_godot
+@pytest.mark.parametrize("speedup", [1, 8])
+def test_capture_replay_matches_serve_mini_collect_3d(speedup):
+    """The mandated broad 3D capture-parity guard: the impulse-driven mini_collect_3d replays
+    byte-identical through capture vs serve, at both speedups."""
+    src = _src(_MINI_3D)
+    actions = ["right"] * 30
+    serve, _r, _n = _serve_trail(src, 0, actions, speedup)
+    cap, _meta = _capture_trail(_MINI_3D, 0, actions, speedup)
+    assert cap == serve, _first_divergent(serve, cap, speedup)
+
+
+@requires_godot
+def test_capture_replay_matches_serve_2d_untouched():
+    """The capture-lane pins keep 2D byte-identical: the World3D pin is 3D-guarded (a 2D game
+    has no World3D), and the pre-build idle settle steps zero physics for 2D too. A 2D witness
+    replays identically through capture vs serve (the 2D path stays untouched)."""
+    src = _src(_MINI)
+    actions = ["up"] * 12 + ["right"] * 16
+    serve, _r, _n = _serve_trail(src, 0, actions, 1)
+    cap, _meta = _capture_trail(_MINI, 0, actions, 1)
+    assert cap == serve, _first_divergent(serve, cap, 1)
+
+
+@requires_godot
+def test_capture_dressed_equals_undressed_tumble_3d():
+    """The visual dresser is a ZERO-CONTACT overlay (proxies in a sibling subtree, transforms
+    mirrored read-only): a dressed capture and an undressed one share an identical state trail,
+    because the game tree/physics are never mutated."""
+    plain, _ = _capture_trail(_TUMBLE_3D, 0, ["push"] * 20, 1, dress=False)
+    dressed, _ = _capture_trail(_TUMBLE_3D, 0, ["push"] * 20, 1, dress=True)
+    assert plain == dressed
 
 
 @requires_godot

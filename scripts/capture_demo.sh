@@ -72,6 +72,10 @@ apptainer exec \
     export DISPLAY='$DISP'
     export LIBGL_ALWAYS_SOFTWARE=1
     export LD_LIBRARY_PATH='$X11LIB':\${LD_LIBRARY_PATH:-}
+    # Replay at the SAME game-tick speedup certification ran at, so the capture host's
+    # physics pins match the serve host that produced the witness (default 1). The stepping
+    # is tick-identical across speedups, but this keeps the demo byte-faithful to certification.
+    export HARNESS_GODOT_SPEEDUP='${HARNESS_GODOT_SPEEDUP:-1}'
     cd '$GI_REPO'
     python3 -m harness game capture '$GAME_ABS' --out '$OUT_ABS' ${EXTRA[*]:-}
   "
