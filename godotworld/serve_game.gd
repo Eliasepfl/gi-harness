@@ -297,6 +297,20 @@ func _rebuild(world_seed: int) -> String:
 	if not missing.is_empty():
 		inst.free()                         # not in the tree yet
 		return "missing contract method(s): " + ", ".join(missing)
+	# 3D DETERMINISM PIN (notes/engines/DETERMINISM_3D.md). The single-instance path adds
+	# the game straight under `root`, so a 3D game's RigidBody3D dynamics live in root's
+	# World3D -- a physics space this path REUSES across every reset. GodotPhysics3D keeps
+	# per-space solver state (contact/broadphase caches, freed-body RID reuse) that a body
+	# free() does NOT scrub, so an episode rebuilt OVER the prior episode's stepped space
+	# diverges from a clean build by a tiny, growing epsilon at the first collision. That
+	# is exactly what fails the G1 two-run determinism gate on force-driven 3D games
+	# (drone/car), whose trajectories never settle to rest to mask it -- measured
+	# delta 5.9e-05 (drone) .. 0.046 (car). Two SEPARATE processes are byte-identical (each
+	# builds over a clean space), which isolates the reused space as the sole cause. Hand
+	# every 3D episode a FRESH World3D so ZERO state crosses the reset boundary. 2D is
+	# untouched (root.world_2d left as-is) -> 2D replays stay byte-for-byte identical.
+	if inst is Node3D:
+		root.world_3d = World3D.new()
 	root.add_child(inst)
 	# The game is a plain Node implementing the method convention (no base class): it
 	# seeds its OWN RandomNumberGenerator from build()'s seed -- the banned-API scan
@@ -609,6 +623,13 @@ func _batch_build_game(vp: SubViewport, inst_seed: int) -> Dictionary:
 	# Isolate the 3D space ONLY for a 3D game -- a 2D game (the common case) would else
 	# pay for an empty per-instance World3D space stepped every frame for nothing.
 	vp.own_world_3d = inst is Node3D
+	# 3D DETERMINISM PIN (notes/engines/DETERMINISM_3D.md). The batched path REUSES each
+	# instance's viewport (its World3D) across episodes, so a 3D instance inherits the same
+	# reused-space GodotPhysics3D state leak the single-instance path had -- hand every 3D
+	# (re)build a FRESH World3D so no solver/broadphase residual crosses the reset boundary.
+	# 2D (vp.world_2d, set once in _batch_new_viewport) is untouched -> 2D stays identical.
+	if inst is Node3D:
+		vp.world_3d = World3D.new()
 	vp.add_child(inst)
 	inst.build(inst_seed)
 	return {"ok": true, "error": "", "game": inst}
