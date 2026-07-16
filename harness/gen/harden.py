@@ -29,7 +29,13 @@ from harness.gen import feedback
 
 
 _LEDGER_PATH = "runs/ledger.jsonl"
-MAX_ROUNDS_PER_FINDING = 3          # convergence guard: rounds per finding [eng.]
+MAX_ROUNDS_PER_FINDING = 3          # convergence guard: DEFECT rounds per finding [eng.]
+DIFFICULTY_BUDGET = 1               # bonus NUDGE rounds for a DIFFICULTY finding [eng.]
+
+# Terminal verdicts that count as a SUCCESSFUL harden (exit code 0). A difficulty-only
+# remainder (HARDENED_HARD) is a SUCCESS: the game is valid + hardened against every DEFECT,
+# it is merely hard-to-learn — not a failed harden. Kept here so the CLI shares one policy.
+HARDEN_SUCCESS_VERDICTS = ("HARDENED", "BULLETPROOF", "HARDENED_HARD")
 
 
 # ======================================================================== #
@@ -209,25 +215,40 @@ def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
                 tiers=(0,), stale: bool = True, run_g3: bool = False,
                 budget_steps: int = 1_000_000, g3_kwargs: dict | None = None,
                 max_rounds: int = MAX_ROUNDS_PER_FINDING,
+                difficulty_budget: int = DIFFICULTY_BUDGET,
                 ledger_path: str | None = None, skill_root=None,
                 skill_use_llm: bool = True, seed: int = 0) -> dict:
     """Run the guarded feedback-repair loop on the game at `game_path`.
 
     Each round: oracles (G4 always; G3' when `run_g3` and the game certifies) ->
-    `compile_directives` -> revise-from-current-source -> re-certify. Convergence guard:
-    at most `max_rounds` rounds; if a defect's fingerprint recurs after a revise (the fix
-    did not remove it) the loop stops with ``REPAIR_STALLED``. A revise that fails to
-    re-certify (verdict != COMPLETED) stops with ``REPAIR_FAILED`` and the last certified
-    version is kept — the ORIGINAL `game_path` file is NEVER written by this loop (revise
-    attempts land in the sandbox; a re-certified revision is adopted as the working copy).
+    `compile_directives` -> revise-from-current-source -> re-certify. Directives are TIERED
+    by severity (``feedback.severity_of``) and BUDGETED accordingly:
+
+      * DEFECT directives (broken shapes, no-stakes, unsolvable opening) get the FULL
+        `max_rounds`. When a round carries both defects and difficulty findings, the DEFECTS
+        are addressed FIRST (a difficulty nudge only fires once the game is defect-clean).
+        Convergence guard: if a DEFECT fingerprint recurs after a revise (the fix did not
+        remove it) the loop stops with ``REPAIR_STALLED``; a defect revise that fails to
+        re-certify (verdict != COMPLETED) stops with ``REPAIR_FAILED``.
+
+      * DIFFICULTY directives (`g3_plateau` / `g3_difficulty`) mean the game is
+        HARD-TO-LEARN, not broken — it re-certifies unchanged. They get a small
+        `difficulty_budget` of BONUS nudge rounds (default 1; 0 disables nudging). A nudge is
+        attempted in the sandbox but NEVER advances the working copy: the certified,
+        defect-clean game is preserved as the deliverable. A difficulty that survives its
+        nudge budget is NOT a failure — the loop terminates ``HARDENED_HARD`` (valid +
+        hardened against every defect, merely hard to learn: a SUCCESS-ish terminal).
+
+    The ORIGINAL `game_path` file is NEVER written by this loop (revise attempts land in the
+    sandbox; a re-certified DEFECT revision is adopted as the working copy).
 
     Returns::
 
         {"schema", "game", "game_path", "directives_issued", "rounds",
          "round_records", "final_verdict", "final_game_path", "original_untouched"}
 
-    `final_verdict` in {HARDENED, BULLETPROOF, CONTINUE_TRAINING, REPAIR_STALLED,
-    REPAIR_FAILED, MAX_ROUNDS, OPEN_UNMAPPED, G4_ERROR}.
+    `final_verdict` in {HARDENED, BULLETPROOF, HARDENED_HARD, CONTINUE_TRAINING,
+    REPAIR_STALLED, REPAIR_FAILED, MAX_ROUNDS, OPEN_UNMAPPED, G4_ERROR}.
     """
     t0 = time.time()
     ledger_path = ledger_path or _LEDGER_PATH
@@ -242,7 +263,12 @@ def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
     final_path = current_path
     budget_for_ledger = budget_steps if run_g3 else None
 
-    for r in range(1, max_rounds + 1):
+    defect_rounds = 0       # DEFECT revise rounds spent (bounded by max_rounds)
+    difficulty_used = 0     # DIFFICULTY nudge rounds spent (bounded by difficulty_budget)
+    r = 0
+
+    while True:
+        r += 1
         source = _read(current_path)
         engine_r = engine or _engine_of(current_path, source)
         oracle = _run_oracles(current_path, source, engine=engine_r, tiers=tiers,
@@ -255,52 +281,106 @@ def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
             rounds.append({"round": r, "directives": [], "verdict": verdict})
             break
 
-        # Convergence guard: a directive we already tried to fix is BACK -> stalled.
-        repeats = [d for d in directives if d.fingerprint in seen]
-        if repeats:
-            verdict = "REPAIR_STALLED"
-            for d in directives:
+        # Tier the round: DEFECTs are spent first; DIFFICULTY is a bonus nudge only once the
+        # game is otherwise defect-clean.
+        defects = [d for d in directives if d.severity == feedback.DEFECT]
+        difficulties = [d for d in directives if d.severity == feedback.DIFFICULTY]
+
+        # ---- DEFECT round -------------------------------------------------------------- #
+        if defects:
+            if defect_rounds >= max_rounds:
+                # Out of DEFECT budget with a defect still standing -> MAX_ROUNDS.
+                verdict = "MAX_ROUNDS"
+                rounds.append({"round": r, "verdict": "MAX_ROUNDS",
+                               "directives": [d.to_dict() for d in defects]})
+                break
+
+            # Convergence guard: a DEFECT we already tried to fix is BACK -> stalled.
+            repeats = [d for d in defects if d.fingerprint in seen]
+            if repeats:
+                verdict = "REPAIR_STALLED"
+                for d in defects:
+                    _append_ledger_event(
+                        _ledger_entry(slug, current_path, d, "REPAIR_STALLED", r,
+                                      backend=backend, budget_steps=budget_for_ledger),
+                        ledger_path)
+                rounds.append({"round": r, "verdict": "REPAIR_STALLED",
+                               "directives": [d.to_dict() for d in defects],
+                               "stalled_fingerprints": [d.fingerprint for d in repeats]})
+                break
+
+            for d in defects:
+                seen.add(d.fingerprint)
+            defect_rounds += 1
+            directives_issued += len(defects)
+
+            round_sandbox = os.path.join(out_dir, slug, f"round_{r}")
+            revise_res = revise_with_directives(
+                current_path, defects, out_dir=round_sandbox, backend=backend,
+                max_repairs=max_repairs, engine=engine_r, skill_root=skill_root,
+                skill_use_llm=skill_use_llm)
+            rv = revise_res.get("verdict")
+            revised_path = revise_res.get("game_path")
+
+            for d in defects:
                 _append_ledger_event(
-                    _ledger_entry(slug, current_path, d, "REPAIR_STALLED", r,
-                                  backend=backend, budget_steps=budget_for_ledger),
+                    _ledger_entry(slug, current_path, d, rv, r, backend=backend,
+                                  budget_steps=budget_for_ledger, revised_path=revised_path),
                     ledger_path)
-            rounds.append({"round": r, "verdict": "REPAIR_STALLED",
-                           "directives": [d.to_dict() for d in directives],
-                           "stalled_fingerprints": [d.fingerprint for d in repeats]})
+            record = {"round": r, "verdict": rv, "revised_game_path": revised_path,
+                      "directives": [d.to_dict() for d in defects]}
+            if difficulties:  # difficulty deferred until the game is defect-clean
+                record["deferred_difficulty"] = [d.source for d in difficulties]
+            rounds.append(record)
+
+            if rv != "COMPLETED":
+                # The fix did NOT re-certify -> keep the last certified version, never
+                # overwrite. Attempts remain in the sandbox for audit.
+                verdict = "REPAIR_FAILED"
+                break
+
+            # Re-certified through the full G0-G3 funnel -> adopt the revised (sandbox) game
+            # as the working copy. The ORIGINAL game_path on disk stays untouched.
+            current_path = revised_path
+            final_path = revised_path
+            continue
+
+        # ---- DIFFICULTY-only round (defect-clean & certified) -------------------------- #
+        # The game is valid and hardened against every defect; a leftover difficulty is
+        # HARD-TO-LEARN, not broken. Spend at most `difficulty_budget` BONUS nudges, then
+        # terminate HARDENED_HARD. A nudge NEVER advances `final_path` — the certified,
+        # defect-clean game is preserved as the deliverable (a phantom fix must not overwrite
+        # a good game).
+        if difficulty_used >= difficulty_budget:
+            verdict = "HARDENED_HARD"
+            rounds.append({"round": r, "verdict": "HARDENED_HARD", "severity": "difficulty",
+                           "nudged": False, "directives": [d.to_dict() for d in difficulties]})
             break
 
-        for d in directives:
-            seen.add(d.fingerprint)
-        directives_issued += len(directives)
-
-        round_sandbox = os.path.join(out_dir, slug, f"round_{r}")
+        difficulty_used += 1
+        directives_issued += len(difficulties)
+        round_sandbox = os.path.join(out_dir, slug, f"round_{r}_difficulty")
         revise_res = revise_with_directives(
-            current_path, directives, out_dir=round_sandbox, backend=backend,
+            current_path, difficulties, out_dir=round_sandbox, backend=backend,
             max_repairs=max_repairs, engine=engine_r, skill_root=skill_root,
             skill_use_llm=skill_use_llm)
         rv = revise_res.get("verdict")
         revised_path = revise_res.get("game_path")
-
-        for d in directives:
+        for d in difficulties:
             _append_ledger_event(
                 _ledger_entry(slug, current_path, d, rv, r, backend=backend,
                               budget_steps=budget_for_ledger, revised_path=revised_path),
                 ledger_path)
-        rounds.append({"round": r, "verdict": rv, "revised_game_path": revised_path,
-                       "directives": [d.to_dict() for d in directives]})
-
-        if rv != "COMPLETED":
-            # The fix did NOT re-certify -> keep the last certified version, never
-            # overwrite. Attempts remain in the sandbox for audit.
-            verdict = "REPAIR_FAILED"
+        rounds.append({"round": r, "verdict": rv, "severity": "difficulty", "nudged": True,
+                       "revised_game_path": revised_path,
+                       "directives": [d.to_dict() for d in difficulties]})
+        if difficulty_used >= difficulty_budget:
+            # Spent the nudge budget; the certified defect-clean game (NOT the nudge) is the
+            # deliverable, and the difficulty is a soft remainder -> HARDENED_HARD, no grind.
+            verdict = "HARDENED_HARD"
             break
-
-        # Re-certified through the full G0-G3 funnel -> adopt the revised (sandbox) game
-        # as the working copy. The ORIGINAL game_path on disk stays untouched.
-        current_path = revised_path
-        final_path = revised_path
-    else:
-        verdict = verdict or "MAX_ROUNDS"
+        # Budget remains (difficulty_budget > 1): re-run oracles for another nudge.
+        continue
 
     return {
         "schema": "harden_report/v1",
