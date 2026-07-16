@@ -43,6 +43,7 @@ _NO_PRESSURE = os.path.join(_GD, "no_pressure.gd")
 _LOSABLE = os.path.join(_GD, "losable.gd")
 _SOFTLOCK_PIT = os.path.join(_GD, "softlock_pit.gd")
 _DEAD_SPACE = os.path.join(_GD, "dead_space.gd")
+_BOUNCE_2D = os.path.join(_GD, "bounce_2d.gd")
 
 
 def _src(path):
@@ -507,10 +508,16 @@ def _serve_trail(src, seed, actions, speedup):
     return _canon_serve_frames(rec["frames"]), rec["result"], rec["ticks"]
 
 
-def _capture_trail(game_path, seed, actions, speedup, dress=False):
-    """The capture-host per-tick trail: run capture_host.gd HEADLESS in fingerprint-only mode
-    (--no-frames, so no display/GL needed), stepping the SAME act+K discipline serve uses, and
-    parse its fingerprint. `--speedup=N` pins the same paired physics scaling."""
+def _capture_trail(game_path, seed, actions, speedup, dress=False, no_frames=True):
+    """The capture-host per-tick trail: run capture_host.gd HEADLESS and parse its fingerprint,
+    stepping the SAME act+K discipline serve uses. `--speedup=N` pins the same paired physics
+    scaling.
+
+    ``no_frames`` (default) is the fingerprint-only fast path (no _grab, so the dresser's per-tick
+    sync() never runs). Set ``no_frames=False`` to exercise the REAL frame-grabbing path headless:
+    _grab runs sync() every tick (the software-GL force_draw/readback are inert under the dummy
+    rasteriser, but the mirror READ still happens) -- this is the path a float-sensitive replay
+    used to diverge on, so it is what a zero-contact regression test must drive."""
     project = default_godot_project()
     work = tempfile.mkdtemp(prefix="parity_")
     try:
@@ -523,8 +530,10 @@ def _capture_trail(game_path, seed, actions, speedup, dress=False):
                 "--capture", "--game-file=%s" % os.path.abspath(game_path),
                 "--actions-file=%s" % witness,
                 "--out=%s" % os.path.join(work, "frames"),
-                "--fingerprint=%s" % fp, "--no-frames",
+                "--fingerprint=%s" % fp,
                 "--speedup=%d" % int(speedup)]
+        if no_frames:
+            argv.append("--no-frames")
         if not dress:
             argv.append("--no-dress")
         env = scrubbed_env()
@@ -599,6 +608,32 @@ def test_capture_dressed_equals_undressed_tumble_3d():
     plain, _ = _capture_trail(_TUMBLE_3D, 0, ["push"] * 20, 1, dress=False)
     dressed, _ = _capture_trail(_TUMBLE_3D, 0, ["push"] * 20, 1, dress=True)
     assert plain == dressed
+
+
+@requires_godot
+def test_capture_framegrab_dressed_matches_serve_float_sensitive_2d():
+    """ZERO-CONTACT under the REAL frame-grabbing path on a FLOAT-SENSITIVE 2D game.
+
+    The frame-grab lane calls the dresser's sync() every tick. sync() must mirror from the body's
+    stored .position/.rotation, NOT read the shape's .global_transform: a .global_transform read
+    mid-physics forces a transform-notification flush that perturbs a chaotic replay (the pachinko
+    ball's bounce cascade diverges within ~50 ticks; a certified debris-docking game diverged at
+    tick 43 and crashed at 130 that docks at 275). Driving _capture_trail with no_frames=False
+    runs that exact mirror-during-stepping path headless, and it must stay byte-for-byte on serve
+    -- INCLUDING well past the tick where the old .global_transform read diverged. Guards the fix
+    in visual_dress.gd sync()/_precompute_mirror_2d(); this whole trail is identical to the
+    --no-frames one, proving the mirror read is inert."""
+    actions = ["noop"] * 160
+    serve, result, nticks = _serve_trail(_src(_BOUNCE_2D), 0, actions, 1)
+    cap, _meta = _capture_trail(_BOUNCE_2D, 0, actions, 1, dress=True, no_frames=False)
+    # A genuinely long, physics-driven episode (not a vacuous 1-tick trail).
+    assert nticks >= 120, nticks
+    assert cap == serve, _first_divergent(serve, cap, 1)
+    # Explicitly assert parity holds PAST the tick the old bug first diverged on (43) and crashed
+    # (130) -- the regression this test exists for.
+    for t in (44, 80, 130, 160):
+        if t in serve:
+            assert cap.get(t) == serve.get(t), "divergence at tick %d" % t
 
 
 @requires_godot

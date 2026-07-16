@@ -132,6 +132,7 @@ func dress(game_root: Node, opts := {}) -> void:
 		_build_3d(shapes)
 	else:
 		_build_2d(shapes)
+		_precompute_mirror_2d()
 
 	# 4. Camera framing (fit-to-scene overview, or follow the controlled body).
 	_setup_camera()
@@ -140,25 +141,69 @@ func dress(game_root: Node, opts := {}) -> void:
 
 
 func sync() -> void:
-	# Mirror each body's current global transform onto its visual proxy. READ-ONLY on the
-	# game tree -- this is the whole zero-contact contract. Called once per captured frame by
-	# the host; never steps physics. Asset proxies are wrapped in an orthonormal mount, so
-	# assigning the mount's global_transform preserves the asset's own fit-scale.
+	# Mirror each body's current pose onto its visual proxy. READ-ONLY on the game tree -- the
+	# whole zero-contact contract. Called once per captured frame by the host; never steps physics.
+	#
+	# 2D mirrors from the body's STORED .position/.rotation (via _mirror_xform_2d) rather than
+	# reading the shape's .global_transform: a .global_transform read mid-physics forces a
+	# transform-notification flush that perturbs a float-sensitive replay (a debris-threading game
+	# docks at tick 275 but the flush diverged it into a crash at ~130). state()'s own reads are
+	# .position/.rotation for exactly this reason. 3D keeps the direct .global_transform read (its
+	# asset mounts carry a fit-scale the compose path would drop; the 3D follow-cam is unchanged).
 	for p in _pairs:
-		var src = p["src"]
 		var proxy = p["proxy"]
-		if not (is_instance_valid(src) and is_instance_valid(proxy)):
+		if not is_instance_valid(proxy):
 			continue
-		proxy.global_transform = src.global_transform
+		if _is_3d:
+			var src = p["src"]
+			if is_instance_valid(src):
+				proxy.global_transform = src.global_transform
+		else:
+			proxy.global_transform = _mirror_xform_2d(p)
 	if _follow and _camera != null and is_instance_valid(_camera) \
 			and _controlled_body != null and is_instance_valid(_controlled_body):
 		# The chase camera trails the controlled body at a FIXED WORLD offset (its orientation
-		# was baked at setup). Reading global_position is read-only on the game tree, so the
-		# zero-contact contract holds exactly as when the 3D cam was parented to the proxy.
+		# was baked at setup). Read-only on the game tree, so the zero-contact contract holds.
 		if _is_3d:
 			_camera.global_position = _follow_pose()
 		else:
-			_camera.global_position = _controlled_body.global_position
+			_camera.global_position = (_controlled_body as Node2D).position
+
+
+func _precompute_mirror_2d() -> void:
+	# Cache, per 2D pair, the data to reproduce the shape's world transform each frame from the
+	# body's STORED .position/.rotation alone -- so sync() never reads .global_transform mid-physics.
+	# The .global_transform reads HERE run ONCE at t=0 (pre-stepping), so they are safe. The
+	# reconstruction proxy = parent_global(t0) * Transform2D(body.rotation, body.position) *
+	# shape_rel is EXACT for a body whose ancestors are static (every GameAPI 2D game: bodies sit
+	# under a fixed game root). A body with moving ancestors keeps its cache empty and falls back
+	# to the direct read in _mirror_xform_2d.
+	for p in _pairs:
+		var src = p["src"]
+		if not is_instance_valid(src) or not (src is Node2D):
+			continue
+		var body := _owning_body(src)
+		if not (body is Node2D):
+			continue
+		var par = (body as Node2D).get_parent()
+		var par_g := (par as Node2D).global_transform if (par is Node2D) else Transform2D()
+		var body_g: Transform2D = par_g * Transform2D(body.rotation, body.position)
+		p["m_body"] = body
+		p["m_par"] = par_g
+		p["m_rel"] = body_g.affine_inverse() * (src as Node2D).global_transform
+
+
+func _mirror_xform_2d(p: Dictionary) -> Transform2D:
+	# Non-perturbing 2D mirror: compose the shape's world transform from the body's stored
+	# .position/.rotation and the t=0-cached parent + shape-relative transforms.
+	var body = p.get("m_body", null)
+	if body != null and is_instance_valid(body) and body is Node2D:
+		return (p["m_par"] as Transform2D) \
+			* Transform2D(body.rotation, body.position) * (p["m_rel"] as Transform2D)
+	var src = p["src"]      # fallback: no cache (moving ancestors / malformed) -> direct read
+	if is_instance_valid(src) and src is Node2D:
+		return (src as Node2D).global_transform
+	return Transform2D()
 
 
 # =========================================================================== #
