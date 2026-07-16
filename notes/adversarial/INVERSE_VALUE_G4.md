@@ -79,6 +79,68 @@ Follow-up worth taking: gate the ladder tier on g3_prime SUCCESS (final_success
 _rate > 0), not artifact existence alone. Zero false certifications in any arm.
 ---
 
+# S1.5 — POLICY-GUIDED DESCENT (Elias's return-then-descend, implemented)
+
+> 2026-07-15. Builds STALE_SEEKING_PLAN.md §3.1 (marked BUILD-FIRST). Slots in the g4
+> ladder BETWEEN the greedy inverse-value tier (S1) and the deep trained seeker (S2):
+> `harness/rl/adversary.py` (`descent_chooser`, `select_waypoints`, `descent_search`),
+> `harness/verify/g4.py` (`_run_descent`, the model-gated CHEAP tier). Same CONFIRM
+> oracle (`refute_prefix`) — no new certification path. Findings shape identical to the
+> certified-softlock class (tier `descent`, family `policy_descent+tree_refute`).
+
+## The idea
+The greedy S1 attacker takes `argmin(pi)` from step 0. Where that collapses to one
+direction it dives OOB (a LOSS, which DETECT refuses) or overshoots a turn, so it can
+never COMPOSE a multi-step pocket entry (navigate AROUND, then IN). S1.5 uses the
+COMPETENT working policy to NAVIGATE to a low-value waypoint, THEN alpha-ramps into the
+freeze pocket — the literature's return-then-explore / PEG plan-then-command pattern.
+
+## Three phases (`adversary.descent_search`)
+1. **Waypoint pool + LOW-V selection** (`select_waypoints`). Targets from (a) the winning
+   witness at PREFIX_HANDOFF cuts (Backplay / CCPT winning-spine) and (b) an inverse-
+   visitation FRONTIER — the lowest-V states from short anti-policy rollouts
+   (`collect_low_v_states`, top-k per rollout; TERMINAL / OOB states EXCLUDED — a body
+   that left the arena is a dead-end, not a reachable RETURN target, and the critic is
+   least reliable exactly there). Selected by LOW V ascending (our adaptation; AVF the
+   adjacent precedent). **[eng.]**
+2. **Return phase** — deterministic prefix replay to the waypoint (`rollout(prefix=...)`);
+   bit-identical run-to-run (sound; a replay-fork, not an engine snapshot). The witness
+   prefix for (a), the recorded action prefix for (b).
+3. **Descent phase** — the alpha-ramped `descent_chooser`: at descent-tick `t`, with prob
+   `alpha = linear_alpha_schedule(t)` take `argmin(pi)` (freeze-seek), else SAMPLE from
+   `pi` (competent navigation — stays alive, keeps mobility). `alpha` ramps `0 -> 1` over
+   `descent_ticks` — a SMOOTH handoff, not a hard switch. **alpha schedule [eng.]**
+Frozen windows -> DETECT -> the SAME `refute_prefix` CONFIRM (soundness unchanged).
+
+## A/B — S1 greedy vs S1.5 descent (candidates + CERTIFIED per 1k SEARCH ticks)
+Same per-arm tick budget, same injected scripted critic (a stand-in for a trained G3'
+policy — soundness is critic-independent: DETECT+CONFIRM certify regardless of how the
+prefix was found). CONFIRM = one tree-solve per candidate (shared downstream cost).
+Reproduce: `python scripts/descent_ab.py` in the certifier image.
+
+Measured 2026-07-15 (Slurm job 18023279, mit_preemptable, speedup 8; budget 2400
+ticks/arm; CONFIRM H=30/4000):
+
+| fixture | arm | ticks | cands | cert | cert/1k |
+|---|---|---|---:|---:|---:|
+| SINGLE-STEP `softlock_pit.gd`  | S1 greedy     | 938 | 13 | 1 | 1.07 |
+| SINGLE-STEP `softlock_pit.gd`  | S1.5 descent  | 357 |  3 | 3 | 8.40 |
+| MULTI-STEP  `softlock_maze.gd` | S1 greedy     | 877 |  0 | 0 | 0.00 |
+| MULTI-STEP  `softlock_maze.gd` | S1.5 descent  | 383 |  8 | 8 | 20.89 |
+
+**Reading it (honest verdict).** On the MULTI-STEP maze the pocket is off BOTH axes from
+the start (needs travel-RIGHT then turn-DOWN, and every impulse is pure-axis so no single
+spammed / argmin-collapsed direction composes it): greedy argmin-from-0 dives straight
+down the start column and certifies **ZERO**, while descent navigates to a pocket-band
+waypoint and certifies **8**. That IS the point of the tier — **S1.5 >= S1, strictly
+greater exactly where composition is required.** On the SINGLE-STEP pit the trap is one
+straight dive away so both trip it, and descent also edges greedy on CERTIFIED/1k (8.40 vs
+1.07): greedy's 13 detections are mostly the pit's period-2 cycle churn that CONFIRM
+REFUTES (1/13 certifies), whereas descent's few candidates are all real softlocks (3/3).
+`softlock_maze.gd` certifies G0-G3 and its pocket is reachable ONLY via the two-leg route
+(`tests/test_gd_descent.py`). Zero false certifications; mini_collect stays clean.
+---
+
 # The TRAINED stale-seeker (PPO escalation tier)
 
 > 2026-07-15. Elias: "can we not use PPO too for getting into stale states?"

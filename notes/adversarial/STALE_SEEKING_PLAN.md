@@ -134,7 +134,16 @@ S2  PPO stale-SEEKER + anti-idle reward   (in-flight — spec below)
 S2+ goal-conditioned / population escalation   (contingency only)
 ```
 
-### 3.1 S1.5 — policy-guided descent (P1)
+### 3.1 S1.5 — policy-guided descent (P1)  [IMPLEMENTED 2026-07-15]
+
+> Built in `harness/rl/adversary.py` (`descent_chooser` alpha-ramp, `select_waypoints`
+> low-V pool, `descent_search`) + `harness/verify/g4.py` (`_run_descent`, cheap model-
+> gated tier slotted between S1 and S2). A/B (S1 greedy vs S1.5 descent) + the multi-step
+> fixture `tests/fixtures/gd_games/softlock_maze.gd` are in `INVERSE_VALUE_G4.md` §S1.5:
+> on the multi-step maze greedy certifies 0, descent certifies 8 (same budget). One
+> adaptation vs the spec below: the frontier EXCLUDES terminal/OOB states (dead bodies
+> are not reachable RETURN targets) — otherwise the critic's OOB unreliability floods the
+> low-V pool. EFFICIENCY-ONLY; CONFIRM unchanged.
 
 Three phases per rollout, composed in `rollout()`'s existing phase machinery:
 
