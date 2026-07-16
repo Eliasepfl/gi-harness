@@ -73,6 +73,7 @@ from harness.rl.env import (
     OBS_CLIP, PER_BODY, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
     Box, Discrete, build_obs_vector,
 )
+from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
 # --- Constants ([eng.] = engineering choice) ---------------------------------
 DEFAULT_PORT_BASE = 47000     # loopback serve base when GIP_PORT_BASE is unset [eng.]
@@ -159,6 +160,9 @@ class GodotServeEnv:
         self._conn = None
         self._proc = None
         self._log = None
+        self._log_offset = 0            # os.pread cursor for the runtime SCRIPT ERROR
+                                        # delta (never the shared write offset)
+        self.runtime_errors: list[dict] = []
 
         # Resolve the game-tick SPEEDUP first (HARNESS_GODOT_SPEEDUP, default 1) so an
         # invalid value fails fast BEFORE binding a port or spawning Godot. The runner
@@ -307,6 +311,7 @@ class GodotServeEnv:
         last_log = ""
         for attempt in range(SPAWN_RETRIES):
             self._log = tempfile.TemporaryFile(mode="w+b")
+            self._log_offset = 0        # fresh tee per attempt -> reset the read cursor
             self._proc = subprocess.Popen(argv, stdout=self._log, stderr=self._log,
                                           stdin=subprocess.DEVNULL, env=child_env)
             conn = self._accept_with_liveness(connect_timeout_s)
@@ -380,6 +385,16 @@ class GodotServeEnv:
             return "GODOT LOG: " + data[-2000:]
         except Exception:
             return ""
+
+    def _runtime_error_delta(self) -> list[dict]:
+        """Runtime/parse SCRIPT ERROR records emitted since the last step (an os.pread
+        tee delta). Monotonic offset -> successive steps never double-count one crash;
+        clean steps return []."""
+        text, self._log_offset = read_stderr_delta(self._log, self._log_offset)
+        errs = parse_runtime_errors(text)
+        if errs:
+            self.runtime_errors.extend(errs)
+        return errs
 
     # -- layout / observation ---------------------------------------------
     def _freeze_layout(self, frame: dict) -> None:
@@ -458,6 +473,12 @@ class GodotServeEnv:
             "n_latched": len(latched_now),
             "success": result == "success",
         }
+        # A runtime SCRIPT ERROR in the generated act() aborts the call silently (the
+        # wire error stays null); attach the parsed cause so a crashing game is visible
+        # rather than misreported. Only added when present -> clean steps are unchanged.
+        errs = self._runtime_error_delta()
+        if errs:
+            info["runtime_errors"] = errs
         return self._observe(frame), float(reward), terminated, truncated, info
 
     def close(self) -> None:

@@ -27,10 +27,122 @@ code), and only ever AFTER the python-side banned-API scan has passed.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import tempfile
 import time
+
+# ---------------------------------------------------------------------------
+# Runtime SCRIPT ERROR capture (ADOPT #1, notes/engines/MCP_FEEDBACK_TOOLS.md).
+#
+# A generated GDScript game that PARSES but CRASHES AT RUNTIME (a null deref in
+# act(), a build() that raises) is invisible to the repair loop today: GDScript
+# has no catchable exceptions, so serve_game.gd's `_game.act()` / `.build()` calls
+# silently abort and the wire keeps reporting `"error": null`; the funnel then sees
+# a MISLEADING downstream symptom ("no controlled body", a dead action). The engine
+# DOES print the truth to stderr, which all three spawners already tee to an
+# anonymous tempfile — read only on fatal aborts, then discarded. These helpers mine
+# that stream: a per-op DELTA read (never the whole log) that parses the SCRIPT ERROR
+# blocks into structured records the funnel/feedback compiler can name.
+#
+# Godot 4.7 runtime block (verified in-image, gdscript://<hash>.gd == the in-memory
+# game; its LINE numbers map 1:1 to the generated source):
+#     SCRIPT ERROR: Invalid access to property or key 'position' on a base object ...
+#               at: act (gdscript://-9223371885574610264.gd:6)
+#               GDScript backtrace (most recent call first):
+#                   [0] act (gdscript://-9223371885574610264.gd:6)
+#                   [1] _initialize (res://serve_game.gd:456)
+# A parse block (in-memory reload) instead reads `Parse Error: ...` at
+# `GDScript::reload (...)`.
+# ---------------------------------------------------------------------------
+_SCRIPT_ERROR_RE = re.compile(r"SCRIPT ERROR:\s*(.*)")
+# `at: <method> (<script>:<line>)` — script may be gdscript://… (colons in the URI)
+# or res://…, so the path is matched greedily up to the FINAL ':<digits>)'.
+_AT_RE = re.compile(r"\bat:\s*(?P<method>[^\s(]+)\s*\((?P<script>.+):(?P<line>\d+)\)")
+# `[N] <method> (<script>:<line>)` backtrace frame.
+_FRAME_RE = re.compile(r"\[\d+\]\s*(?P<method>[^\s(]+)\s*\((?P<script>.+):(?P<line>\d+)\)")
+# Trailing " at: method (script:line)" that Godot sometimes folds onto the message line.
+_AT_SUFFIX_RE = re.compile(r"\s*\bat:\s+\S+\s*\(.+:\d+\).*$")
+
+
+def parse_runtime_errors(text: str, max_records: int = 8) -> list[dict]:
+    """Extract Godot runtime/parse SCRIPT ERROR blocks from tee'd stderr text.
+
+    Returns structured records ``{message, line, method, kind, count}`` — ``kind`` is
+    ``"runtime"`` (a crash mid-call) or ``"parse"`` (an in-memory reload failure). The
+    reported ``line`` is the GAME frame's line (the first ``gdscript://`` frame in the
+    block, whose numbers map 1:1 to the generated .gd); if no game frame is present it
+    falls back to the innermost ``at:`` frame. Deduped by (message, line) — the FIRST N
+    unique blocks are kept, each with an occurrence ``count`` (a crash that fires every
+    tick collapses to one record). PURE + deterministic: identical text -> identical
+    records, so the same crash always yields the same record."""
+    if not text:
+        return []
+    lines = text.splitlines()
+    n = len(lines)
+    heads = [(i, m.group(1).strip())
+             for i, ln in enumerate(lines)
+             for m in (_SCRIPT_ERROR_RE.search(ln),) if m]
+    records: list[dict] = []
+    seen: dict = {}
+    for bi, (idx, raw_msg) in enumerate(heads):
+        end = heads[bi + 1][0] if bi + 1 < len(heads) else n
+        message = _AT_SUFFIX_RE.sub("", raw_msg).strip() or raw_msg
+        frames = []  # (method, script, line) in appearance order within the block
+        for k in range(idx, min(end, idx + 30)):
+            fm = _AT_RE.search(lines[k]) or _FRAME_RE.search(lines[k])
+            if fm:
+                frames.append((fm.group("method"), fm.group("script"),
+                               int(fm.group("line"))))
+        game = next((f for f in frames if "gdscript://" in f[1]), None)
+        chosen = game or (frames[0] if frames else None)
+        method = chosen[0] if chosen else None
+        line = chosen[2] if chosen else None
+        kind = ("parse" if message.lower().startswith("parse error")
+                or (method and "reload" in method.lower()) else "runtime")
+        key = (message, line)
+        if key in seen:
+            records[seen[key]]["count"] += 1
+            continue
+        seen[key] = len(records)
+        records.append({"message": message, "line": line, "method": method,
+                        "kind": kind, "count": 1})
+    return records[:max_records]
+
+
+def read_stderr_delta(log, offset: int) -> tuple[str, int]:
+    """Read the bytes appended to the tee'd ``log`` file since ``offset`` WITHOUT
+    disturbing the shared write position, and return ``(text, new_offset)``.
+
+    The child's stdout/stderr are ``dup2``'d onto ``log``'s open file description, so
+    parent and child SHARE one kernel file offset — a plain ``seek(0)+read()`` (what
+    ``_read_log`` does on the fatal path) would move that offset out from under the
+    still-writing child. ``os.pread`` does a POSITIONED read that leaves the offset
+    put; the current size (``fstat``) is the child's furthest sequential append, so
+    ``[offset, size)`` is exactly the new stderr. Read-only + Python-side: zero effect
+    on the wire, determinism, or a clean run (no SCRIPT ERROR -> empty parse)."""
+    if log is None:
+        return "", offset
+    try:
+        fd = log.fileno()
+        size = os.fstat(fd).st_size
+        if size <= offset:
+            return "", offset
+        data = os.pread(fd, size - offset, offset)
+        return data.decode("utf-8", "replace"), size
+    except Exception:
+        return "", offset
+
+
+def _runtime_error_summary(rec: dict) -> str:
+    """A one-line ``<method>() crashed at line N: <message>`` from a parsed record —
+    the human-readable reproducer the G0 build hint / runtime_error finding carry."""
+    method = rec.get("method") or "a game method"
+    line = rec.get("line")
+    where = f"line {line}" if line is not None else "an unknown line"
+    kind = "parse error" if rec.get("kind") == "parse" else "crashed"
+    return f"{method}() {kind} at {where}: {rec.get('message') or 'runtime script error'}"
 
 
 def _parse_error_line(check_only_output: str) -> str:
@@ -74,6 +186,10 @@ class GdExecutor:
         self._conn = None
         self._proc = None
         self._log = None
+        self._log_offset = 0            # our stderr read cursor (os.pread delta, not the
+                                        # shared write offset); advances monotonically so
+                                        # successive ops never re-report an earlier crash
+        self.runtime_errors: list[dict] = []   # accumulated across run_check + run_batch
         self._inited = False
 
     # -- lazy connect ------------------------------------------------------
@@ -116,6 +232,7 @@ class GdExecutor:
         last_log = ""
         for attempt in range(SPAWN_RETRIES):
             self._log = tempfile.TemporaryFile(mode="w+b")
+            self._log_offset = 0        # fresh tee per attempt -> reset the read cursor
             self._proc = subprocess.Popen(argv, stdout=self._log, stderr=self._log,
                                           stdin=subprocess.DEVNULL, env=child_env)
             conn = self._accept()
@@ -188,6 +305,17 @@ class GdExecutor:
         except Exception:
             return ""
 
+    def _capture_runtime_errors(self) -> list[dict]:
+        """Parse the stderr emitted since the last capture (an ``os.pread`` delta on the
+        tee'd fd — never the whole log, never the shared offset) and accumulate any
+        runtime/parse SCRIPT ERROR records. Returns just this op's new records; empty on
+        a clean op, so it is zero-overhead on healthy runs."""
+        text, self._log_offset = read_stderr_delta(self._log, self._log_offset)
+        errs = parse_runtime_errors(text)
+        if errs:
+            self.runtime_errors.extend(errs)
+        return errs
+
     # -- exchange ----------------------------------------------------------
     def _exchange(self, op: dict) -> dict:
         from harness.rl.godot_env import GodotServeError, _recv_frame, _send_frame
@@ -226,6 +354,20 @@ class GdExecutor:
         if facts.get("ok") is False and facts.get("error"):
             raise VerifyError("gd_check_fatal", str(facts["error"]))
         facts["load"] = load
+        # SURFACE ON THE WIRE (python-side): the check op builds at seed 0 and probes
+        # t=0; GDScript can't raise a catchable error, so serve_game.gd hardcodes
+        # build.ok=true even when build() crashed at runtime. Read the tee delta: a
+        # build-scoped crash must NOT report ok:true (it masquerades as "no controlled
+        # body"); other-method crashes attach as a runtime_error finding.
+        errs = self._capture_runtime_errors()
+        if errs:
+            facts["runtime_error"] = errs[0]
+            facts["runtime_errors"] = errs
+            build_crash = next((e for e in errs if (e.get("method") or "") == "build"),
+                               None)
+            if build_crash and (facts.get("build") or {}).get("ok"):
+                facts["build"] = {"ok": False,
+                                  "error": _runtime_error_summary(build_crash)}
         return facts
 
     def _check_only(self, game_source) -> dict:
@@ -291,7 +433,18 @@ class GdExecutor:
             if frames_every and int(frames_every) > 0:
                 act_msg["frames_every"] = int(frames_every)
             frame = self._exchange(act_msg)
-            out.append(self._rec_from_frame(frame, actions, max_ticks, escape_margin))
+            rec = self._rec_from_frame(frame, actions, max_ticks, escape_margin)
+            # Per-episode runtime crash capture: an act()/build() that raised aborted the
+            # call silently (the wire error stays null), so mine the tee delta and attach
+            # the real cause. Monotonic offset -> episode i never re-reports episode i-1's
+            # crash. Clean episodes add nothing (rec stays byte-identical to before).
+            errs = self._capture_runtime_errors()
+            if errs:
+                rec["runtime_error"] = errs[0]
+                rec["runtime_errors"] = errs
+                if not rec.get("error"):
+                    rec["error"] = _runtime_error_summary(errs[0])
+            out.append(rec)
         return out
 
     @staticmethod

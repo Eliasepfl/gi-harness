@@ -50,6 +50,7 @@ from harness.rl.godot_env import (
     CONNECT_TIMEOUT_S, DEFAULT_PORT_BASE, SERVE_TIMEOUT_S, SPAWN_RETRIES,
     SPAWN_RETRY_DELAY_S, GodotServeError, _recv_frame, _send_frame,
 )
+from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
 
 # --- One batched serve process (spawn/connect mirrors GodotServeEnv's seam) ----
@@ -165,6 +166,9 @@ def _batch_vec_env_cls():
             self._conn = None
             self._listener = None
             self._log = None
+            self._log_offset = 0        # os.pread cursor for the runtime SCRIPT ERROR
+                                        # delta (batched: interleaved -> run-level)
+            self.runtime_errors: list[dict] = []
             if int(n_instances) < 1:
                 raise ValueError(f"n_instances must be >= 1 (got {n_instances})")
 
@@ -276,6 +280,17 @@ def _batch_vec_env_cls():
             except Exception:
                 return ""
 
+        def _runtime_error_delta(self) -> list[dict]:
+            """Runtime/parse SCRIPT ERROR records emitted since the last step (an os.pread
+            tee delta). N worlds share one process, so their stderr interleaves -> these
+            are RUN-LEVEL diagnostics (no per-instance attribution). Monotonic offset ->
+            no double-counting; clean steps return []."""
+            text, self._log_offset = read_stderr_delta(self._log, self._log_offset)
+            errs = parse_runtime_errors(text)
+            if errs:
+                self.runtime_errors.extend(errs)
+            return errs
+
         # -- VecEnv API ----------------------------------------------------
         def reset(self):
             frame = self._exchange({"op": "reset",
@@ -385,6 +400,12 @@ def _batch_vec_env_cls():
                     obs[i] = self._obs_of(r_obs[i], latched, r_ticks[i])
                     self._ep_return[i] = 0.0
                     self._ep_len[i] = 0
+
+            # Run-level runtime SCRIPT ERROR capture (interleaved N worlds); attach to
+            # infos[0] only when present so a clean step's infos stay byte-identical.
+            errs = self._runtime_error_delta()
+            if errs and infos:
+                infos[0]["runtime_errors"] = errs
 
             return obs, rewards, dones, infos
 

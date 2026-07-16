@@ -905,6 +905,43 @@ def _hint_g0(checks: dict) -> str:
     return "static failure (G0)"
 
 
+def _runtime_error_finding(records) -> dict | None:
+    """The first RUNTIME-kind SCRIPT ERROR record (else the first record) as a report
+    finding, or ``None``. Runtime crashes are the ROOT cause the funnel would otherwise
+    misreport as a downstream symptom, so they take priority over a parse-kind record."""
+    records = list(records or [])
+    if not records:
+        return None
+    for r in records:
+        if r.get("kind") == "runtime":
+            return dict(r)
+    return dict(records[0])
+
+
+def _hint_runtime_error(rec: dict) -> str:
+    """A repair hint naming the exact crash site — surfaced INSTEAD of the misleading
+    downstream symptom ("no controlled body" / "dead action") a runtime crash causes."""
+    method = rec.get("method") or "a game method"
+    line = rec.get("line")
+    where = f"res://game.gd:{line}" if line is not None else "an unknown line"
+    verb = "hit a parse error" if rec.get("kind") == "parse" else "crashed"
+    return (f"your {method}() {verb} at {where}: "
+            f"{rec.get('message') or 'runtime script error'} — the engine aborted the "
+            f"call mid-episode (guard the null/uninitialised value). This is the ROOT "
+            f"cause behind any downstream symptom (dead action / missing body).")
+
+
+def _attach_runtime_error(report: dict, executor) -> dict:
+    """Additive: if the executor captured a runtime SCRIPT ERROR (build/act crash), add
+    a ``runtime_error`` finding to the report and override the hint to name the crash.
+    A no-op when nothing crashed, so a clean game's report keys/hint are untouched."""
+    rec = _runtime_error_finding(getattr(executor, "runtime_errors", None))
+    if rec:
+        report["runtime_error"] = rec
+        report["hint"] = _hint_runtime_error(rec)
+    return report
+
+
 def _hint_g1(checks: dict) -> str:
     if not checks.get("no_nan", {}).get("pass", True):
         return "numerical explosion (NaN) during the noop rollout"
@@ -1498,7 +1535,9 @@ def _verify_gdscript(source: str, report: dict) -> dict:
         if not g0["passed"]:
             report["failure_class"] = "ENV_ERROR"
             report["hint"] = _hint_g0(g0["checks"])
-            return report
+            # A build() that crashed at runtime failed the builds gate above with a
+            # downstream-looking symptom; name the real SCRIPT ERROR site instead.
+            return _attach_runtime_error(report, executor)
 
         actions = (facts.get("actions") or {}).get("values") or []
         declared = list(((facts.get("g2") or {}).get("checkpoints") or {}).get("keys", []))
@@ -1514,7 +1553,9 @@ def _verify_gdscript(source: str, report: dict) -> dict:
         if not g1["passed"]:
             report["failure_class"] = "ENV_ERROR"
             report["hint"] = _hint_g1(g1["checks"])
-            return report
+            # An act() that crashed at runtime made its action inert -> G1 reports a
+            # misleading "dead action"; name the real SCRIPT ERROR site instead.
+            return _attach_runtime_error(report, executor)
 
         # --- G2 ---
         g2 = run_g2_js((facts.get("g2") or {}))
