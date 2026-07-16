@@ -1,0 +1,29 @@
+===SMOKE===
+...                                                                      [100%]
+3 passed in 18.64s
+===AB===
+Traceback (most recent call last):
+  File "/home/enaha/GI/gi-harness/.claude/worktrees/agent-a563ad757573dd9a6/harness/rl/godot_env.py", line 205, in __init__
+    listener.bind(("127.0.0.1", self.port))
+OSError: [Errno 98] Address already in use
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/enaha/GI/gi-harness/.claude/worktrees/agent-a563ad757573dd9a6/scripts/stale_seek_ab.py", line 133, in <module>
+    main()
+  File "/home/enaha/GI/gi-harness/.claude/worktrees/agent-a563ad757573dd9a6/scripts/stale_seek_ab.py", line 123, in main
+    rows = bench(args.game, budget_steps=args.budget, horizon=args.horizon,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/enaha/GI/gi-harness/.claude/worktrees/agent-a563ad757573dd9a6/scripts/stale_seek_ab.py", line 91, in bench
+    trained = ss.train_stale_seeker(game_path, budget_steps=budget_steps, num_envs=2,
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/enaha/GI/gi-harness/.claude/worktrees/agent-a563ad757573dd9a6/harness/rl/stale_seek.py", line 453, in train_stale_seeker
+    probe = make_env()
+            ^^^^^^^^^^
+  File "/home/enaha/GI/gi-harness/.claude/worktrees/agent-a563ad757573dd9a6/harness/rl/stale_seek.py", line 446, in make_env
+    return GodotServeEnv(game_path, port_offset=next(_ports), horizon=horizon)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/enaha/GI/gi-harness/.claude/worktrees/agent-a563ad757573dd9a6/harness/rl/godot_env.py", line 208, in __init__
+    raise GodotServeError(
+harness.rl.godot_env.GodotServeError: port_in_use: cannot bind serve port 47000 (GIP_PORT_BASE base 47000 + offset 0): [Errno 98] Address already in use
