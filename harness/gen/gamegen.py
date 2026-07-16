@@ -256,8 +256,17 @@ def _first_user_msg(prompt, engine="py"):
         artifact = "GDScript game class (one .gd file)"
     else:
         artifact = "module"
+    # DIMENSION-NEUTRAL by design (2026-07-16): this line used to hardcode
+    # "2D physics game" — a stale py/js-era inheritance that overrode both the
+    # contract's "Dimension is YOURS" and even an explicit "3D" in the user
+    # prompt (long3d wave: 0/3 explicit-3D prompts produced 3D). The first
+    # user message must never re-bias what the contract deliberately leaves
+    # open. Explicit constraints in the seed (dimension, counts, mechanics)
+    # are the USER's design decisions — honoring them is fidelity, not anchoring.
     return (f'User prompt: "{prompt}"\n'
-            "Design an original 2D physics game for this prompt. Return the "
+            "Design an original physics game for this prompt. Honor every "
+            "explicit constraint the prompt states (its dimension, counts, "
+            "named mechanics); everything it leaves open is yours. Return the "
             f"DESIGN block, then exactly one ```{fence} {artifact} that follows the "
             "required format and every hard constraint.")
 
@@ -665,7 +674,20 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
     n = 0
     while True:
         n += 1
-        code, design = produce(feedback)
+        try:
+            code, design = produce(feedback)
+        except _BackendUnavailable as exc:
+            if not attempts:
+                raise          # backend never produced anything: dispatch-level semantics
+            # Mid-run backend death (e.g. a null-content 200 that survives the
+            # salvage on attempt 3/5) must NOT discard the attempt history: the
+            # earlier attempts + their verify reports are the run's real record
+            # (observed 2026-07-16: gen_0 reported attempts:[] with a1..a5 on
+            # disk). Preserve them under an honest ENV_ERROR.
+            verdict = "ENV_ERROR"
+            note = (note + "; " if note else "") + \
+                f"backend died mid-run on attempt {n}: {exc}"
+            break
         game_path = _write_attempt(run_dir, n, code, ext)
         report = _verify(game_path)
 
