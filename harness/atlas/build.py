@@ -183,7 +183,7 @@ def _games_root_of(game_paths):
 
 def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=False,
                 n_bins=6, ghost_globs=None, frontier_reports=None, games_root=None,
-                log=None):
+                complexity_panel=False, log=None):
     """Aggregate descriptors for ``games`` into ``out_dir/atlas.jsonl`` + ``atlas.svg``.
 
     Returns ``(rows, summary)`` where ``summary`` carries the coverage math + chosen axes.
@@ -294,7 +294,8 @@ def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=
     # --- render atlas.svg + coverage (coverage over certified rows only) ---
     svg_path = os.path.join(out_dir, "atlas.svg")
     summary = render_atlas(rows, svg_path, n_bins=n_bins,
-                           ghosts=ghost_rows, frontier=frontier_rows)
+                           ghosts=ghost_rows, frontier=frontier_rows,
+                           complexity_panel=complexity_panel)
     # persist a machine-readable summary next to the artifacts
     with open(os.path.join(out_dir, "atlas.summary.json"), "w", encoding="utf-8") as fh:
         json.dump({k: v for k, v in summary.items() if k != "svg"}, fh, indent=2,
@@ -364,13 +365,16 @@ def main(argv=None):
                          "(UNSOLVED-but-progressing games still present in the library)")
     ap.add_argument("--games-root", default=None,
                     help="games root dir gating the frontier (default: resolved library root)")
+    ap.add_argument("--complexity", action="store_true",
+                    help="add the opt-in L1 STRUCTURAL-COMPLEXITY strip to atlas.svg "
+                         "(additive; never changes the map axes)")
     args = ap.parse_args(argv)
 
     rows, summary = build_atlas(
         args.games, args.out, reports_glob=args.reports, do_facts=args.facts,
         do_verify=args.verify, n_bins=args.bins, ghost_globs=args.ghosts,
         frontier_reports=args.frontier, games_root=args.games_root,
-        log=lambda *a: print(*a))
+        complexity_panel=args.complexity, log=lambda *a: print(*a))
     _print_summary(rows, summary)
     print(f"wrote {os.path.join(args.out, 'atlas.jsonl')}")
     print(f"wrote {os.path.join(args.out, 'atlas.svg')}")

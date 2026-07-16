@@ -334,17 +334,20 @@ def _find_real_lib():
 
 @pytest.mark.skipif(_find_real_lib() is None,
                     reason="real gd-agentic-skills library not locatable")
-def test_real_library_recovers_unindexed_ai_navigation():
-    # The real library's index forgets 'godot-ai-navigation' (its dir + SKILL.md
-    # fully exist); the reconciled loader must recover it as a routable entry, and
-    # collapse the duplicated 'godot-navigation-pathfinding' to a single entry.
+def test_real_library_index_is_healthy_and_reconciled():
+    # Invariant on the real library after load_index reconciliation: every skill is
+    # routable, no duplicate names survive, and 'godot-ai-navigation' is present (the
+    # skill the broken index used to forget). The reconciliation is defence-in-depth —
+    # a no-op on a clean index — so this holds whether the fix lives in the data or the
+    # loader; the RECOVERY MECHANISM itself is proved by the synthetic-fixture test above.
     real = _find_real_lib()
     index = SC.load_index(real)
     names = [e["name"] for e in index]
     assert "godot-ai-navigation" in names
     assert names.count("godot-navigation-pathfinding") == 1
     assert len(names) == len(set(names))           # no duplicate names survive
-    assert SC._skill_body(real, "godot-ai-navigation")   # body resolves
+    # every reconciled entry resolves to a real body file
+    assert all(SC._skill_body(real, n) for n in names)
 
 
 # =========================================================================== #
