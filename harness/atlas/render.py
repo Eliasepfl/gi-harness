@@ -33,6 +33,10 @@ MUTED = "#8b949e"
 ACCENT = "#3fb950"           # green — 2D games / headline accent
 ACCENT_3D = "#58a6ff"        # blue — 3D games (a second hue, not a second accent)
 UNKNOWN = "#6e7681"          # grey — unknown dimension
+GHOST = "#d2a8ff"            # violet — GHOST reference games (hollow; geometry only)
+GHOST_WASH = "#1b1626"       # faint violet band behind the reference-geometry strip
+FRONTIER = "#f85149"         # red — OVER-BUDGET FRONTIER (hollow; unsolved-but-progressing)
+FRONTIER_WASH = "#2a1517"    # faint red band behind the frontier ring
 
 # Candidate numeric axes, in a FIXED tie-break priority (most behaviourally meaningful
 # first). Discrimination is measured on the data; ties fall back to this order.
@@ -289,8 +293,14 @@ def compute_grid(rows, x_key, y_key, n_bins=6):
 # ======================================================================== #
 # SVG rendering
 # ======================================================================== #
-_W, _H = 1080, 760
-_ML, _MR, _MT, _MB = 92, 300, 78, 92          # margins (right margin holds the legend)
+# The plot panel is the anchor; every band + the legend are laid out relative to it, and
+# the canvas grows to fit whichever optional bands (frontier ring / ghost strip) are shown.
+_PLOT_W, _PLOT_H = 760, 560
+_ML, _MT = 92, 84                 # left / top margin (title + optional frontier band above)
+_AXIS_AREA = 56                   # x-ticks + x-axis label below the plot
+_LEGEND_W = 300                   # right-margin legend column
+_FRONTIER_BAND_W = 82             # width of the off-map frontier ring (right of the plot)
+_GHOST_STRIP_H = 140              # height of the reference-geometry strip (below the plot)
 _FONT = "'SFMono-Regular','Consolas','Liberation Mono',monospace"
 
 
@@ -313,12 +323,140 @@ def _short_slug(slug, n=15):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def render_svg(rows, x_key, y_key, size_key, grid_info, scores):
+def _diamond(cx, cy, r, stroke, *, fill="none", width=2, opacity=1.0):
+    return (f'<polygon points="{cx:.1f},{cy - r:.1f} {cx + r:.1f},{cy:.1f} '
+            f'{cx:.1f},{cy + r:.1f} {cx - r:.1f},{cy:.1f}" fill="{fill}" '
+            f'stroke="{stroke}" stroke-width="{width}" stroke-opacity="{opacity}"/>')
+
+
+def _draw_frontier_band(S, frontier, px0, px1, pw, by0, bh):
+    """The OVER-BUDGET FRONTIER: a margin band above the map listing UNSOLVED-but-
+    progressing games as hollow red rings pinned at their last-known partial progress —
+    the honest edge of the certifiable-under-budget space."""
+    S.append(f'<rect x="{px0}" y="{by0:.1f}" width="{pw}" height="{bh:.1f}" '
+             f'fill="{FRONTIER_WASH}" stroke="{FRONTIER}" stroke-opacity="0.45" '
+             f'stroke-width="1" stroke-dasharray="4 3"/>')
+    S.append(f'<text x="{px0 + 10}" y="{by0 + 15:.1f}" fill="{FRONTIER}" font-size="11" '
+             f'font-weight="bold">OVER-BUDGET FRONTIER — unsolved, still progressing '
+             f'(beyond the tick / solver budget)</text>')
+    shown = sorted(frontier, key=lambda r: (-(r.get("progress") or {}).get(
+        "reached_fraction", 0.0), r.get("slug") or ""))[:6]
+    bar_x1 = px1 - 20
+    bar_x0 = px1 - 168
+    for i, fr in enumerate(shown):
+        ry = by0 + 30 + i * 16
+        prog = fr.get("progress") or {}
+        frac = float(prog.get("reached_fraction") or 0.0)
+        S.append(f'<circle cx="{px0 + 16:.1f}" cy="{ry - 4:.1f}" r="5.5" fill="none" '
+                 f'stroke="{FRONTIER}" stroke-width="2"/>')
+        slug = _short_slug(fr.get("slug"), 26)
+        lab = fr.get("label") or ""
+        S.append(f'<text x="{px0 + 30}" y="{ry:.1f}" fill="{TEXT}" font-size="9.5" '
+                 f'fill-opacity="0.9">{_esc(slug)}  {_esc(lab)}</text>')
+        # a tiny milestone-progress bar (fraction of milestones reached before budget ran out)
+        S.append(f'<rect x="{bar_x0}" y="{ry - 8:.1f}" width="{bar_x1 - bar_x0}" height="6" '
+                 f'fill="{PANEL}" stroke="{BORDER}" stroke-width="0.5"/>')
+        S.append(f'<rect x="{bar_x0}" y="{ry - 8:.1f}" '
+                 f'width="{max(0.0, min(1.0, frac)) * (bar_x1 - bar_x0):.1f}" height="6" '
+                 f'fill="{FRONTIER}" fill-opacity="0.75"/>')
+
+
+def _fmt_num(v):
+    if not isinstance(v, (int, float)):
+        return "—"
+    return f"{int(v)}" if float(v).is_integer() else f"{v:g}"
+
+
+def _draw_ghost_strip(S, rows, ghosts, px0, px1, pw, sy0, sh):
+    """The REFERENCE-GEOMETRY strip: a compact table of the human-authored demo games'
+    HONEST (geometry-only) descriptors, against a one-line summary of our library — so the
+    structural distance to the target quality bar is legible in numbers. Physics-body
+    counts OVERLAP (both a handful); the distance is the authored COMPOSITION layer
+    (dozens–hundreds of scene-graph nodes across many .tscn files) our procedural single
+    -file games have none of."""
+    S.append(f'<rect x="{px0}" y="{sy0:.1f}" width="{pw}" height="{sh:.1f}" '
+             f'fill="{GHOST_WASH}" stroke="{GHOST}" stroke-opacity="0.35" '
+             f'stroke-width="1" stroke-dasharray="4 3"/>')
+    S.append(f'<text x="{px0 + 10}" y="{sy0 + 15:.1f}" fill="{GHOST}" font-size="11" '
+             f'font-weight="bold">REFERENCE GEOMETRY — human-authored demos '
+             f'(godot_rl_agents), geometry only · behaviour axes uncomputable here</text>')
+    gdescs = [g for g in ghosts if isinstance(g.get("descriptors"), dict)]
+    gh_nodes = [g["descriptors"].get("n_nodes") for g in gdescs
+                if isinstance(g["descriptors"].get("n_nodes"), (int, float))]
+    lib_bodies = [v for v in _values(rows, "n_bodies") if v is not None]
+
+    # column x-anchors (monospace table)
+    cx_dia, cx_name = px0 + 18, px0 + 30
+    cx_dim, cx_bod, cx_nod, cx_scn, cx_ext = (px0 + 190, px0 + 232, px0 + 322,
+                                              px0 + 430, px0 + 520)
+    S.append(f'<text x="{cx_name}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold">game</text>'
+             f'<text x="{cx_dim}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold">dim</text>'
+             f'<text x="{cx_bod}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold">bodies</text>'
+             f'<text x="{cx_nod}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold">scene nodes</text>'
+             f'<text x="{cx_scn}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold">.tscn files</text>'
+             f'<text x="{cx_ext}" y="{sy0 + 30:.1f}" fill="{MUTED}" font-size="8.5" '
+             f'font-weight="bold">extent</text>')
+    rows_shown = sorted(gdescs, key=lambda g: -(g["descriptors"].get("n_nodes") or 0))[:6]
+    ry = sy0 + 44
+    for g in rows_shown:
+        d = g["descriptors"]
+        S.append(_diamond(cx_dia, ry - 3, 4.5, GHOST, width=1.6))
+        S.append(f'<text x="{cx_name}" y="{ry:.1f}" fill="{TEXT}" font-size="9">'
+                 f'{_esc(_short_slug(g.get("slug"), 20))}</text>')
+        S.append(f'<text x="{cx_dim}" y="{ry:.1f}" fill="{MUTED}" font-size="9">'
+                 f'{_esc(d.get("dimension") or "—")}</text>')
+        S.append(f'<text x="{cx_bod + 14}" y="{ry:.1f}" fill="{MUTED}" font-size="9" '
+                 f'text-anchor="end">{_fmt_num(d.get("n_bodies"))}</text>')
+        S.append(f'<text x="{cx_nod + 26}" y="{ry:.1f}" fill="{GHOST}" font-size="9" '
+                 f'text-anchor="end">{_fmt_num(d.get("n_nodes"))}</text>')
+        S.append(f'<text x="{cx_scn + 20}" y="{ry:.1f}" fill="{MUTED}" font-size="9" '
+                 f'text-anchor="end">{_fmt_num(d.get("n_scenes"))}</text>')
+        S.append(f'<text x="{cx_ext + 24}" y="{ry:.1f}" fill="{MUTED}" font-size="9" '
+                 f'text-anchor="end">{_fmt_num(d.get("world_extent"))}</text>')
+        ry += 13
+    # the distance line: our library, on the same two honest axes
+    lib_lo = min(lib_bodies) if lib_bodies else None
+    lib_hi = max(lib_bodies) if lib_bodies else None
+    if lib_bodies:
+        span = f"{lib_lo}–{lib_hi}" if lib_lo != lib_hi else f"{lib_lo}"
+        nodes_note = (f"references carry {min(gh_nodes)}–{max(gh_nodes)} authored nodes"
+                      if gh_nodes else "")
+        S.append(f'<text x="{px0 + 10}" y="{sy0 + sh - 8:.1f}" fill="{TEXT}" font-size="9" '
+                 f'fill-opacity="0.92">our library: {span} physics bodies/game '
+                 f'(n={len(lib_bodies)}) · single .gd script · 0 authored scene nodes'
+                 f'{("  —  " + nodes_note) if nodes_note else ""}</text>')
+    else:
+        S.append(f'<text x="{px0 + 10}" y="{sy0 + sh - 8:.1f}" fill="{MUTED}" font-size="9">'
+                 f'our library body counts need --facts / a G0 report; '
+                 f'references carry {min(gh_nodes) if gh_nodes else 0}–'
+                 f'{max(gh_nodes) if gh_nodes else 0} authored scene nodes</text>')
+
+
+def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, frontier=None):
+    ghosts = list(ghosts or [])
+    frontier = list(frontier or [])
+    has_gh, has_fr = bool(ghosts), bool(frontier)
     n_bins = grid_info["n_bins"]
     xb, yb = grid_info["xbounds"], grid_info["ybounds"]
-    px0, py0 = _ML, _MT
-    pw, ph = _W - _ML - _MR, _H - _MT - _MB
-    px1, py1 = px0 + pw, py0 + ph
+
+    # --- adaptive, plot-anchored layout (bands only reserve space when populated) ---
+    px0 = _ML
+    pw, ph = _PLOT_W, _PLOT_H
+    fr_band_y = 66
+    fr_band_h = (24 + min(len(frontier), 6) * 16) if has_fr else 0
+    py0 = (fr_band_y + fr_band_h + 14) if has_fr else _MT
+    py1 = py0 + ph
+    px1 = px0 + pw
+    gs_y = py1 + _AXIS_AREA + 8
+    gs_h = _GHOST_STRIP_H if has_gh else 0
+    legend_x = px1 + 26
+    W = legend_x + _LEGEND_W + 20
+    H = (gs_y + gs_h + 24) if has_gh else int(py1 + _AXIS_AREA + 24)
 
     def sx(x):
         return px0 + (x - xb[0]) / (xb[1] - xb[0]) * pw
@@ -331,15 +469,18 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores):
     s_hi = max(size_vals) if size_vals else 1.0
 
     S = []
-    S.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{_W}" height="{_H}" '
-             f'viewBox="0 0 {_W} {_H}" font-family="{_FONT}">')
-    S.append(f'<rect width="{_W}" height="{_H}" fill="{BG}"/>')
+    S.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+             f'viewBox="0 0 {W} {H}" font-family="{_FONT}">')
+    S.append(f'<rect width="{W}" height="{H}" fill="{BG}"/>')
     # Title + subtitle.
     S.append(f'<text x="{_ML}" y="34" fill="{TEXT}" font-size="21" '
              f'font-weight="bold">THE ATLAS — certified game-space</text>')
     S.append(f'<text x="{_ML}" y="56" fill="{MUTED}" font-size="12">'
              f'each point is a certified game; axes are its deterministic behaviour '
              f'descriptors; dark cells are unexplored territory</text>')
+    # Optional off-map frontier ring (above the plot).
+    if has_fr:
+        _draw_frontier_band(S, frontier, px0, px1, pw, fr_band_y, fr_band_h)
     # Plot panel.
     S.append(f'<rect x="{px0}" y="{py0}" width="{pw}" height="{ph}" fill="{PANEL}" '
              f'stroke="{BORDER}" stroke-width="1"/>')
@@ -373,7 +514,7 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores):
         gy = py1 - i * ch
         S.append(f'<text x="{px0 - 8}" y="{gy + 3:.1f}" fill="{MUTED}" font-size="10" '
                  f'text-anchor="end">{vy:.2g}</text>')
-    S.append(f'<text x="{px0 + pw / 2:.0f}" y="{_H - 40}" fill="{TEXT}" font-size="13" '
+    S.append(f'<text x="{px0 + pw / 2:.0f}" y="{py1 + 44:.0f}" fill="{TEXT}" font-size="13" '
              f'text-anchor="middle">{_esc(_AXIS_LABEL.get(x_key, x_key))} →</text>')
     S.append(f'<text x="26" y="{py0 + ph / 2:.0f}" fill="{TEXT}" font-size="13" '
              f'text-anchor="middle" transform="rotate(-90 26 {py0 + ph / 2:.0f})">'
@@ -400,39 +541,71 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores):
         if not slug:
             continue
         dy = -rad - 3 if (i % 2 == 0) else rad + 9   # stagger above / below
-        S.append(f'<text x="{cx + rad + 3:.1f}" y="{cy + dy:.1f}" fill="{TEXT}" '
-                 f'font-size="9" fill-opacity="0.88">{_esc(_short_slug(slug))}</text>')
+        # Keep labels inside the plot: right-align to the LEFT of points near the right edge.
+        if cx > px1 - 120:
+            S.append(f'<text x="{cx - rad - 3:.1f}" y="{cy + dy:.1f}" fill="{TEXT}" '
+                     f'font-size="9" fill-opacity="0.88" text-anchor="end">'
+                     f'{_esc(_short_slug(slug))}</text>')
+        else:
+            S.append(f'<text x="{cx + rad + 3:.1f}" y="{cy + dy:.1f}" fill="{TEXT}" '
+                     f'font-size="9" fill-opacity="0.88">{_esc(_short_slug(slug))}</text>')
 
-    # Legend / stats panel (right margin).
-    lx = px1 + 24
-    ly = py0 + 4
+    # Optional reference-geometry strip (below the plot).
+    if has_gh:
+        _draw_ghost_strip(S, rows, ghosts, px0, px1, pw, gs_y, gs_h)
+
+    # Legend / stats panel (right margin), laid out top-down with a running cursor.
+    lx = legend_x
     cov = grid_info["coverage"]
-    S.append(f'<text x="{lx}" y="{ly + 10}" fill="{TEXT}" font-size="13" '
+    yy = py0 + 14
+    S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="13" '
              f'font-weight="bold">COVERAGE</text>')
-    S.append(f'<text x="{lx}" y="{ly + 34}" fill="{ACCENT}" font-size="24" '
+    S.append(f'<text x="{lx}" y="{yy + 24}" fill="{ACCENT}" font-size="24" '
              f'font-weight="bold">{cov * 100:.0f}%</text>')
-    S.append(f'<text x="{lx}" y="{ly + 52}" fill="{MUTED}" font-size="10.5">'
+    S.append(f'<text x="{lx}" y="{yy + 42}" fill="{MUTED}" font-size="10.5">'
              f'{grid_info["n_colonized"]} / {grid_info["n_cells"]} cells colonised '
              f'({n_bins}×{n_bins} grid)</text>')
-    S.append(f'<text x="{lx}" y="{ly + 68}" fill="{MUTED}" font-size="10.5">'
+    S.append(f'<text x="{lx}" y="{yy + 58}" fill="{MUTED}" font-size="10.5">'
              f'{grid_info["n_placed"]} games placed, {grid_info["n_unplaced"]} off-map</text>')
+    if has_gh or has_fr:
+        S.append(f'<text x="{lx}" y="{yy + 74}" fill="{MUTED}" font-size="10.5">'
+                 f'coverage is over CERTIFIED games only</text>')
+    yy += 100
 
     # dimension legend
-    yy = ly + 100
     S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
-             f'font-weight="bold">dimension</text>')
+             f'font-weight="bold">dimension (certified)</text>')
     for i, (lab, col) in enumerate((("2D", ACCENT), ("3D", ACCENT_3D), ("?", UNKNOWN))):
         yc = yy + 18 + i * 17
         S.append(f'<circle cx="{lx + 6}" cy="{yc - 4}" r="5" fill="{col}"/>')
         S.append(f'<text x="{lx + 18}" y="{yc}" fill="{MUTED}" font-size="11">{lab}</text>')
+    yy += 18 + 3 * 17 + 14
+
+    # marker classes: the DISTINCT ghost + frontier classes (only when present)
+    if has_gh or has_fr:
+        S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
+                 f'font-weight="bold">marker classes</text>')
+        yy += 18
+        if has_gh:
+            S.append(_diamond(lx + 6, yy - 4, 5.5, GHOST, width=2))
+            S.append(f'<text x="{lx + 18}" y="{yy}" fill="{MUTED}" font-size="11">'
+                     f'reference (geometry only)</text>')
+            yy += 17
+        if has_fr:
+            S.append(f'<circle cx="{lx + 6}" cy="{yy - 4}" r="5" fill="none" '
+                     f'stroke="{FRONTIER}" stroke-width="2"/>')
+            S.append(f'<text x="{lx + 18}" y="{yy}" fill="{MUTED}" font-size="11">'
+                     f'over budget frontier</text>')
+            yy += 17
+        yy += 12
+
     if size_key:
-        yy2 = yy + 18 + 3 * 17 + 14
-        S.append(f'<text x="{lx}" y="{yy2}" fill="{TEXT}" font-size="12" '
+        S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
                  f'font-weight="bold">size = {_esc(_AXIS_SHORT.get(size_key, size_key))}</text>')
+        yy += 26
 
     # emptiest-region briefs
-    yb0 = yy + 18 + 3 * 17 + (46 if size_key else 20)
-    S.append(f'<text x="{lx}" y="{yb0}" fill="{TEXT}" font-size="12" '
+    S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
              f'font-weight="bold">emptiest frontiers</text>')
     seen = set()
     shown = 0
@@ -440,7 +613,7 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores):
         if cell["depth"] < 1 or cell["brief"] in seen:
             continue
         seen.add(cell["brief"])
-        yc = yb0 + 18 + shown * 15
+        yc = yy + 18 + shown * 15
         S.append(f'<text x="{lx}" y="{yc}" fill="{MUTED}" font-size="10">'
                  f'• {_esc(cell["brief"])}</text>')
         shown += 1
@@ -451,14 +624,21 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores):
     return "\n".join(S)
 
 
-def render_atlas(rows, out_svg_path=None, *, n_bins=6):
-    """The public entry point. Selects axes, computes the grid + coverage, renders the
-    SVG (written to ``out_svg_path`` if given), and returns a summary dict:
-    ``{axes, size_axis, coverage, n_cells, n_colonized, n_placed, n_unplaced,
-    empty_cells, axis_scores, svg}``."""
+def render_atlas(rows, out_svg_path=None, *, n_bins=6, ghosts=None, frontier=None):
+    """The public entry point. Selects axes, computes the grid + coverage over the
+    CERTIFIED ``rows``, renders the SVG (written to ``out_svg_path`` if given), and
+    returns a summary dict. ``ghosts`` (geometry-only reference games) and ``frontier``
+    (unsolved-but-progressing games) are OVERLAYS — they render as their own distinct
+    marker classes and never contribute to the coverage math.
+
+    Returns ``{axes, size_axis, coverage, n_cells, n_colonized, n_placed, n_unplaced,
+    n_ghosts, n_frontier, empty_cells, axis_scores, svg}``."""
+    ghosts = list(ghosts or [])
+    frontier = list(frontier or [])
     x_key, y_key, size_key, scores = select_axes(rows, n_bins=n_bins)
     grid_info = compute_grid(rows, x_key, y_key, n_bins=n_bins)
-    svg = render_svg(rows, x_key, y_key, size_key, grid_info, scores) if x_key and y_key else ""
+    svg = (render_svg(rows, x_key, y_key, size_key, grid_info, scores,
+                      ghosts=ghosts, frontier=frontier) if x_key and y_key else "")
     if out_svg_path and svg:
         with open(out_svg_path, "w", encoding="utf-8") as fh:
             fh.write(svg)
@@ -466,6 +646,7 @@ def render_atlas(rows, out_svg_path=None, *, n_bins=6):
             "coverage": grid_info["coverage"], "n_cells": grid_info["n_cells"],
             "n_colonized": grid_info["n_colonized"], "n_placed": grid_info["n_placed"],
             "n_unplaced": grid_info["n_unplaced"],
+            "n_ghosts": len(ghosts), "n_frontier": len(frontier),
             "empty_cells": grid_info["empty_cells"], "axis_scores": scores,
             "axis_labels": {"x": _AXIS_LABEL.get(x_key, x_key),
                             "y": _AXIS_LABEL.get(y_key, y_key)},

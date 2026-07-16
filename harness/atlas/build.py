@@ -27,6 +27,8 @@ import sys
 import time
 
 from harness.atlas.descriptors import DESCRIPTOR_KEYS, describe_game, slug_of
+from harness.atlas.ghosts import build_ghosts
+from harness.atlas.frontier import scan_frontier
 from harness.atlas.render import render_atlas
 
 _ATTEMPT_STEMS = {"a1", "a2", "a3", "a4", "a5"}
@@ -169,13 +171,30 @@ def fresh_verify(game_path):
 # ======================================================================== #
 # The build
 # ======================================================================== #
+def _games_root_of(game_paths):
+    """The ``scenes/games`` root shared by resolved game ``.gd`` paths (the parent of each
+    game's slug dir). Used to gate the frontier ring to games that still exist."""
+    for gp in game_paths:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(gp)))
+        if os.path.isdir(root):
+            return root
+    return None
+
+
 def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=False,
-                n_bins=6, log=None):
+                n_bins=6, ghost_globs=None, frontier_reports=None, games_root=None,
+                log=None):
     """Aggregate descriptors for ``games`` into ``out_dir/atlas.jsonl`` + ``atlas.svg``.
 
     Returns ``(rows, summary)`` where ``summary`` carries the coverage math + chosen axes.
     ``do_facts`` / ``do_verify`` gate the (in-image) engine calls; with both off the build
-    is pure over the report index + game sources (safe on a login node)."""
+    is pure over the report index + game sources (safe on a login node).
+
+    ``ghost_globs`` overlays human-authored REFERENCE games (geometry-only descriptors from
+    their ``.tscn`` sources). ``frontier_reports`` (a glob of ``gen_*.json``) overlays the
+    OVER-BUDGET FRONTIER: UNSOLVED-but-progressing games whose dirs still exist under
+    ``games_root`` (defaults to the resolved library root). Both are OVERLAYS — neither
+    affects the coverage math, which stays over the certified ``games`` only."""
     log = log or (lambda *a: None)
     os.makedirs(out_dir, exist_ok=True)
     game_paths = resolve_games(games)
@@ -240,15 +259,42 @@ def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=
         log(f"  {slug:44s} descriptors={n_present}/{len(DESCRIPTOR_KEYS)} "
             f"report={prov['report_verdict']} facts={prov['facts_source']}")
 
-    # --- emit atlas.jsonl ---
+    # --- overlays: GHOST references + OVER-BUDGET FRONTIER (do not affect coverage) ---
+    ghost_rows = build_ghosts(ghost_globs) if ghost_globs else []
+    for g in ghost_rows:
+        log(f"  [ghost]    {g['slug']:44s} "
+            f"dim={g['descriptors'].get('dimension')} "
+            f"nodes={g['descriptors'].get('n_nodes')} "
+            f"bodies={g['descriptors'].get('n_bodies')} "
+            f"scenes={g['descriptors'].get('n_scenes')}")
+    frontier_rows = []
+    if frontier_reports:
+        root = games_root or _games_root_of(game_paths)
+        frontier_rows = scan_frontier(frontier_reports, games_root=root)
+        for f in frontier_rows:
+            log(f"  [frontier] {f['slug']:44s} {f['label']}")
+
+    # A library game that lands in the frontier ring is represented THERE (unsolved,
+    # over budget), not as a certified point — each game appears in exactly one class.
+    frontier_slugs = {f["slug"] for f in frontier_rows}
+    if frontier_slugs:
+        before = len(rows)
+        rows = [r for r in rows if r["slug"] not in frontier_slugs]
+        if before != len(rows):
+            log(f"  (moved {before - len(rows)} unsolved library game(s) to the frontier ring)")
+
+    # --- emit atlas.jsonl (certified rows + tagged overlays) ---
+    for row in rows:
+        row.setdefault("kind", "certified")
     jsonl_path = os.path.join(out_dir, "atlas.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as fh:
-        for row in rows:
+        for row in rows + ghost_rows + frontier_rows:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
 
-    # --- render atlas.svg + coverage ---
+    # --- render atlas.svg + coverage (coverage over certified rows only) ---
     svg_path = os.path.join(out_dir, "atlas.svg")
-    summary = render_atlas(rows, svg_path, n_bins=n_bins)
+    summary = render_atlas(rows, svg_path, n_bins=n_bins,
+                           ghosts=ghost_rows, frontier=frontier_rows)
     # persist a machine-readable summary next to the artifacts
     with open(os.path.join(out_dir, "atlas.summary.json"), "w", encoding="utf-8") as fh:
         json.dump({k: v for k, v in summary.items() if k != "svg"}, fh, indent=2,
@@ -278,6 +324,10 @@ def _print_summary(rows, summary):
     print(f"axes: X = {x}   Y = {y}   size = {summary['size_axis']}")
     print(f"COVERAGE: {summary['coverage'] * 100:.1f}%  "
           f"({summary['n_colonized']}/{summary['n_cells']} cells colonised)")
+    if summary.get("n_ghosts") or summary.get("n_frontier"):
+        print(f"overlays: {summary.get('n_ghosts', 0)} ghost references, "
+              f"{summary.get('n_frontier', 0)} over-budget frontier "
+              f"(neither counted toward coverage)")
     print("emptiest frontiers (candidate generation targets):")
     seen = set()
     shown = 0
@@ -306,11 +356,21 @@ def main(argv=None):
     ap.add_argument("--verify", action="store_true",
                     help="fresh-verify games with no indexed report (ENGINE; in-image only)")
     ap.add_argument("--bins", type=int, default=6, help="grid bins per axis (default 6)")
+    ap.add_argument("--ghosts", nargs="*", default=None,
+                    help="dirs/globs of human-authored REFERENCE game dirs (geometry-only "
+                         "overlay from their .tscn sources; never affects coverage)")
+    ap.add_argument("--frontier", nargs="*", default=None,
+                    help="glob(s) of gen_*.json to scan for the OVER-BUDGET FRONTIER "
+                         "(UNSOLVED-but-progressing games still present in the library)")
+    ap.add_argument("--games-root", default=None,
+                    help="games root dir gating the frontier (default: resolved library root)")
     args = ap.parse_args(argv)
 
     rows, summary = build_atlas(
         args.games, args.out, reports_glob=args.reports, do_facts=args.facts,
-        do_verify=args.verify, n_bins=args.bins, log=lambda *a: print(*a))
+        do_verify=args.verify, n_bins=args.bins, ghost_globs=args.ghosts,
+        frontier_reports=args.frontier, games_root=args.games_root,
+        log=lambda *a: print(*a))
     _print_summary(rows, summary)
     print(f"wrote {os.path.join(args.out, 'atlas.jsonl')}")
     print(f"wrote {os.path.join(args.out, 'atlas.svg')}")

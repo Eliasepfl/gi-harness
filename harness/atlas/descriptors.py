@@ -241,6 +241,24 @@ def _body_counts(facts):
             "n_static": n_static, "n_dynamic": n_dyn}
 
 
+def _report_body_counts(report):
+    """A total body count (and controlled count) straight from the G0 static report —
+    the honest, engine-free fallback when t=0 facts are absent. ``G0_static.counts.n`` is
+    the number of t=0 bodies the funnel already counted; ``controlled`` lists the
+    controlled bodies. Returns ``(n_bodies|None, n_controlled|None)``."""
+    g0 = _layer_checks(report, "G0_static")
+    n_bodies = None
+    cnt = g0.get("counts")
+    if isinstance(cnt, dict) and isinstance(cnt.get("n"), (int, float)) \
+            and not isinstance(cnt.get("n"), bool):
+        n_bodies = int(cnt["n"])
+    n_ctrl = None
+    ctrl = g0.get("controlled")
+    if isinstance(ctrl, dict) and isinstance(ctrl.get("controlled"), list):
+        n_ctrl = len(ctrl["controlled"])
+    return n_bodies, n_ctrl
+
+
 def _space_util(report, facts):
     """The space-utilisation ratio, preferring a FRESH compute from t=0 facts (reusing
     the on-main ``reachability.space_utilization``) and falling back to the report's
@@ -327,6 +345,16 @@ def describe_game(game_path, verify_report=None, extras=None) -> dict:
 
     lin, meas, dead, su_dims = _space_util(report, facts)
     counts = _body_counts(facts) or {}
+    # Engine-free fallback: when there are no t=0 facts to classify bodies, the G0 static
+    # report still carries a total body count (and the controlled bodies) — enough for the
+    # geometry comparison, with the per-class splits left None.
+    n_bodies = counts.get("n_bodies")
+    n_controlled = counts.get("n_controlled")
+    if n_bodies is None:
+        rep_bodies, rep_ctrl = _report_body_counts(report)
+        n_bodies = rep_bodies
+        if n_controlled is None:
+            n_controlled = rep_ctrl
 
     row = {
         "dimension": _dimension(report, facts, game_path, su_dims),
@@ -342,8 +370,8 @@ def describe_game(game_path, verify_report=None, extras=None) -> dict:
         "pressure_class": _pressure_class(report),
         "has_failure_witness": _has_failure_witness(report),
         "n_checkpoints": _n_checkpoints(report),
-        "n_bodies": counts.get("n_bodies"),
-        "n_controlled": counts.get("n_controlled"),
+        "n_bodies": n_bodies,
+        "n_controlled": n_controlled,
         "n_static": counts.get("n_static"),
         "n_sensor": counts.get("n_sensor"),
         "n_dynamic": counts.get("n_dynamic"),
