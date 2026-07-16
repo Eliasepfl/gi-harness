@@ -143,3 +143,120 @@ at `harness/rl/env.py:113` (`px, py = q.get("pos", (0.0, 0.0))`) — the true-3D
   cheap (fresh policies; budgets are 100k–2M). Tests: `test_gd_wiggle`, obs-layout unit tests. ~½ day incl. tests.
 - **`hidden=256`:** zero code — one kwarg; a screen job. Adopt/revert on the bench number.
 - **LSTM:** image rebuild (`sb3-contrib`) — do **not** pay this without a partial-observability game that needs it.
+
+---
+
+## 6. IMPLEMENTATION — dimension-aware OBS shipped (2026-07-16)
+
+The recommendation in §5.1 is implemented: **OBS changed, net untouched.** The
+`px, py = q.get("pos")` crash is gone; true-3D games now train. Branch
+`worktree-agent-aa45db2b12e51d933`, commits `87d66ba` (obs + unit tests),
+`7d056f7` (in-image 3D regression tests).
+
+### 6.1 The exact 3D layout (the frozen vector)
+Dimension is detected from the **first frame's `pos` arity** and **PINNED** for the
+game's lifetime (a mid-run arity flip raises a clear `AssertionError`, not the old
+silent unpack crash). Two layouts, dimension-selected:
+
+**2D — `PER_BODY_2D = 10`, byte-for-byte the legacy vector (regression-pinned):**
+```
+[present, x/W, y/H, vx/VS, vy/VS, sin(angle), cos(angle), is_static, is_sensor, is_controlled]
+```
+
+**3D — `PER_BODY_3D = 14` floats/body:**
+```
+[present, x/W, y/H, z/D, vx/VS, vy/VS, vz/VS, qx, qy, qz, qw, is_static, is_sensor, is_controlled]
+```
+then a **fixed 16-float egocentric block** (`EGO_BLOCK_3D`), then the shared tail:
+```
+per-body block (N·14)
+  + [ K=3 × (present, dx/W, dy/H, dz/D) ]   # nearest non-controlled bodies, rel. to controlled
+  + [ present, dx/W, dy/H, dz/D ]           # next-UNLATCHED-checkpoint target, rel. to controlled
+  + latched-checkpoint one-hot (C)
+  + normalized tick (1)
+```
+So `obs_dim = N·14 + 16 + C + 1` (e.g. a_3d_game_fly: 6 bodies, 5 cp → 6·14+16+5+1 = **106**;
+tumble_3d: 13 bodies, 1 cp → **200**). Sizing is one function, `env.obs_dim_for(N, C, dim)`,
+shared by all three `_freeze_layout`s.
+
+- **Depth `D`** = `world_size[2]` if the wire ever declares it, else `max(W, H)` — the serve
+  handshake currently ships a 2-tuple world box only, so z is normalized isotropically.
+- **Orientation = a canonical unit quaternion** (chosen over basis vectors): minimal complete
+  rotation (4 floats vs 6), already bounded in [-1,1] so it needs no extent scale, **NaN-safe**
+  (any non-finite → identity), and **sign-canonicalized `w≥0`** so one orientation has exactly
+  one encoding (kills the q/-q double cover → stable, learnable). Sourced, with **no new wire
+  field**: an explicit body `quat` [x,y,z,w] if a game emits one (forward-compatible — picked up
+  at zero layout change), else a **yaw-about-Y** quaternion from the scalar `angle` games emit
+  today (`q = [0, sin(a/2), 0, cos(a/2)]`, faithful to Godot `rotation.y`/`euler().y`).
+- **Egocentric hints — the cheap learnability win, 3D-only** (2D stays byte-identical so trained
+  2D models/tests are untouched). The next-checkpoint target is inferred **honestly, from data
+  already in the frame**: a non-controlled body whose name is associated (case-insensitive
+  substring, either direction) with the first *unlatched* checkpoint key — which on
+  **a_3d_game_fly fires for real** (`ring_2` ← `threaded_ring_2` → the glider gets a vector to
+  the next ring to thread), else the nearest non-controlled **sensor** body, else a zero (present
+  bit off) when nothing is inferable (mini_collect_3d/tumble_3d → the K-nearest block still
+  carries the goal directions).
+
+### 6.2 fingerprint_from_obs (stale_seek) compat
+Kept working and made faithful: `fingerprint_from_obs(obs, body_order, world_size, dim=2)` now
+inverts the pinned layout. The 2D path is unchanged (same `statetree.fingerprint` tuple shape,
+so the existing 2D freeze/motion tests hold). The 3D path returns an extended per-body tuple
+`(name, x, y, z, vx, vy, vz, qx, qy, qz, qw)` at the same `FP_DECIMALS` — a **strictly more
+faithful** freeze test that also catches pure z-motion and rotation the 2D digest drops.
+`fp_delta` is arity-generic and these fingerprints are only ever compared to each other, so the
+wider tuple is safe. Float32-resolution property preserved (~1e-4 px reconstructed ≪ EFFICACY_EPS
+1e-3). `dim` is threaded from the env (`_dim`) through `StaleSeekEnv` and the batched vec wrapper;
+stubs default to 2 → the whole stale-seek suite is unchanged. The shared DETECT constants
+(`EFFICACY_EPS`, `STUCK_WINDOW`, `STUCK_MOVE_MIN`) are still imported, never re-hardcoded.
+
+### 6.3 Model migration
+Old saved SB3 `.zip` policies are **shape-incompatible on 3D games** — but that is a non-event:
+those games *crashed at the obs builder before the first step*, so no 3D policy was ever trained.
+2D models are byte-compatible (2D vector unchanged). No migration; retrain (budgets 100k–2M, cheap).
+SB3 raises a clear shape error on a mismatched `.load` (the load path lives in
+`certify.py`/`sb3_trainer.py`, a concurrent agent's files — left untouched).
+
+### 6.4 Verification
+- **2D no-regression (byte-identity):** `build_obs_vector(dim=2)` reproduces a frozen,
+  independent transcription of the pre-3D builder **byte-for-byte** on a mixed 2D state
+  (present + removed body, latched + unlatched cps) — `test_2d_obs_is_byte_for_byte_the_legacy_layout`.
+  `tests/test_rl_env.py` + `tests/test_stale_seek.py`: **42 passed** (local, conda godot-rl);
+  `tests/test_adversary.py`: **22 passed** — adversary detection untouched (it fingerprints the
+  raw serve snapshot, not the obs).
+- **Unit coverage added:** exact 3D layout, quaternion (yaw + explicit-field + canonicalization),
+  the dimension-pin assert (both directions), NaN-safety, egocentric nearest-K (sort + pad) and
+  the checkpoint hint (first-unlatched / name-match / sensor-fallback / none-inferable), plus
+  3D-fingerprint depth+rotation+topology detection.
+- **In-image (gi-certifier.sif, speedup 8):** a true-3D `tumble_3d` env constructs at **dim=3,
+  obs_dim=200**, reset+step all-finite, **no pos-unpack crash** (the exact `env.py:113` failure
+  the §3 `crash3d` job hit). Committed regression tests
+  `test_gd_serve_env_true_3d_loads_and_steps` + `test_g3_prime_true_3d_trains_without_obs_crash`.
+
+### 6.5 First true-3D training result — a_3d_game_fly
+g3_prime, num_envs=8, speedup=8, in-image (gi-certifier.sif), mit_preemptable, job 18070646.
+**Every arm `ok=True` — the `env.py:113` crash is gone; true-3D games TRAIN.**
+
+| Game | dim | obs_dim | trained steps | first latch @upd | peak mean latch | greedy / stoch SR | eval latch rate | verdict |
+|---|---|---|---|---|---|---|---|---|
+| **a_3d_game_fly** (true-3D) | 3 | **106** | 98,312 (plateau-stop) | 1 (~2k steps) | **0.5 rings** | 0.0 / 0.0 | all rings 0.0 (greedy) | **TRAINS** — first true-3D training ever; partial (threads rings mid-training), plateaus w/o all-5 → difficulty/budget, not a crash |
+| **tumble_3d** (true-3D, the §3 `crash3d` game) | 3 | **200** | 40,960 | 0 | 1.0 | 0.0 / 0.0 | `touched_down` **1.0** | **TRAINS** — the exact ValueError@113 arm now runs; latches the floor-contact cp 100%; un-winnable by design (is_success≡false) |
+| **mini_collect** (2D parity) | 2 | **33** | 24,576 | 1 | 2.0 | 0.0 / 0.0 | `got_first` **0.594** | **PARITY** — 2D layout (10/body, no ego block); trains as before, reached success @step 1048, learns goal-1 (the goal-2 reversal is the hard part, unchanged) |
+
+Reading it: **a_3d_game_fly**, which raised `ValueError: too many values to unpack` at
+`env.py:113` *before the first learning step* (§3 `crash3d`/the bench's true-3D arms), now
+trains a full ~98k-step PPO run over the 106-float 3D obs, threading rings during training
+(peak mean 0.5). It plateaus below full success (all 5 rings) at 120k and early-stops — the
+correct *"route unsolved-but-not-a-crash to the difficulty tuner / more budget"* behavior of
+§5.3, **not** an architecture or obs failure. The greedy eval latch rate is 0 while training
+peaked at 0.5 because these games are deterministic (§3: greedy is binary; the graded signal
+is stochastic) and full ring-threading is genuinely hard at this budget. **mini_collect's
+obs_dim=33** (3·10 + 2 + 1) confirms the 2D path is the untouched legacy layout — 2D parity holds.
+
+### 6.6 Files
+- `harness/rl/env.py` — dimension-aware `build_obs_vector` (+ `_build_obs_2d`/`_build_obs_3d`,
+  `_orientation_quat`, egocentric helpers, `detect_dim`/`obs_dim_for`/`per_body_width`); PlanckEnv
+  `_freeze_layout`/`_observe` pin+pass `_dim`. `PER_BODY` kept as a 2D alias for importers.
+- `harness/rl/godot_env.py`, `harness/rl/godot_vec_env.py` — `_freeze_layout` detect+pin `_dim`,
+  size via `obs_dim_for`, `_observe`/`_obs_of` pass `dim` (obs plumbing only).
+- `harness/rl/stale_seek.py` — `fingerprint_from_obs` 3D inversion + `dim` threading (compat only).
+- `tests/test_rl_env.py`, `tests/test_stale_seek.py`, `tests/test_gd_rl.py` — unit + in-image.
