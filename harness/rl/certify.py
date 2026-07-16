@@ -482,13 +482,31 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # lives until after eval (we reload from it), then is cleaned in the finally.
     import tempfile
     _best_dir = None
+    _eval_probe_env = None
     if best_checkpoint and trainer != "vendored":
         _best_dir = tempfile.mkdtemp(prefix="g3_bestckpt_")
         method_kw["best_model_path"] = os.path.join(_best_dir, "best_policy.zip")
+        # Dedicated eval env for the periodic best-checkpoint GREEDY eval. Created BEFORE the
+        # trainer builds its (batch/shard) venv so it takes a LOWER loopback offset, disjoint
+        # from the training env's port band (the shard cluster reserves a contiguous higher
+        # block). Stepped only inside the callback (single-threaded), closed after training.
+        _eval_probe_env = make_env()
+        _n_pg, _n_ps = 8, 4
+
+        def _eval_fn(model):
+            g = [trainer_mod.greedy_episode(_eval_probe_env, model, seed=s) for s in range(_n_pg)]
+            st = [trainer_mod.sample_episode(_eval_probe_env, model, seed=s, torch_seed=2000 + s)
+                  for s in range(_n_ps)]
+            return {"greedy_sr": sum(1 for e in g if e["success"]) / float(_n_pg),
+                    "stochastic_sr": sum(1 for e in st if e["success"]) / float(_n_ps)}
+
+        method_kw["eval_fn"] = _eval_fn
     train_res = trainer_mod.train(make_env, obs_dim, n_actions,
                                   total_steps=budget_steps, seed=seed, log=log,
                                   wall_clock_budget_s=wall_clock_budget_s,
                                   **method_kw, **train_kwargs)
+    if _eval_probe_env is not None:
+        _eval_probe_env.close()
     agent = train_res["agent"]
 
     # BEST-CHECKPOINT: the policy we certify is the best-by-success snapshot the trainer saved
@@ -655,7 +673,8 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         #     record whether one was used, when, and how the LAST (final) policy compared ---
         "used_best_checkpoint": used_best_checkpoint,
         "best_ckpt_update": train_res.get("best_ckpt_update"),
-        "best_ckpt_success_train": train_res.get("best_ckpt_success"),
+        "best_ckpt_greedy_train": train_res.get("best_ckpt_greedy_sr"),    # eval greedy at snapshot
+        "best_ckpt_stochastic_train": train_res.get("best_ckpt_stochastic_sr"),
         "last_greedy_sr": last_greedy_sr,              # final policy greedy SR (best-vs-last)
         "last_stochastic_sr": last_stochastic_sr,      # final policy stochastic SR
         "reload_parity_ok": reload_parity_ok,          # in-memory eval == from-disk reload eval
