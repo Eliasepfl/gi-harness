@@ -70,8 +70,8 @@ import time
 import numpy as np
 
 from harness.rl.env import (
-    OBS_CLIP, PER_BODY, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
-    Box, Discrete, build_obs_vector,
+    OBS_CLIP, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
+    Box, Discrete, build_obs_vector, detect_dim, obs_dim_for,
 )
 from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
@@ -256,6 +256,7 @@ class GodotServeEnv:
         # Layout is frozen from the init frame (the priming seed-0 build).
         self._body_order: list[str] | None = None
         self._cp_keys: list[str] | None = None
+        self._dim: int = 2                          # pinned in _freeze_layout (2 or 3)
         self.action_space = Discrete(len(self.actions))
         self.observation_space: Box | None = None
         self._freeze_layout(ready)
@@ -404,7 +405,8 @@ class GodotServeEnv:
         # Controlled body first (LLM_RL_SYSTEMS §4.1), then the rest sorted by name.
         self._body_order = list(controlled) + others
         self._cp_keys = list((frame.get("checkpoints") or {}).keys())
-        obs_dim = len(self._body_order) * PER_BODY + len(self._cp_keys) + 1
+        self._dim = detect_dim(obs_state)               # 2D vs true-3D, then PINNED
+        obs_dim = obs_dim_for(len(self._body_order), len(self._cp_keys), self._dim)
         self.observation_space = Box(-OBS_CLIP, OBS_CLIP, (obs_dim,))
 
     def _observe(self, frame: dict) -> np.ndarray:
@@ -413,7 +415,7 @@ class GodotServeEnv:
         return build_obs_vector(
             frame.get("obs_state", {}), frame.get("checkpoints") or {},
             self._body_order, self._cp_keys, self.world_size, self._tick,
-            self.horizon)
+            self.horizon, dim=self._dim)
 
     @staticmethod
     def _latched_set(frame: dict) -> set[str]:

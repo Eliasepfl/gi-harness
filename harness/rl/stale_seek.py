@@ -59,11 +59,11 @@ import numpy as np
 # (Elias directive: a body that never moved is a non-starter, not a soft-lock).
 from harness.verify.gameverify import EFFICACY_EPS
 from harness.verify.g4 import STUCK_WINDOW, STUCK_MOVE_MIN, PROBE_HORIZON
-from harness.core.statetree import fingerprint, fp_delta
+from harness.core.statetree import fingerprint, fp_delta, FP_DECIMALS_DEFAULT
 
 # Obs-layout constants — the reward reads state through the SAME obs vector the
 # policy sees, so the freeze test rides the env's own observation (no side channel).
-from harness.rl.env import PER_BODY, VEL_SCALE
+from harness.rl.env import PER_BODY_2D, PER_BODY_3D, VEL_SCALE, _world_extents
 
 __all__ = [
     "SeekParams", "StaleSeekReward", "fingerprint_from_obs",
@@ -261,31 +261,58 @@ class StaleSeekReward:
 # ======================================================================== #
 # Fingerprint from the observation vector.
 # ======================================================================== #
-def fingerprint_from_obs(obs, body_order, world_size) -> tuple:
-    """Reconstruct a :func:`statetree.fingerprint` from the SAME obs vector the policy
-    sees — so the reward's freeze test uses the env's own observation, no side channel
-    into the serve process.
+def fingerprint_from_obs(obs, body_order, world_size, dim: int = 2) -> tuple:
+    """Reconstruct a state fingerprint from the SAME obs vector the policy sees — so
+    the reward's freeze test uses the env's own observation, no side channel into the
+    serve process. ``dim`` is the env's PINNED layout dimension (2 or 3).
 
     ``build_obs_vector`` normalises pos by world-size, vel by ``VEL_SCALE`` and encodes
-    angle as (sin, cos); we invert that per present body. The mapping is monotonic and
-    float32 resolution (~5e-5 px reconstructed) is far finer than ``EFFICACY_EPS`` (1e-3),
-    so the freeze decision is faithful: an identical state yields a byte-identical obs
-    and hence ``fp_delta == 0``; any move above the threshold shows up above it.
-    A body absent from the obs (present-bit 0) is OMITTED, so a topology change makes
-    ``fp_delta`` infinite exactly as the raw-snapshot path would."""
-    w, h = world_size
+    orientation as (sin,cos) [2D] or a unit quaternion [3D]; we invert that per present
+    body. The mapping is monotonic and float32 resolution (~5e-5 px reconstructed) is
+    far finer than ``EFFICACY_EPS`` (1e-3), so the freeze decision is faithful: an
+    identical state yields a byte-identical obs and hence ``fp_delta == 0``; any move
+    above the threshold shows up above it. A body absent from the obs (present-bit 0)
+    is OMITTED, so a topology change makes ``fp_delta`` infinite exactly as the raw
+    snapshot path would.
+
+    2D returns the SAME tuple shape as :func:`statetree.fingerprint`. 3D returns an
+    extended per-body tuple ``(name, x, y, z, vx, vy, vz, qx, qy, qz, qw)`` (rounded
+    to the same decimals): fingerprints from this function are only ever compared to
+    one another via :func:`fp_delta` (which is arity-generic), so the wider tuple is
+    a strictly MORE faithful freeze test — it also catches pure z-motion and rotation
+    the 2D digest drops."""
+    w, h, d = _world_extents(world_size)
     obs = np.asarray(obs, dtype=np.float64).reshape(-1)
+    if int(dim) == 3:
+        out = []
+        i = 0
+        for name in body_order:
+            if obs[i + 0] >= 0.5:                      # present bit
+                dec = FP_DECIMALS_DEFAULT
+                out.append((
+                    str(name),
+                    round(float(obs[i + 1]) * w, dec),
+                    round(float(obs[i + 2]) * h, dec),
+                    round(float(obs[i + 3]) * d, dec),
+                    round(float(obs[i + 4]) * VEL_SCALE, dec),
+                    round(float(obs[i + 5]) * VEL_SCALE, dec),
+                    round(float(obs[i + 6]) * VEL_SCALE, dec),
+                    round(float(obs[i + 7]), dec), round(float(obs[i + 8]), dec),
+                    round(float(obs[i + 9]), dec), round(float(obs[i + 10]), dec),
+                ))
+            i += PER_BODY_3D
+        return tuple(sorted(out))
     snap: dict = {}
     i = 0
     for name in body_order:
         if obs[i + 0] >= 0.5:                          # present bit
-            px = float(obs[i + 1]) * float(w)
-            py = float(obs[i + 2]) * float(h)
+            px = float(obs[i + 1]) * w
+            py = float(obs[i + 2]) * h
             vx = float(obs[i + 3]) * VEL_SCALE
             vy = float(obs[i + 4]) * VEL_SCALE
             angle = math.atan2(float(obs[i + 5]), float(obs[i + 6]))
             snap[str(name)] = {"pos": (px, py), "vel": (vx, vy), "angle": angle}
-        i += PER_BODY
+        i += PER_BODY_2D
     return fingerprint(snap)
 
 
@@ -312,6 +339,7 @@ class StaleSeekEnv:
         self.action_space = env.action_space
         self._body_order = list(env._body_order)
         self.world_size = tuple(env.world_size)
+        self._dim = int(getattr(env, "_dim", 2))    # env's pinned obs dimension
         p = params or SeekParams()
         # Inherit the env's real horizon into the decay ramp unless the caller pinned one.
         if params is None:
@@ -334,7 +362,8 @@ class StaleSeekEnv:
         obs, info = self.env.reset(seed=seed)
         self._seed = int(seed)
         self.reward.reset()
-        self._prev_fp = fingerprint_from_obs(obs, self._body_order, self.world_size)
+        self._prev_fp = fingerprint_from_obs(obs, self._body_order, self.world_size,
+                                             dim=self._dim)
         self._prev_nlatched = _n_latched(info)
         self._hist = []
         self._tick = 0
@@ -344,7 +373,8 @@ class StaleSeekEnv:
         obs, _r, terminated, truncated, info = self.env.step(action_idx)
         self._hist.append(self.actions[int(action_idx)])
         self._tick = int(info.get("tick", self._tick + 1))
-        cur_fp = fingerprint_from_obs(obs, self._body_order, self.world_size)
+        cur_fp = fingerprint_from_obs(obs, self._body_order, self.world_size,
+                                      dim=self._dim)
         n_latched = _n_latched(info)
         new_latch = n_latched > self._prev_nlatched
         success = bool(info.get("success"))
@@ -423,6 +453,7 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
             self.reward = StaleSeekReward(p)
             self._body_order = list(venv._body_order)
             self.world_size = tuple(venv.world_size)
+            self._dim = int(getattr(venv, "_dim", 2))   # venv's pinned obs dimension
             self._actions = list(venv.actions)
             self._base_seed = int(getattr(venv, "_base_seed", base_seed))
             n = self.num_envs
@@ -436,7 +467,7 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
             for i in range(self.num_envs):
                 self.reward.reset(i)
                 self._prev_fp[i] = fingerprint_from_obs(obs[i], self._body_order,
-                                                        self.world_size)
+                                                        self.world_size, dim=self._dim)
                 self._prev_nlatched[i] = 0
                 self._hist[i] = []
             return obs
@@ -458,7 +489,8 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
                 # On a done step obs[i] is already the RESET obs; the terminal state is
                 # stashed in terminal_observation — fingerprint THAT for the freeze test.
                 frame_obs = info.get("terminal_observation") if done else obs[i]
-                cur_fp = fingerprint_from_obs(frame_obs, self._body_order, self.world_size)
+                cur_fp = fingerprint_from_obs(frame_obs, self._body_order,
+                                              self.world_size, dim=self._dim)
 
                 self._hist[i].append(self._actions[int(self._last_actions[i])])
                 n_latched = int(info.get("n_latched", 0))
@@ -480,7 +512,7 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
                 if done:
                     self.reward.reset(i)
                     self._prev_fp[i] = fingerprint_from_obs(obs[i], self._body_order,
-                                                            self.world_size)
+                                                            self.world_size, dim=self._dim)
                     self._prev_nlatched[i] = 0
                     self._hist[i] = []
                 else:

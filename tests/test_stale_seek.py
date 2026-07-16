@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness.rl import stale_seek as ss  # noqa: E402
-from harness.rl.env import build_obs_vector, PER_BODY  # noqa: E402
+from harness.rl.env import build_obs_vector, PER_BODY, PER_BODY_3D, EGO_BLOCK_3D  # noqa: E402
 from harness.core.statetree import fingerprint, fp_delta  # noqa: E402
 from harness.verify import g4  # noqa: E402
 from harness.verify.executors import PyExecutor  # noqa: E402
@@ -317,6 +317,48 @@ def test_fingerprint_from_obs_absent_body_is_a_topology_change():
     present = ss.fingerprint_from_obs(_obs(120.0), BODY_ORDER, WORLD)
     gone = np.zeros(OBS_DIM, dtype=np.float32)          # present-bit 0 -> body omitted
     assert fp_delta(present, ss.fingerprint_from_obs(gone, BODY_ORDER, WORLD)) == float("inf")
+
+
+# ====================================================================== #
+# 2b. fingerprint_from_obs — the 3D layout (z, vz, quaternion) round-trips.
+# ====================================================================== #
+BODY3 = ["craft"]
+CP3 = ["cp"]
+OBS_DIM_3D = len(BODY3) * PER_BODY_3D + EGO_BLOCK_3D + len(CP3) + 1
+
+
+def _obs3(x=0.0, y=0.0, z=0.0, vx=0.0, vy=0.0, vz=0.0, angle=0.0, latched=False,
+          tick=0, horizon=120):
+    obs_state = {"craft": {"pos": (x, y, z), "vel": (vx, vy, vz), "angle": angle,
+                           "controlled": True}}
+    latched_map = {"cp": (tick if latched else None)}
+    return build_obs_vector(obs_state, latched_map, BODY3, CP3, WORLD, tick, horizon,
+                            dim=3)
+
+
+def test_fingerprint_from_obs_3d_freeze_is_zero_across_ticks():
+    # SAME 3D body state, later tick (the tick channel differs) -> frozen (delta 0).
+    o0 = _obs3(80.0, 60.0, 40.0, angle=0.5, tick=0)
+    o0b = _obs3(80.0, 60.0, 40.0, angle=0.5, tick=9)
+    f0 = ss.fingerprint_from_obs(o0, BODY3, WORLD, dim=3)
+    f0b = ss.fingerprint_from_obs(o0b, BODY3, WORLD, dim=3)
+    assert fp_delta(f0, f0b) < ss.EFFICACY_EPS
+
+
+def test_fingerprint_from_obs_3d_detects_depth_and_rotation():
+    # The 2D digest DROPS z/roll; the 3D fingerprint must catch pure z-motion AND a
+    # pure orientation change — the whole point of the 3D obs.
+    base = ss.fingerprint_from_obs(_obs3(80.0, 60.0, 40.0, angle=0.5), BODY3, WORLD, dim=3)
+    moved_z = ss.fingerprint_from_obs(_obs3(80.0, 60.0, 60.0, angle=0.5), BODY3, WORLD, dim=3)
+    rotated = ss.fingerprint_from_obs(_obs3(80.0, 60.0, 40.0, angle=1.3), BODY3, WORLD, dim=3)
+    assert fp_delta(base, moved_z) > ss.EFFICACY_EPS     # 20 units of depth motion
+    assert fp_delta(base, rotated) > ss.EFFICACY_EPS     # yaw 0.5 -> 1.3
+
+
+def test_fingerprint_from_obs_3d_absent_body_is_a_topology_change():
+    present = ss.fingerprint_from_obs(_obs3(80.0, 60.0, 40.0), BODY3, WORLD, dim=3)
+    gone = np.zeros(OBS_DIM_3D, dtype=np.float32)        # present-bit 0 -> body omitted
+    assert fp_delta(present, ss.fingerprint_from_obs(gone, BODY3, WORLD, dim=3)) == float("inf")
 
 
 # ====================================================================== #
