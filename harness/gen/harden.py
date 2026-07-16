@@ -191,6 +191,12 @@ def _run_oracles(game_path, source, *, engine, tiers, stale, run_g3, budget_step
     pressure = feedback.pressure_finding(report)
     if pressure:
         oracle["pressure"] = pressure
+    # RUNTIME ERROR: a generated game that PARSES but crashes at runtime (a null
+    # deref in act()/build()) — captured from the serve stderr and stashed in the
+    # verify report — compiles a root-cause directive naming the file:line.
+    runtime_err = feedback.runtime_error_finding(report)
+    if runtime_err:
+        oracle["runtime_error"] = runtime_err
     oracle["_verify"] = report
     return oracle
 
