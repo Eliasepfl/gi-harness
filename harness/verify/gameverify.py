@@ -81,6 +81,13 @@ SOLIDITY_TICKS = 2          # consecutive sampled ticks the overlap must persist
 GUIDED_EPISODES = 30        # checkpoint-guided second-pass episodes (longer horizons need more) [eng.]
 GUIDED_SEED_BASE = 1000     # probe seeds 1000+i for the guided pass (v2.1)
 
+# G3.8 material-anchoring (ADVISORY). Evidence thresholds for the center-proximity check —
+# NOT rule text (the contract carries no numbers). A milestone flip is "unanchored" when the
+# controlled body sits farther than the tolerance from every reported body at the flip; the
+# tolerance floors at ANCHOR_TOL_FLOOR px and otherwise scales with the occupancy diagonal.
+ANCHOR_TOL_FLOOR = 24.0     # px: a flip within this of a real body is anchored regardless of arena size [eng.]
+ANCHOR_TOL_FRAC = 0.06      # fraction of the occupancy-bounds diagonal that still counts as "at" a body [eng.]
+
 # G3 solver selection (v2.4): the Go-Explore state-action tree is the default —
 # it chains precise stages random search cannot (see harness/verify/treesolve.py).
 # The legacy random path stays intact and selectable. Override per call with the
@@ -1622,6 +1629,13 @@ def _verify_gdscript(source: str, report: dict) -> dict:
         # but is NOT blocked (see _dead_space_gate). Only on a still-certified game.
         if report.get("passed"):
             report = _dead_space_gate(facts, report)
+
+        # --- G3.8: material-anchoring / MATERIAL REALITY gate (contract: api_gdscript.md)
+        # ADVISORY: replays the certified witness and checks each milestone flip lands ON a real
+        # reported body, not a bare coordinate in open space. Warns + stashes a repair directive
+        # but is NOT blocked (see _anchoring_gate). Only on a still-certified game.
+        if report.get("passed"):
+            report = _anchoring_gate(executor, source, report, facts)
         return report
     except VerifyError as exc:
         # Godot missing / spawn stale / crash / unparseable -> VERIFY_ERROR shape.
@@ -1916,4 +1930,212 @@ def _dead_space_gate(facts, report):
     if su["dead_space"]:
         report["dead_space"] = finding             # only when flagged (cf. runtime_error)
         report.setdefault("warnings", []).append("PROPORTION: " + finding["detail"])
+    return report
+
+
+# ======================================================================== #
+# Material-anchoring gate — G3.8 MATERIAL REALITY (contract: api_gdscript.md)
+# ======================================================================== #
+# The contract: any milestone or win defined by WHERE something is must be anchored to a REAL
+# node with a collision shape (a body or an area the game add_childs in build() and reports in
+# state()), latched off that node's overlap/contact/position — never off a bare coordinate
+# checked with distance math. A goal that is only arithmetic is invisible: it can be memorised,
+# never seen or drawn. This is the spatial-milestone twin of STAKES's is_failure rule — a
+# non-vacuity rule that gives a bare signature (checkpoints()/is_success()) semantic teeth.
+#
+# ADVISORY, mirroring the PRESSURE and PROPORTION gates EXACTLY: a NON-gating sub-check under
+# G3_solve ("material_anchoring", always pass=True; the real signal is the ``anchored`` bool)
+# plus, ONLY when a milestone flips in empty space, a report warning and the top-level
+# ``report["anchoring"]`` finding the feedback bridge reads (parallel to ``report["dead_space"]``).
+# report["passed"] / failure_class are untouched either way — a certified game stays certified,
+# and the existing library (whose 10 ghost-goal games are already certified) is never re-flipped.
+#
+# WHAT IT CHECKS TODAY (necessary-not-sufficient, the same epistemic class as PRESSURE/
+# PROPORTION): CENTER-PROXIMITY at the flip tick. The witness replay (frames_every=1, exactly
+# as the G3 solidity replay) gives per-tick body POSITIONS; the t=0 CHECK geometry gives each
+# body's self-reported extent. For each latched milestone (and the win) we ask: at the flip
+# tick — and the tick before it, so a one-tick-late latch is forgiven — is the controlled body
+# within tolerance of ANY reported body's surface? If the nearest reported body is farther than
+# the tolerance, the milestone latched in open space: a bare coordinate threshold, not an event.
+#
+# WHAT IT CANNOT CHECK YET (deferred to the host wire — notes/engines/MATERIAL_REALITY.md):
+# true geometric OVERLAP, anchoring to an Area the game does NOT self-list, and whether a
+# self-reported "body" actually owns a collision shape. Those need the serve host to emit
+# authoritative per-body extents and a per-tick contact/overlap set (both PURE ADDS that leave
+# the un-requested wire byte-identical, to protect G1 twin-rollout identity). Until then a game
+# that reports a phantom body at the goal coordinate passes this check — the contract still binds
+# it, and the phase makes ZERO host changes on purpose (determinism).
+
+# The synthetic key under which the WIN (the final success tick) is examined as one more
+# spatial milestone — so a checkpoint-less game whose win is a bare coordinate is still caught.
+WIN_MILESTONE_KEY = "is_success"
+
+
+def _anchor_extent(geom) -> float:
+    """A body's representative half-extent from its self-reported footprint (radius /
+    half_extents / aabb), or 0.0 for a bare marker. GENEROUS (the MAX half-dimension) so a
+    body resting against a large solid reads as anchored, never falsely flagged."""
+    if not isinstance(geom, dict):
+        return 0.0
+    r = geom.get("radius")
+    if isinstance(r, (int, float)) and float(r) > 0.0:
+        return abs(float(r))
+    half = geom.get("half_extents")
+    if isinstance(half, (list, tuple)) and half:
+        vals = [abs(float(v)) for v in half if isinstance(v, (int, float))]
+        if vals:
+            return max(vals)
+    aabb = geom.get("aabb")
+    if isinstance(aabb, (list, tuple)) and len(aabb) == 2 \
+            and all(isinstance(c, (list, tuple)) for c in aabb):
+        mn, mx = aabb[0], aabb[1]
+        spans = [abs(float(mx[i]) - float(mn[i])) / 2.0
+                 for i in range(min(len(mn), len(mx)))]
+        if spans:
+            return max(spans)
+    return 0.0
+
+
+def _center_distance(a, b):
+    """Euclidean center distance over the shared leading components (2D or 3D), or None when
+    either position is missing/ragged."""
+    if not (isinstance(a, (list, tuple)) and isinstance(b, (list, tuple))):
+        return None
+    n = min(len(a), len(b))
+    if n < 2:
+        return None
+    try:
+        return math.sqrt(sum((float(a[i]) - float(b[i])) ** 2 for i in range(n)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _anchor_tolerance(geometry, world_size) -> float:
+    """The proximity tolerance: a floor OR a small fraction of the occupancy-bounds diagonal,
+    whichever is larger. Reuses the dead-space gate's playfield box (space_utilization) for the
+    diagonal, falling back to the declared world_size. Numbers here are EVIDENCE thresholds —
+    never rule text; the contract carries no numbers."""
+    diag = 0.0
+    try:
+        from harness.verify.reachability import space_utilization
+        su = space_utilization(geometry, world_size)
+    except Exception:
+        su = None
+    if su and su.get("playfield"):
+        diag = math.sqrt(sum(float(v) ** 2 for v in su["playfield"]))
+    if diag <= 0.0:
+        ws = [float(v) for v in (world_size or []) if isinstance(v, (int, float))]
+        diag = math.sqrt(sum(v * v for v in ws)) if ws else 0.0
+    return max(ANCHOR_TOL_FLOOR, ANCHOR_TOL_FRAC * diag)
+
+
+def _nearest_reported_surface(frames_by_tick, ctrl_name, extents, tick):
+    """Min SURFACE distance (center distance minus both self-reported extents) from the
+    controlled body to ANY non-controlled reported body, sampled at BOTH ``tick`` and
+    ``tick-1`` (a one-tick-late latch is forgiven). Returns (distance, other_name), or
+    (None, None) when neither frame carries the controlled body and a partner."""
+    best, best_other = None, None
+    ctrl_extent = _anchor_extent(extents.get(ctrl_name))
+    for t in (tick, tick - 1):
+        ents = frames_by_tick.get(t)
+        if not isinstance(ents, dict):
+            continue
+        ce = ents.get(ctrl_name)
+        cpos = ce.get("pos") if isinstance(ce, dict) else None
+        if cpos is None:
+            continue
+        for name, q in ents.items():
+            if name == ctrl_name or not isinstance(q, dict) or q.get("controlled"):
+                continue
+            cd = _center_distance(cpos, q.get("pos"))
+            if cd is None:
+                continue
+            d = cd - ctrl_extent - _anchor_extent(extents.get(name))
+            if best is None or d < best:
+                best, best_other = d, name
+    return best, best_other
+
+
+def _unanchored_milestones(frames, geometry, checkpoints, success_tick, world_size):
+    """PURE core of the anchoring gate (engine-agnostic; no executor). Returns the list of
+    offending milestone entries ``{milestone, tick, controlled, nearest_body, distance, tol}``
+    — one per milestone whose flip sits farther than the tolerance from every reported body.
+    Empty list == every milestone is anchored (or there is nothing measurable). Deterministic."""
+    frames_by_tick = {}
+    for fr in frames or []:
+        if isinstance(fr, dict) and fr.get("tick") is not None:
+            frames_by_tick[int(fr["tick"])] = fr.get("entities") or {}
+    geo = {str(g.get("name")): g for g in (geometry or [])
+           if isinstance(g, dict) and g.get("name") is not None}
+    ctrl_name = next((n for n, g in geo.items() if g.get("controlled")), None)
+    if ctrl_name is None or not frames_by_tick:
+        return []
+    tol = _anchor_tolerance(geometry, world_size)
+
+    candidates = [(str(k), int(t)) for k, t in (checkpoints or {}).items() if t is not None]
+    if isinstance(success_tick, int) and success_tick > 0:
+        candidates.append((WIN_MILESTONE_KEY, success_tick))
+
+    offending, seen_flips = [], set()
+    for key, tick in candidates:
+        d, other = _nearest_reported_surface(frames_by_tick, ctrl_name, geo, tick)
+        if d is None or d <= tol:
+            continue                                   # anchored (or unmeasurable -> not flagged)
+        flip = (tick, other)                           # same tick + same nearest body == one flip
+        if flip in seen_flips:
+            continue                                   # the win coincides with a checkpoint flip
+        seen_flips.add(flip)
+        offending.append({"milestone": key, "tick": tick, "controlled": ctrl_name,
+                          "nearest_body": other, "distance": round(d, 1), "tol": round(tol, 1)})
+    return offending
+
+
+def _anchoring_finding(offending) -> dict:
+    """The machine-readable MATERIAL-REALITY finding the feedback compiler consumes. ``outcome``
+    is ``unanchored`` (>=1 milestone flips in empty space) or ``anchored`` (healthy); only the
+    former compiles to a directive (feedback._compile_anchoring)."""
+    offending = list(offending or [])
+    if not offending:
+        return {"outcome": "anchored", "milestones": []}
+    detail = (f"{len(offending)} milestone(s) flip in empty space: " + "; ".join(
+        f"'{m['milestone']}' at tick {m['tick']} is {m['distance']}px from "
+        f"'{m['nearest_body']}' (tolerance {m['tol']}px)" for m in offending))
+    return {"outcome": "unanchored", "milestones": offending, "detail": detail}
+
+
+def _anchoring_gate(executor, game_source, report, facts):
+    """The material-anchoring (MATERIAL REALITY) gate. ADVISORY: replays the certified witness
+    (frames_every=1, as the G3 solidity replay does) and asks whether each latched milestone
+    (and the win) flips within tolerance of a REAL reported body. Records a NON-gating sub-check
+    always; on a flip in empty space it ALSO warns and stashes the finding at
+    ``report["anchoring"]`` for the feedback bridge. Never blocks certification (see the section
+    header). Engine trouble, a witness-less report, or a measurement hiccup leave the verdict
+    untouched."""
+    witness = report.get("witness") or {}
+    actions = witness.get("actions")
+    if not actions:
+        return report                                  # nothing to replay -> no verdict change
+    try:
+        replay = executor.run_batch(
+            game_source, [{"seed": WORLD_SEED, "actions": actions}],
+            len(actions), frames_every=1)[0]
+    except VerifyError:
+        return report                                  # engine trouble -> no verdict change
+    world_size = (facts.get("world_size") or {}).get("declared") or [800, 600]
+    try:
+        offending = _unanchored_milestones(
+            replay.get("frames") or [], facts.get("geometry") or [],
+            witness.get("checkpoints") or {}, witness.get("ticks"), world_size)
+    except Exception:
+        return report                                  # advisory: a measurement hiccup never blocks
+
+    finding = _anchoring_finding(offending)
+    anchored = not offending
+    layer = report.setdefault("layers", {}).setdefault(
+        "G3_solve", {"passed": True, "checks": {}})
+    layer.setdefault("checks", {})["material_anchoring"] = check(
+        True, advisory=True, anchored=anchored, finding=finding)
+    if not anchored:
+        report["anchoring"] = finding                  # only when flagged (cf. dead_space)
+        report.setdefault("warnings", []).append("ANCHORING: " + finding["detail"])
     return report

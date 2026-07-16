@@ -29,6 +29,11 @@ def test_all_sections_present_in_composed_gdscript():
     assert "NO BASE CLASS" in sp                    # a PLAIN node, nothing to resolve
     assert "DESIGN BEFORE YOU CODE" in sp           # design-before-code scaffold
     assert "DIVERSITY IS THE JOB" in sp             # the diversity mandate
+    # MATERIAL REALITY — the spatial-milestone non-vacuity rule (STAKES's twin): a goal in
+    # space is a thing, not a coordinate. Two stable pins harden the wording (a reword is a
+    # coupled prompt+test edit + a fresh integrity snapshot, never a mid-run tweak).
+    assert "MATERIAL REALITY" in sp
+    assert "never off a bare coordinate" in sp
     # The seven method SIGNATURES the has_method contract probe checks (taught by name,
     # not as a filled skeleton — reference, not a worked example).
     for sig in ("func build(world_seed: int) -> void", "func act(action: String) -> void",
@@ -44,6 +49,16 @@ def test_all_sections_present_in_composed_gdscript():
     # design_block_gdscript.md — DESIGN output format.
     assert "DESIGN" in sp and "Milestones:" in sp and "Parts used:" in sp
     assert "# Output format" in sp
+
+
+def test_gdscript_material_reality_binds_only_spatial_milestones():
+    # The rule binds a WHERE-milestone to a real shaped node, but explicitly EXEMPTS a
+    # milestone that is not about a place (a time/motion condition) — so the generator is not
+    # pushed to drop tick/velocity milestones to dodge the check. And it names the advisory
+    # signal ("flips in empty space") so the wording matches the verifier's ANCHORING hint.
+    flat = " ".join(P.compose("gdscript").lower().split())
+    assert "milestones not defined by a place need no anchor" in flat   # the exemption
+    assert "flips in empty space" in flat                               # the advisory signal
 
 
 def test_composed_gdscript_is_reference_not_a_worked_game():

@@ -46,6 +46,16 @@ The taxonomy (one directive-producing row per defect; every other outcome yields
                               detector never triggers). Repair: make failure triggerable.
     * has_pressure / other -> NO directive (a reachable failure was witnessed; healthy).
 
+  ANCHORING (WAVE 3 material-anchoring gate, gameverify._anchoring_gate) — read from
+  ``oracle_results["anchoring"]`` (extract with :func:`anchoring_finding`):
+    * unanchored           -> `unanchored_milestone` (one PER offending milestone): a
+                              milestone/win flips in EMPTY SPACE, far from every reported body —
+                              a bare coordinate threshold, not a physical event (an invisible
+                              goal). Repair: anchor it to a real node with a collision shape and
+                              latch off its overlap/contact/position; leave true non-spatial
+                              (time/motion) milestones as they are.
+    * anchored / other     -> NO directive (every milestone lands on a real body; healthy).
+
   DEAD SPACE (WAVE 2 proportion gate, gameverify._dead_space_gate) — read from
   ``oracle_results["dead_space"]`` (extract with :func:`dead_space_finding`):
     * dead_space           -> `dead_space`: the declared playfield is ~Nx (per axis)
@@ -491,6 +501,71 @@ def dead_space_finding(verify_report: dict) -> dict:
 
 
 # ======================================================================== #
+# MATERIAL REALITY / ANCHORING (WAVE 3 anchoring gate) -> directive
+# ======================================================================== #
+# The material-anchoring gate (gameverify._anchoring_gate, contract: api_gdscript.md
+# "# MATERIAL REALITY") replays the certified witness and asks whether each milestone (and the
+# win) flips ON a real reported body — its overlap/contact/position — or in EMPTY SPACE far from
+# every body. A ghost-goal game (a milestone latched off a bare coordinate + distance math) still
+# CERTIFIES (advisory, non-gating), so this is the spatial-milestone twin of the PRESSURE no-stakes
+# rule: a proof-carrying structural DEFECT (an invisible goal), one directive PER offending
+# milestone so the per-milestone fingerprint + convergence guard can catch a stalled repair.
+# ``unanchored`` compiles; ``anchored`` does not.
+ANCHORING_DIRECTIVE_OUTCOMES = ("unanchored",)
+ANCHORING_HEAD = "UNANCHORED MILESTONE - A CHECKPOINT FLIPS IN EMPTY SPACE"
+
+
+def _anchoring_detail(m: dict) -> str:
+    """The per-milestone repair detail: the flip FACT (which checkpoint, when, how far from the
+    nearest reported body) + the conditional anchor instruction. The escape clause ('if it does
+    not mark a place ... leave it as is') protects legal non-spatial milestones from a REVISE
+    model that would otherwise 'fix' a false positive into a spatial goal."""
+    key = str(m.get("milestone"))
+    return (f"checkpoint '{key}' latches at tick {m.get('tick')} with the controlled body "
+            f"'{m.get('controlled')}' {m.get('distance')}px from the nearest reported body "
+            f"('{m.get('nearest_body')}'; tolerance {m.get('tol')}px) - nothing material is "
+            "there, so the milestone reads as a bare coordinate threshold, not a physical "
+            "event. If this milestone marks a place, anchor it to a real node with a collision "
+            "shape (a body or an area reported in state()) and latch it off that node's "
+            "overlap, contact, or position. If it does not mark a place (a time or motion "
+            "condition), leave it as is and keep the anchor rule for the spatial milestones.")
+
+
+def _compile_anchoring(finding: dict) -> list:
+    """Compile the ``anchoring`` finding into ONE directive PER offending milestone, each keyed
+    (and fingerprinted) on its own milestone so distinct ghosts give distinct fingerprints and a
+    repeated ghost trips the convergence guard. ``anchored`` / other -> no directive."""
+    if not finding:
+        return []
+    if finding.get("outcome") not in ANCHORING_DIRECTIVE_OUTCOMES:
+        return []
+    out, seen = [], set()
+    for m in finding.get("milestones") or []:
+        key = str(m.get("milestone"))
+        text = f"{ANCHORING_HEAD}: {_anchoring_detail(m)}"
+        d = _mk("unanchored_milestone", "anchoring", [key], text,
+                {"tick": m.get("tick"), "distance": m.get("distance"),
+                 "nearest_body": m.get("nearest_body"), "tol": m.get("tol")})
+        if d.fingerprint in seen:
+            continue                                   # same milestone twice -> one directive
+        seen.add(d.fingerprint)
+        out.append(d)
+    return out
+
+
+def anchoring_finding(verify_report: dict) -> dict:
+    """Pull the machine-readable ``anchoring`` finding off a verify report (the gdscript lane
+    stashes it at ``report["anchoring"]`` ONLY when the material-anchoring gate flagged a
+    milestone flipping in empty space — parallel to ``report["dead_space"]``). Returns ``{}``
+    for an anchored game (or a non-gdscript engine). A one-line bridge for the harden driver
+    (``oracle_results["anchoring"] = anchoring_finding(rep)``) that keeps this compiler PURE."""
+    try:
+        return dict((verify_report or {}).get("anchoring") or {})
+    except Exception:
+        return {}
+
+
+# ======================================================================== #
 # RUNTIME ERROR (verify-lane stderr capture) -> directive
 # ======================================================================== #
 # A generated game that PARSES but CRASHES AT RUNTIME (a null deref in act(), a
@@ -552,17 +627,19 @@ def compile_directives(oracle_results: dict) -> list:
     ``oracle_results`` carries optional ``"runtime_error"`` (a captured SCRIPT ERROR
     record — see :func:`runtime_error_finding`), ``"g4"`` (a `run_g4` report),
     ``"pressure"`` (a failure-witness finding — see :func:`pressure_finding`),
+    ``"anchoring"`` (a material-anchoring finding — see :func:`anchoring_finding`),
     ``"dead_space"`` (a proportion finding — see :func:`dead_space_finding`) and
     ``"g3_prime"`` (a `g3_prime` result) dicts. Returns the directives to feed the revise
     loop — RUNTIME CRASH (the root defect) first, then G4 (broken-game shapes), then
-    PRESSURE (no stakes), then DEAD SPACE (proportion polish), then G3' (learnability) —
-    deduplicated by fingerprint. An empty list means either a CLEAN game or a
-    still-progressing G3' run (see :func:`continue_training`)."""
+    PRESSURE (no stakes), then ANCHORING (ghost goals), then DEAD SPACE (proportion polish),
+    then G3' (learnability) — deduplicated by fingerprint. An empty list means either a CLEAN
+    game or a still-progressing G3' run (see :func:`continue_training`)."""
     oracle_results = oracle_results or {}
     directives, seen = [], set()
     for d in (_compile_runtime_error(oracle_results.get("runtime_error") or {})
               + _compile_g4(oracle_results.get("g4") or {})
               + _compile_pressure(oracle_results.get("pressure") or {})
+              + _compile_anchoring(oracle_results.get("anchoring") or {})
               + _compile_dead_space(oracle_results.get("dead_space") or {})
               + _compile_g3(oracle_results.get("g3_prime") or {})):
         if d.fingerprint in seen:
