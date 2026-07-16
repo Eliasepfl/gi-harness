@@ -230,7 +230,12 @@ SB3 raises a clear shape error on a mismatched `.load` (the load path lives in
 - **In-image (gi-certifier.sif, speedup 8):** a true-3D `tumble_3d` env constructs at **dim=3,
   obs_dim=200**, reset+step all-finite, **no pos-unpack crash** (the exact `env.py:113` failure
   the §3 `crash3d` job hit). Committed regression tests
-  `test_gd_serve_env_true_3d_loads_and_steps` + `test_g3_prime_true_3d_trains_without_obs_crash`.
+  `test_gd_serve_env_true_3d_loads_and_steps` + `test_g3_prime_true_3d_trains_without_obs_crash`
+  (which assert *training RUNS + a well-formed dict*, NOT an SR threshold — success curves stay
+  near 0 for ~25k steps at default patience, so an SR gate would be flaky).
+- **Full Godot-gated suite green in-image** (job 18070664, mit_preemptable): `test_gd_rl` +
+  `test_stale_seek` + `test_stale_seek_godot` + `test_adversary` + `test_gd_wiggle` +
+  `test_rl_env` → **94 passed in 1666s**, exit 0.
 
 ### 6.5 First true-3D training result — a_3d_game_fly
 g3_prime, num_envs=8, speedup=8, in-image (gi-certifier.sif), mit_preemptable, job 18070646.
