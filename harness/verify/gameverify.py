@@ -1309,6 +1309,23 @@ def gdscript_route_available() -> bool:
 # ======================================================================== #
 # Orchestration
 # ======================================================================== #
+def verify_game_rescue(game_path: str, sandboxed: bool = True, *, world_factory=None,
+                       **rescue_kwargs) -> dict:
+    """ADDITIVE orchestration: the tree verify funnel, then — ONLY when it leaves the game
+    UNSOLVED-with-progress — an RL-witness SECOND certification pass (`certify.rescue_certify`).
+
+    The plain :func:`verify_game` path is untouched (tree-only, fast, byte-identical); this is
+    the explicit opt-in second lane behind the `game rescue` CLI verb / harden's rl_rescue
+    flag. A tree-certified report is stamped ``witness_source="tree"``; a game the trained
+    policy rescues becomes a first-class certified report with ``witness_source="rl"`` (witness
+    shape identical, so G4 / atlas / demos consume it unchanged). See `rescue_certify` for the
+    convergence + deterministic-replay bar and the honest-failure block. `rescue_kwargs` are
+    forwarded (budget_steps, num_envs, n_eval, thresholds, save_model, g3_fn seam, ...)."""
+    report = verify_game(game_path, sandboxed=sandboxed, world_factory=world_factory)
+    from harness.rl.certify import rescue_certify
+    return rescue_certify(game_path, verify_report=report, **rescue_kwargs)
+
+
 def verify_game(game_path: str, sandboxed: bool = True, *, world_factory=None) -> dict:
     """Run the G0 -> G1 -> G2 -> G3 funnel on the game at `game_path`.
 

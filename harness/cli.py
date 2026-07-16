@@ -461,6 +461,60 @@ def cmd_game_attack(args) -> int:
     return 0 if report.get("passed") else 1
 
 
+def cmd_game_rescue(args) -> int:
+    """RL-witness SECOND certification pass on a game the tree solver left UNSOLVED.
+
+    Runs the tree funnel, then — ONLY when UNSOLVED-with-progress — trains a policy
+    (batched) and, if it converges to a demo-ready policy whose greedy rollout replays
+    bit-exactly through the serve host, upgrades the game to CERTIFIED with an RL witness
+    (witness_source="rl"). No convergence / replay mismatch -> stays UNSOLVED with an honest
+    rescue block. The plain `verify` path is unaffected (this is the opt-in second lane)."""
+    try:
+        from harness.verify.gameverify import verify_game_rescue
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("gameverify", exc, args.json)
+
+    rescue_kw = {}
+    if args.budget is not None:
+        rescue_kw["budget_steps"] = args.budget
+    if args.num_envs is not None:
+        rescue_kw["num_envs"] = args.num_envs
+    if args.n_eval is not None:
+        rescue_kw["n_eval"] = args.n_eval
+    if args.save_model is not None:
+        rescue_kw["save_model"] = args.save_model
+    try:
+        report = verify_game_rescue(args.game_path, **rescue_kw)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game rescue", exc, args.json)
+
+    if args.json:
+        _emit_json(report)
+        return 0 if report.get("passed") else 1
+
+    rescue = report.get("rescue") or {}
+    src = report.get("witness_source")
+    wit = report.get("witness") or {}
+    if report.get("passed") and src == "rl":
+        print(f"RL-CERTIFIED  {args.game_path}")
+        print(f"  witness  : source=rl  ticks={wit.get('ticks')}  seed={wit.get('seed')}")
+        print(f"  rl       : steps={rescue.get('rl_steps')}  greedy_sr={rescue.get('greedy_sr')}"
+              f"  stochastic_sr={rescue.get('stochastic_sr')}  n_eval={rescue.get('n_eval')}")
+        diag = report.get("unsolved_diagnosis") or {}
+        print(f"  note     : solvable-but-hard (tree UNSOLVED, stuck_after="
+              f"{diag.get('stuck_after')}) — preserved for the difficulty tuner")
+    elif report.get("passed"):
+        print(f"CERTIFIED  {args.game_path}  (witness_source={src or 'tree'}; no rescue needed)")
+    else:
+        print(f"UNSOLVED  {args.game_path}")
+        print(f"  rescue   : attempted={rescue.get('attempted', False)}  "
+              f"rescued=False  reason={rescue.get('reason')}")
+        if rescue.get("greedy_sr") is not None:
+            print(f"  rl       : steps={rescue.get('rl_steps')}  "
+                  f"greedy_sr={rescue.get('greedy_sr')}  stochastic_sr={rescue.get('stochastic_sr')}")
+    return 0 if report.get("passed") else 1
+
+
 def cmd_game_watch(args) -> int:
     """Watch a game play live in a pygame window (real-time witness replay)."""
     as_json = getattr(args, "json", False)
@@ -1018,6 +1072,22 @@ def build_parser() -> argparse.ArgumentParser:
                          "cheap-LLM attacker lane; needs an OpenRouter key)")
     ga.add_argument("--json", action="store_true")
     ga.set_defaults(func=cmd_game_attack)
+
+    grsc = gmsub.add_parser(
+        "rescue",
+        help="RL-witness SECOND certification: train a policy to certify a game the tree "
+             "solver left UNSOLVED-with-progress (witness_source=rl)")
+    grsc.add_argument("game_path")
+    grsc.add_argument("--budget", type=int, default=None,
+                      help="RL env-step budget for the rescue attempt (default: 500k)")
+    grsc.add_argument("--num-envs", dest="num_envs", type=int, default=None,
+                      help="batched vec width for training (default: 8)")
+    grsc.add_argument("--n-eval", dest="n_eval", type=int, default=None,
+                      help="greedy/stochastic eval episodes (default: 32)")
+    grsc.add_argument("--save-model", dest="save_model", default=None,
+                      help="persist the trained SB3 model (+ demo_trajectory.json beside it)")
+    grsc.add_argument("--json", action="store_true")
+    grsc.set_defaults(func=cmd_game_rescue)
 
     gw = gmsub.add_parser("watch", help="watch a game play live in a pygame window")
     gw.add_argument("game_path")

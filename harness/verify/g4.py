@@ -1767,6 +1767,42 @@ def _grade(findings, tier1_block, tiers):
     return "hardened"
 
 
+# --- critic-competence gate helpers (the RAISED model-gate predicate's honest surface) --- #
+def _critic_rates(g3_result):
+    """(greedy_sr, stochastic_sr) read from a g3' result, tolerating the legacy key names."""
+    g3 = g3_result if isinstance(g3_result, dict) else {}
+    gr = g3.get("greedy_sr", g3.get("final_success_rate"))
+    sr = g3.get("stochastic_sr", g3.get("stochastic_success_rate"))
+    return gr, sr
+
+
+def _critic_downgrade_note(g3_result) -> str:
+    """The honest reason stamped on a smart block when a handed-off critic is not competent."""
+    gr, sr = _critic_rates(g3_result)
+    return ("critic NOT competent (demo_ready=False, "
+            f"greedy_sr={gr}, stochastic_sr={sr}): the trained value map has not converged, "
+            "so the model-steered smart tier was DOWNGRADED to the critic-free ladder "
+            "(unconverged critic == noise; the A/B showed weak-critic == 0)")
+
+
+def _critic_gate_summary(g3_result, model_armed, critic_ok, downgraded) -> dict:
+    """Top-level surface of the model-gate decision (never a silent drop)."""
+    gr, sr = _critic_rates(g3_result)
+    has_g3 = isinstance(g3_result, dict)
+    return {
+        "model_armed": bool(model_armed),
+        "competent": (None if g3_result is None else bool(critic_ok)),
+        "downgraded": bool(downgraded),
+        "demo_ready": (bool(g3_result.get("demo_ready")) if has_g3 else None),
+        "greedy_sr": gr,
+        "stochastic_sr": sr,
+        "note": (_critic_downgrade_note(g3_result) if downgraded
+                 else ("critic competent -> smart tiers armed"
+                       if (model_armed and critic_ok and has_g3)
+                       else "no critic handoff (g3_result absent or no model artifact)")),
+    }
+
+
 def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
            world_factory=None, seed=0, horizon=PROBE_HORIZON,
            fuzz_random=DEFAULT_FUZZ_RANDOM, fuzz_long=DEFAULT_FUZZ_LONG,
@@ -1775,7 +1811,7 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
            k=DEFAULT_ATTACKS_PER_CALL, models=None,
            stale=False, stale_H=STALE_H, stale_budget=None,
            stale_cand_budget=STALE_CAND_BUDGET, top_m=STALE_TOP_M,
-           game_path=None, model=None, model_path=None, iv_critic=None,
+           game_path=None, model=None, model_path=None, g3_result=None, iv_critic=None,
            iv_candidates=None, iv_env_factory=None, iv_seeds=IV_SEEDS,
            iv_eps=IV_EPS, iv_window=IV_WINDOW, iv_max_ticks=IV_MAX_TICKS,
            descent_critic=None, descent_candidates=None, descent_env_factory=None,
@@ -1800,6 +1836,15 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
     the working policy to a low-V waypoint, then alpha-ramp into the freeze pocket). Both
     are CHEAP (policy rollouts, no training) and both confirm through the SAME
     refute_prefix oracle. With no model the ladder is byte-for-byte unchanged.
+
+    CRITIC-COMPETENCE GATE. A model artifact arms the smart tiers ONLY when its critic
+    CONVERGED — pass the producing `g3_result` and the gate re-checks it with the shared
+    `certify.critic_competent` (demo_ready-style). An UNCONVERGED critic's value map is noise
+    (the A/B showed weak-critic == 0, worse than the critic-free fuzz), so it is DOWNGRADED
+    to the critic-free ladder HONESTLY: the reason rides on each smart block and a top-level
+    `critic_gate` summary — never a silent drop. Injected test/handoff seams are a
+    known-competent critic and bypass this gate; with no `g3_result` the artifact path stays
+    backward-compatible (armed).
 
     `deep=True` additionally arms the DEEP SEEKER tier — a TRAINED PPO stale-seeker
     (harness/rl/stale_seek.py). It is COSTLY (one PPO training per game) so it runs
@@ -1851,10 +1896,25 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
                            k=k, models=models, controlled=controlled, initial=initial,
                            horizon=horizon, requested=1 in tiers)
 
+        # CRITIC-COMPETENCE GATE (the RAISED model-gate predicate). A real model artifact
+        # arms the smart tiers ONLY when its critic CONVERGED to a demo-ready policy
+        # (certify.critic_competent over the producing g3' result). An unconverged critic's
+        # value map is noise — the A/B showed weak-critic == 0, worse than the critic-free
+        # fuzz — so we DOWNGRADE to the critic-free ladder, HONESTLY (reason on each smart
+        # block + the `critic_gate` summary), never silently. Injected test/handoff seams
+        # (critic/candidates/env_factory) ARE a known-competent critic and bypass the g3
+        # gate; with no g3_result the artifact path stays backward-compatible (armed).
+        from harness.rl.certify import critic_competent
+        _model_armed = model is not None or model_path is not None
+        _iv_seams = any(x is not None for x in (iv_critic, iv_candidates, iv_env_factory))
+        _descent_seams = any(x is not None for x in
+                             (descent_critic, descent_candidates, descent_env_factory))
+        _critic_ok = True if g3_result is None else critic_competent(g3_result)
+        _critic_downgraded = bool(_model_armed and not _critic_ok)
+
         # PRIMARY smart tier (ahead of random fuzz in the ladder): the model-steered
-        # inverse-value softlock hunt. Model-gated — skipped (no-op) with no artifact.
-        iv_requested = any(x is not None for x in
-                           (model, model_path, iv_critic, iv_candidates, iv_env_factory))
+        # inverse-value softlock hunt. Armed by a competent critic OR an injected seam.
+        iv_requested = _iv_seams or (_model_armed and _critic_ok)
         iv_block = _run_inverse_value(
             executor, game_source, engine, actions, report,
             requested=iv_requested, controlled=controlled, game_path=game_path, model=model,
@@ -1864,12 +1924,10 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
             iv_seeds=iv_seeds, iv_eps=iv_eps, iv_max_ticks=iv_max_ticks)
 
         # S1.5 SMART TIER — policy-guided descent, slotted BETWEEN S1 (greedy) and the
-        # deep seeker (S2). Same model gate as S1 (a real `model`/`model_path` arms both);
-        # dedicated `descent_*` seams inject a critic/candidates/env for tests WITHOUT
-        # perturbing the S1 (inverse-value) tests. CHEAP (policy rollouts) — standard path.
-        descent_requested = any(x is not None for x in
-                                (model, model_path, descent_critic,
-                                 descent_candidates, descent_env_factory))
+        # deep seeker (S2). Same critic-competence gate as S1 (a competent `model`/`model_path`
+        # arms both); dedicated `descent_*` seams inject a critic/candidates/env for tests
+        # WITHOUT perturbing the S1 (inverse-value) tests. CHEAP (policy rollouts) — std path.
+        descent_requested = _descent_seams or (_model_armed and _critic_ok)
         descent_block = _run_descent(
             executor, game_source, engine, actions, report,
             requested=descent_requested, controlled=controlled, game_path=game_path,
@@ -1878,6 +1936,16 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
             seed=seed, stale_H=stale_H, stale_budget=stale_budget, top_m=top_m,
             window=iv_window, n_waypoints=descent_waypoints, descent_ticks=descent_ticks,
             eps=iv_eps)
+
+        # HONEST DOWNGRADE: a model was in hand but its critic was not competent, so the
+        # model-armed smart tiers were dropped to the critic-free ladder. Annotate each
+        # dropped block's reason (seam-injected blocks ran on their own critic — untouched).
+        if _critic_downgraded:
+            _note = _critic_downgrade_note(g3_result)
+            for _blk, _seamed in ((iv_block, _iv_seams), (descent_block, _descent_seams)):
+                if not _seamed:
+                    _blk["reason"] = _note
+                    _blk["critic_downgraded"] = True
 
         stale_block = _run_stale(executor, game_source, engine, actions, report,
                                  controlled=controlled, initial=initial, horizon=horizon,
@@ -1904,6 +1972,10 @@ def run_g4(game_source, report, *, engine=None, slug="game", tiers=(0,),
         out.update({
             "grade": grade,
             "passed": grade != "open",
+            # The RAISED model-gate's honest surface: whether a handed-off critic was judged
+            # competent and, if not, that the smart tiers were downgraded (never silent).
+            "critic_gate": _critic_gate_summary(g3_result, _model_armed, _critic_ok,
+                                                _critic_downgraded),
             "inverse_value": iv_block,
             "descent": descent_block,
             "tier0": tier0,

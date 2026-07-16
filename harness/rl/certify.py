@@ -41,6 +41,8 @@ and move on" rule lives in ppo.train's plateau early-stop).
 
 from __future__ import annotations
 
+import json
+import os
 import time
 
 from harness.rl.env import PlanckEnv
@@ -50,6 +52,90 @@ DEFAULT_BUDGET = 2_000_000       # env-steps per game (LLM_RL_SYSTEMS §4.1) [en
 N_EVAL = 32                      # greedy eval episodes (fixed seeds) [eng.]
 LEARNABLE_SUCCESS_RATE = 0.5     # greedy success rate to call a game learnable [eng.]
 TRAINERS = ("vendored", "sb3")   # RL trainer backends (sb3 default post-parity R1; vendored kept until one live curriculum round confirms)
+
+# --- Demo-readiness / critic-competence thresholds ([eng.]) ------------------
+# Elias's rule: don't ship a demo (or hand a critic to the value-inverse attacker) off the
+# FIRST lucky witness — the policy may not be optimized and a single win can be chance. Wait
+# until the trained greedy policy wins RELIABLY over the eval seeds AND is robust under
+# action-sampling noise before we call it demo-ready / critic-competent.
+#
+#   DEMO_SR_MIN         GREEDY (deterministic-replay) success floor. Elias wants ~100% over a
+#                       few episodes; 0.9 tolerates one flaky seed on an rng game while on the
+#                       fully-deterministic showcase games (greedy is binary 0/1) it means
+#                       "wins on every eval seed". The demo we ship is THIS greedy rollout.
+#   DEMO_STOCHASTIC_FLOOR
+#                       STOCHASTIC (sampled-rollout) success floor — the "not luck" guard.
+#                       On deterministic games greedy collapses to a single trajectory, so the
+#                       graded evidence that the policy found a ROBUST basin (not a knife-edge
+#                       single path) comes from the sampled rollouts. Sits ABOVE
+#                       LEARNABLE_SUCCESS_RATE (0.5) so demo_ready strictly implies learnable.
+DEMO_SR_MIN = 0.9                # greedy success rate floor for a demo-ready policy [eng.]
+DEMO_STOCHASTIC_FLOOR = 0.6      # stochastic success floor — robustness / not-luck guard [eng.]
+
+
+def is_demo_ready(greedy_sr, stochastic_sr, *, sr_min: float = DEMO_SR_MIN,
+                  stochastic_floor: float = DEMO_STOCHASTIC_FLOOR) -> bool:
+    """A trained policy is DEMO-READY iff its GREEDY success rate clears ``sr_min`` AND its
+    STOCHASTIC success rate clears ``stochastic_floor`` (BOTH — the greedy floor proves the
+    deterministic demo replays reliably, the stochastic floor proves it is not a lucky single
+    path). Pure; the thresholds are [eng.] knobs. A missing/None rate is NOT demo-ready."""
+    try:
+        g = float(greedy_sr)
+        s = float(stochastic_sr)
+    except (TypeError, ValueError):
+        return False
+    return bool(g >= sr_min and s >= stochastic_floor)
+
+
+def critic_competent(g3_result) -> bool:
+    """Is the TRAINED CRITIC in a g3' result converged enough to STEER g4's smart tiers
+    (inverse-value / policy-descent / value_death)?
+
+    The A/B showed a WEAK critic scores ~0 — its value map is noise, so a smart tier built on
+    it is worse than the critic-free fuzz. Competence is demo_ready-style convergence: the
+    greedy policy reliably solves AND is robust under sampling, which is exactly the signal
+    that the value function separates on-path (high-V) from off-path/frozen (low-V) states —
+    the structure the anti-policy / V-frontier / value-death attacks exploit. A missing or
+    still-training result is NOT competent (honest default: downgrade to the critic-free
+    ladder). ONE shared predicate, consumed by g4's model-gate AND harden's oracle step."""
+    if not isinstance(g3_result, dict):
+        return False
+    return bool(g3_result.get("demo_ready"))
+
+
+def _pick_demo_trajectory(greedy_eps: list[dict]) -> dict | None:
+    """The trained agent's OWN deterministic winning rollout, reduced to a replayable demo:
+    the best SUCCESSFUL GREEDY (argmax) episode — fewest ticks, then lowest seed. GREEDY only,
+    so the demo is reproducible (same policy + seed -> same actions) — this is the reliable
+    trained policy playing, NOT the first lucky tree-solver witness. Same {seed, actions}
+    shape as an rl_witness; ``None`` when no greedy episode won."""
+    wins = [e for e in (greedy_eps or []) if e.get("success")]
+    if not wins:
+        return None
+    best = min(wins, key=lambda e: (e["ticks"], e["seed"]))
+    return {"seed": best["seed"], "actions": list(best["actions"]),
+            "ticks": best["ticks"], "greedy": True}
+
+
+def export_demo_trajectory(trajectory: dict, path: str) -> str:
+    """Persist a demo trajectory ({seed, actions, ...}) to ``path`` as the witness-shaped
+    JSON the capture CLI replays verbatim::
+
+        harness game capture <game.gd> --actions <path>
+
+    Capture reads only ``seed`` + ``actions`` (extras are harmless provenance). The demo then
+    IS the trained agent playing, deterministically. Creates the parent dir; returns ``path``."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    payload = {"seed": int(trajectory["seed"]),
+               "actions": [str(a) for a in trajectory["actions"]],
+               "ticks": trajectory.get("ticks"),
+               "greedy": bool(trajectory.get("greedy", True)),
+               "source": "g3_demo"}       # provenance: the trained-policy demo (not a witness)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+    return path
 
 
 def still_improving_from_curve(curve_return, *, patience: int, window: int,
@@ -198,6 +284,8 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              n_eval: int = N_EVAL, seed: int = 0, log=None,
              wall_clock_budget_s=None, trainer: str = "sb3",
              method: str = "ppo", save_model: str | None = None,
+             demo_out: str | None = None, demo_sr_min: float = DEMO_SR_MIN,
+             demo_stochastic_floor: float = DEMO_STOCHASTIC_FLOOR,
              **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
@@ -218,7 +306,17 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         rl_witness ({seed, actions, ticks} | None), wall_clock_s,
         still_improving (curve improving when the budget ended -> the compiler emits
         `continue_training`), per_checkpoint_latch_rate ({checkpoint: fraction of eval
-        episodes that latched it} -> the compiler's checkpoint-pair localiser).
+        episodes that latched it} -> the compiler's checkpoint-pair localiser),
+        demo_ready (greedy_sr >= demo_sr_min AND stochastic_sr >= demo_stochastic_floor —
+        the policy wins RELIABLY, so its greedy rollout is worth shipping as the demo AND
+        its critic is worth handing to g4; see `is_demo_ready`/`critic_competent`),
+        greedy_sr / stochastic_sr (the two demo-gate rates), demo_trajectory
+        ({seed, actions, ticks, greedy} | None — the trained agent's own winning greedy
+        rollout when demo_ready), demo_trajectory_path (where it was written, or None).
+
+    `demo_out` overrides where the demo trajectory JSON is written; when omitted it lands
+    beside the saved model artifact (`<save_model dir>/demo_trajectory.json`). The trajectory
+    replays deterministically via `harness game capture <game> --actions <path>`.
     """
     # The algo registry lives on the SB3 lane only; the vendored CleanRL-mirror PPO
     # exposes no `method` seam, so reject a non-default method up front (before any
@@ -355,6 +453,29 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     learnable = (stochastic_success_rate >= LEARNABLE_SUCCESS_RATE
                  or final_success_rate >= LEARNABLE_SUCCESS_RATE)
 
+    # DEMO-READY / CRITIC-COMPETENT gate (Elias): a demo (and the value-inverse attacker's
+    # critic) must come from a RELIABLY-winning policy, not the first lucky witness. Both the
+    # greedy floor (the deterministic demo replays reliably) AND the stochastic floor (the win
+    # is not a knife-edge single path) must clear. STRICTLY stronger than `learnable`.
+    greedy_sr = final_success_rate
+    stochastic_sr = stochastic_success_rate
+    demo_ready = is_demo_ready(greedy_sr, stochastic_sr, sr_min=demo_sr_min,
+                               stochastic_floor=demo_stochastic_floor)
+
+    # When demo-ready, export the trained policy's OWN winning greedy rollout as a replayable
+    # {seed, actions} demo trajectory (the demo IS the certified reliable agent playing). It
+    # is written beside the model artifact (or to `demo_out`) so the capture CLI can replay it:
+    # `harness game capture <game> --actions <demo_trajectory.json>`.
+    demo_trajectory = _pick_demo_trajectory(greedy_eps) if demo_ready else None
+    demo_trajectory_path = None
+    if demo_trajectory is not None:
+        target = demo_out
+        if target is None and saved_model_path:
+            target = os.path.join(os.path.dirname(saved_model_path) or ".",
+                                  "demo_trajectory.json")
+        if target is not None:
+            demo_trajectory_path = export_demo_trajectory(demo_trajectory, target)
+
     return {
         # --- task-required keys ---
         "learnable": bool(learnable),
@@ -371,6 +492,14 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         # WHICH milestones the policy reaches over the eval episodes (see helper).
         "per_checkpoint_latch_rate": per_checkpoint_latch_rate,
         "saved_model_path": saved_model_path,          # SB3 .zip artifact (if save_model)
+        # --- demo-readiness / critic-competence (Elias's reliability gate) ---
+        # demo_ready gates BOTH consumers: (1) the demo replays this greedy rollout, (2) g4's
+        # smart tiers accept this critic (critic_competent == demo_ready). See `is_demo_ready`.
+        "demo_ready": bool(demo_ready),
+        "greedy_sr": greedy_sr,                        # greedy (deterministic) demo-gate rate
+        "stochastic_sr": stochastic_sr,                # stochastic (robustness) demo-gate rate
+        "demo_trajectory": demo_trajectory,            # {seed, actions, ticks, greedy} | None
+        "demo_trajectory_path": demo_trajectory_path,  # capture --actions target (or None)
         # --- provenance / diagnostics ---
         "title": title,
         "game_path": game_path,
@@ -396,3 +525,146 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "checkpoint_keys": cp_keys,
         "throughput_sps": int(train_res["global_steps"] / max(1e-6, train_res["train_wall_s"])),
     }
+
+
+# ======================================================================== #
+# RL-WITNESS SECOND CERTIFICATION PATH — rescue_certify (scope extension, Elias)
+#
+# A game the G3 TREE solver leaves UNSOLVED but WITH PROGRESS (some milestones reached) is
+# "solvable-but-hard", not broken. Train a policy (the SAME g3_prime + demo_ready + trajectory
+# primitives), and if it CONVERGES to a demo-ready policy whose greedy winning rollout
+# REPLAYS bit-exactly through the frozen serve host (the SAME bar as a tree witness), upgrade
+# the report to a first-class CERTIFIED game carrying an RL witness (witness_source="rl"). The
+# UNSOLVED diagnosis is PRESERVED (a valuable difficulty signal). This never runs inside the
+# plain verify path (a PPO per game) — it is an explicit second pass (CLI verb / harden flag).
+# ======================================================================== #
+RESCUE_BUDGET = 500_000          # bounded RL budget for ONE rescue attempt [eng.]
+RESCUE_NUM_ENVS = 8              # batched in-scene vec width for a rescue train [eng.]
+
+
+def _bridge_replay_for_engine(engine: str, game_source: str, witness: dict) -> dict:
+    """Dispatch the certificate-bridge replay to the engine's NORMAL batch executor."""
+    if engine == "godot":
+        return _bridge_replay_godot(game_source, witness)
+    if engine == "gdscript":
+        return _bridge_replay_gdscript(game_source, witness)
+    return _bridge_replay(game_source, witness)
+
+
+def _rescue_candidacy(report: dict):
+    """Is this verify report a rescue candidate? Returns (ok, reason). ONLY an UNSOLVED
+    verdict WITH PROGRESS (some declared milestone reached >0 times) qualifies — never a
+    broken game (ENV_ERROR/GOAL_ERROR) and never a hopeless UNSOLVED (nothing reached: PPO
+    would be wasted). An already-passed report is handled by the caller (tree-certified)."""
+    if not isinstance(report, dict):
+        return False, "no_report"
+    if report.get("passed"):
+        return False, "already_certified"
+    fc = report.get("failure_class")
+    if fc != "UNSOLVED":
+        return False, f"not_unsolved ({fc})"
+    reach = ((report.get("progress") or {}).get("reach_counts")) or {}
+    if not any(int(v) > 0 for v in reach.values()):
+        return False, "no_progress"      # hopeless — nothing ever reached; do not spend PPO
+    return True, "unsolved_with_progress"
+
+
+def rescue_certify(game_path: str, verify_report: dict | None = None, *,
+                   budget_steps: int = RESCUE_BUDGET, n_eval: int = N_EVAL,
+                   num_envs: int = RESCUE_NUM_ENVS, seed: int = 0, trainer: str = "sb3",
+                   method: str = "ppo", demo_sr_min: float = DEMO_SR_MIN,
+                   demo_stochastic_floor: float = DEMO_STOCHASTIC_FLOOR,
+                   save_model: str | None = None, demo_out: str | None = None,
+                   wall_clock_budget_s=None, log=None, g3_fn=None,
+                   **train_kwargs) -> dict:
+    """Second-path certification of ONE game via a trained RL witness (see banner above).
+
+    `verify_report` is the game's tree verify report (run afresh when omitted). `g3_fn`
+    overrides the trainer entry (defaults to `g3_prime`; tests inject a stub). Returns the
+    (additively) updated report:
+
+      * ALREADY tree-certified -> returned with ``witness_source="tree"`` (no PPO).
+      * NOT an UNSOLVED-with-progress candidate -> ``rescue={attempted:False, reason:...}``.
+      * TRAINED + CONVERGED (demo_ready) + demo trajectory REPLAYS to success -> UPGRADED:
+        ``passed=True, failure_class=None, witness=<rl witness>, witness_source="rl"``,
+        the preserved UNSOLVED diagnosis under ``unsolved_diagnosis``, and a ``rescue`` block
+        with the rl provenance (``rl_steps``, greedy/stochastic SR, ``n_eval``, budget) the
+        Atlas later reads for its composite prover-effort axis.
+      * TRAINED but NO convergence / REPLAY MISMATCH / train error -> report stays UNSOLVED
+        with an honest ``rescue={attempted:True, rescued:False, reason:...}`` block.
+    """
+    if verify_report is None:
+        from harness.verify.gameverify import verify_game
+        verify_report = verify_game(game_path)
+    report = dict(verify_report) if isinstance(verify_report, dict) else {"passed": False}
+
+    # (a) already certified by the tree solver -> first-class TREE witness, no PPO.
+    if report.get("passed"):
+        report.setdefault("witness_source", "tree")
+        return report
+
+    # (b) rescue candidacy: UNSOLVED WITH PROGRESS only.
+    ok, reason = _rescue_candidacy(report)
+    if not ok:
+        report["rescue"] = {"attempted": False, "rescued": False, "reason": reason}
+        return report
+
+    # (c) TRAIN a policy (batched) — reuses the demo_ready + trajectory primitives.
+    train = g3_fn or g3_prime
+    try:
+        g3 = train(game_path, budget_steps=budget_steps, n_eval=n_eval, seed=seed,
+                   trainer=trainer, method=method, num_envs=num_envs,
+                   save_model=save_model, demo_out=demo_out, demo_sr_min=demo_sr_min,
+                   demo_stochastic_floor=demo_stochastic_floor,
+                   wall_clock_budget_s=wall_clock_budget_s, log=log, **train_kwargs)
+    except Exception as exc:  # noqa: BLE001 - a training/bridge crash is an honest failure
+        report["rescue"] = {"attempted": True, "rescued": False, "reason": "train_error",
+                            "error": f"{type(exc).__name__}: {exc}"}
+        return report
+
+    rl_prov = {
+        "rl_steps": g3.get("trained_steps"), "budget_steps": g3.get("budget_steps"),
+        "greedy_sr": g3.get("greedy_sr"), "stochastic_sr": g3.get("stochastic_sr"),
+        "n_eval": g3.get("n_eval"), "demo_ready": bool(g3.get("demo_ready")),
+        "trainer": g3.get("trainer"), "method": g3.get("method"),
+        "saved_model_path": g3.get("saved_model_path"),
+    }
+
+    # (d) convergence gate: the SAME criterion as demo_ready.
+    demo_traj = g3.get("demo_trajectory")
+    if not g3.get("demo_ready") or demo_traj is None:
+        report["rescue"] = {"attempted": True, "rescued": False,
+                            "reason": "no_convergence", **rl_prov}
+        return report
+
+    # (e) REPLAY-VALIDATE the greedy demo trajectory bit-exactly through the serve host
+    #     (the SAME bar as a tree witness — a deterministic replay to success).
+    from harness.verify.gameverify import detect_engine
+    with open(game_path, "r", encoding="utf-8") as fh:
+        game_source = fh.read()
+    engine = detect_engine(game_path, game_source)
+    try:
+        rec = _bridge_replay_for_engine(engine, game_source, demo_traj)
+    except Exception as exc:  # noqa: BLE001 - a bridge crash is an honest replay failure
+        report["rescue"] = {"attempted": True, "rescued": False, "reason": "replay_error",
+                            "error": f"{type(exc).__name__}: {exc}", **rl_prov}
+        return report
+    if rec.get("result") != "success":
+        report["rescue"] = {"attempted": True, "rescued": False, "reason": "replay_mismatch",
+                            "replay_result": rec.get("result"), **rl_prov}
+        return report
+
+    # (f) SUCCESS -> UPGRADE to a first-class RL-certified game (witness parity with the tree
+    #     witness shape: {seed, actions, ticks, checkpoints}), PRESERVING the UNSOLVED
+    #     diagnosis (solvable-but-hard is a valuable signal, kept for the difficulty tuner).
+    witness = {"seed": demo_traj["seed"], "actions": list(demo_traj["actions"]),
+               "ticks": rec.get("ticks", demo_traj.get("ticks")),
+               "checkpoints": dict(rec.get("checkpoints") or {})}
+    report["unsolved_diagnosis"] = report.get("progress")   # preserved difficulty signal
+    report["passed"] = True
+    report["failure_class"] = None
+    report["witness"] = witness
+    report["witness_source"] = "rl"
+    report["rescue"] = {"attempted": True, "rescued": True, "reason": "rl_certified",
+                        "witness_ticks": witness["ticks"], **rl_prov}
+    return report
