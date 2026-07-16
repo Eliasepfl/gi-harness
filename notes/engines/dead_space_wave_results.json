@@ -1,0 +1,124 @@
+[
+  {
+    "i": 0,
+    "kind": "3D-evoking",
+    "prompt": "fly a small craft through a series of floating rings",
+    "skills": [
+      "godot-game-loop-time-trial",
+      "godot-genre-racing"
+    ],
+    "verdict": "COMPLETED",
+    "backend": "openrouter",
+    "path": "/home/enaha/gi_wave_scratch/p0/fly_a_small_craft_through_a_series_of_fl/fly_a_small_craft_through_a_series_of_fl.gd",
+    "dim": "2D",
+    "linear_ratio": 1.526,
+    "dead_space": false,
+    "su_dims": 2,
+    "playfield": [
+      2200.0,
+      600.0
+    ],
+    "span": [
+      2104.0,
+      269.52
+    ]
+  },
+  {
+    "i": 1,
+    "kind": "3D-evoking",
+    "prompt": "park a car into a tight parking slot",
+    "skills": [
+      "godot-genre-racing",
+      "godot-physics-3d"
+    ],
+    "verdict": "UNSOLVED",
+    "backend": "openrouter",
+    "path": "/home/enaha/gi_wave_scratch/p1/park_a_car_into_a_tight_parking_slot/park_a_car_into_a_tight_parking_slot.gd",
+    "dim": "2D",
+    "linear_ratio": 1.0,
+    "dead_space": false,
+    "su_dims": 2,
+    "playfield": [
+      968.0,
+      648.0
+    ],
+    "span": [
+      968.0,
+      648.0
+    ]
+  },
+  {
+    "i": 2,
+    "kind": "3D-evoking",
+    "prompt": "land a probe gently on a landing pad",
+    "skills": [
+      "godot-physics-3d",
+      "godot-2d-physics"
+    ],
+    "verdict": "ENV_ERROR",
+    "backend": "openrouter",
+    "path": "/home/enaha/gi_wave_scratch/p2/land_a_probe_gently_on_a_landing_pad/land_a_probe_gently_on_a_landing_pad.gd",
+    "dim": "2D"
+  },
+  {
+    "i": 3,
+    "kind": "planar",
+    "prompt": "push a block through a maze to the exit",
+    "skills": [
+      "godot-genre-puzzle",
+      "godot-2d-physics"
+    ],
+    "verdict": "COMPLETED",
+    "backend": "template",
+    "path": "/home/enaha/gi_wave_scratch/p3/push_a_block_through_a_maze_to_the_exit/push_a_block_through_a_maze_to_the_exit.gd",
+    "dim": "2D",
+    "linear_ratio": 6.33,
+    "dead_space": true,
+    "su_dims": 2,
+    "playfield": [
+      800.0,
+      600.0
+    ],
+    "span": [
+      444.0,
+      26.98
+    ]
+  },
+  {
+    "i": 4,
+    "kind": "planar",
+    "prompt": "sort falling shapes into the matching bins",
+    "skills": [
+      "godot-2d-physics",
+      "godot-genre-puzzle"
+    ],
+    "verdict": "UNSOLVED",
+    "backend": "openrouter",
+    "path": "/home/enaha/gi_wave_scratch/p4/sort_falling_shapes_into_the_matching_bi/sort_falling_shapes_into_the_matching_bi.gd",
+    "dim": "2D",
+    "linear_ratio": 1.151,
+    "dead_space": false,
+    "su_dims": 2,
+    "playfield": [
+      800.0,
+      724.0
+    ],
+    "span": [
+      604.0,
+      724.0
+    ]
+  },
+  {
+    "i": 5,
+    "kind": "planar",
+    "prompt": "slingshot a ball to knock down a stack of towers",
+    "skills": [
+      "godot-2d-physics",
+      "godot-physics-3d"
+    ],
+    "verdict": "ENV_ERROR",
+    "backend": "openrouter",
+    "path": "/home/enaha/gi_wave_scratch/p5/slingshot_a_ball_to_knock_down_a_stack_o/slingshot_a_ball_to_knock_down_a_stack_o.gd",
+    "dim": "2D"
+  }
+]
