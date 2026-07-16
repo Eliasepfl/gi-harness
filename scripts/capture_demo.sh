@@ -76,6 +76,9 @@ apptainer exec \
     # physics pins match the serve host that produced the witness (default 1). The stepping
     # is tick-identical across speedups, but this keeps the demo byte-faithful to certification.
     export HARNESS_GODOT_SPEEDUP='${HARNESS_GODOT_SPEEDUP:-1}'
+    # Offline asset-routing on a compute node (no OpenRouter key / no egress): keeps the
+    # cosmetic bank-asset routing on its deterministic fallback instead of a doomed LLM call.
+    export HARNESS_OFFLINE='${HARNESS_OFFLINE:-1}'
     cd '$GI_REPO'
     python3 -m harness game capture '$GAME_ABS' --out '$OUT_ABS' ${EXTRA[*]:-}
   "
