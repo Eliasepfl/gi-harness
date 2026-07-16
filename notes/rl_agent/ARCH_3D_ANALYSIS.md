@@ -297,6 +297,20 @@ state()-sampling instant → twin-rollout byte-identity holds WITH rays.
   goal/sensor pads read the sensor class. So each ray is `ray_stride` floats (1, or 1+3=4). `range`
   default is the reference `ray_length=80` (world units); the 3D world box is not wired, so per-world
   extent scaling is a **follow-up** — callers override `range` per game.
+- **Ray FRAME (`ray_frame`, default `"auto"`; sensor-side, NO game/contract change)**: while the
+  controlled body's rotation is **LIVE** the fan/grid is cast in its **body-local** frame (correct FPS
+  facing). Once rotation is **LOCKED** (`lock_rotation` / all angular axis locks — e.g. the fly glider),
+  the body never turns to face its travel, so a body-local retina would stare at a FIXED world direction;
+  `"auto"` then casts in a **HEADING frame** — forward = `normalize(velocity)` (holding its last value
+  below a 1e-2 speed floor, initialized to the body's facing; 3D up = world up, right = orthonormal cross;
+  degenerate forward∥up → keep body-local). Per-instance last-heading is derived purely from the
+  deterministic trajectory (twin determinism stays bit-exact, reset on rebuild) — verified in-image
+  (locked mover translating +X → its CENTER ray hits the +X wall ahead, 2D & 3D; body-mode misses).
+  `"body"` forces body-local. This fixes the real defect Elias flagged (a lock_rotation body's retina
+  aiming at a fixed axis instead of "in front"). NOTE the trade-off — for a body that TRANSLATES without
+  turning, body-local gives a *stable* world-aligned retina while a heading frame reorients with the
+  (jittery) velocity vector; §7.5 shows this can cost more than the down-travel alignment buys on a
+  straight-tube game.
 - **First-frame caveat (verified in-image)**: the reset/init frame's rays read **all-clear** — the
   physics broadphase is populated only after the first step; every stepped frame is faithful (diag
   job 18079661: reset 0/45 hits, step 0 onward 45/45). Negligible for training (one frame/episode).
@@ -346,16 +360,39 @@ global positions it matched/edged positions+rays on ring-1 eval and even hit a f
 §5.3's "route unsolved-but-not-a-crash to the difficulty tuner / more budget", not a crash or obs bug.
 Greedy SR is 0 everywhere (deterministic greedy is binary; the graded signal is the eval latch rate).
 
-**Caveat (honest):** this glider has `lock_rotation=true` and never turns to face its +Z travel, so its
-body-local retina (forward = local −Z) looks backward/sideways — yet the side/floor/ceiling wall rays
-still inform the "stay-centered" fail condition, which is why rays help even here. Games whose craft
-turn to face travel get travel-aligned rays for free. This is a property of the game's body, not the
-sensor (the sensor is faithfully body-local per Elias' "in its local frame").
+**The three arms above used the body-local retina** (rays-work commit, before the heading fix). The
+glider has `lock_rotation=true` and never turns to face its +Z travel, so its body-local retina looked
+backward/sideways — yet the side/floor/ceiling wall rays still informed the "stay-centered" fail
+condition, which is why rays helped even then.
+
+**Heading-frame re-run (pure rays, same game/budget/range, job 18085133) — reported honestly, whatever
+it says:** switching the locked glider's retina to the HEADING frame (now looking +Z down-travel) did
+**NOT** help — it nominally **regressed**:
+
+| pure rays, a_3d_game_fly, 130k | retina frame | trained steps | peak mean latch | eval ring-1 latch | first stochastic success |
+|---|---|---|---|---|---|
+| before (rays-work) | body-local (−Z, backward) | 69,640 | 1.0 | **0.625** | step 61,056 |
+| after (heading fix) | heading (+Z, down-travel) | 89,096 | 0.833 | **0.0** | none |
+
+Honest read: on THIS straight canyon the rings are **non-collider markers** (invisible to rays in either
+frame) and the only colliders are the tube walls, so the *useful* signal (side/floor/ceiling proximity
+for centering) is nearly identical in both frames — while the forward (+Z) rays mostly see open canyon
+(uninformative 1.0) and the velocity-tracking frame is **less stationary** than the fixed body-local one
+for a non-rotating craft. The delta (0.625 → 0.0 greedy-eval) also sits inside the high variance of a
+16-seed greedy eval on an unsolved game (cf. the positions baseline's own 0.0). **Verdict:** the heading
+frame is the principled fix for the locked-body defect (unit-proven: a locked mover's centre ray hits
+the wall ahead) and will pay off on games whose travel direction *varies* and whose obstacles are real
+colliders — but it is **not** a win on this straight-tube marker-ring benchmark, and the body-local frame
+is retained via `ray_frame:"body"`. Default stays `"auto"` per the directive; the honest number argues
+for making the frame a per-game/curriculum choice rather than assuming heading always helps.
 
 ### 7.6 Files (this change)
 - `godotworld/serve_game.gd` — opt-in `rays` parse + `direct_space_state.intersect_ray` fan (2D) /
-  25×5 grid (3D) + per-ray {static,dynamic,sensor} class channel; emitted ONLY when opted in
+  25×5 grid (3D) + per-ray {static,dynamic,sensor} class channel + the `ray_frame` auto/heading
+  selection (`_rotation_locked`/velocity/per-instance last-heading); emitted ONLY when opted in
   (frame byte-identical off). No effect on check/init/reset/act wire when off.
+- `tests/fixtures/gd_games/heading_probe_3d.gd`, `heading_probe_2d.gd`, `heading_still_3d.gd` —
+  locked-rotation movers pinning the heading frame (center-ray-hits-ahead, zero-velocity fallback).
 - `harness/rl/env.py` — `obs_profile` (3 profiles) + `_build_obs_pure`; `build_obs_vector` `rays`
   tail; `n_rays_of`/`ray_stride`/`rays_obs_width`/`normalize_rays`/`obs_dim_for` (profile+ray-float aware).
 - `harness/rl/godot_env.py`, `harness/rl/godot_vec_env.py` — `rays`/`obs_profile` kwargs, tail sizing,

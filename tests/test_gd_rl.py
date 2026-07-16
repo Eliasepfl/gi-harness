@@ -36,6 +36,9 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MINI = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect.gd")
 MINI_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "mini_collect_3d.gd")
 TUMBLE_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "tumble_3d.gd")
+HEADING_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "heading_probe_3d.gd")
+HEADING_2D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "heading_probe_2d.gd")
+HEADING_STILL_3D = os.path.join(_ROOT, "tests", "fixtures", "gd_games", "heading_still_3d.gd")
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -396,6 +399,135 @@ def test_gd_rays_2d_planar_fan():
         obs, _ = env.reset(seed=0)
         assert np.all(np.isfinite(obs))
         assert obs[-w:].min() >= 0.0 and obs[-w:].max() <= 1.0
+    finally:
+        env.close()
+
+
+# ====================================================================== #
+# 6. HEADING-FRAME retina — a locked-rotation body's rays look down-travel
+# ====================================================================== #
+def _ray_dists(obs, rays, dim):
+    """Extract the per-ray normalized distances (stride col 0) from an obs tail."""
+    from harness.rl.env import n_rays_of, ray_stride
+    n, s = n_rays_of(rays, dim), ray_stride(rays)
+    return obs[-n * s:].reshape(n, s)[:, 0], n
+
+
+@requires_godot
+def test_gd_heading_frame_3d_locked_body_center_ray_looks_down_travel():
+    """A lock_rotation 3D body facing −Z but MOVING +X: in 'auto' its heading-frame CENTRE
+    ray points +X and HITS the wall ahead; in 'body' mode it stares down −Z and MISSES.
+    This is the whole point of the heading frame (Elias' locked-body defect fix)."""
+    from harness.rl.env import DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS); rays["range"] = 100.0                 # 25×5 grid; center idx 62
+    center = (DEFAULT_RAYS["n_v"] // 2) * DEFAULT_RAYS["n_h"] + DEFAULT_RAYS["n_h"] // 2
+    # auto (default) -> heading frame for the locked body
+    env = GodotServeEnv(HEADING_3D, port_base=_free_port(),
+                        obs_profile="positions+rays", rays=rays)
+    try:
+        env.reset(seed=0)
+        o, *_ = env.step(0)                                          # velocity +X establishes heading
+        d, _n = _ray_dists(o, rays, 3)
+        assert np.all(np.isfinite(o))
+        assert d[center] < 1.0, "heading centre ray must hit the +X wall ahead"
+    finally:
+        env.close()
+    # body mode -> centre ray points −Z (fixed facing), misses the +X wall
+    rays_body = dict(rays); rays_body["ray_frame"] = "body"
+    envb = GodotServeEnv(HEADING_3D, port_base=_free_port(),
+                         obs_profile="positions+rays", rays=rays_body)
+    try:
+        envb.reset(seed=0)
+        ob, *_ = envb.step(0)
+        db, _n = _ray_dists(ob, rays_body, 3)
+        assert db[center] == 1.0, "body-frame centre ray (−Z) must miss the +X wall"
+    finally:
+        envb.close()
+
+
+@requires_godot
+def test_gd_heading_frame_2d_locked_body_center_ray_looks_down_travel():
+    """2D twin: a lock_rotation body FACING +Y but MOVING +X. Heading centre ray → +X hits
+    the wall; body-frame centre ray → +Y misses. Narrow fov so the contrast is unambiguous."""
+    rays = {"n": 15, "fov_deg": 60.0, "range": 400.0, "class_bits": True, "ray_frame": "auto"}
+    center = 15 // 2
+    env = GodotServeEnv(HEADING_2D, port_base=_free_port(),
+                        obs_profile="positions+rays", rays=rays)
+    try:
+        assert env._dim == 2
+        env.reset(seed=0)
+        o, *_ = env.step(0)
+        d, _n = _ray_dists(o, rays, 2)
+        assert np.all(np.isfinite(o))
+        assert d[center] < 1.0, "heading centre ray must hit the +X wall"
+    finally:
+        env.close()
+    rays_body = dict(rays); rays_body["ray_frame"] = "body"
+    envb = GodotServeEnv(HEADING_2D, port_base=_free_port(),
+                         obs_profile="positions+rays", rays=rays_body)
+    try:
+        envb.reset(seed=0)
+        ob, *_ = envb.step(0)
+        db, _n = _ray_dists(ob, rays_body, 2)
+        assert db[center] == 1.0, "body-frame centre ray (+Y) must miss the +X wall"
+    finally:
+        envb.close()
+
+
+@requires_godot
+def test_gd_heading_frame_determinism_byte_identical():
+    """Twin determinism holds for a LOCKED-rotation game with rays on — the heading state is
+    derived purely from the deterministic trajectory."""
+    from harness.rl.env import DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS); rays["range"] = 100.0
+    seqs = []
+    for _ in range(2):
+        env = GodotServeEnv(HEADING_3D, port_base=_free_port(),
+                            obs_profile="positions+rays", rays=rays)
+        try:
+            trail = [env.reset(seed=0)[0].copy()]
+            for _ in range(6):
+                o, _r, term, trunc, _i = env.step(0)
+                trail.append(o.copy())
+                if term or trunc:
+                    break
+            seqs.append(trail)
+        finally:
+            env.close()
+    assert all(a.tobytes() == b.tobytes() for a, b in zip(*seqs)), \
+        "heading frame broke twin-rollout byte-identity"
+
+
+@requires_godot
+def test_gd_heading_frame_zero_velocity_falls_back_to_facing_no_nan():
+    """Zero-velocity locked body: the heading falls back to the INITIAL FACING (−Z), never
+    normalizing a zero vector (NaN). Wall at −Z, so the centre ray hits it; obs stays finite."""
+    from harness.rl.env import DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS); rays["range"] = 100.0
+    center = (DEFAULT_RAYS["n_v"] // 2) * DEFAULT_RAYS["n_h"] + DEFAULT_RAYS["n_h"] // 2
+    env = GodotServeEnv(HEADING_STILL_3D, port_base=_free_port(),
+                        obs_profile="positions+rays", rays=rays)
+    try:
+        env.reset(seed=0)
+        for _ in range(3):
+            o, *_ = env.step(0)
+            assert np.all(np.isfinite(o)), "zero-velocity heading produced a NaN"
+        d, _n = _ray_dists(o, rays, 3)
+        assert d[center] < 1.0, "facing-fallback centre ray (−Z) must hit the −Z wall"
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_gd_heading_fixture_rays_off_has_no_tail():
+    """rays-off byte-identity: the heading fixture with the default 'positions' profile carries
+    NO ray tail (exact same obs width as before)."""
+    from harness.rl.env import obs_dim_for
+    env = GodotServeEnv(HEADING_3D, port_base=_free_port())          # positions (rays off)
+    try:
+        assert env._obs_profile == "positions" and env._n_ray_floats == 0
+        assert env.observation_space.shape[0] == \
+            obs_dim_for(len(env._body_order), len(env._cp_keys), env._dim)
     finally:
         env.close()
 
