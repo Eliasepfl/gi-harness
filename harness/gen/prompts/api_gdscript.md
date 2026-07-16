@@ -12,12 +12,12 @@ DIVERSITY IS THE JOB, NOT A BONUS. Two prompts that share a word must not become
 
 The root node picks the world's dimension; the fiction chooses which, and neither is the default:
 
-- a 2D root (the `Node2D` family) - a 2D world of `Node2D`-family bodies/areas/shapes. Gravity and view (a side elevation where things fall, or a topdown plane where they coast) are yours to set.
+- a 2D root (the `Node2D` family) - a 2D world of `Node2D`-family bodies/areas/shapes. Gravity and view are yours to set - any orientation the fiction wants, as long as the two agree with each other.
 - a 3D root (the `Node3D` family) - a 3D world of `Node3D`-family bodies/areas/shapes. You MUST call `PhysicsServer3D.set_active(true)` inside `build()` (the one 3D quirk - the headless host leaves the 3D space inactive otherwise). Gravity and orientation are likewise yours to set.
 
 # The controlled body is WHATEVER the game is about
 
-Exactly one dynamic body is `{"controlled": true, "static": false}` - and it is a ship, a car, a plane, a boulder, a fish, a character, whatever your fiction is. Pick the body kind and the collision shape the design needs. NEVER default to a circle/ball because it is easy; the shape is a design decision like every other.
+Exactly one dynamic body is `{"controlled": true, "static": false}` - and it is whatever your fiction is about; no body kind is more expected than any other. Pick the body kind and the collision shape the design needs. NEVER default to a circle/ball because it is easy; the shape is a design decision like every other.
 
 Name each body for what it represents in the fiction; a name may later be used for optional render-only cosmetic dressing that never changes physics, gameplay, or verification.
 

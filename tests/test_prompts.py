@@ -90,11 +90,16 @@ def test_gdscript_banned_list_states_determinism_and_sandbox_reasons():
 
 
 def test_gdscript_gravity_is_the_games_own_choice():
-    # View guidance: gravity/view is the GAME's to set (no hardcoded frame values).
+    # View guidance: gravity/view is the GAME's to set - and the contract offers NO menu.
+    # (2026-07-16 de-bias: enumerating "side elevation or topdown" was itself a two-item
+    # menu steering the frame choice; steering belongs to the user prompt, not the harness.)
     sp = P.compose("gdscript")
     flat = " ".join(sp.lower().split())
     assert "yours to set" in flat                       # gravity/orientation is the game's
-    assert "topdown" in flat and "side" in flat         # both 2D frame anchors named, no values
+    assert "topdown" not in flat                        # no closed frame menu
+    assert "side elevation" not in flat
+    # No fiction menu either: the controlled body must not be pre-cast into example kinds.
+    assert "a ship, a car" not in flat
 
 
 def test_gdscript_prompt_carries_no_anchoring_residue():
