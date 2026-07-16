@@ -267,6 +267,44 @@ def _compile_g3(g3: dict) -> list:
 # ======================================================================== #
 # G4 (adversarial) -> directives
 # ======================================================================== #
+def _frozen_state_facts(fs) -> str:
+    """Render the ENGINE-TRUTH frozen pocket a certified-softlock finding carries into ONE
+    concise, factual clause for the directive (Elias's ask: give the LLM that wrote the game
+    the position + state of the softlock FROM THE ENGINE; his 'engine facts raised' principle
+    — report the state, do NOT prescribe beyond the existing escapable/unreachable ask).
+    Returns "" when no frozen_state rode along (un-enriched / degraded findings).
+
+    These coordinates are TEXT ONLY — they must NEVER enter the dedup fingerprint (the
+    convergence guard keys on the defect identity, not volatile positions), so the caller
+    splices this into ``text``, never into ``checkpoint_keys``."""
+    if not isinstance(fs, dict) or not fs:
+        return ""
+    parts = []
+    ctrl = fs.get("controlled") or {}
+    pos = ctrl.get("pos")
+    if pos is not None:
+        seg = f"the engine holds {ctrl.get('name') or 'the controlled body'} at pos {pos}"
+        vel = ctrl.get("vel")
+        if vel is not None:
+            seg += f" (velocity {vel})"
+        parts.append(seg)
+    nearby = [b for b in (fs.get("nearby") or []) if b.get("name")]
+    if nearby:
+        parts.append("nearest bodies: "
+                     + ", ".join(f"{b['name']} at {b.get('pos')}" for b in nearby[:3]))
+    enclosing = [w["name"] for w in (fs.get("enclosing") or []) if w.get("name")]
+    if enclosing:
+        parts.append("the pocket is walled by static geometry: " + ", ".join(enclosing))
+    ticks = fs.get("ticks_elapsed")
+    if ticks is not None:
+        last_cp = fs.get("last_latched_checkpoint")
+        parts.append(f"{ticks} ticks in, '{last_cp}' was the last checkpoint reached"
+                     if last_cp else f"{ticks} ticks in, with no checkpoint yet latched")
+    if not parts:
+        return ""
+    return " Engine state at the softlock: " + "; ".join(parts) + "."
+
+
 def _g4_directive(finding: dict):
     outcome = finding.get("outcome")
     ev = finding.get("evidence") or {}
@@ -305,11 +343,18 @@ def _g4_directive(finding: dict):
         summary = detail or (
             f"an action prefix (len {len(plan)}) drives the game into a dead-end state")
         if outcome == "softlock":
+            facts = _frozen_state_facts(finding.get("frozen_state"))
+            budget = prov.get("budget")
+            proof = (" The solver PROVED no continuation wins from this state"
+                     + (f" (searched {budget} ticks)." if budget else "."))
             text = (
                 f"SOFTLOCK (dead-end state): {summary}. Reproducer: seed "
                 f"{repro.get('seed')}, action prefix of length {len(plan)}"
                 + (f" (subtree {prov.get('subtree_status')})" if prov else "")
-                + ". Ensure EVERY reachable state can still reach the goal — remove the "
+                + "."
+                + facts
+                + proof
+                + " Ensure EVERY reachable state can still reach the goal — remove the "
                 "one-way trap, or add an escape/reset from the dead end — WITHOUT changing "
                 "the goal or the intended path.")
         else:
@@ -320,7 +365,8 @@ def _g4_directive(finding: dict):
                 "progress. Remove the trap geometry / add an escape so the agent can never "
                 "be permanently immobilised, keeping the intended path intact.")
         return _mk(outcome, "g4", [], text,
-                   {"reproducer": repro, "detail": detail})
+                   {"reproducer": repro, "detail": detail,
+                    "frozen_state": finding.get("frozen_state") or {}})
 
     return None
 
