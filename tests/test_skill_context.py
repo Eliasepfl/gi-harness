@@ -9,6 +9,7 @@ sibling library, skipped when it is not present.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import types
 
@@ -255,3 +256,174 @@ def test_real_library_loads_and_renders():
     names = [s.name for s in SC.select_skills(
         "a top-down game where you herd sheep into a pen", k=2)]
     assert names and all(n.startswith("godot-") for n in names)
+
+
+# =========================================================================== #
+# TASK A.1 — load_index reconciliation against DISK TRUTH (loader robustness)
+# =========================================================================== #
+def _write_skill(root, name, description="body-desc", body="## Body\nreal content here.\n"):
+    """Create skills/<name>/SKILL.md with a YAML frontmatter description under root."""
+    d = os.path.join(root, "skills", name)
+    os.makedirs(d, exist_ok=True)
+    fm = f'---\nname: {name}\ndescription: "{description}"\n---\n\n{body}'
+    with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as fh:
+        fh.write(fm)
+
+
+def _make_lib(root, index_entries):
+    """Write a fabricated library: skills_index.json = index_entries (bodies are
+    created separately via _write_skill so an index entry can be a body-less ghost)."""
+    with open(os.path.join(root, "skills_index.json"), "w", encoding="utf-8") as fh:
+        json.dump(index_entries, fh)
+
+
+def test_load_index_reconciles_dedup_supplement_and_ghost(tmp_path):
+    root = str(tmp_path / "lib")
+    os.makedirs(root)
+    # index lists: a normal skill, the SAME name twice (exact duplicate), and an
+    # index-only GHOST whose body file does not exist on disk.
+    _make_lib(root, [
+        {"name": "godot-real-one", "description": "one", "keywords": ["alpha"]},
+        {"name": "godot-dup", "description": "dup", "keywords": ["beta"]},
+        {"name": "godot-dup", "description": "dup", "keywords": ["beta"]},   # (b) duplicate
+        {"name": "godot-ghost", "description": "ghost", "keywords": ["gamma"]},  # (c) no body
+    ])
+    _write_skill(root, "godot-real-one")
+    _write_skill(root, "godot-dup")
+    # (a) a DISK-ONLY skill: has a SKILL.md but is absent from the index entirely.
+    _write_skill(root, "godot-disk-only",
+                 description="Expert disk-only pathfinding blueprint for delta AI.")
+    # godot-ghost has NO dir/body on disk.
+
+    index = SC.load_index(root)
+    names = [e["name"] for e in index]
+
+    # (b) duplicate collapsed to a single entry
+    assert names.count("godot-dup") == 1
+    # (c) index-only ghost (no body file) skipped -> unroutable phantom removed
+    assert "godot-ghost" not in names
+    # (a) disk-only skill supplemented into the routable index, description from its
+    # SKILL.md frontmatter
+    assert "godot-disk-only" in names
+    disk = next(e for e in index if e["name"] == "godot-disk-only")
+    assert "pathfinding" in disk["description"]
+    # and it is genuinely routable: BM25 can pick it from its own frontmatter terms
+    picked = [s.name for s in SC.select_skills("delta pathfinding blueprint", k=3,
+                                               root=root, use_llm=False)]
+    assert "godot-disk-only" in picked
+    # every reconciled entry resolves to a real body file (no dead references)
+    for e in index:
+        assert SC._skill_body(root, e["name"])
+
+
+def _find_real_lib():
+    cand = os.environ.get("GD_AGENTIC_SKILLS_DIR")
+    if cand and SC.library_root(cand):
+        return SC.library_root(cand)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(8):
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+        c = os.path.join(here, "gd-agentic-skills")
+        if os.path.isfile(os.path.join(c, "skills_index.json")):
+            return c
+    return None
+
+
+@pytest.mark.skipif(_find_real_lib() is None,
+                    reason="real gd-agentic-skills library not locatable")
+def test_real_library_recovers_unindexed_ai_navigation():
+    # The real library's index forgets 'godot-ai-navigation' (its dir + SKILL.md
+    # fully exist); the reconciled loader must recover it as a routable entry, and
+    # collapse the duplicated 'godot-navigation-pathfinding' to a single entry.
+    real = _find_real_lib()
+    index = SC.load_index(real)
+    names = [e["name"] for e in index]
+    assert "godot-ai-navigation" in names
+    assert names.count("godot-navigation-pathfinding") == 1
+    assert len(names) == len(set(names))           # no duplicate names survive
+    assert SC._skill_body(real, "godot-ai-navigation")   # body resolves
+
+
+# =========================================================================== #
+# TASK A.2 — the LLM-route pick ceiling (raised 10 -> 14, binding is observable)
+# =========================================================================== #
+def test_llm_route_ceiling_is_14():
+    # A regression pin: the diagnosis found 10 truncated rich prompts; 14 clears the
+    # observed 8-10 structural + genre/physics/camera/controls demand.
+    assert SC._LLM_ROUTE_CEILING == 14
+
+
+def test_llm_route_returns_up_to_ceiling_and_logs_when_binding(monkeypatch, caplog):
+    # A model that names MANY relevant skills: the ceiling caps the return AND the
+    # binding is logged (never a silent truncation).
+    index = [{"name": f"godot-skill-{i:02d}", "description": f"desc {i}"}
+             for i in range(20)]
+    monkeypatch.setattr(GG, "_openrouter_complete",
+                        lambda system, messages: "\n".join(e["name"] for e in index))
+    with caplog.at_level(logging.INFO, logger="harness.gen.skill_context"):
+        picked = SC._llm_route("a rich structural prompt", index, SC._LLM_ROUTE_CEILING)
+    assert picked == [e["name"] for e in index][:14]     # exactly the ceiling, in order
+    assert any("ceiling" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_llm_route_no_log_when_under_ceiling(monkeypatch, caplog):
+    index = [{"name": f"godot-skill-{i:02d}", "description": f"desc {i}"}
+             for i in range(6)]
+    monkeypatch.setattr(GG, "_openrouter_complete",
+                        lambda system, messages: "\n".join(e["name"] for e in index[:5]))
+    with caplog.at_level(logging.INFO, logger="harness.gen.skill_context"):
+        picked = SC._llm_route("a prompt", index, SC._LLM_ROUTE_CEILING)
+    assert len(picked) == 5
+    assert not any("ceiling" in r.getMessage().lower() for r in caplog.records)
+
+
+# =========================================================================== #
+# TASK A.3 — BM25 fallback degradation is OBSERVABLE (logged + returned reason)
+# =========================================================================== #
+def test_bm25_intended_offline_path_is_not_degraded():
+    # use_llm=False is the DELIBERATE offline path; a healthy match is NOT a degradation.
+    sk = SC.select_skills("platformer jump physics", k=3, root=_FIX, use_llm=False)
+    assert sk
+    diag = SC.last_route_diagnosis()
+    assert diag["route"] == "bm25"
+    assert diag["reason"] == SC.ROUTE_BM25
+    assert diag["degraded"] is False
+
+
+def test_silent_llm_to_bm25_fallback_is_flagged(monkeypatch, caplog):
+    # use_llm=True but the LLM router yields nothing -> we fall back to BM25. This is
+    # the "silent degradation" the audit flagged; it must now be logged + returned.
+    monkeypatch.setattr(SC, "_llm_route", lambda prompt, index, k: [])
+    with caplog.at_level(logging.WARNING, logger="harness.gen.skill_context"):
+        sk = SC.select_skills("platformer jump physics", k=3, root=_FIX, use_llm=True)
+    assert sk                                        # BM25 still produced picks
+    diag = SC.last_route_diagnosis()
+    assert diag["degraded"] is True
+    assert diag["reason"] in (SC.ROUTE_BM25_FALLBACK, SC.ROUTE_BM25_WEAK)
+    assert diag["route"] == "bm25"
+    assert any("DEGRADED" in r.getMessage() for r in caplog.records)
+
+
+def test_bm25_empty_match_is_flagged(caplog):
+    # A prompt with no lexical overlap -> BM25 matches nothing -> observable empty route.
+    with caplog.at_level(logging.WARNING, logger="harness.gen.skill_context"):
+        sk = SC.select_skills("xyzzy quux frobnicate zzz", k=3, root=_FIX, use_llm=False)
+    assert sk == []
+    diag = SC.last_route_diagnosis()
+    assert diag["reason"] == SC.ROUTE_BM25_EMPTY
+    assert diag["degraded"] is True
+    assert any("DEGRADED" in r.getMessage() for r in caplog.records)
+
+
+def test_llm_success_route_is_healthy(monkeypatch):
+    # When the LLM route succeeds, the recorded route is the healthy primary path.
+    monkeypatch.setattr(SC, "_llm_route",
+                        lambda prompt, index, k: ["godot-genre-platformer"])
+    sk = SC.select_skills("platformer jump physics", k=3, root=_FIX, use_llm=True)
+    assert [s.name for s in sk] == ["godot-genre-platformer"]
+    diag = SC.last_route_diagnosis()
+    assert diag["reason"] == SC.ROUTE_LLM
+    assert diag["degraded"] is False

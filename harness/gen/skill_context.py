@@ -40,10 +40,16 @@ Public surface:
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 from collections import namedtuple
+
+# Observability: routing decisions (esp. a silent LLM->BM25 fallback and a degraded
+# BM25 route) are logged here so a bad route is never invisible (composition audit,
+# 2026-07-16). Quiet by default — attach a handler / raise the level to surface it.
+_LOG = logging.getLogger(__name__)
 
 # --- Attribution / framing ---------------------------------------------------
 # The upstream repo, license, and pinned commit. Surfaced verbatim in every
@@ -67,7 +73,22 @@ _TRUNCATION_MARK = "\n... [truncated]"
 # Safety ceiling on the LLM router's pick count — NOT a design cap. The router is
 # told to pick every genuinely relevant skill; this only stops a pathological
 # whole-catalog dump. The token budget (render_skill_context) is the real limiter.
-_LLM_ROUTE_CEILING = 10
+#
+# Raised 10 -> 14 (composition audit, 2026-07-16): the diagnosis found the ceiling
+# BINDS on rich prompts. Live probes returned 8-10 STRUCTURAL skills for an
+# FPS-shaped prompt (stealth + shooter-fps + procgen + navigation + state-machine +
+# 3d-world-building), and a full game also wants its genre + physics/dimension +
+# camera + controls on top — comfortably >10, so a 10-cap silently TRUNCATED real
+# routing. 14 clears the observed rich-prompt demand while still refusing a
+# whole-catalog dump (~95 skills). When the model's list is longer than the ceiling
+# we now log it (see _llm_route) so a binding cap is observable, not silent.
+_LLM_ROUTE_CEILING = 14
+
+# BM25 fallback health: a top document score at/under this is a WEAK lexical match
+# (advisory only — never changes selection, just flags a likely-poor route). BM25
+# scores here are IDF-weighted sums; a solid single-term hit clears this easily, so a
+# top score this low means the query barely lexically overlapped any skill.
+_BM25_WEAK_SCORE = 0.5
 
 # --- Selection tuning --------------------------------------------------------
 # The description + keywords are the curated retrieval keys (that is their whole
@@ -153,6 +174,11 @@ def load_index(root: str | None = None) -> list:
     Each entry is a dict with at least ``name``; ``description`` / ``keywords``
     are the retrieval keys. Any load or parse problem degrades to ``[]`` so a
     library hiccup can never break generation.
+
+    The raw table is RECONCILED against disk truth by :func:`_reconcile_index`
+    (dedup exact-duplicate names, drop entries with no body file, and SUPPLEMENT
+    with skill dirs the index forgot) — a robustness fix in OUR loader; the LGPLv3
+    library files are never edited.
     """
     d = library_root(root)
     if not d:
@@ -171,9 +197,106 @@ def load_index(root: str | None = None) -> list:
         return []
     if not isinstance(data, list):
         return []
-    index = [e for e in data if isinstance(e, dict) and e.get("name")]
+    raw = [e for e in data if isinstance(e, dict) and e.get("name")]
+    index = _reconcile_index(d, raw)
     _INDEX_CACHE[d] = {"mtime": mtime, "index": index, "bm25": _build_bm25(index)}
     return index
+
+
+# --------------------------------------------------------------------------- #
+# Index reconciliation against disk truth (loader robustness; never edits the lib)
+# --------------------------------------------------------------------------- #
+def _has_body_file(root: str, name: str) -> bool:
+    """True when ``skills/<name>/SKILL.md`` exists — i.e. the entry is routable."""
+    return os.path.isfile(os.path.join(root, _SKILLS_SUBDIR, name, _SKILL_FILE))
+
+
+def _skill_dirs_on_disk(root: str) -> list:
+    """Every ``skills/<dir>`` that actually carries a ``SKILL.md`` body, sorted.
+
+    A single bounded ``listdir`` of the skills dir (depth 1) — no recursive walk.
+    """
+    skills_dir = os.path.join(root, _SKILLS_SUBDIR)
+    try:
+        entries = os.listdir(skills_dir)
+    except OSError:
+        return []
+    out = [name for name in sorted(entries)
+           if os.path.isfile(os.path.join(skills_dir, name, _SKILL_FILE))]
+    return out
+
+
+def _frontmatter_description(path: str) -> str:
+    """The ``description:`` field from a SKILL.md YAML frontmatter block (``""`` if
+    none). Line-based, dependency-free (no PyYAML): finds the leading ``---``…``---``
+    block and reads a single-line quoted value, joining a ``|``/``>`` block scalar's
+    indented continuation lines."""
+    try:
+        text = _read_text(path)
+    except OSError:
+        return ""
+    stripped = text.lstrip()
+    if not stripped.startswith("---"):
+        return ""
+    lines = stripped.split("\n")
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return ""
+    fm = lines[1:end]
+    for j, ln in enumerate(fm):
+        m = re.match(r"\s*description\s*:\s*(.*)$", ln)
+        if not m:
+            continue
+        val = m.group(1).strip()
+        if val in ("", "|", ">", "|-", ">-", "|+", ">+"):   # block scalar -> join body
+            collected = []
+            for cont in fm[j + 1:]:
+                if cont.strip() and not cont.startswith((" ", "\t")):
+                    break                                   # dedent to the next key
+                collected.append(cont.strip())
+            val = " ".join(c for c in collected if c)
+        return _clean_description(val)
+    return ""
+
+
+def _reconcile_index(root: str, raw: list) -> list:
+    """Reconcile a vendored routing table against DISK TRUTH (never edits the lib):
+
+      * DEDUP exact-duplicate names (keep the first) — the real gd-agentic index
+        lists ``godot-navigation-pathfinding`` twice, which double-counts it and
+        deflates BM25 IDF for navigation terms;
+      * DROP entries whose ``SKILL.md`` body is absent (an index-only "ghost" that is
+        unroutable and would only pollute BM25 stats);
+      * SUPPLEMENT with disk-only skills: any ``skills/<dir>/SKILL.md`` whose DIR name
+        is not already an entry becomes a routable entry (``name`` = the dir, so
+        :func:`_skill_body` resolves it; ``description`` from the SKILL.md
+        frontmatter) — recovering skills the vendored index forgot. Concretely,
+        ``godot-ai-navigation`` exists on disk with a full SKILL.md but is missing
+        from the index (its frontmatter even mis-declares the pathfinding name), so
+        the index alone would leave it permanently dead weight.
+    """
+    seen = set()
+    reconciled = []
+    for e in raw:
+        name = e["name"]
+        if name in seen:
+            continue
+        if not _has_body_file(root, name):
+            continue
+        seen.add(name)
+        reconciled.append(e)
+    for name in _skill_dirs_on_disk(root):
+        if name in seen:
+            continue
+        seen.add(name)
+        desc = _frontmatter_description(
+            os.path.join(root, _SKILLS_SUBDIR, name, _SKILL_FILE))
+        reconciled.append({"name": name, "description": desc, "keywords": []})
+    return reconciled
 
 
 def _bm25_stats(root: str, index: list):
@@ -301,6 +424,44 @@ def _is_phys_arch(name: str) -> bool:
     return any(h in name for h in _PHYS_ARCH_HINTS)
 
 
+# --- Route observability (the returned/logged "why this route" reason) ----------
+# select_skills records its most recent routing decision here so a DEGRADED route —
+# a silent LLM->BM25 fallback, or a BM25 fallback that barely (or never) matched — is
+# inspectable AND logged, never invisible (composition audit: "_llm_route failure
+# silently degrades production to BM25/no-context"). The LLM-first path is untouched;
+# this only observes what the fallback did.
+ROUTE_LLM = "llm"                      # LLM router produced the picks (healthy primary)
+ROUTE_BM25 = "bm25"                    # BM25 was the REQUESTED path (use_llm=False), matched
+ROUTE_BM25_FALLBACK = "bm25_fallback"  # LLM requested but yielded nothing -> fell back to BM25
+ROUTE_BM25_WEAK = "bm25_weak"          # BM25 ran AND its top score is weak (likely-poor route)
+ROUTE_BM25_EMPTY = "bm25_empty"        # BM25 matched nothing at all (no context injected)
+ROUTE_NONE = "no_library"              # library absent -> graceful no-op (not a degradation)
+
+_LAST_ROUTE: dict = {"reason": None, "route": None, "degraded": False,
+                     "n": 0, "top_score": None, "prompt": None}
+
+
+def last_route_diagnosis() -> dict:
+    """A COPY of :func:`select_skills`'s most recent routing decision (observability).
+
+    Keys: ``reason`` (a ``ROUTE_*`` constant), ``route`` (``"llm"``/``"bm25"``/None),
+    ``degraded`` (bool — a silent LLM->BM25 fallback, or a weak/empty BM25 match),
+    ``n`` (skills returned), ``top_score`` (BM25 top score when the fallback ran),
+    ``prompt``. A degraded route is ALSO logged (WARNING) at decision time."""
+    return dict(_LAST_ROUTE)
+
+
+def _record_route(prompt, reason, route, *, degraded, n, top_score=None):
+    """Store + (when degraded) log the routing decision; returns the reason string."""
+    _LAST_ROUTE.update(reason=reason, route=route, degraded=degraded, n=n,
+                       top_score=top_score, prompt=prompt)
+    if degraded:
+        extra = "" if top_score is None else f", top_score={top_score:.3f}"
+        _LOG.warning("skill route DEGRADED (%s): prompt=%r -> %d skill(s) via %s%s",
+                     reason, (prompt or "")[:80], n, route, extra)
+    return reason
+
+
 def _llm_route(prompt: str, index: list, k: int) -> list:
     """Semantic skill routing via one cheap LLM call (the godot-master pattern).
 
@@ -338,9 +499,13 @@ def _llm_route(prompt: str, index: list, k: int) -> list:
         name = line.strip().lstrip("-*0123456789. ").strip()
         if name in valid and name not in picked:
             picked.append(name)
-        if len(picked) >= k:
-            break
-    return picked
+    # Observability: when the model names MORE relevant skills than the ceiling, the
+    # cap binds and real routing is truncated — log it so a binding ceiling is never
+    # silent (composition audit: the old 10-cap truncated rich prompts invisibly).
+    if len(picked) > k:
+        _LOG.info("skill route: LLM named %d relevant skills; ceiling %d binds, "
+                  "dropping %d least-relevant", len(picked), k, len(picked) - k)
+    return picked[:k]
 
 
 def select_skills(prompt: str, k: int = 3, *, root: str | None = None,
@@ -362,9 +527,11 @@ def select_skills(prompt: str, k: int = 3, *, root: str | None = None,
         return []
     d = library_root(root)
     if not d:
+        _record_route(prompt, ROUTE_NONE, None, degraded=False, n=0)
         return []
     index = load_index(d)
     if not index:
+        _record_route(prompt, ROUTE_NONE, None, degraded=False, n=0)
         return []
     by_name = {e["name"]: e for e in index}
 
@@ -385,11 +552,19 @@ def select_skills(prompt: str, k: int = 3, *, root: str | None = None,
                                  description=(by_name.get(name) or {}).get("description", ""),
                                  body=body))
         if out:
+            _record_route(prompt, ROUTE_LLM, "llm", degraded=False, n=len(out))
             return out
 
+    # --- BM25 fallback (observability only; the LLM-first path above is untouched) ---
+    # Reaching here with use_llm=True means the LLM route yielded nothing usable — the
+    # "silent degradation to BM25/no-context" the composition audit flagged. Surface it.
     ranked = _rank(prompt, d, index)
+    top_score = ranked[0][1] if ranked else 0.0
     matched = [name for name, sc in ranked if sc > 0.0]
+    fell_back = bool(use_llm)                       # LLM requested but we're on BM25
     if not matched:
+        _record_route(prompt, ROUTE_BM25_EMPTY, "bm25", degraded=True, n=0,
+                      top_score=top_score)          # empty route is always worth flagging
         return []
 
     picked: list = []
@@ -413,6 +588,11 @@ def select_skills(prompt: str, k: int = 3, *, root: str | None = None,
         out.append(Skill(name=name,
                          description=_clean_description(by_name[name].get("description", "")),
                          body=body))
+    weak = top_score <= _BM25_WEAK_SCORE
+    reason = (ROUTE_BM25_WEAK if weak else
+              (ROUTE_BM25_FALLBACK if fell_back else ROUTE_BM25))
+    _record_route(prompt, reason, "bm25", degraded=(fell_back or weak),
+                  n=len(out), top_score=top_score)
     return out
 
 
