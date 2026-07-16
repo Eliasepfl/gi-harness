@@ -1250,10 +1250,19 @@ func _probe_checkpoints() -> Dictionary:
 # Formatting helpers (byte-identical to runner.gd)
 # =========================================================================== #
 func _f(x: float) -> String:
+	# Non-finite floats print as "inf"/"nan" via "%f" — INVALID JSON that corrupts
+	# the wire (first hit 2026-07-16: real 3D games read transforms before
+	# entering the tree -> Transform3D() warnings + non-finite pos/vel ->
+	# "unparseable frame"). Serialize them as null: the python side already
+	# treats a null component as a fact (and the NaN oracle catches the game).
+	if not is_finite(x):
+		return "null"
 	return "%.17f" % x
 
 
 func _num(x: float) -> String:
+	if not is_finite(x):
+		return "null"
 	if x == floor(x) and abs(x) < 1.0e15:
 		return "%d" % int(x)
 	return "%.17f" % x
