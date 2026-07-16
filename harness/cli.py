@@ -480,6 +480,8 @@ def cmd_game_rescue(args) -> int:
         rescue_kw["budget_steps"] = args.budget
     if args.num_envs is not None:
         rescue_kw["num_envs"] = args.num_envs
+    if getattr(args, "shards", None) is not None:
+        rescue_kw["num_shards"] = args.shards
     if args.n_eval is not None:
         rescue_kw["n_eval"] = args.n_eval
     if args.save_model is not None:
@@ -911,9 +913,14 @@ def cmd_rl_probe(args) -> int:
         from harness.rl.certify import g3_prime
     except Exception as exc:  # noqa: BLE001
         return _module_missing("rl.certify", exc, args.json)
+    probe_kw = {}
+    if getattr(args, "num_envs", None) is not None:
+        probe_kw["num_envs"] = args.num_envs
+    if getattr(args, "shards", None) is not None:
+        probe_kw["num_shards"] = args.shards
     try:
         result = g3_prime(args.game_path, budget_steps=args.budget,
-                          trainer=args.trainer, method=args.method)
+                          trainer=args.trainer, method=args.method, **probe_kw)
     except Exception as exc:  # noqa: BLE001
         return _call_error("rl probe", exc, args.json)
 
@@ -1086,7 +1093,12 @@ def build_parser() -> argparse.ArgumentParser:
     grsc.add_argument("--budget", type=int, default=None,
                       help="RL env-step budget for the rescue attempt (default: 500k)")
     grsc.add_argument("--num-envs", dest="num_envs", type=int, default=None,
-                      help="batched vec width for training (default: 8)")
+                      help="in-scene batch width K per shard (default: 8)")
+    grsc.add_argument("--shards", dest="shards", type=int, default=None,
+                      help="concurrent Godot batch shards M: M*K logical envs stepped "
+                           "concurrently to use M*K cores (default 1 = single process). "
+                           "Farm presets in notes/rl_agent/SHARDED_VEC_ENV.md — pair a "
+                           "larger --shards with a larger --budget and -c cores.")
     grsc.add_argument("--n-eval", dest="n_eval", type=int, default=None,
                       help="greedy/stochastic eval episodes (default: 32)")
     grsc.add_argument("--save-model", dest="save_model", default=None,
@@ -1186,6 +1198,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="SB3 algorithm (trainer='sb3' only): 'ppo' (default), "
                          "'a2c' or 'dqn'; recorded in the ledger as 'method'. "
                          "trainer='vendored' accepts only 'ppo'.")
+    rp.add_argument("--num-envs", dest="num_envs", type=int, default=None,
+                    help="in-scene batch width K per shard (sb3/gdscript lane; "
+                         "default: trainer default, 8)")
+    rp.add_argument("--shards", dest="shards", type=int, default=None,
+                    help="concurrent Godot batch shards M (sb3/gdscript lane): "
+                         "M*K logical envs stepped concurrently to use M*K cores "
+                         "(default 1 = single process, byte-identical). See "
+                         "notes/rl_agent/SHARDED_VEC_ENV.md for the farm presets.")
     rp.add_argument("--json", action="store_true")
     rp.set_defaults(func=cmd_rl_probe)
 
