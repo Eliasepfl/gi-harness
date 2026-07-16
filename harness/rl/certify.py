@@ -286,6 +286,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              method: str = "ppo", save_model: str | None = None,
              demo_out: str | None = None, demo_sr_min: float = DEMO_SR_MIN,
              demo_stochastic_floor: float = DEMO_STOCHASTIC_FLOOR,
+             rays: dict | None = None, obs_profile: str = "positions",
              **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
@@ -350,7 +351,12 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         _port_seq = itertools.count()
 
         def make_env():
-            return GodotServeEnv(game_path, port_offset=next(_port_seq))
+            # `obs_profile` (positions | positions+rays | rays) + `rays` (the egocentric
+            # raycast grid config) are additive kwargs; the default "positions" keeps the
+            # env byte-identical to the pre-rays obs. Captured here so the probe, training,
+            # and eval envs all size the obs identically.
+            return GodotServeEnv(game_path, port_offset=next(_port_seq), rays=rays,
+                                 obs_profile=obs_profile)
 
         # MULTI-CPU PER GAME: the GDScript lane (serve_game.gd) can serve N in-scene
         # instances over ONE process/socket, so hand the SB3 trainer a batch-vec-env
@@ -361,7 +367,8 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
             def make_batch_venv(n_instances):
                 from harness.rl.godot_vec_env import GodotBatchVecEnv
                 return GodotBatchVecEnv(game_path, n_instances,
-                                        port_offset=next(_port_seq), seed=seed)
+                                        port_offset=next(_port_seq), seed=seed,
+                                        rays=rays, obs_profile=obs_profile)
     else:
         def make_env():
             return PlanckEnv(game_path)

@@ -71,7 +71,9 @@ import numpy as np
 
 from harness.rl.env import (
     OBS_CLIP, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
-    Box, Discrete, build_obs_vector, detect_dim, obs_dim_for,
+    DEFAULT_RAYS, OBS_PROFILES, RAYS_PROFILES,
+    Box, Discrete, build_obs_vector, detect_dim, normalize_rays, obs_dim_for,
+    rays_obs_width,
 )
 from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
@@ -154,7 +156,8 @@ class GodotServeEnv:
                  port_offset: int = 0, exe: str | None = None,
                  project: str | None = None, horizon: int = HORIZON,
                  timeout_s: float = SERVE_TIMEOUT_S,
-                 connect_timeout_s: float = CONNECT_TIMEOUT_S):
+                 connect_timeout_s: float = CONNECT_TIMEOUT_S,
+                 rays: dict | None = None, obs_profile: str = "positions"):
         # Set teardown-relevant handles first so close() is safe on any early raise.
         self._listener = None
         self._conn = None
@@ -177,6 +180,15 @@ class GodotServeEnv:
         self.game_path = game_path
         self.horizon = int(horizon)
         self.timeout_s = float(timeout_s)
+        # Obs profile (Elias 2026-07-16): "positions" (default; byte-identical to today) |
+        # "positions+rays" | "rays" (pure, proprioception-only + rays). The two rays
+        # profiles cast an egocentric fan/grid (the examples' RaycastSensor pattern, no
+        # pixels); rays config fills DEFAULT_RAYS so the host and obs sizer agree. n_rays is
+        # sized at _freeze_layout, once the game's dimension is pinned.
+        self._obs_profile = obs_profile if obs_profile in OBS_PROFILES else "positions"
+        self._rays = (normalize_rays(rays or DEFAULT_RAYS)
+                      if self._obs_profile in RAYS_PROFILES else None)
+        self._n_ray_floats = 0          # n_rays * ray_stride; sized at _freeze_layout
         with open(game_path, "r", encoding="utf-8") as fh:
             self._source = fh.read()
 
@@ -242,8 +254,11 @@ class GodotServeEnv:
 
         # 4) init: load the game (spec/source per dialect) + seeded build at seed 0;
         #    freeze the obs layout from the priming frame.
-        ready = self._exchange({"op": "init", self._init_key: self._source, "seed": 0,
-                                "horizon": self.horizon})
+        init_op = {"op": "init", self._init_key: self._source, "seed": 0,
+                   "horizon": self.horizon}
+        if self._rays is not None:       # only include the key when opted in (wire stays
+            init_op["rays"] = self._rays  # byte-identical to the pre-rays init otherwise)
+        ready = self._exchange(init_op)
         if not ready.get("ok", False) or ready.get("error"):
             self.close()
             raise GodotServeError(
@@ -406,8 +421,24 @@ class GodotServeEnv:
         self._body_order = list(controlled) + others
         self._cp_keys = list((frame.get("checkpoints") or {}).keys())
         self._dim = detect_dim(obs_state)               # 2D vs true-3D, then PINNED
-        obs_dim = obs_dim_for(len(self._body_order), len(self._cp_keys), self._dim)
+        self._n_ray_floats = rays_obs_width(self._rays, self._dim)  # n_rays * ray_stride
+        obs_dim = obs_dim_for(len(self._body_order), len(self._cp_keys), self._dim,
+                              self._obs_profile, self._n_ray_floats)
         self.observation_space = Box(-OBS_CLIP, OBS_CLIP, (obs_dim,))
+
+    def _frame_rays(self, frame: dict):
+        """The frame's flat egocentric raycast list (length ``self._n_ray_floats`` =
+        n_rays*stride, per ray: distance [+ class one-hot]), or None when rays are off
+        (obs stays the no-rays vector). Defends against a short/missing array by padding
+        with 1.0 (nothing seen) so the frozen obs width always holds."""
+        if self._n_ray_floats <= 0:
+            return None
+        r = frame.get("rays")
+        if not isinstance(r, list):
+            return [1.0] * self._n_ray_floats
+        if len(r) < self._n_ray_floats:
+            return list(r) + [1.0] * (self._n_ray_floats - len(r))
+        return r[:self._n_ray_floats]
 
     def _observe(self, frame: dict) -> np.ndarray:
         # runner.gd's `checkpoints` map (name -> tick|null) is exactly the `latched`
@@ -415,7 +446,8 @@ class GodotServeEnv:
         return build_obs_vector(
             frame.get("obs_state", {}), frame.get("checkpoints") or {},
             self._body_order, self._cp_keys, self.world_size, self._tick,
-            self.horizon, dim=self._dim)
+            self.horizon, dim=self._dim, rays=self._frame_rays(frame),
+            obs_profile=self._obs_profile)
 
     @staticmethod
     def _latched_set(frame: dict) -> set[str]:

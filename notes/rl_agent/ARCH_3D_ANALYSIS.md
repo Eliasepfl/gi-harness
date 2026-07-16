@@ -265,3 +265,102 @@ obs_dim=33** (3·10 + 2 + 1) confirms the 2D path is the untouched legacy layout
   size via `obs_dim_for`, `_observe`/`_obs_of` pass `dim` (obs plumbing only).
 - `harness/rl/stale_seek.py` — `fingerprint_from_obs` 3D inversion + `dim` threading (compat only).
 - `tests/test_rl_env.py`, `tests/test_stale_seek.py`, `tests/test_gd_rl.py` — unit + in-image.
+
+---
+
+## 7. EGOCENTRIC RAYCAST OBS — "give the agent what it sees in front of it" (2026-07-16)
+
+Elias-approved follow-on to §5/§6: an **OPT-IN egocentric raycast** obs (the godot_rl_agents
+FPS reference sensor — `examples/.../player.tscn` WideRaycastSensor + `ExtendedRaycastSensor.gd`,
+which is **rays-only, no camera**), plus a **profile knob** to remove the global-position
+"cheat". OFF by default → the obs/wire stay byte-for-byte §6. Branch `agent-a364acf7e4517c294`.
+
+### 7.1 The three obs profiles (one knob, `obs_profile`)
+- **`positions`** (DEFAULT) — §6's obs exactly (global per-body block + 3D ego hints). Byte-identical.
+- **`positions+rays`** — §6's obs + the raycast tail.
+- **`rays`** (the PURE, honest profile Elias wants) — **proprioception ONLY** (the controlled
+  body's own velocity + own orientation: 2D `vx,vy,sin,cos`; 3D `vx,vy,vz,quat`) + the raycast tail
+  + the cp one-hot + tick. **NO global positions of other bodies, NO K-nearest ego block** — the
+  agent knows only how *it* is moving/pointing and sees the world through the rays. Egocentric + honest.
+
+### 7.2 The raycast (a SEMANTIC depth retina, no pixels)
+A deterministic fan/grid cast FROM the controlled body IN ITS LOCAL FRAME via
+`direct_space_state.intersect_ray` (host-side, in `serve_game.gd`), read-only and at the SAME
+state()-sampling instant → twin-rollout byte-identity holds WITH rays.
+- **2D** — a planar fan of `n` rays across `fov_deg` (the world IS a plane).
+- **3D** — the reference **WIDE grid**, `n_h × n_v` (default **25×5**) across `fov_h × fov_v`,
+  centered on forward (azimuth about local +Y, pitch about local +X, forward = local −Z). A single
+  horizontal fan is vertically blind (obstacles above/below); the grid sees both.
+- **Per ray**: a normalized distance (`1.0` = nothing within `range`, else `hit/range ∈ [0,1]`) PLUS,
+  when `class_bits` (default on), a **{static, dynamic, sensor} one-hot** from the collider type —
+  the reference's class channel (ours is team-free); areas are hit (`collide_with_areas=true`) so
+  goal/sensor pads read the sensor class. So each ray is `ray_stride` floats (1, or 1+3=4). `range`
+  default is the reference `ray_length=80` (world units); the 3D world box is not wired, so per-world
+  extent scaling is a **follow-up** — callers override `range` per game.
+- **First-frame caveat (verified in-image)**: the reset/init frame's rays read **all-clear** — the
+  physics broadphase is populated only after the first step; every stepped frame is faithful (diag
+  job 18079661: reset 0/45 hits, step 0 onward 45/45). Negligible for training (one frame/episode).
+- **Config**: `rays:{n, fov_deg, n_h, n_v, fov_h, fov_v, range, class_bits}` (all defaulted). A
+  **NARROW/fovea** second tier (reference NarrowRaycastSensor 25×25, tighter fov) is a documented
+  **follow-up** — same machinery casts a second grid + concatenates; deferred to bound this change.
+
+### 7.3 DETECT / fingerprint compat (all three profiles)
+Rays are DERIVED from body positions, so they are **EXCLUDED from the stale-seek softlock
+fingerprint** (double-counting motion the pose already carries): `fingerprint_from_obs` reads only
+the per-body prefix and stops before the ray tail. The **pure `rays` profile** carries no positions,
+so its freeze test **falls back to the raw serve snapshot** (`env.last_snapshot` / the batched env's
+per-instance `last_snapshots`) — positions keep the freeze test faithful (a constant-velocity drift
+is not "frozen", which a proprioception-only digest would miss). DETECT works on all three.
+
+### 7.4 PARTIAL OBSERVABILITY — rays make games partially observable (memory fix)
+Unlike §6's global-position obs (near-Markov), a raycast obs — and ESPECIALLY the **pure `rays`
+profile** — is **partially observable**: the agent sees only what its rays currently touch (occlusion,
+limited fov, no memory of what it passed). The **first-line fix is `VecFrameStack`** (in-image, SB3;
+`notes/rl_agent/SB3_OFF_THE_SHELF.md`) — stack the last k obs so velocity/approach history is visible
+to the feed-forward MLP; it is a trainer-venv wrapper, no image rebuild. **RecurrentPPO/LSTM** (true
+memory) remains behind the `sb3-contrib` image rebuild (§2, `sb3_trainer.py:54`) — reach for it only
+if frame-stacking proves insufficient on a demonstrably memory-hard game. The pure profile is where
+frame-stacking matters MOST (it has the least instantaneous state).
+- **Reward alignment tie-in**: the reference FPS reward carries an **anti-idle counter**
+  (`n_steps_without_positive_reward`) that penalizes dithering — this aligns with the queued
+  reward-realignment / time-pressure work; a partially-observed agent that can't see the goal is
+  exactly the case where an anti-idle/time term keeps it exploring rather than camping.
+
+### 7.5 Fly-3D three-arm bench — positions vs positions+rays vs pure rays
+Same game (`a_3d_game_fly`), same budget **130k**, sb3 PPO, num_envs=8, speedup=8, in-image
+(`gi-certifier.sif`), mit_preemptable, job **18081066**. Rays = the reference wide grid **25×5 +
+class bits** (`range=40`, the canyon walls are the only colliders). Honest reporting: training RUNS +
+latching, NO success thresholds asserted (the three arms just `ok=True` + well-formed dicts).
+
+| Arm | obs_dim | trained steps | peak mean latch | eval ring-1 latch | eval ring 2/3 | first stochastic success | verdict |
+|---|---|---|---|---|---|---|---|
+| **positions** (baseline, §6.5) | **106** | 86,024 (plateau) | **0.333** | **0.0** | 0.0 / 0.0 | none | trains; barely threads a ring — the §6.5 control |
+| **positions+rays** | **606** | 101,384 (plateau) | **1.0** | **0.562** | 0.0 / 0.0 | none | **rays HELP** — 3× the mean latch, threads ring-1 in 56% of eval eps (baseline never) |
+| **rays** (PURE, honest) | **513** | 69,640 (plateau) | **1.0** | **0.625** | 0.031 / 0.031 | **step 61,056** | **competitive + honest** — no global positions, yet best ring-1 eval AND recorded a full stochastic success once |
+
+Reading it (honestly): **rays help on this game** — both rays arms lift the peak mean latch from the
+baseline's 0.333 to **1.0** and thread ring-1 in eval (0.56 / 0.62) where the position-only baseline
+never does (0.0). The **pure `rays` profile is NOT the expected big loser** at this budget — with NO
+global positions it matched/edged positions+rays on ring-1 eval and even hit a full success once
+(stochastic, step 61k), though it plateau-stopped earlier (69k). No arm solves all-5 rings at 130k →
+§5.3's "route unsolved-but-not-a-crash to the difficulty tuner / more budget", not a crash or obs bug.
+Greedy SR is 0 everywhere (deterministic greedy is binary; the graded signal is the eval latch rate).
+
+**Caveat (honest):** this glider has `lock_rotation=true` and never turns to face its +Z travel, so its
+body-local retina (forward = local −Z) looks backward/sideways — yet the side/floor/ceiling wall rays
+still inform the "stay-centered" fail condition, which is why rays help even here. Games whose craft
+turn to face travel get travel-aligned rays for free. This is a property of the game's body, not the
+sensor (the sensor is faithfully body-local per Elias' "in its local frame").
+
+### 7.6 Files (this change)
+- `godotworld/serve_game.gd` — opt-in `rays` parse + `direct_space_state.intersect_ray` fan (2D) /
+  25×5 grid (3D) + per-ray {static,dynamic,sensor} class channel; emitted ONLY when opted in
+  (frame byte-identical off). No effect on check/init/reset/act wire when off.
+- `harness/rl/env.py` — `obs_profile` (3 profiles) + `_build_obs_pure`; `build_obs_vector` `rays`
+  tail; `n_rays_of`/`ray_stride`/`rays_obs_width`/`normalize_rays`/`obs_dim_for` (profile+ray-float aware).
+- `harness/rl/godot_env.py`, `harness/rl/godot_vec_env.py` — `rays`/`obs_profile` kwargs, tail sizing,
+  per-instance `last_snapshots` (pure-profile DETECT).
+- `harness/rl/stale_seek.py` — `fingerprint_from_obs` profile-aware (rays excluded; pure → snapshot).
+- `harness/rl/certify.py` — `g3_prime` `rays`/`obs_profile` pass-through to the env factories (flag only).
+- `tests/test_rl_env.py`, `tests/test_gd_rl.py` — unit (profiles/stride/pure layout) + in-image
+  (grid casts + class bits + determinism + off-path width).

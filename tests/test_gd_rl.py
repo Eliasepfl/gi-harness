@@ -261,5 +261,144 @@ def test_g3_prime_true_3d_trains_without_obs_crash(monkeypatch):
         assert res["bridge_ok"] is True
 
 
+# ====================================================================== #
+# 5. Egocentric RAYCAST obs (opt-in) — in-image (direct_space_state.intersect_ray)
+# ====================================================================== #
+@requires_godot
+def test_gd_rays_off_is_untouched_obs_width():
+    """The default 'positions' profile carries NO ray tail — obs width is exactly the
+    pre-rays width (the opt-in is truly zero-effect when not requested)."""
+    from harness.rl.env import obs_dim_for
+    env = GodotServeEnv(TUMBLE_3D, port_base=_free_port())      # default obs_profile
+    try:
+        assert env._obs_profile == "positions" and env._n_ray_floats == 0
+        assert env.observation_space.shape[0] == \
+            obs_dim_for(len(env._body_order), len(env._cp_keys), 3)
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_gd_rays_3d_grid_casts_and_detects_geometry():
+    """positions+rays on a true-3D game: the obs grows by the 25x5 depth-retina grid (×4
+    with class bits), every value is finite, the ray tail is in [0,1], and AFTER a step
+    rays HIT the enclosing canyon with the STATIC class bit set — the in-image proof that
+    direct_space_state.intersect_ray + the class channel work (the feature hinges on this).
+    The reset frame is intentionally all-clear (broadphase populated only after step 1)."""
+    from harness.rl.env import obs_dim_for, rays_obs_width, n_rays_of, DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS)
+    rays["range"] = 200.0                                      # tumble_3d's canyon is small
+    env = GodotServeEnv(TUMBLE_3D, port_base=_free_port(),
+                        obs_profile="positions+rays", rays=rays)
+    try:
+        n_rays = n_rays_of(rays, 3)
+        w = rays_obs_width(rays, 3)
+        assert n_rays == 125 and w == 500                     # 25x5 rays × (dist + 3 class)
+        base = obs_dim_for(len(env._body_order), len(env._cp_keys), 3)
+        assert env.observation_space.shape[0] == base + w
+        obs, _ = env.reset(seed=0)
+        assert np.all(np.isfinite(obs))
+        # reset frame: broadphase empty -> all-clear (distance 1.0, no class)
+        reset_tail = obs[-w:]
+        assert np.allclose(reset_tail.reshape(n_rays, 4)[:, 0], 1.0)
+        # after a step the retina sees the canyon walls (STATIC class), distances < 1.0
+        o, _r, _t, _tr, _i = env.step(0)
+        tail = o[-w:].reshape(n_rays, 4)
+        dists, cls = tail[:, 0], tail[:, 1:]
+        assert dists.min() >= 0.0 and dists.max() <= 1.0
+        assert dists.min() < 1.0, "no ray hit the canyon — intersect_ray broke"
+        assert cls.max() <= 1.0 and cls.min() >= 0.0
+        assert cls[:, 0].max() == 1.0, "canyon walls should read the STATIC class bit"
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_gd_rays_determinism_byte_identical_across_sessions():
+    """Two independent serve sessions with rays ON must produce BYTE-identical obs on the
+    same seed+actions — the ray cast is read-only + deterministic, so twin-rollout parity
+    holds WITH rays (the §3 determinism guarantee extended to the raycast tail)."""
+    from harness.rl.env import DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS); rays["range"] = 200.0
+    seqs = []
+    for _ in range(2):
+        env = GodotServeEnv(TUMBLE_3D, port_base=_free_port(),
+                            obs_profile="positions+rays", rays=rays)
+        try:
+            obs, _ = env.reset(seed=0)
+            trail = [obs.copy()]
+            for _ in range(6):
+                o, _r, term, trunc, _i = env.step(0)
+                trail.append(o.copy())
+                if term or trunc:
+                    break
+            seqs.append(trail)
+        finally:
+            env.close()
+    assert len(seqs[0]) == len(seqs[1])
+    assert all(a.tobytes() == b.tobytes() for a, b in zip(*seqs)), \
+        "rays broke twin-rollout byte-identity"
+
+
+@requires_godot
+def test_gd_pure_rays_profile_is_proprioception_plus_grid():
+    """The pure 'rays' profile: obs = proprioception (7 in 3D) + cp one-hot + tick + the
+    ray-float tail — NO global positions. Loads, steps finite, and stays deterministic."""
+    from harness.rl.env import PROPRIO_3D, rays_obs_width, DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS); rays["range"] = 200.0
+    env = GodotServeEnv(TUMBLE_3D, port_base=_free_port(),
+                        obs_profile="rays", rays=rays)
+    try:
+        w = rays_obs_width(rays, 3)
+        want = PROPRIO_3D + len(env._cp_keys) + 1 + w
+        assert env.observation_space.shape[0] == want
+        obs, _ = env.reset(seed=0)
+        assert obs.shape == (want,) and np.all(np.isfinite(obs))
+        for _ in range(3):
+            o, _r, term, trunc, _i = env.step(0)
+            assert np.all(np.isfinite(o))
+            if term or trunc:
+                break
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_gd_rays_class_bits_off_is_one_float_per_ray():
+    """class_bits=False -> the tail is exactly n_rays floats (distance only)."""
+    from harness.rl.env import obs_dim_for, rays_obs_width, n_rays_of, DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS); rays["range"] = 200.0; rays["class_bits"] = False
+    env = GodotServeEnv(TUMBLE_3D, port_base=_free_port(),
+                        obs_profile="positions+rays", rays=rays)
+    try:
+        w = rays_obs_width(rays, 3)
+        assert w == n_rays_of(rays, 3) == 125                 # 1 float/ray, no class
+        base = obs_dim_for(len(env._body_order), len(env._cp_keys), 3)
+        assert env.observation_space.shape[0] == base + w
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_gd_rays_2d_planar_fan():
+    """A 2D `.gd` game gets the planar fan (n rays), NOT the 3D grid — obs grows by the
+    fan's ray-float width."""
+    from harness.rl.env import obs_dim_for, rays_obs_width, n_rays_of, DEFAULT_RAYS
+    rays = dict(DEFAULT_RAYS); rays["range"] = 400.0
+    env = GodotServeEnv(MINI, port_base=_free_port(),
+                        obs_profile="positions+rays", rays=rays)
+    try:
+        assert env._dim == 2
+        assert n_rays_of(rays, 2) == DEFAULT_RAYS["n"] == 16
+        w = rays_obs_width(rays, 2)                            # 16 rays × 4 = 64
+        base = obs_dim_for(len(env._body_order), len(env._cp_keys), 2)
+        assert env.observation_space.shape[0] == base + w
+        obs, _ = env.reset(seed=0)
+        assert np.all(np.isfinite(obs))
+        assert obs[-w:].min() >= 0.0 and obs[-w:].max() <= 1.0
+    finally:
+        env.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -261,10 +261,20 @@ class StaleSeekReward:
 # ======================================================================== #
 # Fingerprint from the observation vector.
 # ======================================================================== #
-def fingerprint_from_obs(obs, body_order, world_size, dim: int = 2) -> tuple:
+def fingerprint_from_obs(obs, body_order, world_size, dim: int = 2,
+                         obs_profile: str = "positions", snapshot=None) -> tuple:
     """Reconstruct a state fingerprint from the SAME obs vector the policy sees — so
     the reward's freeze test uses the env's own observation, no side channel into the
     serve process. ``dim`` is the env's PINNED layout dimension (2 or 3).
+
+    ``obs_profile`` keeps DETECT working across all three obs profiles:
+    * ``"positions"`` / ``"positions+rays"`` — reconstruct per body from the obs prefix
+      (the opt-in ray tail sits AFTER everything read here, so it is transparently
+      ignored — rays are excluded from the softlock digest, see below).
+    * ``"rays"`` (PURE) — the obs carries NO positions, so the freeze fingerprint FALLS
+      BACK to the raw serve ``snapshot`` (``{name:{pos,vel,angle}}`` — the env's
+      ``last_snapshot``); positions from the snapshot keep the freeze test faithful (a
+      constant-velocity drift is NOT frozen, which a proprioception-only digest would miss).
 
     ``build_obs_vector`` normalises pos by world-size, vel by ``VEL_SCALE`` and encodes
     orientation as (sin,cos) [2D] or a unit quaternion [3D]; we invert that per present
@@ -280,7 +290,16 @@ def fingerprint_from_obs(obs, body_order, world_size, dim: int = 2) -> tuple:
     to the same decimals): fingerprints from this function are only ever compared to
     one another via :func:`fp_delta` (which is arity-generic), so the wider tuple is
     a strictly MORE faithful freeze test — it also catches pure z-motion and rotation
-    the 2D digest drops."""
+    the 2D digest drops.
+
+    The OPT-IN egocentric raycast tail (``env.rays_obs_width(rays, dim)`` floats appended
+    AFTER the cp one-hot + tick) is DELIBERATELY EXCLUDED: this reconstruction reads only the
+    per-body prefix and stops, so rays never enter the softlock digest. They are derived
+    from body positions, so folding them in would double-count motion the per-body pose
+    already captures — a frozen body yields a frozen fingerprint whether rays are on or off."""
+    if obs_profile == "rays":
+        # Pure profile: the obs carries no positions -> fingerprint the raw serve snapshot.
+        return fingerprint(snapshot or {})
     w, h, d = _world_extents(world_size)
     obs = np.asarray(obs, dtype=np.float64).reshape(-1)
     if int(dim) == 3:
@@ -340,6 +359,7 @@ class StaleSeekEnv:
         self._body_order = list(env._body_order)
         self.world_size = tuple(env.world_size)
         self._dim = int(getattr(env, "_dim", 2))    # env's pinned obs dimension
+        self._obs_profile = str(getattr(env, "_obs_profile", "positions"))
         p = params or SeekParams()
         # Inherit the env's real horizon into the decay ramp unless the caller pinned one.
         if params is None:
@@ -358,12 +378,20 @@ class StaleSeekEnv:
         self._hist: list[str] = []
         self._tick = 0
 
+    def _fp(self, obs):
+        """Freeze fingerprint for the env's obs profile. Pure 'rays' obs carries no
+        positions, so it falls back to the env's raw ``last_snapshot`` (see
+        ``fingerprint_from_obs``); positions/positions+rays reconstruct from the obs."""
+        return fingerprint_from_obs(
+            obs, self._body_order, self.world_size, dim=self._dim,
+            obs_profile=self._obs_profile,
+            snapshot=getattr(self.env, "last_snapshot", None))
+
     def reset(self, seed: int = 0):
         obs, info = self.env.reset(seed=seed)
         self._seed = int(seed)
         self.reward.reset()
-        self._prev_fp = fingerprint_from_obs(obs, self._body_order, self.world_size,
-                                             dim=self._dim)
+        self._prev_fp = self._fp(obs)
         self._prev_nlatched = _n_latched(info)
         self._hist = []
         self._tick = 0
@@ -373,8 +401,7 @@ class StaleSeekEnv:
         obs, _r, terminated, truncated, info = self.env.step(action_idx)
         self._hist.append(self.actions[int(action_idx)])
         self._tick = int(info.get("tick", self._tick + 1))
-        cur_fp = fingerprint_from_obs(obs, self._body_order, self.world_size,
-                                      dim=self._dim)
+        cur_fp = self._fp(obs)
         n_latched = _n_latched(info)
         new_latch = n_latched > self._prev_nlatched
         success = bool(info.get("success"))
@@ -454,6 +481,7 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
             self._body_order = list(venv._body_order)
             self.world_size = tuple(venv.world_size)
             self._dim = int(getattr(venv, "_dim", 2))   # venv's pinned obs dimension
+            self._obs_profile = str(getattr(venv, "_obs_profile", "positions"))
             self._actions = list(venv.actions)
             self._base_seed = int(getattr(venv, "_base_seed", base_seed))
             n = self.num_envs
@@ -462,12 +490,23 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
             self._hist: list[list[str]] = [[] for _ in range(n)]
             self._last_actions = np.zeros(n, dtype=int)
 
+        def _fp_i(self, obs_i, i):
+            """Instance i's freeze fingerprint for the venv's obs profile. Pure 'rays'
+            obs carries no positions -> fall back to the venv's per-instance
+            ``last_snapshots`` (positions), keeping DETECT faithful on all profiles."""
+            snap = None
+            if self._obs_profile == "rays":
+                snaps = getattr(self.venv, "last_snapshots", None)
+                snap = snaps[i] if snaps is not None and i < len(snaps) else None
+            return fingerprint_from_obs(obs_i, self._body_order, self.world_size,
+                                        dim=self._dim, obs_profile=self._obs_profile,
+                                        snapshot=snap)
+
         def reset(self):
             obs = self.venv.reset()
             for i in range(self.num_envs):
                 self.reward.reset(i)
-                self._prev_fp[i] = fingerprint_from_obs(obs[i], self._body_order,
-                                                        self.world_size, dim=self._dim)
+                self._prev_fp[i] = self._fp_i(obs[i], i)
                 self._prev_nlatched[i] = 0
                 self._hist[i] = []
             return obs
@@ -489,8 +528,7 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
                 # On a done step obs[i] is already the RESET obs; the terminal state is
                 # stashed in terminal_observation — fingerprint THAT for the freeze test.
                 frame_obs = info.get("terminal_observation") if done else obs[i]
-                cur_fp = fingerprint_from_obs(frame_obs, self._body_order,
-                                              self.world_size, dim=self._dim)
+                cur_fp = self._fp_i(frame_obs, i)
 
                 self._hist[i].append(self._actions[int(self._last_actions[i])])
                 n_latched = int(info.get("n_latched", 0))
@@ -511,8 +549,7 @@ def make_stale_seek_vec_wrapper(venv, params: Optional[SeekParams] = None, *,
 
                 if done:
                     self.reward.reset(i)
-                    self._prev_fp[i] = fingerprint_from_obs(obs[i], self._body_order,
-                                                            self.world_size, dim=self._dim)
+                    self._prev_fp[i] = self._fp_i(obs[i], i)
                     self._prev_nlatched[i] = 0
                     self._hist[i] = []
                 else:

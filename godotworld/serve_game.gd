@@ -51,6 +51,14 @@ const SPEEDUP_MAX := 16
 const PLAY_MARGIN := 400.0              # px padding past the level extent -> play-bounds
                                         # (Elias directive 2: a controlled body leaving
                                         # this TRUNCATES the episode, it is not a break)
+# --- Egocentric raycast obs (OPT-IN; the examples' RaycastSensor pattern, no pixels) ---
+# ZERO effect unless init carries a `rays:{n, fov_deg, range}` key: no cast, no wire
+# byte, obs unchanged. When on, every frame gains a "rays" array of N normalized hit
+# distances (1.0 = nothing within range) cast FROM the controlled body IN ITS LOCAL
+# FRAME, via direct_space_state.intersect_ray (deterministic, read-only, excludes the
+# body itself), computed at the SAME point in the tick as state() so replay parity holds.
+const RAYS_MAX := 4096                  # sanity cap on total ray count (protocol guard) [eng.]
+const RAYS_DIM_MAX := 128               # per-axis cap (n, n_h, n_v) [eng.]
 
 # The GameAPI contract methods a generated game MUST implement (GAME_API.md).
 const REQUIRED_METHODS := ["build", "act", "state", "checkpoints",
@@ -74,6 +82,19 @@ var _world_w := DEFAULT_W
 var _world_h := DEFAULT_H
 var _actions_cache := []                # actions() captured at build (handshake)
 var _speedup := 1
+# Egocentric raycast config (opt-in). _rays_on stays false unless init passed a rays key,
+# keeping every frame byte-identical to the pre-rays wire. 2D games cast a planar fan of
+# _rays_n across _rays_fov_deg; 3D games cast a rectangular depth-retina grid of
+# _rays_nh x _rays_nv across _rays_fov_h x _rays_fov_v. Range (world units) is shared.
+var _rays_on := false
+var _rays_n := 16                       # 2D planar fan ray count
+var _rays_fov_deg := 180.0
+var _rays_nh := 25                      # 3D grid: horizontal rays (reference wide sensor)
+var _rays_nv := 5                       # 3D grid: vertical rays
+var _rays_fov_h := 120.0
+var _rays_fov_v := 60.0
+var _rays_range := 80.0                 # world units; reference ray_length
+var _rays_class_bits := true            # per-ray {static,dynamic,sensor} one-hot (semantic)
 # Play-bounds (x,y) computed at (re)build from the world box + t=0 body positions +
 # PLAY_MARGIN; the controlled body leaving it truncates the episode (Elias directive 2).
 var _play_min_x := -PLAY_MARGIN
@@ -560,6 +581,7 @@ func _op_init(msg: Dictionary) -> String:
 	if not comp.ok:
 		return '{"ok":false,"error":"%s"}' % _esc(comp.error)
 	_script = comp.script
+	_parse_rays(msg.get("rays", null))      # opt-in egocentric raycast obs (no-op if absent)
 	# An explicit n_instances key (even ==1) selects the BATCHED array-frame path; its
 	# ABSENCE keeps the legacy single-instance scalar frame byte-identical to before.
 	_batched = msg.has("n_instances")
@@ -935,6 +957,7 @@ func _batch_frame_json(with_handshake: bool) -> String:
 	var trunc_parts := PackedStringArray()
 	var nan_parts := PackedStringArray()
 	var oob_parts := PackedStringArray()
+	var rays_parts := PackedStringArray()
 	for i in range(_n_instances):
 		obs_parts.append(_entities_json_of(_games[i]))
 		cp_parts.append(_checkpoints_json_i(i))
@@ -947,16 +970,304 @@ func _batch_frame_json(with_handshake: bool) -> String:
 		trunc_parts.append(_b(bool(_done_trunc_arr[i])))
 		nan_parts.append(_b(bool(_nan_arr[i])))
 		oob_parts.append("[%s]" % _oob_json_of(_games[i], 0.0))
+		if _rays_on:
+			rays_parts.append(_rays_json_of(_games[i]))
 	var head := ""
 	if with_handshake:
 		head = '"ok":true,"actions":%s,' % _actions_json()
+	# rays_part is "" unless init opted in (byte-identical batched wire when off); when
+	# on it appends a per-instance array-of-arrays after "oob" so leading keys never shift.
+	var rays_part := ""
+	if _rays_on:
+		rays_part = ',"rays":[%s]' % ",".join(rays_parts)
 	return ('{%s"n_instances":%d,"obs_state":[%s],"checkpoints":[%s],"tick":[%s],'
 		+ '"result":[%s],"done_term":[%s],"done_trunc":[%s],'
-		+ '"world_size":[%s,%s],"nan":[%s],"oob":[%s],"error":null}') % [
+		+ '"world_size":[%s,%s],"nan":[%s],"oob":[%s]%s,"error":null}') % [
 		head, _n_instances, ",".join(obs_parts), ",".join(cp_parts),
 		",".join(tick_parts), ",".join(result_parts), ",".join(term_parts),
 		",".join(trunc_parts), _num(_world_w), _num(_world_h),
-		",".join(nan_parts), ",".join(oob_parts)]
+		",".join(nan_parts), ",".join(oob_parts), rays_part]
+
+
+# =========================================================================== #
+# Egocentric raycasts (OPT-IN). A deterministic fan cast FROM the controlled body IN
+# ITS LOCAL FRAME via direct_space_state.intersect_ray -- read-only, so it steps no
+# physics and mutates no state (a twin rollout is byte-identical WITH rays on). Cast at
+# the SAME state() sampling instant the frame is built. The body itself is excluded, and
+# a missing body / unavailable space degrades to all-1.0 (nothing seen), never an error.
+#
+# LAYOUT (documented for the obs consumer) -- standardized on the godot_rl_agents FPS
+# reference sensor (examples player.tscn WideRaycastSensor + ExtendedRaycastSensor.gd):
+#   2D -- a planar fan of `n` rays across `fov_deg`, centered on the body's facing (local
+#         +X, transform.x -- the direction the reported `angle` points). The world IS a plane.
+#   3D -- a WIDE DEPTH RETINA: a rectangular `n_h x n_v` (default 25x5) grid across
+#         `fov_h x fov_v` centered on forward (azimuth about the body's local up +Y basis,
+#         pitch about local right +X basis; forward is local -Z, Godot's forward). Row-major,
+#         vertical rows outer, exactly n_h*n_v rays. A single horizontal fan is vertically
+#         blind (obstacles above/below) -- the grid sees both.
+# PER-RAY FLOATS (the wire is a FLAT, interleaved array): the normalized distance (1.0 =
+# nothing within `range`, else hit_distance/range in [0,1]) PLUS, when class_bits is on
+# (default, matching the reference class channel), a {static, dynamic, sensor} one-hot from
+# the collider type (all-zero on no hit). So each ray is 1 float, or 1+3=4 with class bits.
+# Areas ARE hit (collide_with_areas=true) so goal/sensor pads read as the sensor class -- the
+# SEMANTIC retina. FIRST-FRAME NOTE: the reset/init frame reads all-clear because the physics
+# broadphase is only populated after the first step; every stepped frame is faithful.
+# NARROW/FOVEA second tier (a denser tighter-fov grid, reference NarrowRaycastSensor 25x25):
+# a documented FOLLOW-UP -- the same machinery casts a second grid and concatenates; deferred
+# to keep this change bounded (it threads a second config block through host + obs sizing).
+# =========================================================================== #
+func _parse_rays(r) -> void:
+	# Opt-in egocentric raycast config. Anything but a well-formed dict leaves rays OFF ->
+	# the wire stays byte-identical to the pre-rays frame. Carries BOTH the 2D-fan params
+	# (n, fov_deg) and the 3D-grid params (n_h, n_v, fov_h, fov_v); the host picks per the
+	# controlled body's dimension. Range (world units) is shared.
+	_rays_on = false
+	if typeof(r) != TYPE_DICTIONARY:
+		return
+	_rays_n = clampi(int(r.get("n", 16)), 0, RAYS_DIM_MAX)
+	_rays_fov_deg = clampf(float(r.get("fov_deg", 180.0)), 1.0, 360.0)
+	_rays_nh = clampi(int(r.get("n_h", 25)), 0, RAYS_DIM_MAX)
+	_rays_nv = clampi(int(r.get("n_v", 5)), 0, RAYS_DIM_MAX)
+	_rays_fov_h = clampf(float(r.get("fov_h", 120.0)), 1.0, 360.0)
+	_rays_fov_v = clampf(float(r.get("fov_v", 60.0)), 1.0, 179.0)
+	_rays_range = maxf(1.0, float(r.get("range", 80.0)))
+	_rays_class_bits = bool(r.get("class_bits", true))
+	# On only if SOME axis yields rays (2D fan n>0 OR 3D grid nh*nv>0).
+	_rays_on = _rays_n > 0 or (_rays_nh > 0 and _rays_nv > 0)
+
+
+func _rays_json_of(game) -> String:
+	# JSON array of N normalized hit distances at the obs %.17f precision.
+	var parts := PackedStringArray()
+	for v in _cast_rays_of(game):
+		parts.append(_f(float(v)))
+	return "[%s]" % ",".join(parts)
+
+
+func _append_ray(out: Array, dist_norm: float, collider) -> void:
+	# One ray's obs floats: the normalized distance, then (when class_bits on) a
+	# {static, dynamic, sensor} one-hot from the collider type. No hit -> all-zero class.
+	out.append(dist_norm)
+	if not _rays_class_bits:
+		return
+	var is_static := 0.0
+	var is_dynamic := 0.0
+	var is_sensor := 0.0
+	if collider != null:
+		if collider is Area2D or collider is Area3D:
+			is_sensor = 1.0
+		elif collider is StaticBody2D or collider is StaticBody3D:
+			is_static = 1.0
+		else:
+			is_dynamic = 1.0        # RigidBody/CharacterBody/AnimatableBody/etc.
+	out.append(is_static)
+	out.append(is_dynamic)
+	out.append(is_sensor)
+
+
+func _all_clear_rays(n_rays: int) -> Array:
+	# n_rays rays, each all-clear (distance 1.0, no class) -> n_rays * ray_stride floats.
+	var out := []
+	for i in range(n_rays):
+		_append_ray(out, 1.0, null)
+	return out
+
+
+func _game_dim_of(game) -> int:
+	# The game's dimension from the first body's pos arity in state() (>=3 -> 3D), so the
+	# ray COUNT (2D fan vs 3D grid) is known even when no controlled node is found.
+	for b in _safe_state_of(game).get("bodies", []):
+		if typeof(b) != TYPE_DICTIONARY:
+			continue
+		var p = b.get("pos", [])
+		if typeof(p) == TYPE_ARRAY and p.size() > 0:
+			return 3 if p.size() >= 3 else 2
+	return 2
+
+
+func _expected_ray_count(game) -> int:
+	return (_rays_nh * _rays_nv) if _game_dim_of(game) == 3 else _rays_n
+
+
+func _cast_rays_of(game) -> Array:
+	# The deterministic fan/grid -> Array[float] in [0,1]. Length: 2D fan _rays_n, 3D grid
+	# _rays_nh*_rays_nv (the depth retina). A missing body -> all-1.0 at the right count.
+	if not _rays_on:
+		return []
+	if game == null or not is_instance_valid(game):
+		return _all_clear_rays(_expected_ray_count(game))
+	var nm := _controlled_name_of_game(game)
+	var node := _controlled_body_node(game, nm)
+	if node == null or not is_instance_valid(node):
+		return _all_clear_rays(_expected_ray_count(game))   # no body to cast from -> clear
+	if node is CollisionObject3D:
+		return _cast_rays_3d(node)
+	if node is CollisionObject2D:
+		return _cast_rays_2d(node)
+	return _all_clear_rays(_expected_ray_count(game))
+
+
+func _controlled_name_of_game(game) -> String:
+	for b in _safe_state_of(game).get("bodies", []):
+		if typeof(b) == TYPE_DICTIONARY and bool(b.get("controlled", false)):
+			return str(b.get("name", ""))
+	return ""
+
+
+func _controlled_pos_of_game(game) -> Array:
+	for b in _safe_state_of(game).get("bodies", []):
+		if typeof(b) == TYPE_DICTIONARY and bool(b.get("controlled", false)):
+			var p = b.get("pos", [])
+			if typeof(p) == TYPE_ARRAY:
+				return p
+	return []
+
+
+func _collect_collision_objects(node: Node, out: Array) -> void:
+	for c in node.get_children():
+		if c is CollisionObject2D or c is CollisionObject3D:
+			out.append(c)
+		_collect_collision_objects(c, out)
+
+
+func _controlled_body_node(game, nm: String) -> Node:
+	# The controlled body's physics node. Fast path: a CollisionObject descendant whose
+	# node name == the state-reported controlled name (true for our games, which set
+	# node.name to that string). Fallback: the CollisionObject nearest the reported pos --
+	# so a game that names its node differently still casts from the right place.
+	var cands := []
+	_collect_collision_objects(game, cands)
+	if cands.is_empty():
+		return null
+	if nm != "":
+		for c in cands:
+			if str(c.name) == nm:
+				return c
+	var target := _controlled_pos_of_game(game)
+	if target.is_empty():
+		return cands[0]
+	var best: Node = null
+	var best_d := INF
+	for c in cands:
+		var gp := _node_global_pos_arr(c)
+		if gp.is_empty():
+			continue
+		var d := _pos_dist2(gp, target)
+		if d < best_d:
+			best_d = d
+			best = c
+	return best if best != null else cands[0]
+
+
+func _node_global_pos_arr(c) -> Array:
+	if c is Node3D:
+		var v: Vector3 = c.global_transform.origin
+		return [v.x, v.y, v.z]
+	if c is Node2D:
+		var v2: Vector2 = c.global_position
+		return [v2.x, v2.y]
+	return []
+
+
+func _pos_dist2(a: Array, b: Array) -> float:
+	var n := mini(a.size(), b.size())
+	var s := 0.0
+	for i in range(n):
+		var d := float(a[i]) - float(b[i])
+		s += d * d
+	return s
+
+
+func _fan_azimuths_2d() -> Array:
+	# N azimuth offsets (deg) evenly across fov, centered on forward (the RaycastSensor fan).
+	var out := []
+	var step := _rays_fov_deg / float(_rays_n)
+	var start := step * 0.5 - _rays_fov_deg * 0.5
+	for i in range(_rays_n):
+		out.append(start + float(i) * step)
+	return out
+
+
+func _fan_dirs_3d() -> Array:
+	# The DEPTH RETINA: a rectangular _rays_nh x _rays_nv grid of (azimuth, pitch) pairs
+	# covering _rays_fov_h x _rays_fov_v centered on forward. Row-major (vertical rows
+	# outer, horizontal columns inner), exactly _rays_nh*_rays_nv rays. Deterministic order.
+	var out := []
+	var az_step := _rays_fov_h / float(maxi(1, _rays_nh))
+	var az_start := az_step * 0.5 - _rays_fov_h * 0.5
+	var pt_step := _rays_fov_v / float(maxi(1, _rays_nv))
+	var pt_start := pt_step * 0.5 - _rays_fov_v * 0.5
+	for iv in range(_rays_nv):
+		var pitch := pt_start + float(iv) * pt_step
+		for ih in range(_rays_nh):
+			out.append([az_start + float(ih) * az_step, pitch])
+	return out
+
+
+func _cast_rays_3d(node) -> Array:
+	var n_grid := _rays_nh * _rays_nv
+	var vp: Viewport = node.get_viewport()
+	if vp == null:
+		return _all_clear_rays(n_grid)
+	var world: World3D = vp.find_world_3d()
+	if world == null:
+		return _all_clear_rays(n_grid)
+	var space: PhysicsDirectSpaceState3D = world.direct_space_state
+	if space == null:
+		return _all_clear_rays(n_grid)
+	var xform: Transform3D = node.global_transform
+	var basis := xform.basis.orthonormalized()
+	var origin: Vector3 = xform.origin
+	var fwd: Vector3 = -basis.z            # Godot's forward
+	var up: Vector3 = basis.y
+	var right: Vector3 = basis.x
+	var exclude: Array[RID] = [node.get_rid()]
+	var out := []
+	for pd in _fan_dirs_3d():
+		var dir: Vector3 = fwd.rotated(right, deg_to_rad(pd[1])).rotated(up, deg_to_rad(pd[0]))
+		var q := PhysicsRayQueryParameters3D.create(origin, origin + dir * _rays_range)
+		q.collide_with_areas = true         # so goal/sensor AREAs are seen (class channel)
+		q.collide_with_bodies = true
+		q.exclude = exclude
+		var hit := space.intersect_ray(q)
+		if hit.is_empty():
+			_append_ray(out, 1.0, null)
+		else:
+			var d := clampf(origin.distance_to(hit["position"]) / _rays_range, 0.0, 1.0)
+			_append_ray(out, d, hit.get("collider"))
+	return out
+
+
+func _cast_rays_2d(node) -> Array:
+	var vp: Viewport = node.get_viewport()
+	if vp == null:
+		return _all_clear_rays(_rays_n)
+	var world: World2D = vp.find_world_2d()
+	if world == null:
+		return _all_clear_rays(_rays_n)
+	var space: PhysicsDirectSpaceState2D = world.direct_space_state
+	if space == null:
+		return _all_clear_rays(_rays_n)
+	var xform: Transform2D = node.global_transform
+	var origin: Vector2 = xform.origin
+	var fwd: Vector2 = xform.x.normalized()   # local +X (the direction `angle` points)
+	if fwd.length() < 0.5:
+		fwd = Vector2.RIGHT
+	var exclude: Array[RID] = [node.get_rid()]
+	var out := []
+	for az in _fan_azimuths_2d():
+		var dir: Vector2 = fwd.rotated(deg_to_rad(az))
+		var q := PhysicsRayQueryParameters2D.create(origin, origin + dir * _rays_range)
+		q.collide_with_areas = true         # so goal/sensor AREAs are seen (class channel)
+		q.collide_with_bodies = true
+		q.exclude = exclude
+		var hit := space.intersect_ray(q)
+		if hit.is_empty():
+			_append_ray(out, 1.0, null)
+		else:
+			var d := clampf(origin.distance_to(hit["position"]) / _rays_range, 0.0, 1.0)
+			_append_ray(out, d, hit.get("collider"))
+	return out
 
 
 # =========================================================================== #
@@ -978,6 +1289,12 @@ func _frame_json(with_handshake: bool, margin: float, frames_json := "") -> Stri
 	var frames_part := ""
 	if frames_json != "":
 		frames_part = ',"frames":%s' % frames_json
+	# rays_part is "" unless init opted in (byte-identical wire when off); when on it
+	# rides AFTER frames so the leading keys never shift. Computed here, at the same
+	# state() sampling instant as obs, so a twin rollout is byte-identical WITH rays on.
+	var rays_part := ""
+	if _rays_on:
+		rays_part = ',"rays":%s' % _rays_json_of(_game)
 	# "error":null is hardcoded: a runtime SCRIPT ERROR inside the generated act()
 	# aborts the call without raising, so it is undetectable in-process. The Python
 	# executor attaches the real cause per-episode from the tee'd stderr delta
@@ -985,10 +1302,10 @@ func _frame_json(with_handshake: bool, margin: float, frames_json := "") -> Stri
 	# preserves single-instance byte-identity on clean runs.
 	return ('{%s"obs_state":%s,"checkpoints":%s,"tick":%d,"result":%s,'
 		+ '"done_term":%s,"done_trunc":%s,"world_size":[%s,%s],'
-		+ '"nan":%s,"oob":[%s]%s,"error":null}') % [
+		+ '"nan":%s,"oob":[%s]%s%s,"error":null}') % [
 		head, obs, _checkpoints_json(), _applied, res_str,
 		_b(_done_term), _b(_done_trunc), _num(_world_w), _num(_world_h),
-		_b(_nan), oob, frames_part]
+		_b(_nan), oob, frames_part, rays_part]
 
 
 func _entities_json() -> String:

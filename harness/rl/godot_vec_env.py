@@ -44,7 +44,8 @@ import numpy as np
 
 from harness.rl.env import (
     OBS_CLIP, R_CHECKPOINT, R_FAILURE, R_SUCCESS, HORIZON,
-    build_obs_vector, detect_dim, obs_dim_for,
+    DEFAULT_RAYS, OBS_PROFILES, RAYS_PROFILES,
+    build_obs_vector, detect_dim, normalize_rays, obs_dim_for, rays_obs_width,
 )
 from harness.rl.godot_env import (
     CONNECT_TIMEOUT_S, DEFAULT_PORT_BASE, SERVE_TIMEOUT_S, SPAWN_RETRIES,
@@ -161,7 +162,8 @@ def _batch_vec_env_cls():
                      exe: str | None = None, project: str | None = None,
                      horizon: int = HORIZON, seed: int = 0,
                      timeout_s: float = SERVE_TIMEOUT_S,
-                     connect_timeout_s: float = CONNECT_TIMEOUT_S):
+                     connect_timeout_s: float = CONNECT_TIMEOUT_S,
+                     rays: dict | None = None, obs_profile: str = "positions"):
             self._proc = None
             self._conn = None
             self._listener = None
@@ -176,6 +178,13 @@ def _batch_vec_env_cls():
             self.horizon = int(horizon)
             self.timeout_s = float(timeout_s)
             self._base_seed = int(seed)
+            # Obs profile + opt-in egocentric raycast obs (see harness.rl.godot_env).
+            # "positions" (default) -> wire + obs byte-identical; the rays profiles cast an
+            # egocentric fan/grid per instance. n_rays sized at _freeze_layout (dim-pinned).
+            self._obs_profile = obs_profile if obs_profile in OBS_PROFILES else "positions"
+            self._rays = (normalize_rays(rays or DEFAULT_RAYS)
+                          if self._obs_profile in RAYS_PROFILES else None)
+            self._n_ray_floats = 0      # n_rays * ray_stride; sized at _freeze_layout
             with open(game_path, "r", encoding="utf-8") as fh:
                 self._source = fh.read()
 
@@ -215,10 +224,12 @@ def _batch_vec_env_cls():
                 self.port, exe, project, connect_timeout_s)
 
             n = int(n_instances)
-            ready = self._exchange({"op": "init", "source": self._source,
-                                    "seed": self._base_seed,
-                                    "base_seed": self._base_seed,
-                                    "n_instances": n, "horizon": self.horizon})
+            init_op = {"op": "init", "source": self._source,
+                       "seed": self._base_seed, "base_seed": self._base_seed,
+                       "n_instances": n, "horizon": self.horizon}
+            if self._rays is not None:       # only when opted in (batched wire stays
+                init_op["rays"] = self._rays  # byte-identical to the pre-rays init else)
+            ready = self._exchange(init_op)
             if not ready.get("ok", False) or ready.get("error"):
                 self.close()
                 raise GodotServeError(
@@ -235,6 +246,10 @@ def _batch_vec_env_cls():
             self._ep_return = [0.0] * n
             self._ep_len = [0] * n
             self._pending_action_strs = None
+            # Per-instance raw pose snapshot ({name:{pos,vel,angle}}), kept fresh so the
+            # stale-seek freeze test works on the PURE 'rays' profile (whose obs carries no
+            # positions -> DETECT reads this snapshot). Mirrors GodotServeEnv.last_snapshot.
+            self.last_snapshots = [{} for _ in range(n)]
 
             obs_space = spaces.Box(low=-OBS_CLIP, high=OBS_CLIP,
                                    shape=(self._obs_dim,), dtype=np.float32)
@@ -250,13 +265,36 @@ def _batch_vec_env_cls():
             cp0 = (frame.get("checkpoints") or [{}])[0] or {}
             self._cp_keys = list(cp0.keys())
             self._dim = detect_dim(obs_state0)          # 2D vs true-3D, then PINNED
+            self._n_ray_floats = rays_obs_width(self._rays, self._dim)  # n_rays*ray_stride
             self._obs_dim = obs_dim_for(len(self._body_order), len(self._cp_keys),
-                                        self._dim)
+                                        self._dim, self._obs_profile, self._n_ray_floats)
 
-        def _obs_of(self, obs_state: dict, latched: dict, tick: int) -> np.ndarray:
+        def _rays_row(self, rays_frame, i):
+            """Instance i's flat raycast list (length ``self._n_ray_floats``), or None when
+            off. ``rays_frame`` is the frame's per-instance array-of-arrays (or None)."""
+            if self._n_ray_floats <= 0:
+                return None
+            row = rays_frame[i] if isinstance(rays_frame, list) and i < len(rays_frame) else None
+            if not isinstance(row, list):
+                return [1.0] * self._n_ray_floats
+            if len(row) < self._n_ray_floats:
+                return list(row) + [1.0] * (self._n_ray_floats - len(row))
+            return row[:self._n_ray_floats]
+
+        def _obs_of(self, obs_state: dict, latched: dict, tick: int,
+                    rays=None) -> np.ndarray:
             return build_obs_vector(obs_state or {}, latched or {}, self._body_order,
                                     self._cp_keys, self.world_size, int(tick),
-                                    self.horizon, dim=self._dim)
+                                    self.horizon, dim=self._dim, rays=rays,
+                                    obs_profile=self._obs_profile)
+
+        @staticmethod
+        def _snapshot_of(obs_state: dict) -> dict:
+            """One instance's per-body pose ({name:{pos,vel,angle}}) — the raw-snapshot
+            path the stale-seek freeze test uses for the pure 'rays' profile."""
+            obs = obs_state or {}
+            return {n: {"pos": q.get("pos"), "vel": q.get("vel"),
+                        "angle": q.get("angle")} for n, q in obs.items()}
 
         # -- wire ----------------------------------------------------------
         def _exchange(self, op: dict) -> dict:
@@ -302,10 +340,13 @@ def _batch_vec_env_cls():
             cps = frame["checkpoints"]
             obss = frame["obs_state"]
             ticks = frame["tick"]
+            rays_frame = frame.get("rays")
             for i in range(self.num_envs):
                 latched = cps[i] or {}
                 self._prev_latched[i] = {k for k, v in latched.items() if v is not None}
-                obs[i] = self._obs_of(obss[i], latched, ticks[i])
+                obs[i] = self._obs_of(obss[i], latched, ticks[i],
+                                      rays=self._rays_row(rays_frame, i))
+                self.last_snapshots[i] = self._snapshot_of(obss[i])
                 self._ep_return[i] = 0.0
                 self._ep_len[i] = 0
             return obs
@@ -322,10 +363,13 @@ def _batch_vec_env_cls():
                                     "instances": list(range(self.num_envs)),
                                     "seeds": seeds, "base_seed": self._base_seed})
             obs = np.zeros((self.num_envs, self._obs_dim), dtype=np.float32)
+            rays_frame = frame.get("rays")
             for i in range(self.num_envs):
                 latched = frame["checkpoints"][i] or {}
                 self._prev_latched[i] = {k for k, v in latched.items() if v is not None}
-                obs[i] = self._obs_of(frame["obs_state"][i], latched, frame["tick"][i])
+                obs[i] = self._obs_of(frame["obs_state"][i], latched, frame["tick"][i],
+                                      rays=self._rays_row(rays_frame, i))
+                self.last_snapshots[i] = self._snapshot_of(frame["obs_state"][i])
                 self._ep_return[i] = 0.0
                 self._ep_len[i] = 0
             return obs
@@ -345,6 +389,7 @@ def _batch_vec_env_cls():
             results = frame["result"]
             dterm = frame["done_term"]
             dtrunc = frame["done_trunc"]
+            rays_frame = frame.get("rays")
 
             obs = np.zeros((n, self._obs_dim), dtype=np.float32)
             rewards = np.zeros(n, dtype=np.float32)
@@ -370,7 +415,9 @@ def _batch_vec_env_cls():
                 dones[i] = done
                 self._ep_return[i] += reward
                 self._ep_len[i] += 1
-                obs[i] = self._obs_of(obss[i], latched, ticks[i])
+                obs[i] = self._obs_of(obss[i], latched, ticks[i],
+                                      rays=self._rays_row(rays_frame, i))
+                self.last_snapshots[i] = self._snapshot_of(obss[i])
 
                 info = {"result": result, "tick": int(ticks[i]),
                         "n_latched": len(latched_now),
@@ -395,11 +442,14 @@ def _batch_vec_env_cls():
                 r_obs = rframe["obs_state"]
                 r_cps = rframe["checkpoints"]
                 r_ticks = rframe["tick"]
+                r_rays = rframe.get("rays")
                 for i in done_indices:
                     latched = r_cps[i] or {}
                     self._prev_latched[i] = {k for k, v in latched.items()
                                              if v is not None}
-                    obs[i] = self._obs_of(r_obs[i], latched, r_ticks[i])
+                    obs[i] = self._obs_of(r_obs[i], latched, r_ticks[i],
+                                          rays=self._rays_row(r_rays, i))
+                    self.last_snapshots[i] = self._snapshot_of(r_obs[i])
                     self._ep_return[i] = 0.0
                     self._ep_len[i] = 0
 
