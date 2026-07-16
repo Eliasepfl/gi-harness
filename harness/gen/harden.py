@@ -244,6 +244,13 @@ def _run_oracles(game_path, source, *, engine, tiers, stale, run_g3, budget_step
     pressure = feedback.pressure_finding(report)
     if pressure:
         oracle["pressure"] = pressure
+    # WAVE 3 MATERIAL REALITY: lift the non-gating material-anchoring finding stashed in the
+    # verify report so _compile_anchoring can turn a ghost-goal milestone (a checkpoint/win that
+    # flips in empty space, off a bare coordinate) into a per-milestone repair directive
+    # (compiler order: PRESSURE -> ANCHORING -> DEAD SPACE -> G3').
+    anchoring = feedback.anchoring_finding(report)
+    if anchoring:
+        oracle["anchoring"] = anchoring
     # RUNTIME ERROR: a generated game that PARSES but crashes at runtime (a null
     # deref in act()/build()) — captured from the serve stderr and stashed in the
     # verify report — compiles a root-cause directive naming the file:line.
