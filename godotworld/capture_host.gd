@@ -58,6 +58,7 @@ var _applied := 0
 var _frames_written := 0
 var _result := ""
 var _no_dress := false
+var _dress_mode := ""        # auto|proxy|respect; "" -> visual_dress.gd's own default
 var _no_frames := false
 var _fp_path := ""
 var _fp_lines: PackedStringArray = PackedStringArray()
@@ -87,6 +88,7 @@ func _run() -> void:
 	_every = max(1, _int_arg("--every=", 1))
 	_max_frames = max(1, _int_arg("--max-frames=", 400))
 	_no_dress = _has_flag("--no-dress")     # identity-test lane (no overlay at all)
+	_dress_mode = _str_arg("--dress-mode=", "")   # auto|proxy|respect (see visual_dress.gd)
 	_no_frames = _has_flag("--no-frames")   # step + fingerprint only, write no PNGs
 	_fp_path = _str_arg("--fingerprint=", "")
 	_assets_file = _str_arg("--assets-file=", "")
@@ -200,7 +202,12 @@ func _run() -> void:
 			"view_h": float(_height),
 			"assets": _load_assets_dict(_assets_file),
 			"manifest_path": _assets_manifest,
+			# "" -> the dresser's own default (auto / HARNESS_DRESS_MODE).
+			"dress_mode": _dress_mode,
 		})
+		# What the game authored for itself, and therefore what we did NOT stamp over it. A
+		# flattened demo is diagnosable from the capture log alone.
+		print("capture_host: dress census ", _stage.census())
 
 	# Ensure the out dir exists.
 	DirAccess.make_dir_recursive_absolute(_out_dir)

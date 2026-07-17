@@ -26,10 +26,36 @@
 # and in a normal desktop Godot window alike. No external assets required (the bank
 # assets are an optional visual upgrade; the primitive path always renders).
 #
+# RESPECTING AUTHORSHIP (dress_mode, default "auto")
+#   The dresser was written for a BARE game and used to treat every game as bare: it recoloured
+#   every body from the 4-role palette, stamped the same procedural sky + ground + sun on every
+#   3D scene, and make_current()'d its own camera -- so a game that had authored an arena floor,
+#   glowing posts and a red guard rendered as identical orange/teal/blue-gray boxes under a
+#   generic sky, framed by a camera its author never chose. 14 of the 22 certified games author
+#   real fiction-specific visuals; all of it was being discarded or z-fought.
+#
+#   dress() now takes a read-only VISNODE CENSUS of the game tree first (_census_node, folded
+#   into the existing _collect_shapes walk) and only fills in what the game did NOT bring:
+#     * a body that draws its own visual keeps it     -> no proxy, no recolour
+#     * a game that authored a Camera2D/Camera3D      -> we build no camera and steal no frame
+#     * a game that authored a light / environment    -> we stamp neither over it
+#     * a game that painted its own world (scene-level visual or its own env) -> no backdrop
+#   A game that authored NOTHING takes exactly the old path, node for node -- the ~8 genuinely
+#   bare games depend on it.
+#
+#   dress_mode: "auto" (default; the above) | "proxy" (legacy: dress everything, ignore
+#   authorship) | "respect" (strict: draw nothing the game did not ask for). Also settable via
+#   the HARNESS_DRESS_MODE env var (opts win), so any lane can force the old look.
+#
+# THE CENSUS IS READ-ONLY, like everything else here: it reads node classes and their draw
+# properties and never writes. In particular it NEVER calls make_current() on the game's own
+# camera -- the game's camera is already current by virtue of being the only one in the tree;
+# we simply stop overriding it.
+#
 # API:
 #   var stage := load("res://visual_dress.gd").new()
 #   parent.add_child(stage)                 # a SIBLING of the game, never a child of it
-#   stage.dress(game_root, {follow=false, assets={...}, manifest_path="..."})
+#   stage.dress(game_root, {follow=false, assets={...}, manifest_path="...", dress_mode="auto"})
 #   ... each rendered frame ...
 #   stage.sync()                            # mirror transforms (read-only on the game)
 
@@ -72,9 +98,22 @@ const Z_STATIC := -10
 const Z_SENSOR := -5
 const Z_DYNAMIC := 10
 
+# ---- dress modes ----------------------------------------------------------- #
+const MODE_AUTO := "auto"            # respect what the game authored, fill what's missing
+const MODE_PROXY := "proxy"          # legacy: proxy/recolour everything, own the camera
+const MODE_RESPECT := "respect"      # strict: the game presents itself, we add nothing
+
 # ---- discovered state ----------------------------------------------------- #
 var _pairs: Array = []               # [{src: Node(shape), proxy: Node}]
 var _is_3d := false
+# ---- visnode census (what the GAME authored for itself; read-only) --------- #
+var _dress_mode := MODE_AUTO
+var _authored_bodies := {}           # body instance-id -> true (this body draws its own visual)
+var _authored_root_visual := false   # a scene-level visual: the game painted its own world
+var _authored_camera := false        # the game brought its own Camera2D/Camera3D
+var _authored_light := false         # the game brought its own Light3D
+var _authored_env := false           # the game brought its own WorldEnvironment
+var _controlled_ext_set := false
 var _assets_norm: Dictionary = {}    # normalised-body-name -> bank asset id (from route_assets)
 var _manifest_path := ""             # abs/res:// path to assets/manifest.json (AssetLoader source)
 var _asset_by_body: Dictionary = {}  # body instance-id -> resolved asset id (t=0 matched)
@@ -114,9 +153,12 @@ func dress(game_root: Node, opts := {}) -> void:
 	_manifest_path = str(opts.get("manifest_path", ""))
 	_build_assets_norm(opts.get("assets", {}))
 	_read_cam_opts(opts)
+	_read_dress_mode(opts)
 
-	# 1. Discover every collision shape in the game tree (READ-ONLY walk).
+	# 1. Discover every collision shape in the game tree (READ-ONLY walk), taking the visnode
+	#    census on the way: what did this game already author for itself?
 	var shapes: Array = []
+	_census_node(game_root)          # the root itself may be the scene's own visual
 	_collect_shapes(game_root, shapes)
 
 	# 2. Identify the controlled body by matching state()'s controlled entry to a body.
@@ -213,6 +255,7 @@ func _collect_shapes(node: Node, out: Array) -> void:
 	# Depth-first: every CollisionShape2D/3D (with a real shape) or CollisionPolygon2D
 	# whose owning body we can name. We record the SHAPE node (its global transform is
 	# what moves with the body, honouring any per-shape offset) + its owning body.
+	# The same walk takes the visnode census (read-only) -- one pass over the tree.
 	for child in node.get_children():
 		var body := _owning_body(child)
 		if child is CollisionShape2D and child.shape != null:
@@ -221,6 +264,7 @@ func _collect_shapes(node: Node, out: Array) -> void:
 			out.append({"shape": child, "body": body, "kind": "2d_poly"})
 		elif child is CollisionShape3D and child.shape != null:
 			out.append({"shape": child, "body": body, "kind": "3d_shape"})
+		_census_node(child)
 		_collect_shapes(child, out)
 
 
@@ -231,6 +275,141 @@ func _owning_body(shape_node: Node) -> Node:
 			return p
 		p = p.get_parent()
 	return shape_node
+
+
+# =========================================================================== #
+# Visnode census -- what the GAME authored for itself (READ-ONLY)
+# =========================================================================== #
+func _census_node(n: Node) -> void:
+	# Tally one node of the game tree into the census. Cameras and lights/environments are
+	# their own buckets (they are not "visuals" to be proxied); everything that actually draws
+	# is attributed to its owning body, or to the scene when it hangs at game-root level.
+	if n is Camera2D or n is Camera3D:
+		_authored_camera = true
+		return
+	if n is Light3D:
+		_authored_light = true
+		return
+	if n is WorldEnvironment:
+		_authored_env = true
+		return
+	if not _draws_something(n):
+		return
+	var body := _owning_body_or_null(n)
+	if body != null:
+		_authored_bodies[body.get_instance_id()] = true
+	else:
+		# A visual with no owning body: the game's own backdrop / terrain / decor.
+		_authored_root_visual = true
+
+
+func _draws_something(n: Node) -> bool:
+	# Does this node put REAL pixels on screen? Deliberately STRICT: an empty MeshInstance3D or
+	# a degenerate Polygon2D draws nothing, and must NOT suppress the proxy that is the only
+	# thing making that body visible. Anything not listed here (particles, TileMap, ...) simply
+	# reads as "not authored" and keeps the old proxy path -- a safe default, never a regression.
+	if n is MeshInstance3D:
+		return (n as MeshInstance3D).mesh != null
+	if n is MultiMeshInstance3D:
+		return (n as MultiMeshInstance3D).multimesh != null
+	if n is CSGShape3D:
+		return true
+	if n is SpriteBase3D:            # Sprite3D / AnimatedSprite3D / Label3D
+		return true
+	if n is Polygon2D:
+		return (n as Polygon2D).polygon.size() >= 3
+	if n is Line2D:
+		return (n as Line2D).points.size() >= 2
+	if n is Sprite2D:
+		return (n as Sprite2D).texture != null
+	if n is AnimatedSprite2D:
+		return (n as AnimatedSprite2D).sprite_frames != null
+	if n is ColorRect or n is TextureRect:
+		return true
+	return false
+
+
+func _owning_body_or_null(n: Node) -> Node:
+	# The CollisionObject that OWNS this node (nearest body ancestor), or null when it hangs at
+	# scene level. Distinct from _owning_body(), which returns the node itself as a fallback --
+	# here the difference between "this body's art" and "the world's art" is the whole point.
+	var p := n.get_parent()
+	while p != null:
+		if p is CollisionObject2D or p is CollisionObject3D:
+			return p
+		p = p.get_parent()
+	return null
+
+
+func _read_dress_mode(opts: Dictionary) -> void:
+	# opts win over the env var; anything unrecognised falls back to "auto" (never crash a demo
+	# over a typo'd knob).
+	var m := str(opts.get("dress_mode", ""))
+	if m == "":
+		m = OS.get_environment("HARNESS_DRESS_MODE")
+	if m != MODE_AUTO and m != MODE_PROXY and m != MODE_RESPECT:
+		m = MODE_AUTO
+	_dress_mode = m
+
+
+func census() -> Dictionary:
+	# Exposed for the host's logging + the dress tests: what the game brought of its own, and
+	# therefore what we did NOT stamp over it.
+	return {"mode": _dress_mode, "authored_bodies": _authored_bodies.size(),
+		"root_visual": _authored_root_visual, "camera": _authored_camera,
+		"light": _authored_light, "env": _authored_env}
+
+
+# ---- census -> decisions (the ONLY places the census changes behaviour) ---- #
+func _should_proxy(rec: Dictionary) -> bool:
+	# A body that painted its own visual keeps it: the authored art IS the visual, and a
+	# palette-coloured proxy on top would z-fight it and flatten the fiction.
+	if _dress_mode == MODE_PROXY:
+		return true
+	if _dress_mode == MODE_RESPECT:
+		return false
+	var body = rec["body"]
+	if body == null or not is_instance_valid(body):
+		return true
+	return not _authored_bodies.has(body.get_instance_id())
+
+
+func _should_stamp_env() -> bool:
+	if _dress_mode == MODE_PROXY:
+		return true
+	if _dress_mode == MODE_RESPECT:
+		return false
+	return not _authored_env
+
+
+func _should_stamp_light() -> bool:
+	if _dress_mode == MODE_PROXY:
+		return true
+	if _dress_mode == MODE_RESPECT:
+		return false
+	return not _authored_light
+
+
+func _should_stamp_scene() -> bool:
+	# The generic backdrop (2D slate rectangle / 3D ground quad). A game that painted its own
+	# world -- scene-level visual, or its own environment/sky -- has chosen its background;
+	# a game that only skinned its BODIES still wants a floor under them ("fill what's missing").
+	if _dress_mode == MODE_PROXY:
+		return true
+	if _dress_mode == MODE_RESPECT:
+		return false
+	return not (_authored_root_visual or _authored_env)
+
+
+func _should_own_camera() -> bool:
+	# make_current() on our camera is what threw away every authored camera in the library.
+	# When the game brought one, it is already the viewport's current camera; we build none and
+	# leave theirs entirely alone (zero-contact).
+	if _dress_mode == MODE_PROXY:
+		return true
+	if _dress_mode == MODE_RESPECT:
+		return false
+	return not _authored_camera
 
 
 func _controlled_pos_from_state(game_root: Node):
@@ -315,12 +494,16 @@ func _build_2d(shapes: Array) -> void:
 	# backdrop is added after bounds are known (below); collect proxies first.
 	var ctrl_shape = null
 	for rec in shapes:
+		# Bounds come from COLLISION geometry and frame the whole scene, so they are taken for
+		# every body -- including one we leave to its own authored art.
+		_expand_bounds_2d(rec)
+		if not _should_proxy(rec):
+			continue
 		var proxy = _make_2d_proxy(rec)
 		if proxy == null:
 			continue
 		_stage2d.add_child(proxy)
 		_pairs.append({"src": rec["shape"], "proxy": proxy})
-		_expand_bounds_2d(rec)
 		if rec["role"] == "controlled" and ctrl_shape == null:
 			ctrl_shape = rec["shape"]
 
@@ -330,22 +513,26 @@ func _build_2d(shapes: Array) -> void:
 
 	# Backdrop rectangle behind everything. Oversized well past the scene so it fills the
 	# whole camera view (no gray letterbox band) in overview OR follow framing -- it is a
-	# single flat polygon, so the size is free.
-	var bg := Polygon2D.new()
-	bg.name = "Backdrop"
-	var cx := (_min.x + _max.x) * 0.5
-	var cy := (_min.y + _max.y) * 0.5
-	var big: float = max(_max.x - _min.x, _max.y - _min.y) * 2.0 + max(_view_w, _view_h)
-	bg.polygon = PackedVector2Array([
-		Vector2(cx - big, cy - big), Vector2(cx + big, cy - big),
-		Vector2(cx + big, cy + big), Vector2(cx - big, cy + big)])
-	bg.color = COL_BG_2D
-	bg.z_index = Z_BG
-	_stage2d.add_child(bg)
+	# single flat polygon, so the size is free. Skipped for a game that painted its own world
+	# (the lander's brown crater terrain, the platformers' ColorRect skies).
+	if _should_stamp_scene():
+		var bg := Polygon2D.new()
+		bg.name = "Backdrop"
+		var cx := (_min.x + _max.x) * 0.5
+		var cy := (_min.y + _max.y) * 0.5
+		var big: float = max(_max.x - _min.x, _max.y - _min.y) * 2.0 + max(_view_w, _view_h)
+		bg.polygon = PackedVector2Array([
+			Vector2(cx - big, cy - big), Vector2(cx + big, cy - big),
+			Vector2(cx + big, cy + big), Vector2(cx - big, cy + big)])
+		bg.color = COL_BG_2D
+		bg.z_index = Z_BG
+		_stage2d.add_child(bg)
 
 	# A soft translucent halo tracking the agent so it stays legible in a wide overview
 	# (the true-size body polygon is still drawn on top -- the halo never misrepresents
 	# the collision size). Radius scales with the course, not the tiny body.
+	# ctrl_shape is set only when the agent was PROXIED, so an agent the game drew itself (the
+	# lander's yellow probe) keeps its own colour instead of wearing our orange halo.
 	if ctrl_shape != null:
 		var span2: float = max(_max.x - _min.x, _max.y - _min.y)
 		var halo_r: float = max(span2 * 0.02, 22.0)
@@ -494,39 +681,49 @@ func _build_3d(shapes: Array) -> void:
 	_stage3d.name = "DemoStage3D"
 	add_child(_stage3d)
 
-	# Environment + sky + ambient (a clean, lit backdrop -- godot_rl examples look).
-	var we := WorldEnvironment.new()
-	var env := Environment.new()
-	env.background_mode = Environment.BG_SKY
-	var sky := Sky.new()
-	var sky_mat := ProceduralSkyMaterial.new()
-	sky_mat.sky_top_color = Color(0.35, 0.52, 0.78)
-	sky_mat.sky_horizon_color = Color(0.70, 0.78, 0.86)
-	sky_mat.ground_bottom_color = Color(0.24, 0.26, 0.30)
-	sky_mat.ground_horizon_color = Color(0.55, 0.60, 0.66)
-	sky.sky_material = sky_mat
-	env.sky = sky
-	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-	env.ambient_light_energy = 0.6
-	we.environment = env
-	_stage3d.add_child(we)
+	# Environment + sky + ambient (a clean, lit backdrop -- godot_rl examples look). Stamped
+	# only over a game that brought no sky of its own: the arena shooter and the ring courses
+	# author a WorldEnvironment + sun deliberately, and ours used to bury both.
+	if _should_stamp_env():
+		var we := WorldEnvironment.new()
+		var env := Environment.new()
+		env.background_mode = Environment.BG_SKY
+		var sky := Sky.new()
+		var sky_mat := ProceduralSkyMaterial.new()
+		sky_mat.sky_top_color = Color(0.35, 0.52, 0.78)
+		sky_mat.sky_horizon_color = Color(0.70, 0.78, 0.86)
+		sky_mat.ground_bottom_color = Color(0.24, 0.26, 0.30)
+		sky_mat.ground_horizon_color = Color(0.55, 0.60, 0.66)
+		sky.sky_material = sky_mat
+		env.sky = sky
+		env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
+		env.ambient_light_energy = 0.6
+		we.environment = env
+		_stage3d.add_child(we)
 
-	var sun := DirectionalLight3D.new()
-	sun.rotation = Vector3(deg_to_rad(-55.0), deg_to_rad(-40.0), 0.0)
-	sun.light_energy = 1.1
-	sun.shadow_enabled = true
-	_stage3d.add_child(sun)
+	if _should_stamp_light():
+		var sun := DirectionalLight3D.new()
+		sun.rotation = Vector3(deg_to_rad(-55.0), deg_to_rad(-40.0), 0.0)
+		sun.light_energy = 1.1
+		sun.shadow_enabled = true
+		_stage3d.add_child(sun)
 
 	for rec in shapes:
+		# Bounds/extents come from COLLISION geometry and frame the whole scene, so they are
+		# taken for every body -- including one we leave to its own authored art.
+		_expand_bounds_3d(rec)
+		if rec["role"] == "controlled" and not _controlled_ext_set:
+			_controlled_ext = _shape_half_extent_3d(rec["shape"].shape)
+			_controlled_ext_set = true
+		if not _should_proxy(rec):
+			continue
 		var proxy = _make_3d_proxy(rec)
 		if proxy == null:
 			continue
 		_stage3d.add_child(proxy)
 		_pairs.append({"src": rec["shape"], "proxy": proxy})
-		_expand_bounds_3d(rec)
 		if rec["role"] == "controlled" and _controlled_proxy == null:
 			_controlled_proxy = proxy
-			_controlled_ext = _shape_half_extent_3d(rec["shape"].shape)
 
 	if not _bounds_valid():
 		_min = Vector3(0, 0, 0)
@@ -535,24 +732,26 @@ func _build_3d(shapes: Array) -> void:
 	# A backdrop plane at the FAR end of the scene's thinnest ("depth") axis -- it grounds
 	# the scene without ever occluding the bodies (the camera views from the near side of
 	# that axis). Orientation is derived from the AABB, so it works for any 3D layout.
-	var span := _max - _min
-	var center := (_min + _max) * 0.5
-	var depth := _thin_axis_dir(span)
-	var big3: float = span.length() + max(_view_w, _view_h)
-	var floor_mi := MeshInstance3D.new()
-	var qm := QuadMesh.new()
-	qm.size = Vector2(big3, big3)
-	floor_mi.mesh = qm
-	var gmat := StandardMaterial3D.new()
-	gmat.albedo_color = COL_GROUND_3D
-	gmat.roughness = 0.95
-	gmat.cull_mode = BaseMaterial3D.CULL_DISABLED
-	floor_mi.mesh.surface_set_material(0, gmat)
-	# QuadMesh faces +Z by default; aim its normal along +depth (toward the camera side).
-	floor_mi.position = center - depth * (span.length() * 0.5 + 60.0)
-	floor_mi.look_at_from_position(floor_mi.position, floor_mi.position + depth,
-		_up_for(depth))
-	_stage3d.add_child(floor_mi)
+	# Skipped for a game that painted its own world (the arena's floor + sky).
+	if _should_stamp_scene():
+		var span := _max - _min
+		var center := (_min + _max) * 0.5
+		var depth := _thin_axis_dir(span)
+		var big3: float = span.length() + max(_view_w, _view_h)
+		var floor_mi := MeshInstance3D.new()
+		var qm := QuadMesh.new()
+		qm.size = Vector2(big3, big3)
+		floor_mi.mesh = qm
+		var gmat := StandardMaterial3D.new()
+		gmat.albedo_color = COL_GROUND_3D
+		gmat.roughness = 0.95
+		gmat.cull_mode = BaseMaterial3D.CULL_DISABLED
+		floor_mi.mesh.surface_set_material(0, gmat)
+		# QuadMesh faces +Z by default; aim its normal along +depth (toward the camera side).
+		floor_mi.position = center - depth * (span.length() * 0.5 + 60.0)
+		floor_mi.look_at_from_position(floor_mi.position, floor_mi.position + depth,
+			_up_for(depth))
+		_stage3d.add_child(floor_mi)
 
 
 func _make_3d_proxy(rec: Dictionary):
@@ -758,6 +957,12 @@ func _load_asset(asset_id: String, target_size: Vector3, anchor: String):
 # Camera framing
 # =========================================================================== #
 func _setup_camera() -> void:
+	# The game's OWN camera frames the demo when it brought one: we build none, and never touch
+	# theirs (it is already the viewport's current camera -- there is nothing to make current).
+	# This is the make_current() theft that used to discard the framing 7 of the 22 certified
+	# games authored for themselves. _camera stays null -> sync()'s follow block is inert.
+	if not _should_own_camera():
+		return
 	if _is_3d:
 		_setup_camera_3d()
 	else:
