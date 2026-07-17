@@ -72,9 +72,10 @@ import numpy as np
 from harness.rl.env import (
     OBS_CLIP, HORIZON,
     DEFAULT_RAYS, OBS_PROFILES, RAYS_PROFILES,
-    Box, Discrete, build_obs_vector, detect_dim, normalize_rays, obs_dim_for,
-    rays_obs_width, step_reward,
+    Box, Discrete, MultiBinary, build_obs_vector, detect_dim, normalize_rays,
+    obs_dim_for, rays_obs_width, step_reward,
 )
+from harness.verify.chord import chord_from_mask
 from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
 # --- Constants ([eng.] = engineering choice) ---------------------------------
@@ -157,7 +158,8 @@ class GodotServeEnv:
                  project: str | None = None, horizon: int = HORIZON,
                  timeout_s: float = SERVE_TIMEOUT_S,
                  connect_timeout_s: float = CONNECT_TIMEOUT_S,
-                 rays: dict | None = None, obs_profile: str = "positions"):
+                 rays: dict | None = None, obs_profile: str = "positions",
+                 chord_mode: bool = False, allow_idle: bool | None = None):
         # Set teardown-relevant handles first so close() is safe on any early raise.
         self._listener = None
         self._conn = None
@@ -180,6 +182,19 @@ class GodotServeEnv:
         self.game_path = game_path
         self.horizon = int(horizon)
         self.timeout_s = float(timeout_s)
+        # CHORD mode (Phase 2, opt-in). OFF (default) -> Discrete action space + a single verb
+        # string per tick on the wire: byte-identical to every pre-chord run. ON -> a
+        # MultiBinary(n_actions) space; step() maps the 0/1 vector to the sorted chord wire
+        # form (a lone pressed key stays a plain str -> the legacy singleton wire is preserved).
+        # allow_idle is the serve-init capability that legalises the all-keys-off IDLE tick
+        # (empty chord []): default None -> the chord env turns it ON (General Intuition's own
+        # controller can output all-keys-off, so parity argues for idle; STAKES/game pressure,
+        # not the action-space shape, is what punishes idling). Idle is meaningless without
+        # chords, so it is force-OFF outside chord mode -> the discrete wire stays untouched.
+        self.chord_mode = bool(chord_mode)
+        if allow_idle is None:
+            allow_idle = self.chord_mode
+        self.allow_idle = self.chord_mode and bool(allow_idle)
         # Obs profile (Elias 2026-07-16): "positions" (default; byte-identical to today) |
         # "positions+rays" | "rays" (pure, proprioception-only + rays). The two rays
         # profiles cast an egocentric fan/grid (the examples' RaycastSensor pattern, no
@@ -258,6 +273,8 @@ class GodotServeEnv:
                    "horizon": self.horizon}
         if self._rays is not None:       # only include the key when opted in (wire stays
             init_op["rays"] = self._rays  # byte-identical to the pre-rays init otherwise)
+        if self.allow_idle:              # opt-in capability: legalise the empty-chord IDLE
+            init_op["allow_idle"] = True  # tick (absent -> host rejects [] as a protocol error)
         ready = self._exchange(init_op)
         if not ready.get("ok", False) or ready.get("error"):
             self.close()
@@ -272,7 +289,10 @@ class GodotServeEnv:
         self._body_order: list[str] | None = None
         self._cp_keys: list[str] | None = None
         self._dim: int = 2                          # pinned in _freeze_layout (2 or 3)
-        self.action_space = Discrete(len(self.actions))
+        # MultiBinary(n) in chord mode (per-key Bernoulli policy); Discrete(n) otherwise --
+        # both expose ``.n`` (the declared-verb count) uniformly.
+        self.action_space = (MultiBinary(len(self.actions)) if self.chord_mode
+                             else Discrete(len(self.actions)))
         self.observation_space: Box | None = None
         self._freeze_layout(ready)
 
@@ -474,13 +494,19 @@ class GodotServeEnv:
         self.last_snapshot = self._snapshot_of(frame)
         return self._observe(frame), {"latched": dict(frame.get("checkpoints") or {})}
 
-    def step(self, action_idx: int):
+    def step(self, action):
         if self._done:
             raise RuntimeError("step() after episode end — call reset() first")
-        action = self.actions[int(action_idx)]
+        # CHORD: `action` is a MultiBinary 0/1 vector -> the sorted chord wire form (a lone
+        # pressed key stays a plain str; all-keys-off -> [] idle when allow_idle). DISCRETE:
+        # `action` is an index -> the single verb string (byte-identical to the pre-chord wire).
+        if self.chord_mode:
+            wire = chord_from_mask(action, self.actions, allow_empty=self.allow_idle)
+        else:
+            wire = self.actions[int(action)]
         # One decision tick per step (n_ticks=1) — keeps per-step semantics identical
         # to the batch witness replay (one action per tick through run_batch).
-        frame = self._exchange({"op": "act", "actions": [action], "n_ticks": 1})
+        frame = self._exchange({"op": "act", "actions": [wire], "n_ticks": 1})
         self._tick = int(frame.get("tick", self._tick + 1))
         result = frame.get("result")
 

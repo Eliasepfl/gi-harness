@@ -52,6 +52,7 @@ from harness.rl.godot_env import (
     CONNECT_TIMEOUT_S, DEFAULT_PORT_BASE, SERVE_TIMEOUT_S, SPAWN_RETRIES,
     SPAWN_RETRY_DELAY_S, GodotServeError, _recv_frame, _send_frame,
 )
+from harness.verify.chord import chord_from_mask
 from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
 
@@ -164,7 +165,8 @@ def _batch_vec_env_cls():
                      horizon: int = HORIZON, seed: int = 0,
                      timeout_s: float = SERVE_TIMEOUT_S,
                      connect_timeout_s: float = CONNECT_TIMEOUT_S,
-                     rays: dict | None = None, obs_profile: str = "positions"):
+                     rays: dict | None = None, obs_profile: str = "positions",
+                     chord_mode: bool = False, allow_idle: bool | None = None):
             self._proc = None
             self._conn = None
             self._listener = None
@@ -179,6 +181,13 @@ def _batch_vec_env_cls():
             self.horizon = int(horizon)
             self.timeout_s = float(timeout_s)
             self._base_seed = int(seed)
+            # CHORD mode (Phase 2, opt-in) -- see GodotServeEnv. OFF (default) keeps the
+            # Discrete space + single-verb wire byte-identical; ON -> MultiBinary(n) act space
+            # and step_async maps each instance's 0/1 vector to the sorted chord wire form.
+            # allow_idle (the empty-chord IDLE capability) defaults ON with chords, OFF without.
+            self._chord_mode = bool(chord_mode)
+            _idle = self._chord_mode if allow_idle is None else bool(allow_idle)
+            self._allow_idle = self._chord_mode and _idle
             # Obs profile + opt-in egocentric raycast obs (see harness.rl.godot_env).
             # "positions" (default) -> wire + obs byte-identical; the rays profiles cast an
             # egocentric fan/grid per instance. n_rays sized at _freeze_layout (dim-pinned).
@@ -230,6 +239,8 @@ def _batch_vec_env_cls():
                        "n_instances": n, "horizon": self.horizon}
             if self._rays is not None:       # only when opted in (batched wire stays
                 init_op["rays"] = self._rays  # byte-identical to the pre-rays init else)
+            if self._allow_idle:             # opt-in empty-chord IDLE capability (see host)
+                init_op["allow_idle"] = True
             ready = self._exchange(init_op)
             if not ready.get("ok", False) or ready.get("error"):
                 self.close()
@@ -254,7 +265,8 @@ def _batch_vec_env_cls():
 
             obs_space = spaces.Box(low=-OBS_CLIP, high=OBS_CLIP,
                                    shape=(self._obs_dim,), dtype=np.float32)
-            act_space = spaces.Discrete(len(self.actions))
+            act_space = (spaces.MultiBinary(len(self.actions)) if self._chord_mode
+                         else spaces.Discrete(len(self.actions)))
             super().__init__(n, obs_space, act_space)
 
         # -- layout --------------------------------------------------------
@@ -376,8 +388,16 @@ def _batch_vec_env_cls():
             return obs
 
         def step_async(self, actions) -> None:
-            acts = np.asarray(actions).reshape(-1)
-            self._pending_action_strs = [self.actions[int(a)] for a in acts]
+            acts = np.asarray(actions)
+            if self._chord_mode:
+                # Each ROW is one instance's MultiBinary vector -> its sorted chord wire form
+                # (lone key -> plain str; all-off -> [] when allow_idle). Never flatten here.
+                self._pending_action_strs = [
+                    chord_from_mask(row, self.actions, allow_empty=self._allow_idle)
+                    for row in acts]
+            else:
+                self._pending_action_strs = [
+                    self.actions[int(a)] for a in acts.reshape(-1)]
 
         def step_wait(self):
             frame = self._exchange({"op": "act",

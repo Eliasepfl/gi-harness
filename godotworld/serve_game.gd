@@ -124,6 +124,9 @@ var _play_max_y := DEFAULT_H + PLAY_MARGIN
 # amortises the per-tick engine loop and the socket round-trip across N worlds (the
 # godot_rl_agents batching idea). Parallel arrays are indexed by instance 0..N-1.
 var _batched := false                   # true once init carried an n_instances key
+var _allow_idle := false                # Phase-2 capability: legalise the empty-chord IDLE
+                                        # tick (init "allow_idle":true). OFF -> [] is a
+                                        # protocol error, byte-identical to the pre-chord host
 var _n_instances := 1                   # N worlds over one socket (>=1 when batched)
 var _base_seed := 0                     # instance i is (re)built at seed base_seed + i
 var _games := []                        # per-instance game Node
@@ -472,6 +475,20 @@ func _safe_checkpoints() -> Dictionary:
 # =========================================================================== #
 # Stepping (act) -- mirrors runner.gd's per-tick body: act + K=6 + latch + terminal
 # =========================================================================== #
+# PHASE-2 IDLE GUARD. An empty chord [] is a "press nothing" idle tick -- legal ONLY when
+# the init carried allow_idle:true. Off (default), reject it as a protocol error BEFORE any
+# physics steps (mirrors Python's normalize_action rejecting empties without allow_empty), so
+# a policy/witness cannot smuggle a silent no-op tick past a host that never opted in. Returns
+# true IFF a violation is present.
+func _empty_chord_violation(actions_list: Array) -> bool:
+	if _allow_idle:
+		return false
+	for a in actions_list:
+		if ChordUtil.is_empty_chord(a):
+			return true
+	return false
+
+
 func _op_act(msg: Dictionary) -> String:
 	if _batched:
 		return await _op_act_batch(msg)
@@ -480,6 +497,8 @@ func _op_act(msg: Dictionary) -> String:
 	var actions_list = msg.get("actions", [])
 	if typeof(actions_list) != TYPE_ARRAY:
 		actions_list = []
+	if _empty_chord_violation(actions_list):
+		return '{"ok":false,"error":"empty chord [] not permitted (allow_idle capability off)"}'
 	var n_ticks := int(msg.get("n_ticks", actions_list.size()))
 	var margin := float(msg.get("escape_margin", 0.0))
 	# frames_every>0 -> capture a per-tick {tick, entities:{...}} frame every N
@@ -597,6 +616,7 @@ func _op_init(msg: Dictionary) -> String:
 		return '{"ok":false,"error":"%s"}' % _esc(comp.error)
 	_script = comp.script
 	_parse_rays(msg.get("rays", null))      # opt-in egocentric raycast obs (no-op if absent)
+	_allow_idle = bool(msg.get("allow_idle", false))  # Phase-2 empty-chord IDLE capability
 	# An explicit n_instances key (even ==1) selects the BATCHED array-frame path; its
 	# ABSENCE keeps the legacy single-instance scalar frame byte-identical to before.
 	_batched = msg.has("n_instances")
@@ -788,6 +808,8 @@ func _op_act_batch(msg: Dictionary) -> String:
 	var actions_list = msg.get("actions", [])
 	if typeof(actions_list) != TYPE_ARRAY:
 		actions_list = []
+	if _empty_chord_violation(actions_list):
+		return '{"ok":false,"error":"empty chord [] not permitted (allow_idle capability off)"}'
 	var n_ticks := int(msg.get("n_ticks", 1))
 	await _batch_do_ticks(actions_list, n_ticks)
 	return _batch_frame_json(false)

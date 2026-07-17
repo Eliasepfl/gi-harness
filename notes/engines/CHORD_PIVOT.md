@@ -1,6 +1,6 @@
 # The CHORD Pivot
 
-**Status:** Phase 1 landed (host-only). Phases 2-3 designed, not yet built.
+**Status:** Phase 1 landed (host-only). **Phase 2 built** (MultiBinary PPO — §8). Phase 3 designed.
 **Scope of Phase 1:** the harness can now apply MULTIPLE verbs in a single decision
 tick, as a pure HOST capability. Zero contract change, zero game-file change, byte-
 identical for every existing single-verb witness and every existing wire message.
@@ -166,15 +166,106 @@ the contract prompt text, and every game file under the GameAPI contract.
 
 ## 7. Phases 2 and 3 — designed, not built
 
-- **Phase 2 — MultiBinary PPO.** Give the RL policy a **MultiBinary** action space (one
-  bit per declared verb) matching General Intuition's simultaneous-controller model.
-  The bridge from the policy's binary vector to a wire chord is direct: the set bits map
-  to a **sorted array** — the exact canonical form Phase 1's boundary already consumes.
-  No new wire format; Phase 2 is a new *producer* of the Phase-1 wire. Touches
-  `sb3_trainer` / `env.py` (the action space + the vector→chord bridge).
+- **Phase 2 — MultiBinary PPO.** BUILT — see §8 below.
 
 - **Phase 3 — Escalade formalized.** Turn §2's doctrine into a certification path: a
   game the tree cannot solve on the single-key subspace is *escaladed* to the RL court,
   whose verdict becomes the certificate; the G1 layer gains a single-chord-win
   extension. **Tow Stitch is the first client** — the first game whose feasibility lives
   in chord space and is certified by escalade rather than by the tree.
+
+---
+
+## 8. Phase 2 — MultiBinary PPO (built)
+
+Phase 2 gives the RL policy the simultaneous-controller action model directly. It is a
+new **producer** of the Phase-1 wire — no new wire format, no contract change — and it is
+**opt-in and byte-identical when off**: every existing Discrete run, wire message, and
+witness is unchanged.
+
+### The action space
+
+`chord_mode` (default OFF) swaps the env's `Discrete(n_actions)` for a
+`MultiBinary(n_actions)` space — one bit per declared verb. SB3's PPO fits per-key
+**Bernoulli** heads over it natively (no policy-code change). Greedy eval is per-key
+argmax (prob > 0.5). Each tick's 0/1 vector is reduced to the wire form through the ONE
+boundary, `harness/verify/chord.py::chord_from_mask` (→ `wire_action`): a **single**
+pressed key collapses to a plain `str` (the legacy singleton wire is preserved byte for
+byte), **two or more** become a sorted `list[str]` chord — exactly the canonical form
+Phase 1's host (`ChordUtil.apply`) already consumes. No canonicalization logic is
+duplicated; `chord_from_mask` is a thin bridge over `wire_action`.
+
+### The all-zeros design point — the IDLE tick (the one open decision, as landed)
+
+An all-keys-off vector is "press nothing" = an **idle tick**. Phase 1's contract has *no*
+built-in idle move and `normalize_action` rejects empty chords. The decision (Elias's
+recommendation, implemented): add an explicit **`allow_idle`** capability on the serve
+init (default **OFF** = byte-identical). When on, an empty chord `[]` is legal on the
+wire and the host applies **zero `act()` calls**, then steps physics as normal; the chord
+env turns it on.
+
+Two reasons idling is the right primitive, and safe:
+1. **Parity.** General Intuition's own controller-style policy can output all-keys-off, so
+   an all-zeros vector must have a defined meaning; refusing it would force a phantom
+   "always press something" constraint the reference model does not have.
+2. **STAKES, not action-shape, punishes idling.** Idling is **losing by design** —
+   game pressure (time-decayed success bonus, failure terminals, play-bounds) makes a
+   do-nothing tick strictly worse than acting. So an idle move does **not** create free
+   stalling; the anti-idle enforcement lives in the *game*, not in the action space. (The
+   reward realignment already removed the do-nothing basin risk on the shaping side.)
+
+The empty-chord capability is guarded, mirroring Python↔GDScript symmetrically:
+- **Python:** `normalize_action` / `wire_action` / `wire_actions` / `chord_from_mask` take
+  an explicit `allow_empty` flag (default **False** — every existing call site keeps
+  rejecting empties). Empty → `()` / wire form `[]`. An empty *verb* string `""` is still
+  rejected (that is a malformed verb, not idle).
+- **GDScript:** `ChordUtil.apply` with an empty `Array` makes zero `act()` calls (the
+  natural fall-through of the per-verb loop); `ChordUtil.is_empty_chord` is the shared
+  predicate. `serve_game.gd` reads `allow_idle` at init and, when OFF, **rejects** an
+  empty chord as a protocol error at the act boundary *before* any physics — the exact
+  mirror of Python rejecting empties without `allow_empty`.
+
+Idle is force-OFF outside chord mode (meaningless for a single-verb Discrete wire), so the
+Discrete path never carries the capability key.
+
+### Files touched
+
+- `harness/verify/chord.py` — `allow_empty` on `normalize_action`/`wire_action`/
+  `wire_actions`; new `chord_from_mask` (the single MultiBinary→wire bridge).
+- `harness/rl/env.py` — new `MultiBinary` duck-typed space; the gymnasium adapter
+  re-exports `MultiBinary(n)` in chord mode and passes the raw vector through (Discrete
+  keeps the `int()` cast — byte-identical).
+- `harness/rl/godot_env.py` (`GodotServeEnv`) & `harness/rl/godot_vec_env.py`
+  (`GodotBatchVecEnv`) — `chord_mode` / `allow_idle` ctor args; MultiBinary act space;
+  `step` / `step_async` map the vector to the wire chord; init carries `allow_idle` when on.
+- `harness/rl/godot_shard_env.py` — `step_async` fan-out keeps MultiBinary rows 2-D
+  (flattening only the Discrete index vector); chord flows to shards via `env_kwargs`.
+- `harness/rl/sb3_trainer.py` — `_rollout` records the WIRE-action list in chord mode
+  (`chord_from_mask`), so the greedy demo/witness is `str | list | []` and replays through
+  `GdExecutor.run_batch` unchanged.
+- `harness/rl/certify.py` — `g3_prime(chord_mode, allow_idle)` threaded to every env
+  factory; `export_demo_trajectory` routes actions through `wire_actions` (never `str(a)`,
+  which flattened chords); `action_histogram(chord=…)` emits per-KEY press frequency + the
+  **chord-size distribution** (0/1/2/3+ keys per tick, `mean_chord_size`).
+- `harness/verify/gd_exec.py` — `run_batch` auto-detects an idle demo and inits the serve
+  host with `allow_idle` + `wire_actions(allow_empty=…)` (legacy batches byte-identical).
+- `godotworld/chord_util.gd` — `is_empty_chord` + empty-Array idle docs.
+- `godotworld/serve_game.gd` — `_allow_idle` capability (init) + the empty-chord protocol
+  guard on both act paths.
+- `harness/cli.py` — `harness rl probe --chord`.
+- Tests: `tests/test_chord_normalize.py` (+`allow_empty`, `chord_from_mask`),
+  `tests/test_chord_phase2.py` (new: gym adapter space/passthrough, chord histogram, demo
+  export, idle auto-detect). In-image: MultiBinary smoke + witness-export replay assert.
+
+### Out of scope (unchanged)
+
+Tree-solver chords (single-key subspace by doctrine — the first-instance judge), G4
+attackers in chord space (Phase 3), the contract prompt text, every GameAPI game file.
+
+### Bench — Discrete vs MultiBinary (mini_collect, same 400k budget)
+
+_Filled in from the in-image run (proven config: additive reward, eval-keyed
+best-checkpoint, patience 200)._
+
+<!-- BENCH_TABLE -->
+

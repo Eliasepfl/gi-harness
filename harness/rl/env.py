@@ -332,6 +332,18 @@ class Discrete:
 
 
 @dataclass
+class MultiBinary:
+    """Gymnasium-compatible MultiBinary space (exposes ``.n``): an ``n``-dim vector of
+    independent 0/1 bits -- the Phase-2 CHORD action space (one bit per declared verb,
+    a set bit = that key pressed this tick). Exposes ``.n`` like :class:`Discrete` so the
+    duck-typed spaces stay uniform; ``sample`` draws a uniform bit vector."""
+    n: int
+
+    def sample(self, rng: np.random.Generator) -> np.ndarray:
+        return rng.integers(0, 2, size=self.n).astype(np.int8)
+
+
+@dataclass
 class Box:
     """Gymnasium-compatible continuous box space (exposes ``.shape``/``.low``/``.high``)."""
     low: float
@@ -914,7 +926,17 @@ def _gym_env_cls():
             obs_dim = int(planck_env.observation_space.shape[0])
             self.observation_space = spaces.Box(
                 low=-OBS_CLIP, high=OBS_CLIP, shape=(obs_dim,), dtype=np.float32)
-            self.action_space = spaces.Discrete(planck_env.action_space.n)
+            # CHORD mode (Phase 2): when the wrapped env opts into chords its action space
+            # is MultiBinary(n) -- SB3 then fits per-key Bernoulli heads. Default OFF ->
+            # Discrete(n), byte-identical to the pre-chord wrapper. The wrapped env owns the
+            # vector->wire mapping in its own step (see GodotServeEnv.step), so this wrapper
+            # only re-exports the space and passes the raw action through unchanged.
+            self.chord_mode = bool(getattr(planck_env, "chord_mode", False))
+            self.allow_idle = bool(getattr(planck_env, "allow_idle", False))
+            if self.chord_mode:
+                self.action_space = spaces.MultiBinary(planck_env.action_space.n)
+            else:
+                self.action_space = spaces.Discrete(planck_env.action_space.n)
             # Convenience passthroughs the eval rollouts read (action strings, horizon).
             self.actions = planck_env.actions
             self.horizon = planck_env.horizon
@@ -926,6 +948,10 @@ def _gym_env_cls():
             return obs, info
 
         def step(self, action):
+            # CHORD: pass the MultiBinary vector THROUGH (the wrapped env maps it to a wire
+            # chord); Discrete: cast to a Python int as before (byte-identical).
+            if self.chord_mode:
+                return self._env.step(action)
             return self._env.step(int(action))
 
         def close(self):

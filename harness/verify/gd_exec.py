@@ -242,6 +242,8 @@ class GdExecutor:
                                         # successive ops never re-report an earlier crash
         self.runtime_errors: list[dict] = []   # accumulated across run_check + run_batch
         self._inited = False
+        self._idle_inited = False        # True once init carried the allow_idle capability
+                                         # (a Phase-2 demo with empty-chord IDLE ticks)
 
     # -- lazy connect ------------------------------------------------------
     def _ensure_connected(self) -> None:
@@ -461,18 +463,42 @@ class GdExecutor:
                 pass
 
     # -- surface: run_batch ------------------------------------------------
+    @staticmethod
+    def _episodes_have_idle(episodes) -> bool:
+        """True IFF any episode carries an empty-chord IDLE tick (a ``[]``/``()`` action) --
+        the Phase-2 press-nothing tick. Used to AUTO-enable the serve host's allow_idle
+        capability so an idle demo replays, while a legacy batch (no empties) stays
+        byte-identical (the capability key never touches the wire)."""
+        for ep in (episodes or []):
+            for a in ep.get("actions", []):
+                if isinstance(a, (list, tuple)) and len(a) == 0:
+                    return True
+        return False
+
     def run_batch(self, game_source, episodes, max_ticks, frames_every=0,
-                  escape_margin=None) -> list[dict]:
+                  escape_margin=None, allow_idle: bool | None = None) -> list[dict]:
         from harness.verify.executors import VerifyError
         self._ensure_connected()
+        # PHASE-2 IDLE replay: a demo whose actions carry an empty chord [] is an IDLE
+        # (press-nothing) tick, legal only when the serve host is initialised with the
+        # allow_idle capability AND wire_actions is told allow_empty. `allow_idle=None`
+        # (default) AUTO-DETECTS it from the episodes, so a legacy (no-empty) batch stays
+        # byte-identical (no allow_idle key on the wire) and an idle demo just replays.
+        want_idle = (self._episodes_have_idle(episodes) if allow_idle is None
+                     else bool(allow_idle))
         # Horizon disabled (a huge cap): the per-episode n_ticks bounds each run so
         # batch semantics match runner.gd's episode mode exactly (min(max_ticks, len)).
-        if not self._inited:
-            ready = self._exchange({"op": "init", "source": game_source,
-                                    "seed": 0, "horizon": 100000000})
+        # Re-init if we now need the idle capability but the live host was inited without it.
+        if (not self._inited) or (want_idle and not self._idle_inited):
+            init_op = {"op": "init", "source": game_source,
+                       "seed": 0, "horizon": 100000000}
+            if want_idle:
+                init_op["allow_idle"] = True
+            ready = self._exchange(init_op)
             if ready.get("ok") is False:
                 raise VerifyError("gd_init_failed", str(ready.get("error")))
             self._inited = True
+            self._idle_inited = want_idle
 
         max_ticks = int(max_ticks)
         out: list[dict] = []
@@ -480,8 +506,9 @@ class GdExecutor:
             seed = int(ep.get("seed", 0))
             # Single boundary: canonicalize each action to its wire form. A single
             # verb str stays a str (byte-identical to pre-chord batches); a chord
-            # (list of verbs) is validated + sorted; None noop ticks pass through.
-            actions = wire_actions(ep.get("actions", []))
+            # (list of verbs) is validated + sorted; None noop ticks pass through; an
+            # empty chord [] is the idle tick, kept only when allow_empty (want_idle).
+            actions = wire_actions(ep.get("actions", []), allow_empty=want_idle)
             self._exchange({"op": "reset", "seed": seed})
             n_ticks = min(max_ticks, len(actions))
             act_msg = {"op": "act", "actions": actions, "n_ticks": n_ticks}
