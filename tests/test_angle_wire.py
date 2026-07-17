@@ -93,6 +93,21 @@ def test_obs_builder_accepts_vector_angle():
     assert vec is not None and len(vec) > 0
 
 
+def test_solver_fingerprint_accepts_vector_angle():
+    # statetree.fingerprint crashed on float([x,y,z]) — the tree solver's own
+    # angle trap (found by the A/B analyst: subm3D only certified after the game
+    # fell back to scalar yaw). Every component must join the fingerprint.
+    from harness.core.statetree import fingerprint, fp_delta
+    snap_v = {"probe": {"pos": [1, 2], "vel": [0, 0], "angle": [10.0, 45.0, 5.0]}}
+    snap_s = {"floor": {"pos": [0, 0], "vel": [0, 0], "angle": 0.25}}
+    fv, fs = fingerprint(snap_v), fingerprint(snap_s)
+    assert fv[0][-3:] == (10.0, 45.0, 5.0)
+    assert fs[0][-1] == 0.25
+    # A rotation-only change IS a state change (delta > 0).
+    snap_v2 = {"probe": {"pos": [1, 2], "vel": [0, 0], "angle": [10.0, 46.0, 5.0]}}
+    assert fp_delta(fv, fingerprint(snap_v2)) == 1.0
+
+
 # --- Godot: the fixed host serves the natural 3D reading ----------------------
 
 @requires_godot

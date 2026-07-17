@@ -48,6 +48,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Iterable, Iterator, Optional
 
+from harness.core import wire
+
 # --- Constants ([eng.] = engineering choice to calibrate) ----------------- #
 SCHEMA_VERSION = 1
 
@@ -100,13 +102,16 @@ def fingerprint(snapshot: dict, decimals: int = FP_DECIMALS_DEFAULT) -> tuple:
         body = snapshot[name] or {}
         pos = body.get("pos") or (0.0, 0.0)
         vel = body.get("vel") or (0.0, 0.0)
-        angle = body.get("angle", 0.0) or 0.0
+        # angle may be a scalar (2D / legacy 3D yaw) or an [x,y,z] Euler vector
+        # (the natural 3D reading the wire now carries). EVERY component joins the
+        # fingerprint — a rotation change is a state change — and float(list) used
+        # to crash the solver here (the A/B analyst's contract<->verifier find).
+        ang = wire.angle_components(body.get("angle", 0.0) or 0.0)
         out.append((
             str(name),
             round(float(pos[0]), decimals), round(float(pos[1]), decimals),
             round(float(vel[0]), decimals), round(float(vel[1]), decimals),
-            round(float(angle), decimals),
-        ))
+        ) + tuple(round(a, decimals) for a in ang))
     return tuple(out)
 
 

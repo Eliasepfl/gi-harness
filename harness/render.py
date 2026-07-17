@@ -11,6 +11,7 @@ Physics is never touched — masking is purely visual.
 """
 
 from __future__ import annotations
+from harness.core import wire
 
 import math
 import zlib
@@ -242,7 +243,7 @@ def _oriented_sprite(cropped: Image.Image, q: dict, scale: float,
     or None if the target size is degenerate. Coordinates are screen-space."""
     shape = q.get("shape", "box")
     verts = q.get("verts")
-    angle = float(q.get("angle", 0.0) or 0.0)
+    angle = wire.angle_yaw(q.get("angle", 0.0) or 0.0)
     l, b, r, t = q["bbox"]
     static = bool(q.get("static"))
 

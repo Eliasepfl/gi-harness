@@ -33,6 +33,7 @@ arguments)`` routes a function call by name. No write verb lives here: the spine
 is read/oracle-only (``designer_write`` is the sole write path, §4).
 """
 from __future__ import annotations
+from harness.core import wire
 
 import json as _json
 import math as _math
@@ -282,7 +283,7 @@ def _shape_aabb(body: dict) -> list[float] | None:
     verts = _local_verts(body, shape)
     if not verts:
         return None
-    ang = float(body.get("angle", 0.0) or 0.0)
+    ang = wire.angle_yaw(body.get("angle", 0.0) or 0.0)
     ca, sa = _math.cos(ang), _math.sin(ang)
     left = bottom = _math.inf
     right = top = -_math.inf
