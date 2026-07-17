@@ -33,6 +33,8 @@ import subprocess
 import tempfile
 import time
 
+from harness.verify.chord import wire_actions
+
 # ---------------------------------------------------------------------------
 # Runtime SCRIPT ERROR capture (ADOPT #1, notes/engines/MCP_FEEDBACK_TOOLS.md).
 #
@@ -422,7 +424,10 @@ class GdExecutor:
         out: list[dict] = []
         for ep in episodes:
             seed = int(ep.get("seed", 0))
-            actions = list(ep.get("actions", []))
+            # Single boundary: canonicalize each action to its wire form. A single
+            # verb str stays a str (byte-identical to pre-chord batches); a chord
+            # (list of verbs) is validated + sorted; None noop ticks pass through.
+            actions = wire_actions(ep.get("actions", []))
             self._exchange({"op": "reset", "seed": seed})
             n_ticks = min(max_ticks, len(actions))
             act_msg = {"op": "act", "actions": actions, "n_ticks": n_ticks}

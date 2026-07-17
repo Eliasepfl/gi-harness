@@ -35,6 +35,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from harness.verify.chord import wire_actions
+
 # Render env knobs (overridable; defaults match the empirically-verified in-image path).
 DISPLAY_DRIVER = os.environ.get("HARNESS_CAPTURE_DISPLAY_DRIVER", "x11")
 RENDER_DRIVER = os.environ.get("HARNESS_CAPTURE_RENDER_DRIVER", "opengl3")
@@ -258,7 +260,7 @@ def _scan_trajectory(exe: str, project: str, game_path: str, actions, seed: int,
     try:
         witness = os.path.join(work, "w.json")
         Path(witness).write_text(
-            json.dumps({"seed": int(seed), "actions": [str(a) for a in actions]}),
+            json.dumps({"seed": int(seed), "actions": wire_actions(actions)}),
             encoding="utf-8")
         fp = os.path.join(work, "fp.txt")
         argv = [exe, "--headless", "--path", project, "-s", "res://capture_host.gd", "--",
@@ -348,7 +350,7 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     Path(frames_out).mkdir(parents=True, exist_ok=True)
     actions_file = os.path.join(work, "witness.json")
     Path(actions_file).write_text(
-        json.dumps({"seed": int(seed), "actions": [str(a) for a in actions]}),
+        json.dumps({"seed": int(seed), "actions": wire_actions(actions)}),
         encoding="utf-8")
 
     # Trajectory-aware framing (3D): pre-scan the witness once headless so the render overlay
