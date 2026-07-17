@@ -599,13 +599,6 @@ def _free_port() -> int:
 
 
 @requires_godot
-@pytest.mark.xfail(reason="BLOCKED ON REWARD MISALIGNMENT (2026-07-16 convergence probe: "
-                   "PPO wins mini_collect at step ~1k by exploration, then CONVERGES to a "
-                   "never-winning local optimum — return plateaus at first-checkpoint "
-                   "shaping, success bonus does not dominate; curve_success tail all 0.0 "
-                   "after 200k steps, patience 200). The demo_ready machinery is fully "
-                   "tested offline; this smoke flips on when the G3' reward is realigned "
-                   "(terminal-success dominance + time pressure).", strict=False)
 def test_demo_trajectory_replays_through_gd_exec_in_image(monkeypatch, tmp_path):
     """mini_collect converges fast: a modest sb3 budget makes it demo-ready, the trained
     policy's greedy rollout is exported to demo_trajectory.json BESIDE the model, and that
@@ -617,15 +610,24 @@ def test_demo_trajectory_replays_through_gd_exec_in_image(monkeypatch, tmp_path)
 
     monkeypatch.setenv("GIP_PORT_BASE", str(_free_port()))
     model = str(tmp_path / "policy.zip")
-    # num_steps left at the trainer default: tiny rollouts (64x4=256 steps/update)
-    # make the UPDATE-counted plateau patience expire after only ~2-5k steps ->
-    # undertrained policy, SR 0.0 (first in-image run caught this).
-    res = g3_prime(MINI, budget_steps=200_000, trainer="sb3", seed=0, n_eval=8,
-                   num_envs=4, wall_clock_budget_s=600, save_model=model)
+    # BUDGET (2026-07-16, reward realigned): the convergence probe fixed the reward to ADDITIVE
+    # bounded shaping + a decayed terminal (harness.rl.env; PBRS is invariant-but-non-guiding and
+    # stalls). mini_collect then reaches demo_ready — but only at a REAL budget: 8-env probes give
+    # greedy 1.0 / stochastic 0.56 @ 400k (short of the 0.6 floor) and demo_ready (1.0/1.0) @ 1.5M.
+    # So this in-image smoke runs the real 8-env pipeline at 1.5M with best_checkpoint (default),
+    # which snapshots the best-by-greedy-eval policy — demo_ready is captured by ~500k steps
+    # (~3 min < the 600s wall budget), robust to the last policy degrading (best-vs-last: last
+    # greedy collapsed to 0 @ 400k while best held 1.0). ~4 min in-image, gated on Godot.
+    # patience=200 matches the convergence probe: the default (40) stops the progress-plateau
+    # at ~40 updates (~41k steps) before mini_collect makes checkpoint progress (the first smoke
+    # run caught this — greedy 0 in 21s). 200 gives the policy room to climb to the win.
+    res = g3_prime(MINI, budget_steps=1_500_000, trainer="sb3", seed=0, n_eval=8,
+                   num_envs=8, patience=200, wall_clock_budget_s=600, save_model=model)
 
     assert res["demo_ready"] is True, (
         f"mini_collect did not converge to demo-ready "
-        f"(greedy_sr={res['greedy_sr']} stochastic_sr={res['stochastic_sr']})")
+        f"(greedy_sr={res['greedy_sr']} stochastic_sr={res['stochastic_sr']} "
+        f"best_ckpt_update={res.get('best_ckpt_update')} last_greedy_sr={res.get('last_greedy_sr')})")
     path = res["demo_trajectory_path"]
     assert path == os.path.join(os.path.dirname(model), "demo_trajectory.json")
     assert os.path.exists(path)
