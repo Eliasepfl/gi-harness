@@ -57,6 +57,13 @@ class Episode:
         return self.meta.get("outcome", "")
 
     @property
+    def trajectory_kind(self) -> str:
+        """How this episode's trajectory was produced: ``demo`` / ``witness`` (clean wins) or
+        ``random`` / ``perturbed`` (the negatives). Legacy packages (all wins) default to
+        ``demo``."""
+        return self.meta.get("trajectory_kind", "demo")
+
+    @property
     def ticks(self) -> int:
         return int(self.meta.get("ticks", 0))
 
@@ -166,15 +173,46 @@ class EpisodeDataset:
         ep_rel = record.get("paths", {}).get("episode")
         if ep_rel:
             return (self.root / ep_rel).parent
-        return self.root / record["slug"] / str(record["seed"])
+        key = record.get("episode_key") or record.get("seed")
+        return self.root / record["slug"] / str(key)
 
-    def episodes(self, slugs=None):
-        """Yield :class:`Episode` for every record (optionally filtered to ``slugs``)."""
+    def _record_kind(self, record: dict) -> str:
+        """The ``trajectory_kind`` of a manifest record: taken from the manifest line when
+        present (the fast path), else read once from the episode's ``episode.json`` (a package
+        discovered without a manifest). Legacy packages default to ``demo``."""
+        k = record.get("trajectory_kind")
+        if k:
+            return k
+        try:
+            return Episode(str(self._ep_dir(record))).trajectory_kind
+        except Exception:  # noqa: BLE001 -- a missing/broken package just has no kind
+            return ""
+
+    def kinds(self) -> list:
+        """Sorted unique ``trajectory_kind`` values present (demo|witness|random|perturbed)."""
+        return sorted({self._record_kind(r) for r in self._records if self._record_kind(r)})
+
+    def episodes(self, slugs=None, kinds=None):
+        """Yield :class:`Episode` for every record, optionally filtered to ``slugs`` and/or
+        ``kinds`` (a ``trajectory_kind`` string or an iterable of them)."""
         allow = set(slugs) if slugs is not None else None
+        want = ({kinds} if isinstance(kinds, str) else set(kinds)) if kinds is not None else None
         for r in self._records:
             if allow is not None and r.get("slug") not in allow:
                 continue
+            if want is not None and self._record_kind(r) not in want:
+                continue
             yield Episode(str(self._ep_dir(r)))
+
+    def filter_by_kind(self, kinds, slugs=None):
+        """Yield :class:`Episode` for every episode whose ``trajectory_kind`` is in ``kinds`` (a
+        string or an iterable), optionally restricted to ``slugs``. The behavioral-diversity
+        filter: e.g. ``filter_by_kind(("demo", "witness"))`` for the clean WINS,
+        ``filter_by_kind(("random", "perturbed"))`` for the NEGATIVES. The by-GAME split
+        (:meth:`split_by_game`) is orthogonal and unchanged -- compose them for a held-out
+        wins/negatives view."""
+        want = {kinds} if isinstance(kinds, str) else set(kinds)
+        yield from self.episodes(slugs=slugs, kinds=want)
 
     def split_by_game(self, frac: float = 0.8, seed: int = 0):
         """Deterministic BY-GAME split: returns ``(train_slugs, test_slugs)`` -- disjoint

@@ -244,6 +244,9 @@ class GdExecutor:
         self._inited = False
         self._idle_inited = False        # True once init carried the allow_idle capability
                                          # (a Phase-2 demo with empty-chord IDLE ticks)
+        self._verbs: list[str] = []      # the game's declared action verbs (its actions()),
+                                         # stashed from the init reply -- the SAME signal the
+                                         # RL env's self.actions reads (see declared_verbs)
 
     # -- lazy connect ------------------------------------------------------
     def _ensure_connected(self) -> None:
@@ -475,9 +478,36 @@ class GdExecutor:
                     return True
         return False
 
+    def _ensure_inited(self, game_source, want_idle: bool) -> None:
+        """Idempotently init the serve host (load the game + seed-0 build) and stash the
+        game's declared action verbs (``self._verbs``) from the init reply -- the SAME
+        ``actions()`` signal the RL env's ``self.actions`` reads. No-op when the host is
+        already inited at the required idle capability, so the wire stays byte-identical
+        to before for every existing caller (this only ADDS the verb stash)."""
+        from harness.verify.executors import VerifyError
+        self._ensure_connected()
+        if (not self._inited) or (want_idle and not self._idle_inited):
+            init_op = {"op": "init", "source": game_source,
+                       "seed": 0, "horizon": 100000000}
+            if want_idle:
+                init_op["allow_idle"] = True
+            ready = self._exchange(init_op)
+            if ready.get("ok") is False:
+                raise VerifyError("gd_init_failed", str(ready.get("error")))
+            self._inited = True
+            self._idle_inited = want_idle
+            self._verbs = list(ready.get("actions") or [])
+
+    def declared_verbs(self, game_source) -> list[str]:
+        """The game's declared action verbs (its ``actions()``), read from the serve init
+        reply -- the discrete action space a random policy samples over, and exactly the
+        list the RL env pins as ``self.actions``. Inits the host on first use; cheap and
+        idempotent thereafter."""
+        self._ensure_inited(game_source, want_idle=False)
+        return list(self._verbs)
+
     def run_batch(self, game_source, episodes, max_ticks, frames_every=0,
                   escape_margin=None, allow_idle: bool | None = None) -> list[dict]:
-        from harness.verify.executors import VerifyError
         self._ensure_connected()
         # PHASE-2 IDLE replay: a demo whose actions carry an empty chord [] is an IDLE
         # (press-nothing) tick, legal only when the serve host is initialised with the
@@ -489,16 +519,7 @@ class GdExecutor:
         # Horizon disabled (a huge cap): the per-episode n_ticks bounds each run so
         # batch semantics match runner.gd's episode mode exactly (min(max_ticks, len)).
         # Re-init if we now need the idle capability but the live host was inited without it.
-        if (not self._inited) or (want_idle and not self._idle_inited):
-            init_op = {"op": "init", "source": game_source,
-                       "seed": 0, "horizon": 100000000}
-            if want_idle:
-                init_op["allow_idle"] = True
-            ready = self._exchange(init_op)
-            if ready.get("ok") is False:
-                raise VerifyError("gd_init_failed", str(ready.get("error")))
-            self._inited = True
-            self._idle_inited = want_idle
+        self._ensure_inited(game_source, want_idle)
 
         max_ticks = int(max_ticks)
         out: list[dict] = []

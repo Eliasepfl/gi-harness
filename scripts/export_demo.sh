@@ -69,6 +69,9 @@ apptainer exec \
     # Replay at the SAME game-tick speedup certification ran at (default 1), so the capture
     # host's physics pins match the serve host that produced the witness (byte-faithful).
     export HARNESS_GODOT_SPEEDUP='${HARNESS_GODOT_SPEEDUP:-1}'
+    # Serve/capture host port base -- keep in the 49xxx range and spread per job so the
+    # random-rollout/perturbation serve host never collides with another user's Godot.
+    export GIP_PORT_BASE='${GIP_PORT_BASE:-49152}'
     # Offline asset-routing on a compute node (no OpenRouter key / no egress): keeps the
     # cosmetic bank-asset routing on its deterministic fallback instead of a doomed LLM call.
     export HARNESS_OFFLINE='${HARNESS_OFFLINE:-1}'

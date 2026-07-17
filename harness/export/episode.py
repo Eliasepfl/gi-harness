@@ -145,23 +145,45 @@ def step_reward_parts(c_before: int, c_after: int, n_cp: int, result, tick: int,
 # --------------------------------------------------------------------------- #
 # State trail (code-defined truth) -- one deterministic every-frame replay
 # --------------------------------------------------------------------------- #
-def _state_trail(source: str, engine: str, actions: list, seed: int,
-                 max_ticks: int, round_dp: int = 4) -> dict:
-    """Replay the witness ONCE with ``frames_every=1`` and return the code-state trail::
+def _trail_from_rec(rec: dict, engine: str, source: str, round_dp: int = 4) -> dict:
+    """Map ONE ``run_batch`` record (frames_every=1) to the code-state trail dict::
 
         {"frames":     [{"tick": int, "entities": {name: body_dict}}, ...],  # tick 0..T
          "checkpoints": {name: latch_tick|None},   # episode-level latch map
          "result":      "success"|"failure"|...,   # terminal classification
-         "world_size":  [W, H],  "ticks": T}
+         "world_size":  [W, H],  "ticks": T,  "error": ...}
+
+    Shared by the single-episode :func:`_state_trail` and the batched
+    ``harness.export.rollouts._state_trails_batch`` so both channels parse an executor
+    record identically. Floats in the body dicts are rounded to ``round_dp`` decimals for
+    compact, deterministic storage (the reward labels do NOT depend on this rounding --
+    they are recomputed from the integer latch ticks)."""
+    from harness.verify.executors import _round_floats
+    if engine == "godot":
+        from harness.verify.executors import normalize_godot_record
+        _title, _prompt, frames_raw = normalize_godot_record(rec, source)
+    else:
+        frames_raw = rec.get("frames", [])
+    frames = _round_floats(frames_raw, int(round_dp))
+    return {
+        "frames": frames,
+        "checkpoints": dict(rec.get("checkpoints") or {}),
+        "result": rec.get("result"),
+        "world_size": list(rec.get("world_size") or (800, 600)),
+        "ticks": int(rec.get("ticks", 0)),
+        "error": rec.get("error"),
+    }
+
+
+def _state_trail(source: str, engine: str, actions: list, seed: int,
+                 max_ticks: int, round_dp: int = 4) -> dict:
+    """Replay ONE witness with ``frames_every=1`` and return its code-state trail (see
+    :func:`_trail_from_rec` for the shape).
 
     Engine-agnostic: dispatches to the same executors the verify/replay lanes use
     (js/godot/gdscript/py) and calls their ``run_batch`` -- pure reuse, no
-    reimplementation. Floats in the body dicts are rounded to ``round_dp`` decimals for
-    compact, deterministic storage (the reward labels do not depend on this rounding --
-    they are recomputed from the integer latch ticks)."""
-    from harness.verify.executors import (
-        GodotExecutor, JsExecutor, PyExecutor, _round_floats,
-    )
+    reimplementation."""
+    from harness.verify.executors import GodotExecutor, JsExecutor, PyExecutor
 
     gd_ex = None
     if engine == "js":
@@ -179,22 +201,7 @@ def _state_trail(source: str, engine: str, actions: list, seed: int,
     finally:
         if gd_ex is not None:       # the serve host is a persistent process
             gd_ex.close()
-    rec = recs[0]
-
-    if engine == "godot":
-        from harness.verify.executors import normalize_godot_record
-        _title, _prompt, frames_raw = normalize_godot_record(rec, source)
-    else:
-        frames_raw = rec.get("frames", [])
-    frames = _round_floats(frames_raw, int(round_dp))
-    return {
-        "frames": frames,
-        "checkpoints": dict(rec.get("checkpoints") or {}),
-        "result": rec.get("result"),
-        "world_size": list(rec.get("world_size") or (800, 600)),
-        "ticks": int(rec.get("ticks", 0)),
-        "error": rec.get("error"),
-    }
+    return _trail_from_rec(recs[0], engine, source, round_dp)
 
 
 def _entities_of(frame: dict) -> dict:
@@ -259,58 +266,66 @@ def _capture_frames(game_path: str, out_gif: str, actions: list, seed: int,
 # --------------------------------------------------------------------------- #
 # The exporter
 # --------------------------------------------------------------------------- #
-def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = None,
-                   witness_mode: str = "auto", seed_default: int = 0,
-                   follow: bool | None = None, width: int = 960, height: int = 540,
-                   fps: int = 20, cam_dist: float | None = None,
-                   dimension_hint: str | None = None,
-                   render_frames: bool = True) -> dict:
-    """Export ONE (game, trajectory) pair to ``<out_dir>/<slug>/<seed>/``.
+# Every episode declares HOW its trajectory was produced. This is the behavioral-diversity
+# axis a reward model needs: wins are not the only truth -- failures/timeouts are free,
+# perfectly-labelled NEGATIVES (see the dataset README "Behavioral diversity" section).
+#   * "demo"      -- a trained-policy demo trajectory (witness_source rl): a clean WIN.
+#   * "witness"   -- the tree solver's certified witness (witness_source tree): a clean WIN.
+#   * "random"    -- a seeded random-policy rollout: whatever outcome it reaches (mostly a
+#                    fast failure/timeout on a STAKES game -- that is the point).
+#   * "perturbed" -- the winning witness with K seeded action corruptions: a NEAR-MISS, the
+#                    most informative negative (it looks like progress, then is not).
+TRAJECTORY_KINDS = ("demo", "witness", "random", "perturbed")
 
-    Resolves the witness (explicit ``--actions`` > trained-policy ``demo_trajectory.json``
-    > a fresh verify's tree witness -- honest ``witness_source``), replays it ONCE for the
-    code-STATE trail, renders it for the PIXEL trail (unless ``render_frames`` is False, the
-    offline dry path used by tests), recomputes the reward per tick through the RL env's
-    ``step_reward``, and writes ``episode.json`` + ``steps.jsonl`` + ``frames/t%05d.png``.
 
-    Returns a manifest-ready record; raises ``ValueError`` on an empty witness or a
-    STATE/PIXEL tick-count mismatch (the alignment contract must hold or the package is
-    not written)."""
-    game_path = os.path.abspath(game_path)
-    source = Path(game_path).read_text(encoding="utf-8")
+def kind_for_witness_source(witness_source: str) -> str:
+    """Map a clean-win ``witness_source`` (rl|tree) to its ``trajectory_kind`` (demo|witness).
+    The trained-policy demo is ``demo``; the tree solver's witness is ``witness``."""
+    return "demo" if witness_source == "rl" else "witness"
 
-    from harness.verify.gameverify import detect_engine
-    engine = detect_engine(game_path, source)
 
-    # -- witness resolution (reuse the capture lane's canonical resolver) -----------
-    from harness.cli import _resolve_capture_witness
-    wit = _resolve_capture_witness(
-        game_path, actions_arg=actions_arg, seed_default=seed_default,
-        auto_demo=(witness_mode != "tree"))
-    actions, seed = wit["actions"], int(wit["seed"])
-    if not actions:
-        raise ValueError(
-            f"no witness found for {game_path} (game does not certify?) -- nothing to export")
+def _write_package(game_path: str, out_dir: str, source: str, engine: str,
+                   actions: list, seed: int, trail: dict, *,
+                   trajectory_kind: str, witness_source: str,
+                   witness_path: str | None, episode_key: str | None = None,
+                   render_frames: bool = True, follow: bool | None = None,
+                   width: int = 960, height: int = 540, fps: int = 20,
+                   cam_dist: float | None = None, dimension_hint: str | None = None,
+                   extra_meta: dict | None = None) -> dict:
+    """Write ONE episode package from an ALREADY-REPLAYED code-state ``trail`` (the shape
+    :func:`_trail_from_rec` returns). Engine/witness-agnostic core shared by the winning-demo
+    path (:func:`export_episode`) and the negative-mining paths
+    (``harness.export.rollouts``): given the trail + its ``actions``/``seed`` + the honest
+    ``trajectory_kind``/``witness_source``, it recomputes the reward per tick through
+    ``env.step_reward``, optionally renders the PIXEL channel (``render_frames``), and writes
+    ``<out>/<slug>/<episode_key>/{episode.json,steps.jsonl,frames/}``.
 
-    # -- code-STATE trail (single deterministic every-frame replay) ------------------
-    n_actions = len(actions)
-    trail = _state_trail(source, engine, actions, seed, max_ticks=n_actions + 4)
+    ``episode_key`` is the per-episode sub-directory (defaults to ``str(seed)`` -- the legacy
+    one-episode-per-seed layout); negatives pass a namespaced key (``random-<seed>``,
+    ``perturbed-<seed>-<i>``) so many episodes of the same game/seed never collide. Raises
+    ``ValueError`` on an empty/degenerate trail or a STATE/PIXEL tick-count mismatch (the
+    alignment contract must hold or the package is not written)."""
+    slug = Path(game_path).resolve().parent.name
     state_frames = trail["frames"]
     if not state_frames:
-        raise ValueError(f"state replay produced no frames for {game_path}")
+        raise ValueError(f"state replay produced no frames for {slug} "
+                         f"(kind={trajectory_kind}, seed={seed})")
+    T_pre = len(state_frames) - 1             # decision ticks (frame 0 is the build)
+    if T_pre < 1:
+        raise ValueError(f"trajectory too short for {slug} (kind={trajectory_kind}, "
+                         f"seed={seed}): {T_pre} ticks -- nothing to export")
+
     cp_latch = trail["checkpoints"]           # {name: latch_tick|None}, declared order
     n_cp = len(cp_latch)
     result = trail["result"]
-    ticks = trail["ticks"] or (len(state_frames) - 1)
 
     # Dimension: the authoritative runtime detector (first body's pos arity), the SAME
     # signal env's obs machinery pins. dimension_hint only overrides for a headless test.
     dim_int = rl_env.detect_dim(_entities_of(state_frames[0]))
     dimension = dimension_hint or ("3D" if dim_int == 3 else "2D")
 
-    # -- layout the package dir ------------------------------------------------------
-    slug = Path(game_path).resolve().parent.name
-    ep_dir = Path(out_dir) / slug / str(seed)
+    key = episode_key or str(seed)
+    ep_dir = Path(out_dir) / slug / key
     frames_dir = ep_dir / "frames"
     if ep_dir.exists():
         shutil.rmtree(ep_dir)
@@ -318,7 +333,9 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
 
     # -- PIXEL trail (capture; sized so PNG ordinal == tick) -------------------------
     n_png = 0
+    frame_surplus = 0
     capture_meta = {}
+    n_actions = len(actions)
     follow_flag = bool(follow) if follow is not None else (dimension == "3D")
     if render_frames:
         raw_frames_dir = ep_dir / "_frames_raw"
@@ -329,21 +346,31 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
             follow=follow_flag, width=width, height=height, fps=fps,
             max_frames=n_actions + 8, cam_dist=cam_dist)
         pngs = sorted(raw_frames_dir.glob("frame_*.png"))
-        # Contract: the capture host emits t=0 (settle) + one PNG per tick 1..T, ordinal
-        # == tick. len(pngs) must equal len(state_frames) (both tick 0..T).
-        if len(pngs) != len(state_frames):
+        # The code-STATE trail (with the reward labels) is authoritative for T: it is tick 0..T,
+        # so n_state = T + 1 and the pixel channel must supply a frame for every tick 1..T. The
+        # capture host emits t=0 (settle) + one PNG per tick, ordinal == tick. For a clean WIN both
+        # channels stop at the same terminal tick (exact match). For a NON-terminating NEGATIVE the
+        # capture host can render a SMALL trailing SURPLUS -- it and the serve host detect the
+        # terminal one tick apart. The replay is byte-faithful up to that divergence (the winning
+        # witness matches exactly), so frames 1..T align with the reward trail regardless; we KEEP
+        # 1..T and DROP the settle frame + any surplus tail. A DEFICIT (fewer PNGs than the reward
+        # trail -> a tick 1..T has no pixel, e.g. real subsampling) is a hard error.
+        n_state = len(state_frames)            # tick 0..T
+        if len(pngs) < n_state:
             shutil.rmtree(raw_frames_dir, ignore_errors=True)
             raise ValueError(
-                f"pixel/state tick-count mismatch for {slug}: {len(pngs)} PNG frames vs "
-                f"{len(state_frames)} state frames (subsampling? capture result="
+                f"pixel/state tick-count DEFICIT for {slug}: {len(pngs)} PNG frames < "
+                f"{n_state} state frames (subsampling? capture result="
                 f"{capture_meta.get('result')})")
-        # Drop the t=0 settle frame; rename frame_0000t.png -> frames/t%05d.png (t=1..T).
+        frame_surplus = len(pngs) - n_state    # trailing frames past the reward trail's terminal
         for png in pngs:
             ordinal = int(png.stem.split("_")[-1])
-            if ordinal == 0:
-                continue                       # the settle/build frame lives in build_state
+            if ordinal <= 0 or ordinal >= n_state:
+                continue                       # settle frame (0) + surplus tail (>= n_state)
             shutil.move(str(png), str(frames_dir / f"t{ordinal:05d}.png"))
         shutil.rmtree(raw_frames_dir, ignore_errors=True)
+        # Every tick 1..T must now have exactly one PNG (a subsampled trail leaves a gap ->
+        # n_png < T -> the frame/step check below fires).
         n_png = len(sorted(frames_dir.glob("t*.png")))
 
     # -- steps.jsonl (one line per decision tick t=1..T) -----------------------------
@@ -368,13 +395,15 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
         "game_file": game_path,
         "engine": engine,
         "dimension": dimension,
+        "trajectory_kind": trajectory_kind,
         "objective_text": objective_text,
         "prompt": deslug(slug),
         "checkpoint_names": checkpoint_names,
         "checkpoints_latch": cp_latch,
         "seed": seed,
-        "witness_source": wit["witness_source"],
-        "witness_path": wit["witness_path"],
+        "episode_key": key,
+        "witness_source": witness_source,
+        "witness_path": witness_path,
         "ticks": T,
         "n_steps": len(steps),
         "n_frames": n_png if render_frames else 0,
@@ -397,9 +426,12 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
             "rendered": bool(render_frames),
             "result": capture_meta.get("result"),
             "width": width, "height": height, "follow": follow_flag,
+            "trailing_frames_dropped": frame_surplus,
         },
         "paths": {"steps": "steps.jsonl", "frames": "frames"},
     }
+    if extra_meta:
+        episode.update(extra_meta)
 
     (ep_dir / "episode.json").write_text(
         json.dumps(episode, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -411,12 +443,14 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
     return {
         "slug": slug,
         "dim": dimension,
+        "trajectory_kind": trajectory_kind,
         "outcome": episode["outcome"],
         "ticks": T,
         "n_steps": len(steps),
         "n_frames": episode["n_frames"],
-        "witness_source": wit["witness_source"],
+        "witness_source": witness_source,
         "seed": seed,
+        "episode_key": key,
         "episode_return": episode["episode_return"],
         "paths": {
             "dir": str(ep_dir),
@@ -425,6 +459,51 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
             "frames": str(frames_dir),
         },
     }
+
+
+def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = None,
+                   witness_mode: str = "auto", seed_default: int = 0,
+                   follow: bool | None = None, width: int = 960, height: int = 540,
+                   fps: int = 20, cam_dist: float | None = None,
+                   dimension_hint: str | None = None,
+                   render_frames: bool = True) -> dict:
+    """Export ONE (game, WINNING-witness) pair to ``<out_dir>/<slug>/<seed>/``.
+
+    Resolves the witness (explicit ``--actions`` > trained-policy ``demo_trajectory.json``
+    > a fresh verify's tree witness -- honest ``witness_source``, mapped to a ``demo``/
+    ``witness`` ``trajectory_kind``), replays it ONCE for the code-STATE trail, and hands off
+    to :func:`_write_package` (which renders the PIXEL trail unless ``render_frames`` is False,
+    recomputes the reward per tick through ``env.step_reward``, and writes the package).
+
+    Returns a manifest-ready record; raises ``ValueError`` on an empty witness or a
+    STATE/PIXEL tick-count mismatch (the alignment contract must hold or the package is
+    not written)."""
+    game_path = os.path.abspath(game_path)
+    source = Path(game_path).read_text(encoding="utf-8")
+
+    from harness.verify.gameverify import detect_engine
+    engine = detect_engine(game_path, source)
+
+    # -- witness resolution (reuse the capture lane's canonical resolver) -----------
+    from harness.cli import _resolve_capture_witness
+    wit = _resolve_capture_witness(
+        game_path, actions_arg=actions_arg, seed_default=seed_default,
+        auto_demo=(witness_mode != "tree"))
+    actions, seed = wit["actions"], int(wit["seed"])
+    if not actions:
+        raise ValueError(
+            f"no witness found for {game_path} (game does not certify?) -- nothing to export")
+
+    # -- code-STATE trail (single deterministic every-frame replay) ------------------
+    trail = _state_trail(source, engine, actions, seed, max_ticks=len(actions) + 4)
+
+    return _write_package(
+        game_path, out_dir, source, engine, actions, seed, trail,
+        trajectory_kind=kind_for_witness_source(wit["witness_source"]),
+        witness_source=wit["witness_source"], witness_path=wit["witness_path"],
+        episode_key=str(seed), render_frames=render_frames, follow=follow,
+        width=width, height=height, fps=fps, cam_dist=cam_dist,
+        dimension_hint=dimension_hint)
 
 
 DATASET_README = r"""# GI Episode Dataset -- code-defined truth bridged to pixels
@@ -443,16 +522,17 @@ the **pixel frame** rendered by the in-engine capture host at the very same tick
 
 ```
 <root>/
-  manifest.jsonl              one line per episode (slug, dim, outcome, ticks, paths, ...)
+  manifest.jsonl              one line per episode (slug, trajectory_kind, outcome, ticks, paths, ...)
   README.md                   this file
-  <slug>/<seed>/
-    episode.json              episode meta (objective_text, dimension, reward scheme, build)
+  <slug>/<episode_key>/       <episode_key> = <seed> (win) | random-<seed> | perturbed-<seed>-<i>
+    episode.json              episode meta (objective_text, dimension, trajectory_kind, reward scheme, build)
     steps.jsonl               one line per decision tick t (action, state, reward, done)
-    frames/t%05d.png          the rendered pixel frame at tick t (t = 1..ticks)
+    frames/t%05d.png          the rendered pixel frame at tick t (t = 1..ticks) -- ABSENT for a state-only package
 ```
 
-`len(steps) == len(frames) == episode.json:ticks`. The pixel `frames/t00001.png` and the
-`steps.jsonl` line with `t == 1` describe the SAME tick of the SAME replay (the exporter
+`len(steps) == episode.json:ticks` always; `len(frames) == len(steps)` *wherever frames exist*
+(a state-only negative has `n_frames == 0` and no `frames/*.png`). The pixel `frames/t00001.png`
+and the `steps.jsonl` line with `t == 1` describe the SAME tick of the SAME replay (the exporter
 asserts the two channels' tick counts match before writing the package).
 
 ## `episode.json`
@@ -463,6 +543,8 @@ asserts the two channels' tick counts match before writing the package).
 | `game_file` | absolute path to the `.gd` game source |
 | `engine` | `gdscript` / `godot` / `js` / `py` |
 | `dimension` | `2D` or `3D` (from the runtime pos arity -- `env.detect_dim`) |
+| `trajectory_kind` | `demo` / `witness` / `random` / `perturbed` -- HOW the trajectory was produced (the behavioral-diversity axis; see below) |
+| `episode_key` | the episode sub-directory under `<slug>/` (`<seed>` for a win, `random-<seed>` / `perturbed-<seed>-<i>` for a negative) |
 | `objective_text` | the generation prompt + the ordered checkpoint names (the reward-model text conditioning) |
 | `checkpoint_names` / `checkpoints_latch` | declared checkpoints and the tick each latched (`null` = never) |
 | `seed` | world seed of the replay |
@@ -495,17 +577,70 @@ so a label here is byte-identical to the RL training signal. `total = shaping + 
 time-decayed success payoff / failure penalty, attached ONLY to the terminal tick (`step_reward`
 keeps the terminal OUTSIDE the shaping). The exporter never reimplements the reward math.
 
+## Behavioral diversity -- NEGATIVES, not only wins
+
+A reward model trained ONLY on winning trajectories learns that *everything is progress*.
+The failure and timeout episodes are free, perfectly-labelled NEGATIVES -- the reward labels
+come from the SAME `env.step_reward` import, so a losing frame's label is training truth too.
+Every episode declares its `trajectory_kind`:
+
+| kind | how it was produced | typical outcome |
+|------|---------------------|-----------------|
+| `demo` | a trained-policy demo trajectory (`witness_source=rl`) | **success** (a clean win) |
+| `witness` | the tree solver's certified witness (`witness_source=tree`) | **success** (a clean win) |
+| `random` | a seeded random-policy rollout (`--random-rollouts N --horizon H`), rolled through the same batch executor | mostly **failure/timeout** (rare lucky win) |
+| `perturbed` | the winning witness with K seeded action corruptions -- swap/drop/replace at random ticks (`--perturb <witness> K`) | **near-miss** failure/timeout (the most informative negative) |
+
+The reward geometry makes the negatives *mechanically* separable from the wins: a win carries
+the time-decayed terminal payoff (`>= R_SUCCESS * SUCCESS_TIME_FLOOR = 5.0`), while the whole
+shaping mass is bounded by `SHAPING_MASS = 1.0` and a failure adds `R_FAILURE = -2.0`. So every
+`failure`/`timeout` episode's return is strictly below every `success` return -- by construction,
+not by luck.
+
+**Random rollouts on STAKES games mostly end in fast failure -- that is the point.** A random
+policy on a marble maze tips the ball off in a handful of ticks; those fast-failure frames ARE
+the negative class the reward model must learn to score low. Do not filter them out.
+
+### Recommended mix for the reward model
+
+Per game, aim for roughly: **all wins (`demo`/`witness`) + >= 2x `random` + >= 1x `perturbed`**.
+The wins anchor the top of the reward scale; the random rollouts populate the low-reward /
+early-failure regime; the perturbed near-misses are the hard, high-value examples that sit right
+next to a winning trajectory and then diverge (they teach the boundary, not just the extremes).
+
+### Frames cost tradeoff (the pixel channel is the expensive part)
+
+Rendering the pixel channel dominates export cost, so the knobs are explicit:
+
+| mode | frames by default | flag |
+|------|-------------------|------|
+| `demo` / `witness` | **rendered** | `--no-frames` for state-only |
+| `random` | **state-only** (no frames) | `--random-frames` to render (bulk, expensive) |
+| `perturbed` | **rendered** | `--no-perturb-frames` for state-only |
+
+A **state-only** package (no `frames/`) still carries the full per-tick `state` + `reward` labels,
+so it is directly useful for reward-label *pretraining* and dynamics-from-state `(state_t,
+action_t) -> state_t+1`. Render pixels for the FEW, high-value perturbed near-misses; keep the
+MANY bulk random negatives state-only. `--no-frames` is a global kill-switch (state-only for
+everything). `len(frames) == len(steps)` holds *wherever frames exist*; a state-only package has
+`n_frames == 0` and the loader's `Episode.validate(require_frames=False)` skips the pixel check.
+
 ## Loader (torch-free, numpy-free)
 
 ```python
 from harness.export.loader import EpisodeDataset
 ds = EpisodeDataset("<root>")
-train, test = ds.split_by_game(frac=0.8, seed=0)   # split BY GAME slug
+train, test = ds.split_by_game(frac=0.8, seed=0)   # split BY GAME slug (never by episode)
 for ep in ds.episodes(slugs=test):                 # a held-out game the model never saw
-    ep.validate()                                  # len(steps)==n_steps==ticks, 1 frame/step
+    ep.validate(require_frames=(ep.meta["n_frames"] > 0))   # state-only packages skip pixels
     for s in ep.steps:
-        frame = ep.frame_path(s["t"])              # -> <root>/<slug>/0/frames/t00001.png
-        y = s["reward"]["total"]                   # the training label
+        y = s["reward"]["total"]                   # the training label (win OR loss)
+        if ep.meta["n_frames"]:
+            frame = ep.frame_path(s["t"])          # -> <root>/<slug>/<key>/frames/t00001.png
+
+# Filter by behavioral kind (wins vs negatives) -- split stays BY GAME:
+wins = list(ds.filter_by_kind(("demo", "witness")))
+negatives = list(ds.filter_by_kind(("random", "perturbed"), slugs=train))
 ```
 
 ## The intended experiment (the reward-model bridge)
@@ -543,14 +678,20 @@ def ensure_readme(out_dir: str) -> None:
 
 def append_manifest(out_dir: str, record: dict) -> None:
     """Append ONE episode record as a line to ``<out_dir>/manifest.jsonl`` (relative paths).
-    Idempotent per (slug, seed): a re-export of the same episode replaces its prior line."""
+    Idempotent per (slug, episode_key): a re-export of the SAME episode replaces its prior
+    line. The key is the episode sub-directory -- ``str(seed)`` for a legacy one-per-seed
+    package, or a namespaced ``random-<seed>``/``perturbed-<seed>-<i>`` for a negative -- so
+    many episodes of the same game (and even the same world seed) coexist without clobbering."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     manifest = out / "manifest.jsonl"
     slug, seed = record["slug"], record["seed"]
+    key = str(record.get("episode_key") or seed)
     rel = {
         "slug": slug,
         "seed": seed,
+        "episode_key": key,
+        "trajectory_kind": record.get("trajectory_kind", "demo"),
         "dim": record["dim"],
         "outcome": record["outcome"],
         "ticks": record["ticks"],
@@ -558,9 +699,9 @@ def append_manifest(out_dir: str, record: dict) -> None:
         "witness_source": record["witness_source"],
         "episode_return": record["episode_return"],
         "paths": {
-            "episode": f"{slug}/{seed}/episode.json",
-            "steps": f"{slug}/{seed}/steps.jsonl",
-            "frames": f"{slug}/{seed}/frames",
+            "episode": f"{slug}/{key}/episode.json",
+            "steps": f"{slug}/{key}/steps.jsonl",
+            "frames": f"{slug}/{key}/frames",
         },
     }
     lines = []
@@ -572,7 +713,8 @@ def append_manifest(out_dir: str, record: dict) -> None:
                 row = json.loads(line)
             except ValueError:
                 continue
-            if row.get("slug") == slug and row.get("seed") == seed:
+            row_key = str(row.get("episode_key") or row.get("seed"))
+            if row.get("slug") == slug and row_key == key:
                 continue                       # drop the stale line for this episode
             lines.append(line)
     lines.append(json.dumps(rel, ensure_ascii=False, separators=(",", ":")))

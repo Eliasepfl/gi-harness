@@ -547,40 +547,86 @@ def cmd_game_capture(args) -> int:
 
 
 def cmd_game_export(args) -> int:
-    """Export a certified game's witness replay to an EPISODE PACKAGE (the GI bullet-3
-    reward-model substrate): ``<out>/<slug>/<seed>/`` with episode.json + steps.jsonl +
-    frames/t%05d.png, and a top-level manifest.jsonl line. Bridges code-defined truth
-    (per-tick state + step_reward labels) and the pixel channel (the rendered frame)."""
+    """Export a certified game to EPISODE PACKAGE(s) (the GI bullet-3 reward-model substrate):
+    ``<out>/<slug>/<episode_key>/`` with episode.json + steps.jsonl + frames/t%05d.png, and a
+    manifest.jsonl line each. Bridges code-defined truth (per-tick state + step_reward labels)
+    and the pixel channel (the rendered frame).
+
+    By DEFAULT exports the winning witness (a clean win). Two negative-mining sources add
+    behavioral diversity so the reward model sees losses too, not only progress:
+      * ``--random-rollouts N --horizon H`` -- N seeded random-policy episodes (state-only by
+        default; ``--random-frames`` to render). Mostly fast failures/timeouts -- the negatives.
+      * ``--perturb <witness> K`` -- K near-miss variants of the winning witness (rendered by
+        default; ``--no-perturb-frames`` for state-only). The most informative negatives.
+    ``--no-demo`` skips the winning export (negatives only)."""
     try:
         from harness.export.episode import (
             append_manifest, ensure_readme, export_episode,
         )
+        from harness.export.rollouts import (
+            export_perturbations, export_random_rollouts,
+        )
     except Exception as exc:  # noqa: BLE001
         return _module_missing("export", exc, args.json)
 
+    follow = (True if args.follow else None)
+    n_random = int(getattr(args, "random_rollouts", 0) or 0)
+    perturb = getattr(args, "perturb", None)
+    records: list = []
     try:
-        record = export_episode(
-            args.game_path, args.out, actions_arg=args.actions,
-            witness_mode=getattr(args, "witness", "auto"), seed_default=args.seed,
-            follow=(True if args.follow else None), width=args.width, height=args.height,
-            fps=args.fps, cam_dist=getattr(args, "cam_dist", None),
-            render_frames=not args.no_frames)
+        # 1) the winning witness (a clean win) -- unless suppressed
+        if not getattr(args, "no_demo", False):
+            records.append(export_episode(
+                args.game_path, args.out, actions_arg=args.actions,
+                witness_mode=getattr(args, "witness", "auto"), seed_default=args.seed,
+                follow=follow, width=args.width, height=args.height,
+                fps=args.fps, cam_dist=getattr(args, "cam_dist", None),
+                render_frames=not args.no_frames))
+        # 2) random-policy rollouts (NEGATIVES) -- state-only unless --random-frames
+        if n_random > 0:
+            records += export_random_rollouts(
+                args.game_path, args.out, n=n_random, horizon=int(args.horizon),
+                seed_base=int(getattr(args, "random_seed_base", 0)),
+                render_frames=(bool(getattr(args, "random_frames", False))
+                               and not args.no_frames),
+                follow=follow, width=args.width, height=args.height, fps=args.fps,
+                cam_dist=getattr(args, "cam_dist", None))
+        # 3) perturbed near-misses (NEGATIVES) -- rendered unless --no-perturb-frames
+        if perturb:
+            wit_path, k = perturb[0], int(perturb[1])
+            records += export_perturbations(
+                args.game_path, args.out, witness_path=wit_path, k=k,
+                n_corruptions=int(getattr(args, "perturb_corruptions", 2)),
+                seed_base=int(getattr(args, "perturb_seed_base", 0)),
+                render_frames=(not bool(getattr(args, "no_perturb_frames", False))
+                               and not args.no_frames),
+                follow=follow, width=args.width, height=args.height, fps=args.fps,
+                cam_dist=getattr(args, "cam_dist", None))
     except ValueError as exc:
         return _call_error("game export", exc, args.json)
     except Exception as exc:  # noqa: BLE001
         return _call_error("game export", exc, args.json)
 
-    append_manifest(args.out, record)
+    if not records:
+        return _call_error("game export",
+                           ValueError("nothing exported (--no-demo with no negatives?)"),
+                           args.json)
+
+    for rec in records:
+        append_manifest(args.out, rec)
     ensure_readme(args.out)
 
     if args.json:
-        _emit_json(record)
+        _emit_json(records if len(records) > 1 else records[0])
     else:
-        print(f"EXPORTED  {record['slug']}  [{record['dim']}]  {record['outcome']}")
-        print(f"  ticks  : {record['ticks']}   steps : {record['n_steps']}   "
-              f"frames : {record['n_frames']}")
-        print(f"  witness: {record['witness_source']}   return : {record['episode_return']}")
-        print(f"  dir    : {record['paths']['dir']}")
+        from collections import Counter
+        dist = Counter(r["outcome"] for r in records)
+        for rec in records:
+            print(f"EXPORTED  {rec['slug']}  [{rec['dim']}]  {rec['trajectory_kind']:9} "
+                  f"{rec['outcome']:8}  ticks={rec['ticks']:>4}  frames={rec['n_frames']:>4}  "
+                  f"return={rec['episode_return']:+.3f}  {rec['episode_key']}")
+        print(f"  {len(records)} episode(s); outcome distribution: "
+              f"{dict(dist)}")
     return 0
 
 
@@ -1298,8 +1344,32 @@ def build_parser() -> argparse.ArgumentParser:
     ge.add_argument("--fps", type=int, default=20, help="companion GIF playback fps")
     ge.add_argument("--seed", type=int, default=0)
     ge.add_argument("--no-frames", action="store_true",
-                    help="skip the pixel channel (state + reward labels only) -- the "
-                         "offline path for environments without a display/Godot render lane")
+                    help="GLOBAL pixel kill-switch: state + reward labels only, for every "
+                         "kind (the offline path for environments without a display/Godot "
+                         "render lane, and the cheap bulk-negative path)")
+    # -- behavioral diversity: NEGATIVES (random rollouts + perturbed near-misses) --------
+    ge.add_argument("--no-demo", action="store_true",
+                    help="do NOT export the winning witness (export only the negatives below)")
+    ge.add_argument("--random-rollouts", type=int, default=0, metavar="N",
+                    help="also export N seeded random-policy episodes (NEGATIVES: mostly fast "
+                         "failure/timeout). State-only by default -- see --random-frames")
+    ge.add_argument("--horizon", type=int, default=300,
+                    help="decision-tick budget for each random rollout (default 300 = env.HORIZON)")
+    ge.add_argument("--random-seed-base", type=int, default=0,
+                    help="world/policy seeds for the random rollouts are BASE..BASE+N-1 (default 0)")
+    ge.add_argument("--random-frames", action="store_true",
+                    help="ALSO render the pixel channel for the random rollouts (expensive; "
+                         "off by default -- bulk negatives stay state-only)")
+    ge.add_argument("--perturb", nargs=2, metavar=("WITNESS", "K"), default=None,
+                    help="also export K near-miss NEGATIVES: corrupt the winning witness JSON "
+                         "at WITNESS (swap/drop/replace at random ticks). Rendered by default "
+                         "(few, high-value pixels) -- see --no-perturb-frames")
+    ge.add_argument("--perturb-corruptions", type=int, default=2, metavar="C",
+                    help="corruptions injected per perturbed episode (default 2)")
+    ge.add_argument("--perturb-seed-base", type=int, default=0,
+                    help="perturbation seed for variant i is BASE+i (default 0)")
+    ge.add_argument("--no-perturb-frames", action="store_true",
+                    help="skip the pixel channel for the perturbed near-misses (state-only)")
     ge.add_argument("--json", action="store_true")
     ge.set_defaults(func=cmd_game_export)
 

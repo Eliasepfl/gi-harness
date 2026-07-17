@@ -21,12 +21,27 @@ The reward labels are recomputed per tick through
 
 from __future__ import annotations
 
-from harness.export.episode import SCHEMA_VERSION, export_episode
+from harness.export.episode import (
+    SCHEMA_VERSION,
+    TRAJECTORY_KINDS,
+    export_episode,
+)
 from harness.export.loader import Episode, EpisodeDataset, load_episode
+from harness.export.rollouts import (
+    export_perturbations,
+    export_random_rollouts,
+    perturb_actions,
+    random_actions,
+)
 
 __all__ = [
     "SCHEMA_VERSION",
+    "TRAJECTORY_KINDS",
     "export_episode",
+    "export_random_rollouts",
+    "export_perturbations",
+    "random_actions",
+    "perturb_actions",
     "Episode",
     "EpisodeDataset",
     "load_episode",
