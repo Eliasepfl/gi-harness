@@ -567,3 +567,194 @@ the editor/agent authors; the audited host certifies.
 **Why it's the right next brick.** It closes the generation feedback loop the harness never had
 (blind regen → guided repair) while keeping the certification invariants and trust boundary exactly
 as strong. Sequenced **after** Phase 2 (author-and-verify one game) and **before** wide waves.
+
+---
+
+## 10. The editor-diagnostics feedback loop [Elias: "give script/code errors and feedback to Hermes"]
+
+> Elias flagged this as *one of the most interesting points*. The harness's blind single-file
+> generator never sees why a script fails — it regenerates from scratch. The overnight A/B showed
+> the concrete cost: a **Godot-3-ghost parse error** (a removed-in-4 API — `PoolIntArray`,
+> `PolygonShape2D`, `yield`, Godot-3 signal syntax) silently sank **5–9 attempts/game**, because a
+> parse failure returns nothing the blind generator can act on. godot-ai turns that black hole into a
+> **line-numbered, in-editor repair loop**.
+
+The loop is **two tiers**, in strict order. Tier 1 fixes *code that won't parse/run* using the
+editor's own diagnostics; only code that survives Tier 1 is worth spending Tier 2 (certification)
+compute on. Exact tool names/returns live in **`notes/GODOT_AI_TOOL_MAP.md`**.
+
+### Tier 1 — editor diagnostics (godot-ai): make it parse, make it run
+
+Three sub-channels, each cheaper than the last to reach, all carrying line numbers where the engine
+can supply them (see TOOL_MAP §1):
+
+1. **Write-time** — `script_create`/`script_patch` validate the `.gd` *before* the import step and
+   return `diagnostics[]` + `diagnostics_detail` (`log_capture` = real parse diagnostics with a
+   line; `fallback` = best-effort `details.fallback_line`) **in the same reply**. The agent gets the
+   parse error on the file it just wrote, before running anything. This is where a Godot-3 ghost dies
+   in one round trip instead of nine.
+2. **Editor log** — `logs_read(source="editor", include_details=true)` returns
+   `{source, level, text, path, line, function}` entries: parse errors, GDScript reload warnings,
+   `@tool` runtime errors, `push_error`/`push_warning`, and the Debugger dock's Errors-tab rows. A
+   one-shot **doorbell** (`new_errors_since_last_call` / `new_errors_hint`, or `editor_errors_hint`
+   on a game read) is stamped on any tool reply when new errors appear — read the log, don't poll.
+3. **Runtime** — `project_run` returns `game_status` + `recent_errors`; a boot-time parse/load error
+   freezes the game in a debugger **break** and `game_status.break = {reason, can_debug, pre_live}`
+   names the failing script. `game_manage(get_scene_tree/get_node_info)` reads live state;
+   `editor_manage(op="game_eval")` probes the running game (its `EVAL_RUNTIME_ERROR` gives a message
+   but **no line** — for line numbers stay in channels 1–2). `editor_screenshot(source="game")` lets
+   the agent *see* the running frame.
+
+**Tier-1 driver sequence** (per authored/patched script):
+```
+script_create(res://game.gd, <source>)          # or script_patch for an edit
+  └─ read reply.diagnostics / diagnostics_detail  ── parse error? → fix text → re-write ─┐
+     (loop until diagnostics_detail == "none")                                            │
+script_attach(/root/Game, res://game.gd)  ◄──────────────────────────────────────────────┘
+project_run(mode="main", autosave=false)
+  └─ game_status.status == "break"/"not_live"?  → logs_read(source="editor"/"game",
+                                                     include_details=true) → fix → repeat
+  └─ status == "live"?  → game_manage inputs + get_scene_tree to sanity-check behaviour
+project_manage(op="stop")
+```
+Only when Tier 1 yields a script that parses, attaches, and runs does the driver hand off to Tier 2.
+
+### Tier 2 — the certification funnel (`harness-funnel`, §9): determinism, solvability, cert
+
+`extract_game(project_path)` pulls the GameAPI `.gd` (7-method static scan) →
+`verify_game(game_source)` runs the **frozen** funnel out-of-process and returns `verdict`,
+`per_gate`, `hint`, and the typed `directives[]`/`directive_text` (the `feedback.py`/`harden.py`
+repair payload). The agent applies each directive as a `script_patch` **in the editor** (re-entering
+Tier 1 to keep it parsing), then re-calls `verify_game` until the verdict improves. `capture_demo`
+lets it see a solved GIF; `atlas_place` aims the next game at an empty world×play cell. **The
+in-session verdict is advisory** — the certificate of record always re-runs out-of-session on a
+clean fingerprinted host (§9 trust boundary).
+
+### Why the two tiers must stay separate
+
+Tier 1 is the **editor's** truth (does this GDScript parse/run in a live Godot?) and Tier 2 is the
+**funnel's** truth (does it certify deterministic + solvable through the frozen host?). A
+Godot-3-ghost parse error is invisible to Tier 2 in a useful way — `verify_game` would just report
+`VERIFY_ERROR` "verify crashed before producing a report" (exactly what the funnel returns for a
+build/act error), which is *far* less actionable than the editor's `line: N, "Could not find type
+PoolIntArray"`. Spending a Godot-host cert spawn to discover "your script doesn't parse" is the
+waste Tier 1 eliminates. Tier 1 is also **cheaper** (no serve-host spawn, no port, no engine lock)
+and **tighter** (write-tool reply, no second call). Keep the cheap, precise editor loop in front of
+the expensive, authoritative cert loop.
+
+### Tier-1 proof (compute-node test)
+
+`poc-tier1.sbatch` + `tier1_client.py` (in `poc-godot-ai/`) stand up the proven PoC-1 chain (uv MCP
+server ↔ live editor in the sif under Xvfb) and, over MCP: (1) `script_create` a script carrying the
+Godot-3 ghosts `PoolIntArray`/`PoolVector2Array`, asserting the reply hands back a **line-numbered**
+diagnostic; (2) `logs_read(source="editor", include_details=true)` shows the same error with
+`{path, line, function, text}`; (3) `script_patch` fixes `Pool*`→`Packed*` and the diagnostics
+clear — the full write→diagnose→fix cycle. Gates: `G1` ghost surfaces a diagnostic, `G2` it carries
+a line number, `G3` the fix clears it.
+
+**Result — PASS** (job `18190344`, `logs/gai-tier1-18190344.out`). `script_create`/`script_patch`
+returned inline, line-numbered diagnostics (`diagnostics_detail=log_capture`):
+```
+line 3: Parse Error: Could not find type "PoolIntArray" in the current scope.
+line 3: Parse Error: Function "PoolIntArray()" not found in base self.
+        Did you mean to use "PackedInt32Array()"?
+line 6: Parse Error: Could not find type "PoolVector2Array" in the current scope.
+line 6:  … Did you mean to use "PackedVector2Array()"?
+```
+(Godot even names the Godot-4 replacement.) The editor process log carried the same as
+`SCRIPT ERROR: Parse Error … at: GDScript::reload (res://ghost_game.gd:6)`. After the
+`Pool*`→`Packed*` `script_patch`, the reply came back `diagnostics_detail=none`, `diagnostics: []`
+— fixed. `G1/G2/G3` all PASS → `TIER1_RESULT: PASS`.
+
+**Field note that sharpens the design.** In this run `logs_read(source="editor")` returned an *empty*
+ring at the moment of the read, while the **write-tool's inline `diagnostics`** (channel 1a) carried
+the full line-numbered error every time. Lesson: **prefer the write-tool reply (channel 1a) as the
+primary parse-error signal** — it's synchronous with the edit and immune to ring-buffer timing;
+treat `logs_read(source="editor")` (channel 2) as the corroborating/aggregate view and for
+*runtime* errors that no write tool produced.
+
+---
+
+## 11. Full agent autonomy inside a disposable sandbox [Elias directive]
+
+> **Direction (Elias, explicit — supersedes the earlier "kill --yolo" draft).** Hermes should be
+> free to run **pretty much any tools, code, and MCP** — full autonomy. `--yolo` (and broad
+> tool/MCP access) is the **sanctioned** mode, not something to eliminate. The certificate's
+> integrity does **not** come from restricting what the agent may do in-session; it comes from
+> **where** the agent runs (a throwaway sandbox that can't reach the real repo, `main`, or the
+> frozen host) and from **re-verifying** its output out-of-session on the frozen fingerprinted host.
+> **Trust from re-verification, not from restricting tools.**
+
+### Why full autonomy is safe to sanction (what `--yolo` actually does)
+
+Source-checked against the installed Hermes v0.18.2 (`~/.hermes/hermes-agent/`), so the grant is
+understood, not assumed:
+
+- `--yolo` sets `HERMES_YOLO_MODE=1` (frozen at import, `tools/approval.py:35`) and **bypasses the
+  dangerous-*shell-command* approval gate** on the `terminal` tool (after the unbypassable floors).
+- **Hermes has no per-*tool* approval gate at all.** MCP tools — our `harness-funnel` + the godot-ai
+  editor tools — are **never** gated regardless of `--yolo`. `hermes -z`/`--oneshot` also force-sets
+  yolo unconditionally (`oneshot.py:220-221`).
+- **Still unbypassable even under `--yolo`** (the only floors that remain, and they are the sane
+  default): the hardline blocklist (`rm -rf /`, `mkfs`, `dd` to a raw device, fork bombs —
+  `approval.py:2896`), the sudo-stdin guard, and the user's `approvals.deny` globs
+  (`approval.py:3212`). Nothing here restricts *building games*; they only stop host-destroying
+  shell commands.
+
+So "full autonomy" costs nothing we rely on: the agent can use the editor tools, the funnel tools,
+shell, filesystem, and web freely. The sanctioned invocation is simply the existing one —
+```
+hermes -z "<task>" -m <model> --provider openrouter --yolo --cli   # broad tools, all MCP, code exec
+```
+(any of `hermes chat -q … --yolo`, extra `hermes mcp add` servers, etc. are equally fine). **The
+safety does not come from that line.** It comes from the two boundaries below.
+
+### The trust boundary: a disposable sandbox + out-of-session re-verification
+
+These protect Elias's work and certification integrity **without** touching the agent's build
+freedom. They are the sane default (he can drop them too, but they cost the agent nothing):
+
+1. **Run Hermes only inside a disposable, wall-clock-bounded sbatch job.** Full-autonomy code
+   execution is fenced by *what the job can reach*, not by what the agent is allowed to call:
+   - The editor project is a **throwaway copy on `/orcd/scratch`** (`cp -r … project-<jobid>`,
+     `rm -rf` on exit), bound into the sif. The real `gi-harness` repo is **not** checked out in
+     the job; the harness is reachable only **read-only via `PYTHONPATH`** to a worktree, and the
+     funnel's `verify_game` writes only into per-call `mkdtemp` sandboxes. So the agent cannot
+     mutate the real repo, **cannot push to `main`**, and cannot edit the frozen host — those paths
+     simply aren't writable from inside the job.
+   - `sbatch --time=…` bounds the blast radius in wall-clock; `trap cleanup EXIT` tears down the
+     scratch project, sandbox, editor, and servers.
+   - Loopback-only servers (godot-ai `:8000`, funnel `:8010`, serve hosts pinned to the 54xxx band)
+     — node-local, nothing exposed.
+   - **Cert-merge-freeze respected** (repo memory): never merge/push `main` while cert jobs run in
+     `~/gi`; this lane lives in a worktree and its jobs run on scratch. *Within* that fence, Hermes
+     does anything it likes.
+
+2. **Final certification always re-runs out-of-session on the frozen fingerprinted host** (§9,
+   already the design). In-session `verify_game` verdicts are **advisory** fast feedback; the
+   certificate of record is minted by the existing out-of-session batch verify, keyed by the
+   artifact hash, on a clean host the agent never touched. The verifier stays **outside** the
+   agent's trust domain. A fully-autonomous agent cannot launder a bad game into a certificate,
+   because the certificate isn't its to mint — it's re-derived from the extracted `.gd` afterwards.
+
+> **Production pattern, one line:** *full agent autonomy inside a disposable sandbox; trust comes
+> from re-verification of the extracted artifact on the frozen host, not from restricting the
+> agent's tools.* This is the same trust boundary §3 and §9 already state — the editor/agent
+> authors with maximum freedom; the audited host certifies.
+
+### Re-run evidence (already on record)
+
+The **existing** `poc3.sbatch` *is* the sanctioned pattern and it already ran — full-autonomy Hermes
+(`-z … --yolo --cli`) connected to **both** MCP servers inside a throwaway scratch sandbox, with the
+frozen serve host invoked out-of-process. Job `18189027` funnel receipts show the autonomous agent
+authoring `ball_to_goal.gd` (a 3754-byte GameAPI script) and driving `verify_game` end-to-end:
+```
+FUNNEL | verify_game(len=310, …)   -> verdict=ENV_ERROR  (G0 correctly rejected randomize())
+FUNNEL | extract_game(project_path=…poc-godot-ai)
+FUNNEL | verify_game(len=3754, …)  -> verdict=VERIFY_ERROR (Hermes-authored ball_to_goal.gd)
+```
+(The `VERIFY_ERROR` verdicts trace to a *separate* Godot-host-verify environment issue — the host
+crashes before emitting a report even for the known-good `mini_collect.gd` fixture, STEP A — **not**
+to the autonomy or the sandbox; the certificate of record re-runs out-of-session regardless, so this
+is an infra bug to fix in the funnel's host launcher, tracked apart from this section.) No restricted
+allowlist is needed or wanted; the sandbox + out-of-session re-cert are the whole guarantee.
