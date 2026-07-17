@@ -60,6 +60,58 @@ class FakeLadderEnv:
         return [float(self._x)], (1.0 if term else 0.0), term, False, info
 
 
+class FakeServeLadderEnv(FakeLadderEnv):
+    """FakeLadderEnv + a ``serve_replay`` fast path (duck-types GodotServeEnv's one-round-trip
+    bulk replay): applies the whole prefix in one call, landing in the SAME state as N step()
+    calls, and returns None (having done nothing) when no leading action is valid — the
+    all-or-nothing contract :func:`replay_prefix` relies on to fall back cleanly."""
+
+    def __init__(self, *, goal: int = 100):
+        super().__init__(goal=goal)
+        self.serve_replay_calls = 0
+
+    def serve_replay(self, names):
+        wires = []
+        for a in names:
+            if a in self.actions:
+                wires.append(a)
+            else:
+                break
+        if not wires:
+            return None
+        self.serve_replay_calls += 1
+        obs = info = None
+        term = False
+        for a in wires:
+            obs, _r, t, tr, info = self.step(self.actions.index(a))
+            if t or tr:
+                term = True
+                break
+        return obs, info, term
+
+
+# ====================================================================== #
+# 0) Fast-path serve_replay parity + fallback
+# ====================================================================== #
+def test_replay_prefix_prefers_serve_replay_and_matches_perstep():
+    prefix = ["up", "up", "noop", "up", "down", "up"]
+    fast = FakeServeLadderEnv()
+    obs_fast, _info, term_fast = replay_prefix(fast, prefix, seed=7)
+    assert fast.serve_replay_calls == 1                 # the fast path was taken
+    obs_gen, _i2, term_gen = replay_prefix(FakeLadderEnv(), prefix, seed=7)
+    assert obs_fast == obs_gen                          # byte-identical end state to per-step
+    assert term_fast is False and term_gen is False
+
+
+def test_serve_replay_none_falls_back_to_generic():
+    fast = FakeServeLadderEnv()
+    # First action not in vocab -> serve_replay returns None (sends nothing) -> generic path,
+    # which breaks at the unknown action and yields the post-reset state.
+    obs, _info, term = replay_prefix(fast, ["NOPE", "up"], seed=0)
+    assert fast.serve_replay_calls == 0
+    assert obs == [0.0] and term is False
+
+
 # ====================================================================== #
 # 1) Prefix-replay determinism
 # ====================================================================== #
