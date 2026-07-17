@@ -31,6 +31,7 @@ import random
 import re
 import traceback
 
+from harness.repair_language import PRESERVE_SHORT, REACHABILITY_FIXES
 from harness.core.sandbox import (
     SandboxViolation, load_scene_namespace, scan_source,
 )
@@ -1007,8 +1008,15 @@ def _hint_g3(checks: dict, layer: dict) -> str:
                 f"(< {TRIVIAL_TICKS}); make the goal require real play")
     if not checks.get("milestones_latched", {"pass": True}).get("pass", True):
         dead = checks["milestones_latched"].get("dead", [])
+        # "fix or remove them" (pre-2026-07-16) offered DELETION as an equal option, and
+        # deleting is always the cheaper branch — so the model took it, and a staged
+        # design lost a stage per repair round. A dead milestone means the winning path
+        # misses it: re-wire the path, keep the milestone. [ambition audit]
         return (f"dead milestone(s) never latched on the winning path: "
-                f"{', '.join(dead)} — fix or remove them")
+                f"{', '.join(dead)} — re-wire each so the winning path actually latches "
+                f"it: put it ON the intended route, or gate the goal behind it so no win "
+                f"can skip it. Keep every milestone; do not delete one to pass this "
+                f"check; {PRESERVE_SHORT}")
     if not checks.get("solvable", {}).get("pass", True):
         return _hint_unsolved(checks, layer.get("progress"))
     if not checks.get("replayable", {}).get("pass", True):
@@ -1025,21 +1033,39 @@ def _hint_g3(checks: dict, layer: dict) -> str:
 
 
 def _hint_unsolved(checks: dict, progress: dict | None) -> str:
-    """Milestone-aware UNSOLVED hint: name the boundary where the probe stalls."""
+    """Milestone-aware UNSOLVED hint: name the boundary where the probe stalls, then ask
+    for a REACHABILITY fix at exactly that boundary.
+
+    These three hints were the loop's main ambition launderers (2026-07-16 audit): they
+    said "make the goal easier to reach" / "make the first stage easier", and the model
+    obeyed by demolishing the mechanic (unlocking every door, collapsing a dwell-timer
+    alarm to disarm-on-touch, lining the objectives on one axis). An unreached opening is
+    a REACHABILITY defect, so they now name the local fix and forbid the demolition —
+    mirroring the `g3_unsolvable` directive that already got this right. See
+    `harness.repair_language`."""
     total = checks.get("episodes", {}).get("run", PROBE_EPISODES)
     if not progress or not progress.get("reach_counts"):
         return (f"no random rollout reached success in {total} episodes "
-                f"x {PROBE_HORIZON} ticks — make the goal easier to reach")
+                f"x {PROBE_HORIZON} ticks — bring the first objective within reach of "
+                f"the starting state and verify the ACTIONS actually move the agent "
+                f"toward it (adjust {REACHABILITY_FIXES}), WITHOUT removing the goal; "
+                f"{PRESERVE_SHORT}")
     reach = progress["reach_counts"]
     declared = list(reach)
     stuck = progress.get("stuck_after")
     if stuck is None:
         return (f"no episode reached the first milestone '{declared[0]}' "
-                f"in {total} episodes — make the first stage easier")
+                f"in {total} episodes — bring '{declared[0]}' within reach of the "
+                f"starting state and verify the ACTIONS actually move the agent toward "
+                f"it (adjust {REACHABILITY_FIXES}), WITHOUT removing '{declared[0]}' or "
+                f"any later stage; {PRESERVE_SHORT}")
     nxt = declared[declared.index(stuck) + 1] if declared.index(stuck) + 1 < len(declared) \
         else "success"
     return (f"{reach[stuck]}/{total} episodes reached '{stuck}', none reached "
-            f"'{nxt}' — the game is stuck between '{stuck}' and '{nxt}'")
+            f"'{nxt}' — the game is stuck between '{stuck}' and '{nxt}'; make exactly "
+            f"that one step reachable (widen the gap, steady the hazard, enlarge the "
+            f"target, or relax the timing at that step alone) and keep every stage "
+            f"through '{stuck}', and every stage after '{nxt}', intact; {PRESERVE_SHORT}")
 
 
 # ======================================================================== #

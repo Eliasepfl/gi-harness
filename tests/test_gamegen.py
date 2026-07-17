@@ -360,8 +360,10 @@ def test_repair_permanent_goal_error(tmp_path, monkeypatch):
     assert len(res["attempts"]) == 4
 
 
-def test_env_errors_capped_and_discarded(tmp_path, monkeypatch):
-    # ENV_ERROR (G0 load/build failures): hard cap at 5, regardless of max_repairs.
+def test_identical_env_errors_stall_guard_discards(tmp_path, monkeypatch):
+    # An IDENTICAL ENV_ERROR every attempt is a stalled loop: the convergence guard cuts
+    # it at _REPAIR_STALL_CAP (4), CHEAPER than the old flat cap of 5 — grinding the same
+    # compile error is exactly the "discard, don't grind" waste (2026-07-16 rebudget).
     def fake_verify(path):
         return {"passed": False, "failure_class": "ENV_ERROR",
                 "hint": "module failed to load", "witness": None}
@@ -372,7 +374,114 @@ def test_env_errors_capped_and_discarded(tmp_path, monkeypatch):
                            backend="template", max_repairs=20)
 
     assert res["verdict"] == "ENV_ERROR"
-    assert len(res["attempts"]) == 5
+    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 4, was a flat 5
+    assert res.get("stalled_fingerprint")                        # recorded for telemetry
+
+
+def test_distinct_env_errors_run_to_the_raised_compile_cap(tmp_path, monkeypatch):
+    # DISTINCT compile errors each round = the model is making progress through
+    # successive build failures, so the (raised) compile cap governs, not the stall
+    # guard: it now gets 12 attempts (was 5) to work through them.
+    def fake_verify(path):
+        fake_verify.n += 1
+        return {"passed": False, "failure_class": "ENV_ERROR",
+                "layers": {"G0_static": {"checks": {f"builds_{fake_verify.n}": {"pass": False}}}},
+                "hint": f"distinct build failure {fake_verify.n}", "witness": None}
+    fake_verify.n = 0
+
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
+                           backend="template", max_repairs=20)
+
+    assert res["verdict"] == "ENV_ERROR"
+    assert len(res["attempts"]) == GG._COMPILE_CAP_DEFAULT       # 12, was 5
+
+
+def test_convergence_guard_short_circuits_a_stalled_repair(tmp_path, monkeypatch):
+    # THE HEADLINE SAFETY PROPERTY: with the budget raised (max_repairs 8), a loop that
+    # keeps recompiling the SAME defect must NOT burn all 9 attempts. The convergence
+    # guard keys on the defect fingerprint (failure_class + failing checks + stall
+    # boundary) and stops at _REPAIR_STALL_CAP identical recurrences.
+    def fake_verify(path):
+        return {"passed": False, "failure_class": "GOAL_ERROR",
+                "hint": "success true at t=0", "witness": None}
+
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("catch the ball", out_dir=str(tmp_path),
+                           backend="template")   # default max_repairs (8) now
+
+    assert res["verdict"] == "GOAL_ERROR"
+    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 4, NOT 9
+    assert res.get("stalled_fingerprint")
+    assert "stalled" in res.get("note", "").lower()
+
+
+def test_convergence_guard_does_not_cut_a_progressing_loop(tmp_path, monkeypatch):
+    # The guard must not FALSE-POSITIVE on real progress: a loop whose stall boundary
+    # advances each round (m1 -> m2 -> m3 -> win) mints a NEW fingerprint every time, so
+    # it is never cut early — it runs until it actually passes. This is exactly the
+    # `_report_fingerprint` "key on the stall boundary" rationale under test.
+    frontier = ["m1", "m2", "m3"]
+
+    def fake_verify(path):
+        i = fake_verify.n
+        fake_verify.n += 1
+        if i >= len(frontier):
+            return {"passed": True, "failure_class": None, "hint": "",
+                    "witness": {"seed": 1, "actions": ["left"], "ticks": 7}}
+        return {"passed": False, "failure_class": "UNSOLVED",
+                "hint": f"stuck at {frontier[i]}",
+                "layers": {"G3_solve": {"checks": {"solvable": {"pass": False}}}},
+                "progress": {"reach_counts": {k: 1 for k in frontier[:i + 1]},
+                             "stuck_after": frontier[i]},
+                "witness": None}
+    fake_verify.n = 0
+
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
+                           backend="template")   # default max_repairs (8)
+
+    assert res["verdict"] == "COMPLETED"
+    # 3 progressing UNSOLVED attempts + the passing 4th; the stall guard (cap 4 on
+    # IDENTICAL fingerprints) never fires because every fingerprint differs.
+    assert len(res["attempts"]) == 4
+    assert "stalled_fingerprint" not in res
+
+
+def test_repair_budget_is_configurable_via_env(tmp_path, monkeypatch):
+    # All three knobs are env-overridable, read at call time (house style: HARNESS_*).
+    monkeypatch.setenv("HARNESS_REPAIR_STALL_CAP", "2")
+
+    def fake_verify(path):
+        return {"passed": False, "failure_class": "GOAL_ERROR",
+                "hint": "success true at t=0", "witness": None}
+
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("catch the ball", out_dir=str(tmp_path),
+                           backend="template", max_repairs=20)
+
+    assert res["verdict"] == "GOAL_ERROR"
+    assert len(res["attempts"]) == 2          # HARNESS_REPAIR_STALL_CAP=2 respected
+
+
+def test_raised_budget_defaults_and_resolution_precedence(monkeypatch):
+    # The new free-model defaults, and explicit-arg > env > default precedence.
+    monkeypatch.delenv("HARNESS_MAX_REPAIRS", raising=False)
+    monkeypatch.delenv("HARNESS_COMPILE_CAP", raising=False)
+    monkeypatch.delenv("HARNESS_REPAIR_STALL_CAP", raising=False)
+    assert GG._max_repairs() == 8
+    assert GG._compile_cap() == 12
+    assert GG._repair_stall_cap() == 4
+    assert GG._max_repairs(3) == 3            # explicit arg wins over the default
+    monkeypatch.setenv("HARNESS_MAX_REPAIRS", "10")
+    assert GG._max_repairs() == 10            # env wins over the default
+    assert GG._max_repairs(3) == 3            # ...but explicit still wins over env
+    monkeypatch.setenv("HARNESS_COMPILE_CAP", "not-a-number")
+    assert GG._compile_cap() == 12            # unparseable -> default, never crash
 
 
 def test_unsolved_verdict(tmp_path, monkeypatch):

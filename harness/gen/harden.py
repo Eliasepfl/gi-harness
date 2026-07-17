@@ -169,7 +169,7 @@ def _ledger_entry(slug, game_path, directive, verdict, round_no, *, backend,
 # Revise wiring
 # ======================================================================== #
 def revise_with_directives(game_path: str, directives, *, out_dir: str,
-                           backend: str = "auto", max_repairs: int = 4,
+                           backend: str = "auto", max_repairs: int | None = None,
                            engine=None, skill_root=None,
                            skill_use_llm: bool = True) -> dict:
     """Revise the CURRENT game so it satisfies `directives`, via the existing minimal-edit
@@ -311,7 +311,7 @@ def _clean_verdict(oracle: dict) -> str:
 
 
 def harden_game(game_path: str, *, out_dir: str = "scenes/games/harden",
-                backend: str = "auto", max_repairs: int = 4, engine=None,
+                backend: str = "auto", max_repairs: int | None = None, engine=None,
                 tiers=(0,), stale: bool = True, run_g3: bool = False,
                 budget_steps: int = 1_000_000, g3_kwargs: dict | None = None,
                 max_rounds: int = MAX_ROUNDS_PER_FINDING,

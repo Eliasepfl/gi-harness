@@ -44,7 +44,7 @@ from typing import Any, Callable
 # --------------------------------------------------------------------------- #
 def design(prompt_or_source: str, directive: str | None = None,
            engine: str | None = None, backend: str = "auto", *,
-           out_dir: str = "scenes/games", max_repairs: int = 4,
+           out_dir: str = "scenes/games", max_repairs: int | None = None,
            use_bank: bool = True) -> dict:
     """Generate (or revise) a game and return a compact generation report.
 
