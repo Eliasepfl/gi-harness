@@ -264,8 +264,55 @@ attackers in chord space (Phase 3), the contract prompt text, every GameAPI game
 
 ### Bench — Discrete vs MultiBinary (mini_collect, same 400k budget)
 
-_Filled in from the in-image run (proven config: additive reward, eval-keyed
-best-checkpoint, patience 200)._
+One comparison run, identical proven config both arms (additive reward, eval-keyed
+best-checkpoint, `patience 200`, `num_envs 8`, `HARNESS_GODOT_SPEEDUP 8`); the ONLY
+difference is `chord_mode`. mini_collect is a 2-D 4-verb collect game (`up/down/left/right`,
+two gems). n_eval = 32 greedy + 32 stochastic seeds. (SLURM 18121678 disc / 18121679 mb.)
 
-<!-- BENCH_TABLE -->
+| metric | Discrete (baseline) | MultiBinary (chords) |
+|---|---|---|
+| action space | `Discrete(4)` | `MultiBinary(4)` |
+| **greedy success rate** | **1.0** | **0.0** |
+| **stochastic success rate** | **0.312** | **0.344** |
+| **steps to first success** | **1,048** | **72,664** |
+| learnable / demo-ready | true / no | false / no |
+| witness→batch bridge replays | yes (`bridge_ok`) | **yes (`bridge_ok`)** |
+| throughput (steps/s) | 2,196 | 1,838 |
+| trained steps / updates | 400,384 / 391 | 400,384 / 391 |
+
+**Chord-size distribution** (fraction of ticks pressing 0 / 1 / 2 / 3+ keys):
+
+| pool | 0 (idle) | 1 | 2 | 3+ | mean |
+|---|---|---|---|---|---|
+| MultiBinary greedy | 0.000 | 0.000 | 0.746 | 0.254 | 2.258 |
+| MultiBinary stochastic | 0.045 | 0.232 | 0.369 | 0.354 | — |
+
+**Per-key press counts** (greedy pool): Discrete `up 256 / down 384 / left 0 / right 512`;
+MultiBinary `up 1190 / down 1284 / left 9600 / right 9600`.
+
+**Honest read (a negative on this game — as expected).** On mini_collect the MultiBinary
+policy **loses**: Discrete wins greedily every time (1.0) and finds its first win in ~1k
+steps; MultiBinary never consolidates a greedy win (0.0) and needs ~70× more steps to its
+first stochastic success (72,664 vs 1,048). The chord-size + per-key numbers say WHY — the
+greedy chord policy **degenerated**: it presses `left`+`right` on *every* one of the 9,600
+greedy ticks (two opposing, cancelling keys), uses a 2+-key chord 100 % of the time and a
+single key or idle 0 % of the time (mean 2.26 keys/tick). For a game single keys already
+solve, the 2ⁿ action space is pure exploration tax and the Bernoulli heads saturate toward
+"press everything". The stochastic SR edging Discrete (0.344 vs 0.312) is noise off a
+degenerate policy, and neither arm is demo-ready.
+
+This is the doctrine, confirmed empirically: **chords are a per-game capability, not a free
+win.** The expected payoff is on games whose feasibility genuinely needs simultaneity
+(3-D thrust composition, forced diagonals), NOT a 2-D game the single-key subspace already
+solves. So the **default stays Discrete and `chord_mode` is opt-in** — exactly as built. The
+one unambiguous positive: the MultiBinary chord *witness* (2-key chords and all) replayed
+bit-exactly to success through `GdExecutor.run_batch` (`bridge_ok = true`), so the Phase-2
+export→replay path is proven end-to-end in a real training run, not just in unit tests.
+
+_Test-infra note:_ the full in-image battery (18119403) was green on correctness
+(**124 passed, 1 skipped**) but tripped `tests/test_gd_batch_vec.py::test_batch_vec_env_faster_than_dummy`
+— a **throughput race** (batch must out-run DummyVecEnv in a wall-clock speed test) that
+flakes on a contended node and is unrelated to any Phase-2 change. It cost the whole
+`afterok` bench chain (auto-cancelled). Recommend giving that test a tolerance margin or a
+`@pytest.mark.flaky` / speed-ratio floor so a loaded node cannot red the suite.
 
