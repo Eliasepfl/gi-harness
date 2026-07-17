@@ -356,14 +356,17 @@ def test_repair_permanent_goal_error(tmp_path, monkeypatch):
                            backend="template", max_repairs=3)
 
     assert res["verdict"] == "GOAL_ERROR"
-    # 1 initial attempt + 3 repairs.
-    assert len(res["attempts"]) == 4
+    # An identical, permanent GOAL_ERROR (success true at t=0) is a stall: the convergence
+    # guard cuts it at _REPAIR_STALL_CAP (2 now, was 4) - it is not a reframe-eligible
+    # family (not containment, not a last-mile wall), so no grace attempt is spent.
+    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 2
 
 
 def test_identical_env_errors_stall_guard_discards(tmp_path, monkeypatch):
     # An IDENTICAL ENV_ERROR every attempt is a stalled loop: the convergence guard cuts
-    # it at _REPAIR_STALL_CAP (4), CHEAPER than the old flat cap of 5 — grinding the same
-    # compile error is exactly the "discard, don't grind" waste (2026-07-16 rebudget).
+    # it at _REPAIR_STALL_CAP (2 now, was 4) — grinding the same compile error is exactly
+    # the "discard, don't grind" waste. "module failed to load" is not a reframe-eligible
+    # family (not containment, not last-mile), so no grace attempt is spent.
     def fake_verify(path):
         return {"passed": False, "failure_class": "ENV_ERROR",
                 "hint": "module failed to load", "witness": None}
@@ -374,7 +377,7 @@ def test_identical_env_errors_stall_guard_discards(tmp_path, monkeypatch):
                            backend="template", max_repairs=20)
 
     assert res["verdict"] == "ENV_ERROR"
-    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 4, was a flat 5
+    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 2, was 4
     assert res.get("stalled_fingerprint")                        # recorded for telemetry
 
 
@@ -402,7 +405,8 @@ def test_convergence_guard_short_circuits_a_stalled_repair(tmp_path, monkeypatch
     # THE HEADLINE SAFETY PROPERTY: with the budget raised (max_repairs 8), a loop that
     # keeps recompiling the SAME defect must NOT burn all 9 attempts. The convergence
     # guard keys on the defect fingerprint (failure_class + failing checks + stall
-    # boundary) and stops at _REPAIR_STALL_CAP identical recurrences.
+    # boundary) and stops at _REPAIR_STALL_CAP identical recurrences. GOAL_ERROR
+    # "success true at t=0" is not a reframe-eligible family, so no grace is spent.
     def fake_verify(path):
         return {"passed": False, "failure_class": "GOAL_ERROR",
                 "hint": "success true at t=0", "witness": None}
@@ -413,7 +417,7 @@ def test_convergence_guard_short_circuits_a_stalled_repair(tmp_path, monkeypatch
                            backend="template")   # default max_repairs (8) now
 
     assert res["verdict"] == "GOAL_ERROR"
-    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 4, NOT 9
+    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 2, NOT 9
     assert res.get("stalled_fingerprint")
     assert "stalled" in res.get("note", "").lower()
 
@@ -445,10 +449,100 @@ def test_convergence_guard_does_not_cut_a_progressing_loop(tmp_path, monkeypatch
                            backend="template")   # default max_repairs (8)
 
     assert res["verdict"] == "COMPLETED"
-    # 3 progressing UNSOLVED attempts + the passing 4th; the stall guard (cap 4 on
+    # 3 progressing UNSOLVED attempts + the passing 4th; the stall guard (cap 2 on
     # IDENTICAL fingerprints) never fires because every fingerprint differs.
     assert len(res["attempts"]) == 4
     assert "stalled_fingerprint" not in res
+
+
+def test_containment_reframe_grants_one_varied_grace_attempt(tmp_path, monkeypatch):
+    # Item 4: a containment / out-of-bounds escape that survives a repair is reframe-
+    # eligible — the stall guard (cap 2) does NOT stop cold on the first repeat; it spends
+    # ONE more attempt on a VARIED directive, then stops if it still recurs. So an identical
+    # containment defect yields 3 attempts (2 + 1 grace), not 2.
+    def fake_verify(path):
+        return {"passed": False, "failure_class": "ENV_ERROR",
+                "hint": "dynamic body out of bounds: puck", "witness": None}
+
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("a puck on ice", out_dir=str(tmp_path),
+                           backend="template", max_repairs=20)
+
+    assert res["verdict"] == "ENV_ERROR"
+    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT + 1   # 2 + 1 reframe grace
+    assert res.get("stalled_fingerprint")           # still stalls AFTER the grace attempt
+
+
+def test_containment_reframe_varies_the_directive_framing(tmp_path, monkeypatch):
+    # Item 4: the GRACE repair (attempt 3) carries a CONCRETE alternate framing the earlier
+    # repair (attempt 2) did not — "clamp in _physics_process, not act()" — instead of
+    # re-sending the same hint.
+    seen_msgs = []
+
+    def fake_complete(client, system, messages):
+        seen_msgs.append([m for m in messages if m["role"] == "user"][-1]["content"])
+        return "DESIGN\nTheme: t\n```python\n" + GG._DRIFT + "\n```"
+
+    def fake_verify(path):
+        return {"passed": False, "failure_class": "ENV_ERROR",
+                "hint": "dynamic body out of bounds: puck", "witness": None}
+
+    monkeypatch.setattr(GG, "_make_client", lambda: object())
+    monkeypatch.setattr(GG, "_llm_complete", fake_complete)
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("invent something", out_dir=str(tmp_path),
+                           backend="anthropic", max_repairs=20)
+
+    assert res["verdict"] == "ENV_ERROR"
+    assert len(res["attempts"]) == 3
+    repair_msgs = [m for m in seen_msgs if "failed verification" in m]
+    assert len(repair_msgs) == 2                    # attempts 2 and 3
+    assert "Change the containment APPROACH" not in repair_msgs[0]   # first repair: normal
+    assert "Change the containment APPROACH" in repair_msgs[1]       # grace repair: varied
+    assert "_physics_process" in repair_msgs[1]
+    assert "do NOT re-send the same fix" in repair_msgs[1]
+
+
+def test_last_mile_reframe_surfaces_closest_approach_telemetry(tmp_path, monkeypatch):
+    # Item 3: an UNSOLVED run that reaches its milestones but stalls one step short is
+    # reframe-eligible. On the first repeat it spends ONE grace attempt whose directive
+    # carries the solver's CLOSEST-APPROACH reach telemetry (the exact reach numbers) so the
+    # fix is targeted, not guessed. Fires ONLY on the repeat; the first repair does not.
+    seen_msgs = []
+
+    def fake_complete(client, system, messages):
+        seen_msgs.append([m for m in messages if m["role"] == "user"][-1]["content"])
+        return "DESIGN\nTheme: t\n```python\n" + GG._DRIFT + "\n```"
+
+    def fake_verify(path):
+        return {"passed": False, "failure_class": "UNSOLVED",
+                "hint": "359/360 episodes reached 'past_right', none reached 'success'",
+                "witness": None,
+                "progress": {"reach_counts": {"moved": 360, "past_left": 360,
+                                              "past_right": 359},
+                             "stuck_after": "past_right"}}
+
+    monkeypatch.setattr(GG, "_make_client", lambda: object())
+    monkeypatch.setattr(GG, "_llm_complete", fake_complete)
+    _install_gameverify(monkeypatch, fake_verify)
+
+    res = GG.generate_game("balance the beam", out_dir=str(tmp_path),
+                           backend="anthropic", max_repairs=20)
+
+    assert res["verdict"] == "UNSOLVED"
+    assert len(res["attempts"]) == 3                       # 2 + 1 telemetry grace
+    assert res.get("stalled_fingerprint")                  # dedup intact: grace fires once
+    repair_msgs = [m for m in seen_msgs if "failed verification" in m]
+    assert len(repair_msgs) == 2
+    assert "Closest-approach telemetry" not in repair_msgs[0]   # first repair: no telemetry
+    assert "Closest-approach telemetry" in repair_msgs[1]       # grace repair: telemetry
+    assert "'past_right' 359/360" in repair_msgs[1]             # the exact reach numbers
+    assert "'past_right' -> 'success'" in repair_msgs[1]        # the single stuck step
+    # The tag never leaks into the stored attempt or the dumped report JSON.
+    for att in res["attempts"]:
+        assert "_reframe" not in att.get("report", {})
 
 
 def test_repair_budget_is_configurable_via_env(tmp_path, monkeypatch):
@@ -475,7 +569,7 @@ def test_raised_budget_defaults_and_resolution_precedence(monkeypatch):
     monkeypatch.delenv("HARNESS_REPAIR_STALL_CAP", raising=False)
     assert GG._max_repairs() == 8
     assert GG._compile_cap() == 12
-    assert GG._repair_stall_cap() == 4
+    assert GG._repair_stall_cap() == 2   # 2026-07-17: cut 4 -> 2 (+reframe grace)
     assert GG._max_repairs(3) == 3            # explicit arg wins over the default
     monkeypatch.setenv("HARNESS_MAX_REPAIRS", "10")
     assert GG._max_repairs() == 10            # env wins over the default
@@ -495,7 +589,10 @@ def test_unsolved_verdict(tmp_path, monkeypatch):
                            backend="template", max_repairs=2)
 
     assert res["verdict"] == "UNSOLVED"
-    assert len(res["attempts"]) == 3
+    # Identical UNSOLVED with NO progress diagnosis is not a last-mile family (no reach
+    # telemetry to surface), so the stall guard cuts it at _REPAIR_STALL_CAP (2 now, was 4)
+    # with no reframe grace - was 3 under the old cap of 4.
+    assert len(res["attempts"]) == GG._REPAIR_STALL_CAP_DEFAULT   # 2
 
 
 def test_verification_unavailable_partial(tmp_path, monkeypatch):

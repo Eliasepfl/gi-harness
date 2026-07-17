@@ -31,7 +31,9 @@ import re
 import shutil
 import time
 
-from harness.repair_language import PRESERVE_CLAUSE, PRINCIPLE, REACHABILITY_FIXES
+from harness.repair_language import (
+    PRESERVE_CLAUSE, PRINCIPLE, REACHABILITY_FIXES, reframe_clause, reframe_kind,
+)
 from harness.core import integrity
 from harness.gen import prompts
 from harness.gen import retrieval
@@ -64,27 +66,35 @@ _MAX_TOKENS = 16000
 #     which is exactly what an AMBITIOUS multi-stage game needs — keeping the mechanic
 #     AND fixing it takes more rounds than flattening it, so the old tight budget was
 #     itself a standing argument for demolition;
-#   * a STALLED repair gets LESS room than before (cut at 4 identical defects, was 5),
+#   * a STALLED repair gets LESS room than before (cut at 2 identical defects, was 5),
 #     because grinding an unchanged error is the waste the old cap was really aiming at.
 #
 # So the effective budget by case, old -> new:
-#   identical defect every round   5 -> 4 attempts   (CHEAPER than today)
+#   identical defect every round   5 -> 2 attempts   (CHEAPER than today; +1 reframe grace
+#                                                     for the two families below)
 #   varying env/compile errors     5 -> 12 attempts  (room to converge)
 #   varying verify defects         5 -> 9 attempts   (max_repairs 8 + 1)
 # Progress buys room; spinning does not. That is the whole trade.
 #
-# Why 4 and not 2 (the harden loop cuts on the FIRST repeat, harden.py:419): that guard
-# keys on a fully-typed directive from the post-cert oracle suite (row + checkpoints),
-# whereas `_report_fingerprint` below is necessarily coarser. A coarser key needs more
-# evidence before it calls a stall, so 4 leaves three genuine swings at one defect while
-# still cutting below every other ceiling.
+# Why 2 now, not 4 (2026-07-17 parser-friction A/B): the A/B traces showed the guard fired
+# only after FOUR byte-identical diagnoses (cargo att4-7, stack att6-9, herd att3-6) — i.e.
+# after the model had already wasted them re-failing an error the SAME hint could not fix.
+# Cutting at 2 stops the grind one strike sooner. To keep that from throwing away a genuine
+# near-miss, the two defect FAMILIES that have a concrete alternate framing —
+# `reframe_kind` in `harness.repair_language`: a containment escape (escalate the clamp
+# APPROACH) and a last-mile solvability wall (surface the solver's closest-approach reach
+# telemetry) — get ONE reframed grace attempt on that first repeat before the run stops,
+# spending it on a VARIED directive instead of a re-sent one. Every other defect keeps the
+# pure "2 identical -> stop" invariant. (The harden loop already cuts on the first repeat,
+# harden.py:419, keying on a fully-typed post-cert directive; this coarser generation-lane
+# key now matches that discipline.)
 #
 # All three are overridable (HARNESS_COMPILE_CAP / HARNESS_MAX_REPAIRS /
 # HARNESS_REPAIR_STALL_CAP), read at CALL time so a test or a run can retune without
 # reimporting. An explicit `max_repairs=` argument always wins over the env.
 _COMPILE_CAP_DEFAULT = 12      # max attempts on env/compile errors (G0 load/build)
 _MAX_REPAIRS_DEFAULT = 8       # repairs after the initial attempt (max_attempts = +1)
-_REPAIR_STALL_CAP_DEFAULT = 4  # identical defect fingerprints seen -> stop, don't grind
+_REPAIR_STALL_CAP_DEFAULT = 2  # identical defect fingerprints seen -> stop, don't grind
 
 # OpenRouter backend ([eng.] = engineering choices)
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -427,6 +437,13 @@ def _repair_user_msg(report):
     fc = report.get("failure_class") if isinstance(report, dict) else None
     hint = report.get("hint", "") if isinstance(report, dict) else ""
     progress = report.get("progress") if isinstance(report, dict) else None
+    # Reframe escalation (items 3+4): the repair loop tags a report with `_reframe` when
+    # this SAME defect just survived a repair and belongs to a family with a concrete
+    # alternate framing (a containment escape, or a last-mile solvability wall). POP it —
+    # so the tag never enters the dumped JSON or the stored attempt — and splice the varied
+    # clause / closest-approach telemetry. TEXT ONLY: it never touches the dedup fingerprint
+    # (which keys on the defect identity, not this volatile one-shot escalation).
+    reframe = report.pop("_reframe", None) if isinstance(report, dict) else None
     prefix = ""
     if progress:
         # Checkpoint diagnosis (v2.1): name the stuck boundary first.
@@ -434,12 +451,32 @@ def _repair_user_msg(report):
                   "between the named milestones.\n")
     if fc == "UNSOLVED":
         hint = _UNSOLVED_HINT + (f" ({hint})" if hint else "")
+    reframe_text = ""
+    if reframe:
+        clause = reframe_clause(reframe, report)
+        if clause:
+            reframe_text = ("This defect survived a repair UNCHANGED — do NOT re-send the "
+                            "same fix. " + clause + "\n")
     body = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     return (prefix +
             "The previous game failed verification. Fix ONLY the game module "
             "(same format and constraints, no imports).\n"
-            f"Hint: {hint}\nVerifier report (JSON):\n{body}\n"
+            f"Hint: {hint}\n" + reframe_text +
+            f"Verifier report (JSON):\n{body}\n"
             "Return the corrected DESIGN block and one ```python module.")
+
+
+def _reframe_kind_of(report):
+    """Classify a stalled report into a reframe family (items 3+4) or ``None``.
+
+    Thin adapter over :func:`harness.repair_language.reframe_kind`, feeding it the shapes
+    the loop already has: the failure class, the failed-check ids (`_failing_checks`), the
+    one-line hint, and the milestone reach `progress`. ``None`` means the defect keeps the
+    pure "N identical -> stop" invariant (no reframe grace is spent)."""
+    if not isinstance(report, dict):
+        return None
+    return reframe_kind(report.get("failure_class"), _failing_checks(report),
+                        report.get("hint"), report.get("progress"))
 
 
 # --- Anthropic backend -------------------------------------------------------
@@ -903,6 +940,7 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
     compile_cap = _compile_cap()
     stall_cap = _repair_stall_cap()
     seen_fingerprints: dict = {}
+    reframed: set = set()          # fingerprints already granted their one reframe attempt
     stalled_fingerprint = None
     max_attempts = max_repairs + 1  # 1 initial attempt + max_repairs repairs
 
@@ -962,6 +1000,19 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
         fp = _report_fingerprint(report)
         seen_fingerprints[fp] = seen_fingerprints.get(fp, 0) + 1
         if seen_fingerprints[fp] >= stall_cap:
+            # Reframe grace (items 3+4): the FIRST time an identical defect trips the stall
+            # guard, if it belongs to a family with a concrete alternate framing — a
+            # containment escape (escalate the clamp APPROACH) or a last-mile solvability
+            # wall (surface closest-approach reach telemetry) — spend ONE more attempt on a
+            # VARIED / telemetry-enriched directive instead of stopping cold, then stop if
+            # it still recurs. Scoped to those families (`_reframe_kind_of`) so every other
+            # defect keeps the pure "N identical -> stop" convergence invariant.
+            kind = _reframe_kind_of(report)
+            if kind and fp not in reframed and n < max_attempts:
+                reframed.add(fp)
+                report["_reframe"] = kind          # popped by _repair_user_msg (text-only)
+                feedback = report
+                continue
             verdict = report.get("failure_class") or "ENV_ERROR"
             stalled_fingerprint = fp
             note = (note + "; " if note else "") + (

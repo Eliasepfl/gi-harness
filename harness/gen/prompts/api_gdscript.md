@@ -70,6 +70,10 @@ Your code runs untrusted, in-container. Using anything below is an automatic rej
 
 Write ordinary GDScript: `func`, `var`, `if`/`for`/`match`, arithmetic, vector math, `abs`/`min`/`max`/`clamp`/`sqrt`, real Godot nodes, and a `RandomNumberGenerator` you seed. `PhysicsServer3D.set_active(true)` in a 3D `build()` is allowed and required; it is the ONE PhysicsServer call you make.
 
+# RUNTIME IS GODOT 4.x, not Godot 3 - a hard rule (anti-hallucination, not style)
+
+The loader is Godot 4.x; call ONLY names that exist in Godot 4 - a half-remembered Godot 3 invents classes and methods that fail: a RigidBody uses `apply_central_force`/`apply_torque_impulse` (there is no `add_central_force` or `apply_angular_impulse`); an area node reports overlap via `overlaps_body`/`has_overlapping_bodies` (there is no `has_overlapping_body`); clamp a vector with `limit_length` (there is no `Vector2.limited`); a kinematic body is `CharacterBody2/3D` (there is no `KinematicBody`); joints are `PinJoint`/`HingeJoint`/`SliderJoint`/`GrooveJoint` (the 2D/3D variants) - there is no `FixedJoint3D`, no `PolygonShape2D` shape resource, and no Godot-3 `MODE_*` body-mode enum (a body's kind is set by the class you pick, e.g. a static-vs-dynamic node, not a `MODE_STATIC` constant).
+
 # Common gate failures - the repair loop hands you a TYPED hint; design them out
 
 - **G0 parse error** - fix the exact syntax; the standalone `--check-only` reports the parser's own message and line.
