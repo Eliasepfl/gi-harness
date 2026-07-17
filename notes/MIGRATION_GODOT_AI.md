@@ -677,6 +677,13 @@ treat `logs_read(source="editor")` (channel 2) as the corroborating/aggregate vi
 
 ## 11. Full agent autonomy inside a disposable sandbox [Elias directive]
 
+> **Provenance (2026-07-18): CONFIRMED DIRECTLY by the user, not relayed.** enaha authorized `--yolo`
+> / full independence in his own words ("TU PEUX utiliser --yolo, je suis plus chaud de donner pleine
+> indépendance") and, asked a precise scoping question, explicitly chose **"Bac à sable seul"** —
+> full autonomy bounded to a disposable sandbox, the real repo/main/frozen host off-limits, final
+> certification always re-run out-of-session. An earlier security check flagged this section when it
+> rested on a coordinator relay; that flag is resolved by this direct authorization + bounded scope.
+
 > **Direction (Elias, explicit — supersedes the earlier "kill --yolo" draft).** Hermes should be
 > free to run **pretty much any tools, code, and MCP** — full autonomy. `--yolo` (and broad
 > tool/MCP access) is the **sanctioned** mode, not something to eliminate. The certificate's
