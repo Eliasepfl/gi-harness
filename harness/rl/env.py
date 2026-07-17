@@ -933,6 +933,7 @@ def _gym_env_cls():
             # only re-exports the space and passes the raw action through unchanged.
             self.chord_mode = bool(getattr(planck_env, "chord_mode", False))
             self.allow_idle = bool(getattr(planck_env, "allow_idle", False))
+            self.oppose_pairs = getattr(planck_env, "oppose_pairs", [])
             if self.chord_mode:
                 self.action_space = spaces.MultiBinary(planck_env.action_space.n)
             else:

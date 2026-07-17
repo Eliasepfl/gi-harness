@@ -25,7 +25,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.rl import certify as C  # noqa: E402
+from harness.rl.chord_probe import antiparallel_pairs  # noqa: E402
 from harness.rl.env import Discrete, MultiBinary, wrap_gym  # noqa: E402
+from harness.verify.chord import chord_from_mask, project_opposition  # noqa: E402
 from harness.verify.gd_exec import GdExecutor  # noqa: E402
 
 
@@ -158,3 +160,59 @@ def test_gdexecutor_detects_idle_demo():
     assert GdExecutor._episodes_have_idle([{"actions": ["a", [], "b"]}]) is True
     assert GdExecutor._episodes_have_idle([{"actions": ["a", ["b", "c"]]}]) is False
     assert GdExecutor._episodes_have_idle([]) is False
+
+
+# ============================================================ CONTRADICTORY-CHORD projection
+# Effect vectors modelling a 4-verb 2D mover: up/down are antiparallel, left/right are
+# antiparallel; up vs left/right are orthogonal (not opposed). Actions ordered [up,down,left,right].
+_UP, _DOWN, _LEFT, _RIGHT = (0, 1, 2, 3)
+_MOVER_VECS = [(0.0, 1.0), (0.0, -1.0), (-1.0, 0.0), (1.0, 0.0)]
+
+
+def test_antiparallel_pairs_discovers_opposites_mechanically():
+    """Near-antiparallel effect vectors (cosine < -0.9, comparable magnitude) are discovered;
+    orthogonal ones are not. Derived from the VECTORS only — no action names involved."""
+    pairs = antiparallel_pairs(_MOVER_VECS)
+    assert (_UP, _DOWN) in pairs and (_LEFT, _RIGHT) in pairs
+    # up/left, up/right, down/left, down/right are orthogonal -> never paired
+    assert (_UP, _LEFT) not in pairs and (_UP, _RIGHT) not in pairs
+    assert len(pairs) == 2
+
+
+def test_antiparallel_pairs_rejects_incomparable_magnitude():
+    """A strong action is NOT paired with a weak near-opposite one (magnitude ratio guard)."""
+    vecs = [(0.0, 10.0), (0.0, -1.0)]      # antiparallel but 10x magnitude gap
+    assert antiparallel_pairs(vecs, mag_ratio=3.0) == []
+    # within the ratio, the same direction pair IS discovered
+    assert antiparallel_pairs([(0.0, 2.0), (0.0, -1.0)], mag_ratio=3.0) == [(0, 1)]
+
+
+def test_antiparallel_pairs_excludes_zero_effect_actions():
+    """An action with ~no measured effect (a non-mover) is never contradictory."""
+    vecs = [(0.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+    assert antiparallel_pairs(vecs) == [(1, 2)]
+
+
+def test_project_opposition_drops_both_when_both_pressed():
+    pairs = [(_UP, _DOWN), (_LEFT, _RIGHT)]
+    # up+down pressed -> both dropped; left survives
+    assert project_opposition([1, 1, 1, 0], pairs) == [0, 0, 1, 0]
+    # only one of a pair pressed -> untouched
+    assert project_opposition([1, 0, 0, 1], pairs) == [1, 0, 0, 1]
+    # both pairs pressed -> all four drop (the mb degenerate 'left+right+up+down' collapses)
+    assert project_opposition([1, 1, 1, 1], pairs) == [0, 0, 0, 0]
+    # a non-opposing multi-key chord is untouched
+    assert project_opposition([1, 0, 0, 1], [(_UP, _DOWN)]) == [1, 0, 0, 1]
+
+
+def test_chord_from_mask_applies_projection():
+    acts = ["up", "down", "left", "right"]
+    pairs = [(_UP, _DOWN), (_LEFT, _RIGHT)]
+    # left+right (the mb degenerate) -> both drop -> nothing pressed -> idle [] (allow_empty)
+    assert chord_from_mask([0, 0, 1, 1], acts, allow_empty=True, oppose_pairs=pairs) == []
+    # up + left+right -> the opposing pair drops, 'up' survives as a singleton str
+    assert chord_from_mask([1, 0, 1, 1], acts, allow_empty=True, oppose_pairs=pairs) == "up"
+    # up + right (non-opposing) -> a real 2-key chord, sorted
+    assert chord_from_mask([1, 0, 0, 1], acts, oppose_pairs=pairs) == ["right", "up"]
+    # no pairs given -> byte-identical to the un-projected mapping
+    assert chord_from_mask([0, 0, 1, 1], acts, oppose_pairs=None) == ["left", "right"]

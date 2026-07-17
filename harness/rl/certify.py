@@ -390,6 +390,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              rays: dict | None = None, obs_profile: str = "positions",
              best_checkpoint: bool = True,
              chord_mode: bool = False, allow_idle: bool | None = None,
+             ban_contradictions: bool = True,
              **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
@@ -463,6 +464,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
 
     make_batch_venv = None
     make_shard_venv = None
+    # CONTRADICTORY-CHORD projection (Phase 2, Elias): the ONE single-instance probe env
+    # (the `probe = make_env()` below) mechanically discovers near-antiparallel action pairs;
+    # they are shared to every training/eval env via this holder so the whole run uses ONE
+    # measured opposition set (the batched host never self-probes). None -> "discover" (the
+    # probe env); a list -> "use these" (every later env). Empty when chord_mode/ban is off.
+    _oppose = {"pairs": None, "named": []}
+
     if engine in ("godot", "gdscript"):
         import itertools
         from harness.rl.godot_env import GodotServeEnv
@@ -474,10 +482,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
             # `obs_profile` (positions | positions+rays | rays) + `rays` (the egocentric
             # raycast grid config) are additive kwargs; the default "positions" keeps the
             # env byte-identical to the pre-rays obs. Captured here so the probe, training,
-            # and eval envs all size the obs identically.
+            # and eval envs all size the obs identically. `oppose_pairs=None` on the FIRST
+            # (probe) call -> that env self-discovers; later calls receive the shared list.
             return GodotServeEnv(game_path, port_offset=next(_port_seq), rays=rays,
                                  obs_profile=obs_profile,
-                                 chord_mode=chord_mode, allow_idle=allow_idle)
+                                 chord_mode=chord_mode, allow_idle=allow_idle,
+                                 ban_contradictions=ban_contradictions,
+                                 oppose_pairs=_oppose["pairs"])
 
         # MULTI-CPU PER GAME: the GDScript lane (serve_game.gd) can serve N in-scene
         # instances over ONE process/socket, so hand the SB3 trainer a batch-vec-env
@@ -490,7 +501,9 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
                 return GodotBatchVecEnv(game_path, n_instances,
                                         port_offset=next(_port_seq), seed=seed,
                                         rays=rays, obs_profile=obs_profile,
-                                        chord_mode=chord_mode, allow_idle=allow_idle)
+                                        chord_mode=chord_mode, allow_idle=allow_idle,
+                                        ban_contradictions=ban_contradictions,
+                                        oppose_pairs=_oppose["pairs"])
 
             # SHARDING (Elias, 2026-07-16: "32 cores per run"): M INDEPENDENT batch
             # shards stepped concurrently = M*K logical envs, so ONE learner saturates
@@ -507,7 +520,9 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
                                         env_kwargs={"rays": rays,
                                                     "obs_profile": obs_profile,
                                                     "chord_mode": chord_mode,
-                                                    "allow_idle": allow_idle})
+                                                    "allow_idle": allow_idle,
+                                                    "ban_contradictions": ban_contradictions,
+                                                    "oppose_pairs": _oppose["pairs"]})
     else:
         def make_env():
             return PlanckEnv(game_path)
@@ -521,6 +536,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     cp_keys = list(probe._cp_keys)
     action_names = list(getattr(probe, "actions", []) or [])   # for the eval action histogram
     is_3d = int(getattr(probe, "_dim", 2)) == 3    # per-axis aggregates are for 3D games
+    # The probe env self-discovered the MEASURED contradictory-chord pairs (chord mode + ban);
+    # share them to every training/eval env via the holder and record them (index + action-name
+    # pairs) for the eval artifact — transparency (Elias reads these) and reproducibility.
+    _disc = [tuple(p) for p in (getattr(probe, "oppose_pairs", []) or [])]
+    _oppose["pairs"] = _disc
+    _oppose["named"] = [[action_names[i], action_names[j]] for (i, j) in _disc
+                        if i < len(action_names) and j < len(action_names)]
     probe.close()
 
     # --- Train ---
@@ -755,6 +777,8 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "trainer": trainer,
         "method": method,                                     # algo (ledger key)
         "chord_mode": bool(chord_mode),                       # Phase-2 MultiBinary action space
+        "chord_ban_contradictions": bool(chord_mode and ban_contradictions),
+        "chord_opposition_pairs": _oppose["named"],           # MEASURED near-antiparallel pairs
         "stochastic_success_rate": stochastic_success_rate,   # graded learnability
         "budget_steps": budget_steps,
         "trained_steps": train_res["global_steps"],

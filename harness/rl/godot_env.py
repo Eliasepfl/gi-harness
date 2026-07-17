@@ -159,7 +159,8 @@ class GodotServeEnv:
                  timeout_s: float = SERVE_TIMEOUT_S,
                  connect_timeout_s: float = CONNECT_TIMEOUT_S,
                  rays: dict | None = None, obs_profile: str = "positions",
-                 chord_mode: bool = False, allow_idle: bool | None = None):
+                 chord_mode: bool = False, allow_idle: bool | None = None,
+                 ban_contradictions: bool = True, oppose_pairs=None):
         # Set teardown-relevant handles first so close() is safe on any early raise.
         self._listener = None
         self._conn = None
@@ -302,6 +303,50 @@ class GodotServeEnv:
         # Current world pose ({name:{pos,vel,angle}}); kept fresh on reset/step for the
         # inverse-value attacker's fingerprint trail (harness.rl.adversary). Read-only.
         self.last_snapshot: dict = self._snapshot_of(ready)
+
+        # CONTRADICTORY-CHORD projection (Phase 2, Elias). In chord mode, mechanically probe
+        # each action's effect vector on the controlled body and record near-antiparallel pairs
+        # (chord_probe.antiparallel_pairs) so a both-pressed self-cancelling combo projects to
+        # NEITHER key in the mask->wire mapping (see chord_from_mask/oppose_pairs). Opposition is
+        # derived from MEASURED physics, NEVER action names. Explicit `oppose_pairs` (from
+        # g3_prime's ONE shared probe) skips the per-env probe; ban_contradictions=False or a
+        # non-chord env -> no pairs (byte-identical to before).
+        self.ban_contradictions = bool(ban_contradictions)
+        if oppose_pairs is not None:
+            self.oppose_pairs = [tuple(p) for p in oppose_pairs]
+        elif self.chord_mode and self.ban_contradictions:
+            self.oppose_pairs = self._discover_opposition()
+        else:
+            self.oppose_pairs = []
+
+    # -- contradictory-chord probe / discovery ----------------------------
+    def probe_effect_vectors(self, *, k_ticks: int = 8, seed: int = 0) -> list:
+        """Measure each action's EFFECT VECTOR: from a fresh reset at ``seed``, apply the
+        action ALONE for ``k_ticks`` decision ticks and record the controlled body's net
+        displacement (one 3-vector per action). Bypasses ``step``/the chord projection (raw
+        single-verb wire), so it is safe to call before ``oppose_pairs`` exists. It leaves the
+        serve world dirty -- the caller restores a clean build (``_discover_opposition`` does)."""
+        from harness.rl.env import _controlled_pos
+        vecs = []
+        for verb in self.actions:
+            f0 = self._exchange({"op": "reset", "seed": int(seed)})
+            p0 = np.asarray(_controlled_pos(f0.get("obs_state", {}), self._body_order),
+                            dtype=float)
+            fn = self._exchange({"op": "act", "actions": [verb], "n_ticks": int(k_ticks)})
+            p1 = np.asarray(_controlled_pos(fn.get("obs_state", {}), self._body_order),
+                            dtype=float)
+            vecs.append(p1 - p0)
+        return vecs
+
+    def _discover_opposition(self, *, k_ticks: int = 8, seed: int = 0) -> list:
+        """Probe effect vectors and return the mechanically-discovered near-antiparallel
+        action-index pairs, then RESTORE a clean seed-``seed`` build (the probe stepped the
+        world). Names are never consulted -- only the measured physics."""
+        from harness.rl.chord_probe import antiparallel_pairs
+        vecs = self.probe_effect_vectors(k_ticks=k_ticks, seed=seed)
+        pairs = antiparallel_pairs(vecs)
+        self.reset(seed=int(seed))              # discard the probe's dirty world
+        return pairs
 
     # -- provisioning -----------------------------------------------------
     def _ensure_provisioned(self) -> None:
@@ -498,10 +543,12 @@ class GodotServeEnv:
         if self._done:
             raise RuntimeError("step() after episode end — call reset() first")
         # CHORD: `action` is a MultiBinary 0/1 vector -> the sorted chord wire form (a lone
-        # pressed key stays a plain str; all-keys-off -> [] idle when allow_idle). DISCRETE:
-        # `action` is an index -> the single verb string (byte-identical to the pre-chord wire).
+        # pressed key stays a plain str; all-keys-off -> [] idle when allow_idle). A both-pressed
+        # measured-antiparallel pair projects to neither (oppose_pairs). DISCRETE: `action` is an
+        # index -> the single verb string (byte-identical to the pre-chord wire).
         if self.chord_mode:
-            wire = chord_from_mask(action, self.actions, allow_empty=self.allow_idle)
+            wire = chord_from_mask(action, self.actions, allow_empty=self.allow_idle,
+                                   oppose_pairs=self.oppose_pairs)
         else:
             wire = self.actions[int(action)]
         # One decision tick per step (n_ticks=1) — keeps per-step semantics identical

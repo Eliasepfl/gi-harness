@@ -166,7 +166,8 @@ def _batch_vec_env_cls():
                      timeout_s: float = SERVE_TIMEOUT_S,
                      connect_timeout_s: float = CONNECT_TIMEOUT_S,
                      rays: dict | None = None, obs_profile: str = "positions",
-                     chord_mode: bool = False, allow_idle: bool | None = None):
+                     chord_mode: bool = False, allow_idle: bool | None = None,
+                     ban_contradictions: bool = True, oppose_pairs=None):
             self._proc = None
             self._conn = None
             self._listener = None
@@ -188,6 +189,13 @@ def _batch_vec_env_cls():
             self._chord_mode = bool(chord_mode)
             _idle = self._chord_mode if allow_idle is None else bool(allow_idle)
             self._allow_idle = self._chord_mode and _idle
+            # CONTRADICTORY-CHORD projection (Phase 2): measured-antiparallel pairs come from
+            # g3_prime's ONE shared single-instance probe (the batched host does not self-probe);
+            # a both-pressed pair projects to neither in step_async. Empty -> no projection.
+            self.ban_contradictions = bool(ban_contradictions)
+            self._oppose_pairs = ([tuple(p) for p in oppose_pairs]
+                                  if (self._chord_mode and self.ban_contradictions
+                                      and oppose_pairs) else [])
             # Obs profile + opt-in egocentric raycast obs (see harness.rl.godot_env).
             # "positions" (default) -> wire + obs byte-identical; the rays profiles cast an
             # egocentric fan/grid per instance. n_rays sized at _freeze_layout (dim-pinned).
@@ -391,9 +399,11 @@ def _batch_vec_env_cls():
             acts = np.asarray(actions)
             if self._chord_mode:
                 # Each ROW is one instance's MultiBinary vector -> its sorted chord wire form
-                # (lone key -> plain str; all-off -> [] when allow_idle). Never flatten here.
+                # (lone key -> plain str; all-off -> [] when allow_idle; a both-pressed measured-
+                # antiparallel pair -> neither). Never flatten here.
                 self._pending_action_strs = [
-                    chord_from_mask(row, self.actions, allow_empty=self._allow_idle)
+                    chord_from_mask(row, self.actions, allow_empty=self._allow_idle,
+                                    oppose_pairs=self._oppose_pairs)
                     for row in acts]
             else:
                 self._pending_action_strs = [

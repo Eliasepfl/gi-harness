@@ -188,6 +188,51 @@ def test_chord_and_idle_wire_actions_replay_through_executor():
 
 
 # ====================================================================== #
+# 3b. Contradictory-chord projection — pairs discovered from MEASURED physics
+# ====================================================================== #
+@requires_godot
+def test_chord_env_discovers_opposition_pairs_mechanically():
+    """The chord env probes each action's effect vector on the controlled body and discovers
+    the near-antiparallel pairs — for mini_collect (up/down, left/right) — from the MEASURED
+    displacement, never the names. A both-pressed opposing pair then projects to neither."""
+    env = GodotServeEnv(MINI, port_base=_free_port(), chord_mode=True)
+    try:
+        acts = env.actions                       # ["up","down","left","right"]
+        named = {tuple(sorted((acts[i], acts[j]))) for i, j in env.oppose_pairs}
+        assert ("down", "up") in named, env.oppose_pairs      # opposite vertical movers
+        assert ("left", "right") in named, env.oppose_pairs   # opposite lateral movers
+        # left+right (the mb degenerate self-cancel) -> projects to neither -> idle []
+        assert chord_from_mask(_mask(acts, "left", "right"), acts,
+                               allow_empty=env.allow_idle,
+                               oppose_pairs=env.oppose_pairs) == []
+        # a NON-opposing chord (up+right) survives as a real 2-key chord
+        w = chord_from_mask(_mask(acts, "up", "right"), acts, allow_empty=env.allow_idle,
+                            oppose_pairs=env.oppose_pairs)
+        assert isinstance(w, list) and set(w) == {"up", "right"}
+        # and stepping a projected (fully self-cancelling) mask is a clean idle tick
+        env.reset(seed=0)
+        _o, _r, _t, _tr, i = env.step(_mask(acts, "left", "right"))
+        assert i["tick"] == 1
+    finally:
+        env.close()
+
+
+@requires_godot
+def test_chord_ban_can_be_disabled():
+    """ban_contradictions=False -> no pairs discovered (projection off), so left+right stays a
+    real 2-key chord (the A/B knob)."""
+    env = GodotServeEnv(MINI, port_base=_free_port(), chord_mode=True,
+                        ban_contradictions=False)
+    try:
+        assert env.oppose_pairs == []
+        w = chord_from_mask(_mask(env.actions, "left", "right"), env.actions,
+                            allow_empty=env.allow_idle, oppose_pairs=env.oppose_pairs)
+        assert isinstance(w, list) and set(w) == {"left", "right"}
+    finally:
+        env.close()
+
+
+# ====================================================================== #
 # 4. MultiBinary g3_prime learnability pipeline (needs sb3) + chord histogram
 # ====================================================================== #
 @requires_godot
@@ -205,6 +250,10 @@ def test_g3_prime_chord_smoke_emits_chord_histogram(monkeypatch):
                    chord_mode=True)
 
     assert res["chord_mode"] is True
+    assert res["chord_ban_contradictions"] is True   # projection on by default in chord mode
+    # opposition pairs are logged (mechanically discovered) — up/down + left/right for mini_collect
+    assert ["down", "up"] in res["chord_opposition_pairs"] or \
+           ["up", "down"] in res["chord_opposition_pairs"], res["chord_opposition_pairs"]
     assert res["bridge_ok"] in (None, True)          # never a broken serve/batch bridge
     assert res["trained_steps"] >= 4000 - 64 * 2
     hist = res["action_histogram"]["greedy"]

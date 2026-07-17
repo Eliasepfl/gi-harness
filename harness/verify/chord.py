@@ -128,7 +128,32 @@ def wire_actions(actions: Iterable, valid: Optional[Iterable[str]] = None, *,
     return out
 
 
-def chord_from_mask(mask, actions: Sequence, *, allow_empty: bool = False):
+def project_opposition(mask, oppose_pairs) -> list:
+    """CONTRADICTORY-CHORD resolution (Phase 2, Elias). Given a 0/1 ``mask`` and
+    ``oppose_pairs`` -- a list of ``(i, j)`` index pairs whose action EFFECT VECTORS were
+    MEASURED to be near-antiparallel (see :func:`harness.rl.chord_probe.antiparallel_pairs`)
+    -- DROP BOTH members of any such pair that are BOTH pressed. Their physical net effect
+    is ~zero anyway, so this is RESOLUTION, not punishment: no reward term, no illegal-action
+    machinery, just the mask the physics would have realised. Opposition is derived MECHANICALLY
+    from the probe (never from action names -- no taxonomy). Returns a NEW list; the collected
+    clears are computed off the ORIGINAL mask so the result is order-independent.
+
+    An action may appear in several pairs; it is cleared if ANY of its pairs is fully pressed."""
+    mask = list(mask)
+    if not oppose_pairs:
+        return mask
+    clear: set = set()
+    for i, j in oppose_pairs:
+        if mask[i] and mask[j]:
+            clear.add(i)
+            clear.add(j)
+    for k in clear:
+        mask[k] = 0
+    return mask
+
+
+def chord_from_mask(mask, actions: Sequence, *, allow_empty: bool = False,
+                    oppose_pairs=None):
     """The SINGLE MultiBinary->wire bridge (Phase 2). Map a binary ``mask`` (an iterable
     of 0/1, one bit per verb, positionally aligned with the game's ordered ``actions``)
     to the canonical wire form via :func:`wire_action` -- so a single pressed key collapses
@@ -136,6 +161,13 @@ def chord_from_mask(mask, actions: Sequence, *, allow_empty: bool = False):
     become a sorted ``list[str]`` chord, and (only when ``allow_empty``) all-keys-off
     becomes the empty list ``[]`` idle tick. Reuses ``wire_action`` for the canonicalization
     so the sort/collapse/validate rules live in exactly one place.
+
+    ``oppose_pairs`` (opt-in): measured-antiparallel index pairs. When given, the mask is
+    first passed through :func:`project_opposition` so a pressed contradictory pair drops
+    BOTH keys (a self-cancelling combo becomes the move the physics would realise -- possibly
+    the ``[]`` idle tick when nothing else is pressed). This is the ENV-side projection that
+    collapses the 2^n space toward the natural controller semantics and stops exploration
+    wasting mass on self-cancelling combos.
 
     ``mask`` length must equal ``len(actions)`` (a shape mismatch is a caller bug, raised
     as :class:`ChordError`). Truthiness of each bit is used, so a numpy int/bool row works.
@@ -145,5 +177,7 @@ def chord_from_mask(mask, actions: Sequence, *, allow_empty: bool = False):
     if len(mask) != len(actions):
         raise ChordError(
             f"mask length {len(mask)} != n_actions {len(actions)}")
+    if oppose_pairs:
+        mask = project_opposition(mask, oppose_pairs)
     pressed = [a for a, bit in zip(actions, mask) if bit]
     return wire_action(pressed, actions, allow_empty=allow_empty)

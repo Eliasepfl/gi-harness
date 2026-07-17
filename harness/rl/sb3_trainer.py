@@ -507,6 +507,7 @@ def _rollout(env, model, seed: int, *, greedy: bool, torch_seed=None) -> dict:
         torch.manual_seed(torch_seed)
     chord = bool(getattr(env, "chord_mode", False))
     allow_idle = bool(getattr(env, "allow_idle", False))
+    oppose_pairs = getattr(env, "oppose_pairs", None)   # measured contradictory-chord pairs
     obs, _ = env.reset(seed=seed)
     action_strings: list = []
     total = 0.0
@@ -518,7 +519,8 @@ def _rollout(env, model, seed: int, *, greedy: bool, torch_seed=None) -> dict:
         if chord:
             mask = np.asarray(action).reshape(-1)
             action_strings.append(
-                chord_from_mask(mask, env.actions, allow_empty=allow_idle))
+                chord_from_mask(mask, env.actions, allow_empty=allow_idle,
+                                oppose_pairs=oppose_pairs))
             step_action = mask
         else:
             a = int(np.asarray(action).reshape(-1)[0])
