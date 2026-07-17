@@ -15,6 +15,17 @@ Nothing here generates, mutates, or re-certifies existing games; the funnel is u
 CLI::
 
     python -m harness.atlas.build --games '<glob-or-list>' --out runs/atlas/ [--reports ...] [--facts] [--verify]
+
+THE CUT is a choice, not a commitment — the raw descriptors always land in ``atlas.jsonl``
+so any map can be re-cut from them after the fact::
+
+    # flagship: WORLD × PLAY (default), solver effort demoted to point size
+    python -m harness.atlas.build --games 'scenes/games/*' --out runs/atlas/
+    # the legacy map (effort × entropy), kept renderable verbatim
+    python -m harness.atlas.build ... --legacy-cut
+    # any other cut: any composite, any descriptor, or 'auto'
+    python -m harness.atlas.build ... --x n_mechanics --y witness_entropy
+    python -m harness.atlas.build --axis-choices        # list every valid axis
 """
 
 from __future__ import annotations
@@ -26,6 +37,10 @@ import os
 import sys
 import time
 
+from harness.atlas.composites import (
+    AUTO, AxisSpace, DEFAULT_MIN_EVIDENCE, DEFAULT_NORM, DEFAULT_SIZE, DEFAULT_X, DEFAULT_Y,
+    LEGACY_X, LEGACY_Y, NORM_MODES, axis_choices,
+)
 from harness.atlas.descriptors import DESCRIPTOR_KEYS, describe_game, slug_of
 from harness.atlas.ghosts import build_ghosts
 from harness.atlas.frontier import scan_frontier
@@ -183,7 +198,8 @@ def _games_root_of(game_paths):
 
 def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=False,
                 n_bins=6, ghost_globs=None, frontier_reports=None, games_root=None,
-                complexity_panel=False, log=None):
+                complexity_panel=False, x=None, y=None, size=DEFAULT_SIZE,
+                norm=DEFAULT_NORM, min_evidence=DEFAULT_MIN_EVIDENCE, log=None):
     """Aggregate descriptors for ``games`` into ``out_dir/atlas.jsonl`` + ``atlas.svg``.
 
     Returns ``(rows, summary)`` where ``summary`` carries the coverage math + chosen axes.
@@ -194,7 +210,12 @@ def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=
     their ``.tscn`` sources). ``frontier_reports`` (a glob of ``gen_*.json``) overlays the
     OVER-BUDGET FRONTIER: UNSOLVED-but-progressing games whose dirs still exist under
     ``games_root`` (defaults to the resolved library root). Both are OVERLAYS — neither
-    affects the coverage math, which stays over the certified ``games`` only."""
+    affects the coverage math, which stays over the certified ``games`` only.
+
+    ``x``/``y``/``size`` choose the CUT (default: the WORLD × PLAY composites with solver
+    effort demoted to size); ``norm``/``min_evidence`` tune composite construction. The
+    RAW descriptors are always written to ``atlas.jsonl`` regardless of the cut, so the map
+    is re-cuttable after the fact and no claim depends on this build's axis choice."""
     log = log or (lambda *a: None)
     os.makedirs(out_dir, exist_ok=True)
     game_paths = resolve_games(games)
@@ -286,6 +307,14 @@ def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=
     # --- emit atlas.jsonl (certified rows + tagged overlays) ---
     for row in rows:
         row.setdefault("kind", "certified")
+    # Attach the DERIVED composite block beside (never instead of) the raw descriptors:
+    # an audit trail carrying each axis's value, its evidence, and which components backed
+    # it. Composites are library-relative, so this is a snapshot of THIS build — every
+    # reader (including our own renderer) recomputes from the raw descriptors rather than
+    # trusting these numbers. They exist so a claim can be checked, not so it can be reused.
+    blocks = AxisSpace(rows, norm=norm, min_evidence=min_evidence).composite_rows()
+    for row, blk in zip(rows, blocks):
+        row["composites"] = blk
     jsonl_path = os.path.join(out_dir, "atlas.jsonl")
     with open(jsonl_path, "w", encoding="utf-8") as fh:
         for row in rows + ghost_rows + frontier_rows:
@@ -295,7 +324,8 @@ def build_atlas(games, out_dir, *, reports_glob=None, do_facts=False, do_verify=
     svg_path = os.path.join(out_dir, "atlas.svg")
     summary = render_atlas(rows, svg_path, n_bins=n_bins,
                            ghosts=ghost_rows, frontier=frontier_rows,
-                           complexity_panel=complexity_panel)
+                           complexity_panel=complexity_panel, x=x, y=y, size=size,
+                           norm=norm, min_evidence=min_evidence)
     # persist a machine-readable summary next to the artifacts
     with open(os.path.join(out_dir, "atlas.summary.json"), "w", encoding="utf-8") as fh:
         json.dump({k: v for k, v in summary.items() if k != "svg"}, fh, indent=2,
@@ -317,14 +347,36 @@ def load_rows(jsonl_path):
 # ======================================================================== #
 # CLI
 # ======================================================================== #
+def _print_axis_coverage(summary, axis):
+    """Print one axis's TRUTHFUL backing: for a composite, the per-component coverage over
+    the library and the evidence ceiling; for a raw descriptor, simple presence."""
+    cov = (summary.get("axis_coverage") or {}).get(axis)
+    if not cov:
+        return
+    n = cov["n_total"]
+    print(f"  {axis.upper()} = {cov['name']}: {cov['n_placed']}/{n} placeable, "
+          f"{cov['n_full_evidence']}/{n} with FULL evidence "
+          f"(max evidence achieved: {cov['max_evidence']:.2f} of 1.00)")
+    for key, c in (cov.get("components") or {}).items():
+        gap = "" if c["n_present"] else "   <-- NOTHING in this library"
+        guard = "guarded" if c["guarded"] else "UNGUARDED"
+        print(f"      w={c['weight']:.2f}  {key:22s} {c['n_present']:2d}/{n}  "
+              f"[{guard}, {c['transform']}]{gap}")
+
+
 def _print_summary(rows, summary):
     x, y = summary["axes"]
     print("=" * 70)
     print(f"ATLAS built over {len(rows)} games "
           f"({summary['n_placed']} placed, {summary['n_unplaced']} off-map)")
     print(f"axes: X = {x}   Y = {y}   size = {summary['size_axis']}")
+    print(f"norm = {summary.get('norm')}   min_evidence = {summary.get('min_evidence')}")
     print(f"COVERAGE: {summary['coverage'] * 100:.1f}%  "
           f"({summary['n_colonized']}/{summary['n_cells']} cells colonised)")
+    print(f"DESCRIPTOR COMPLETENESS: {summary.get('n_incomplete')}/{len(rows)} games have "
+          f"INCOMPLETE descriptors on these axes")
+    _print_axis_coverage(summary, "x")
+    _print_axis_coverage(summary, "y")
     if summary.get("n_ghosts") or summary.get("n_frontier"):
         print(f"overlays: {summary.get('n_ghosts', 0)} ghost references, "
               f"{summary.get('n_frontier', 0)} over-budget frontier "
@@ -368,13 +420,46 @@ def main(argv=None):
     ap.add_argument("--complexity", action="store_true",
                     help="add the opt-in L1 STRUCTURAL-COMPLEXITY strip to atlas.svg "
                          "(additive; never changes the map axes)")
+    # --- the CUT: the map is a choice, not a commitment ---
+    ap.add_argument("--x", default=DEFAULT_X, metavar="AXIS",
+                    help=f"X axis: a composite, a descriptor, or 'auto' "
+                         f"(default: {DEFAULT_X})")
+    ap.add_argument("--y", default=DEFAULT_Y, metavar="AXIS",
+                    help=f"Y axis: a composite, a descriptor, or 'auto' "
+                         f"(default: {DEFAULT_Y})")
+    ap.add_argument("--size", default=DEFAULT_SIZE, metavar="AXIS",
+                    help=f"point-size annotation (default: {DEFAULT_SIZE} — solver effort "
+                         f"is an ANNOTATION, never an axis)")
+    ap.add_argument("--legacy-cut", action="store_true",
+                    help=f"shorthand for --x {LEGACY_X} --y {LEGACY_Y} (the pre-WORLD×PLAY "
+                         f"map, kept renderable verbatim)")
+    ap.add_argument("--norm", default=DEFAULT_NORM, choices=list(NORM_MODES),
+                    help=f"composite normalisation over the library (default: "
+                         f"{DEFAULT_NORM}; 'rank' spreads by construction and inflates "
+                         f"apparent coverage — read it for ORDERING, not magnitude)")
+    ap.add_argument("--min-evidence", type=float, default=DEFAULT_MIN_EVIDENCE,
+                    metavar="F",
+                    help=f"minimum fraction of a composite's weight that must be backed "
+                         f"by real data before a game is placed (default: "
+                         f"{DEFAULT_MIN_EVIDENCE}); below it the game goes off-map rather "
+                         f"than onto a fabricated coordinate")
+    ap.add_argument("--axis-choices", action="store_true",
+                    help="print every valid --x/--y value and exit")
     args = ap.parse_args(argv)
+
+    if args.axis_choices:
+        print("\n".join(axis_choices()))
+        return 0
+    x_axis, y_axis = args.x, args.y
+    if args.legacy_cut:
+        x_axis, y_axis = LEGACY_X, LEGACY_Y
 
     rows, summary = build_atlas(
         args.games, args.out, reports_glob=args.reports, do_facts=args.facts,
         do_verify=args.verify, n_bins=args.bins, ghost_globs=args.ghosts,
         frontier_reports=args.frontier, games_root=args.games_root,
-        complexity_panel=args.complexity, log=lambda *a: print(*a))
+        complexity_panel=args.complexity, x=x_axis, y=y_axis, size=args.size,
+        norm=args.norm, min_evidence=args.min_evidence, log=lambda *a: print(*a))
     _print_summary(rows, summary)
     print(f"wrote {os.path.join(args.out, 'atlas.jsonl')}")
     print(f"wrote {os.path.join(args.out, 'atlas.svg')}")
