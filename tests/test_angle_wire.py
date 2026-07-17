@@ -106,8 +106,8 @@ def test_vector_angle_game_serves_parseable_frames():
     finally:
         ex.close()
     assert rec.get("error") in (None, ""), rec.get("error")
-    obs = rec.get("obs_state") or {}
-    ang = (obs.get("probe") or {}).get("angle")
+    snap = rec.get("final_snapshot") or {}
+    ang = (snap.get("probe") or {}).get("angle")
     assert isinstance(ang, list) and len(ang) == 3, ang
 
 
@@ -124,7 +124,7 @@ def test_vector_angle_twin_determinism():
                                16)[0]
         finally:
             ex.close()
-        obs = rec.get("obs_state") or {}
-        runs.append((obs.get("probe") or {}).get("angle"))
+        snap = rec.get("final_snapshot") or {}
+        runs.append((snap.get("probe") or {}).get("angle"))
     assert runs[0] == runs[1], (runs[0], runs[1])
     assert any(abs(c) > 1e-9 for c in runs[0]), "probe never rotated; test is vacuous"
