@@ -110,7 +110,10 @@ func _run() -> void:
 				var a = parsed.get("actions", [])
 				if typeof(a) == TYPE_ARRAY:
 					for v in a:
-						_actions.append(str(v))
+						# Preserve the wire form: a String stays a single verb (byte-
+						# identical to legacy witnesses); an Array stays a chord. The
+						# act spot below dispatches on type via ChordUtil.
+						_actions.append(v)
 
 	# Load + compile the game source (in-memory, like serve_game.gd).
 	var gf := FileAccess.open(game_file, FileAccess.READ)
@@ -218,9 +221,11 @@ func _replay() -> void:
 		stride = max(1, int(ceil(float(n) / float(_max_frames - 2))))
 
 	for i in range(n):
-		var action := str(_actions[i]) if i < _actions.size() else ""
-		if action != "":
-			_game.act(action)
+		var raw = _actions[i] if i < _actions.size() else ""
+		# Empty String = noop tick (legacy semantics preserved). A String verb or an
+		# Array chord goes through the single ChordUtil boundary, same as serve.
+		if typeof(raw) == TYPE_ARRAY or str(raw) != "":
+			ChordUtil.apply(_game, raw)
 		_applied += 1
 		var frozen := false
 		for k in range(K_STEPS):

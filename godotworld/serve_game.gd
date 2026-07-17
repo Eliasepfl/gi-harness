@@ -504,7 +504,7 @@ func _do_ticks(actions_list: Array, n_ticks: int, frames_every: int,
 		if actions_list.size() > 0:
 			action = actions_list[i] if i < actions_list.size() else actions_list[actions_list.size() - 1]
 		if action != null:
-			_game.act(str(action))
+			ChordUtil.apply(_game, action)      # String verb OR Array chord, canonical order
 		_applied += 1
 		for k in range(K_STEPS):
 			await physics_frame
@@ -801,7 +801,7 @@ func _batch_do_ticks(actions_list: Array, n_ticks: int) -> void:
 			if i < actions_list.size():
 				action = actions_list[i]
 			if action != null:
-				_games[i].act(str(action))
+				ChordUtil.apply(_games[i], action)   # String verb OR Array chord, canonical order
 			_applied_arr[i] += 1
 		for k in range(K_STEPS):
 			await physics_frame                     # steps EVERY instance's space at once
