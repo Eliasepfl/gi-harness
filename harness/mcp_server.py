@@ -39,16 +39,36 @@ RESOURCE BOUNDS
     the way of the MCP servers (godot-ai :8000, this server :8010).
   * Sane subprocess budgets (the funnel's own GAMEVERIFY_TIMEOUT_S) + sandbox cleanup.
 
+RUNTIME ENV (REQUIRED)
+----------------------
+The server MUST run in an env that has the harness RUNTIME deps (numpy) as well as fastmcp.
+The gd verify route lazy-imports ``harness.rl.godot_env`` (numpy) inside
+``GdExecutor.__init__``, so a numpy-less env IMPORTS the server fine but crashes on the
+FIRST gd verify. Run under EITHER the ``godot-rl`` conda env (``module load
+miniforge/24.3.0-0 && conda activate godot-rl``; carries numpy + the harness deps, add
+fastmcp) OR the godot-ai uv env with ``uv run --with numpy``. NEVER the bare godot-ai uv
+env (it ships fastmcp but not numpy) -- that was the PoC-3 Step-A failure. A missing dep now
+surfaces as a self-diagnosing ``error_cause`` (e.g. ``ModuleNotFoundError: No module named
+'numpy'``), never an opaque "verify crashed".
+
 RUN (compute node; the godot-ai uv env ships fastmcp 3.4.4 + python 3.12)
 ------------------------------------------------------------------------
+The funnel needs BOTH fastmcp AND the harness runtime deps. The godot-ai uv env has
+fastmcp but NOT numpy, and the gd verify route lazy-imports ``harness.rl.godot_env``
+(numpy) inside ``GdExecutor.__init__`` -- so the server IMPORTS fine but the first gd
+verify would crash without it. Bring numpy along with ``--with numpy``:
+
     PYTHONPATH=<gi-harness-worktree> \
     HARNESS_GODOT_EXE=<godot-console-binary-or-apptainer-wrapper> \
     GIP_PORT_BASE=54000 \
-    ~/.local/bin/uv --project /home/enaha/GI/godot-ai run --no-sync \
+    ~/.local/bin/uv --project /home/enaha/GI/godot-ai run --no-sync --with numpy \
         python -m harness.mcp_server --host 127.0.0.1 --port 8010
 
-Alternatively, under the harness's native env (``module load miniforge/24.3.0-0 &&
-conda activate godot-rl``) once ``fastmcp`` is installed there -- see sec.9 env discipline.
+Alternatively, under the harness's NATIVE env (``module load miniforge/24.3.0-0 &&
+conda activate godot-rl``), which already carries numpy + the harness runtime deps, once
+``fastmcp`` is installed there (sec.9 env discipline). Either way the gd verify route needs
+numpy present -- a missing dep now surfaces as a self-diagnosing ``error_cause``/hint, not
+an opaque "verify crashed".
 Register with Hermes as ``harness-funnel`` -> ``http://127.0.0.1:8010/mcp``.
 """
 
@@ -367,6 +387,7 @@ def _do_verify(game_source: str, level: int | None) -> dict:
         # VERIFY_ERROR shape (engine missing / timeout / crash): still typed feedback.
         return {"verdict": "VERIFY_ERROR", "passed": False,
                 "failure_class": "VERIFY_ERROR", "error": report.get("error"),
+                "error_cause": _error_cause(report.get("error")),
                 "per_gate": {}, "hint": _verify_error_hint(report.get("error")),
                 "directives": [], "directive_text": "", "warnings": [],
                 "witness_summary": None, "progress": None,
@@ -420,16 +441,38 @@ _LEVEL_NOTE = ("`level` is advisory metadata only: the frozen funnel always runs
               "G0-G3 schedule; no parameter can weaken, skip, or reconfigure a gate.")
 
 
+def _error_cause(error) -> str | None:
+    """The single most informative line of a VERIFY_ERROR: the final traceback line (the
+    real exception), else the message. Surfacing this turns an opaque 'verify crashed' into
+    a self-diagnosing failure (e.g. a missing runtime dep in the server's env)."""
+    if not isinstance(error, dict):
+        return None
+    tb = error.get("traceback")
+    if tb:
+        lines = [ln for ln in str(tb).splitlines() if ln.strip()]
+        if lines:
+            return lines[-1].strip()
+    return error.get("message")
+
+
 def _verify_error_hint(error) -> str:
     if isinstance(error, dict):
         t = error.get("type")
+        cause = _error_cause(error)
         if t == "timeout":
             return "verify timed out -- the game may loop or be too slow to solve."
         if t in ("crash", "exception"):
+            # A ModuleNotFoundError here is a SERVER-ENV problem (the funnel needs the
+            # harness runtime deps, e.g. numpy), NOT a bug in the game -- name it so.
+            if cause and "ModuleNotFoundError" in cause:
+                return (f"verify could not run: {cause}. The funnel server's env is missing "
+                        "a harness runtime dependency -- start it with numpy available "
+                        "(see harness.mcp_server run instructions). Not a game error.")
+            if cause:
+                return f"verify crashed before producing a report: {cause}"
             return "verify crashed before producing a report; check the script for a build/act error."
-        msg = error.get("message") or error.get("traceback")
-        if msg:
-            return f"verify environment error: {str(msg)[:200]}"
+        if cause:
+            return f"verify environment error: {str(cause)[:200]}"
     return "verify could not run (engine unavailable or environment error)."
 
 
