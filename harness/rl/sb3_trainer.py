@@ -366,7 +366,8 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           method: str = DEFAULT_METHOD, make_batch_venv=None, num_shards: int = 1,
           make_shard_venv=None, torch_num_threads: int | None = None,
           best_model_path: str | None = None, eval_fn=None,
-          eval_freq_updates: int = EVAL_FREQ_UPDATES, **overrides) -> dict:
+          eval_freq_updates: int = EVAL_FREQ_UPDATES,
+          warmstart=None, rnd=None, **overrides) -> dict:
     """Train an SB3 learner on `make_env` (a 0-arg PlanckEnv factory) for
     ~`total_steps` env-steps and return the same dict shape as `ppo.train` (agent +
     curves + steps_to_first_success + bookkeeping, plus the resolved `method`).
@@ -405,10 +406,14 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     # One PlanckEnv per vec slot, wrapped as gymnasium.Env then Monitored so each
     # episode-end info carries r/l PLUS our success + n_latched (info_keywords) —
     # the callback reads those to rebuild the vendored curves.
-    def _make_init():
+    def _make_init(slot: int = 0):
         def _init():
-            return Monitor(wrap_gym(make_env()),
-                           info_keywords=("success", "n_latched"))
+            # WITNESS-WARMSTART (OPT-IN): thread the shared curriculum + a per-slot rng seed
+            # into the gym adapter so each slot Backplay-replays an independently-drawn
+            # witness prefix on reset. `warmstart=None` -> wrap_gym byte-identical to before.
+            genv = wrap_gym(make_env(), warmstart=warmstart,
+                            ws_seed=(int(seed) * 1000 + slot))
+            return Monitor(genv, info_keywords=("success", "n_latched"))
         return _init
 
     # MULTI-CPU PER GAME (Elias, 2026-07-15). SB3's SubprocVecEnv does NOT fit: each
@@ -423,7 +428,12 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     # the old path everywhere (debug). Farm-level parallelism (1 game/array task) is
     # orthogonal and still live.
     num_shards = int(num_shards)
-    force_dummy = os.environ.get("HARNESS_VECENV") == "dummy"
+    # WITNESS-WARMSTART lives in the gym adapter's reset (Backplay prefix replay via the
+    # single-instance serve stepping); the batched serve_game.gd host steps all N instances
+    # together and has no per-slot prefix seam. So warmstart FORCES the sequential
+    # DummyVecEnv lane (N independent GodotServeEnv slots, each replay-capable) — the clean
+    # reuse of the adversary idiom with zero engine changes. Documented, opt-in.
+    force_dummy = (os.environ.get("HARNESS_VECENV") == "dummy") or (warmstart is not None)
     # SHARDING first (M*K logical envs over M concurrent Godot processes), then the
     # single-process batch, then the sequential DummyVecEnv. num_shards==1 never takes
     # the shard path -> the batch/dummy behavior stays byte-identical to before.
@@ -440,7 +450,24 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     elif use_batch:
         venv = make_batch_venv(num_envs)
     else:
-        venv = DummyVecEnv([_make_init() for _ in range(num_envs)])
+        venv = DummyVecEnv([_make_init(i) for i in range(num_envs)])
+
+    # RND (OPT-IN, anti-camping): compose a VecEnvWrapper around the ONE venv all three
+    # lanes converge on, adding the bounded/decaying intrinsic bonus in step_wait and
+    # training the predictor on the collected obs. `rnd=None` -> no wrapper -> byte-identical
+    # to vanilla PPO. Reward invariants are respected (see harness.rl.rnd): the wrapper never
+    # touches step_reward or the `success` certificate, the bonus is bounded and anneals to
+    # `int_coef_final` while RND's own novelty decay drives it to ~0 at convergence.
+    rnd_wrapper = None
+    if rnd is not None:
+        from harness.rl import rnd as rnd_mod
+        rcfg = dict(rnd) if isinstance(rnd, dict) else {}
+        model_kw = {k: rcfg[k] for k in ("feat_dim", "hidden", "lr") if k in rcfg}
+        rnd_model = rnd_mod.RNDModel(obs_dim, seed=seed, device=device, **model_kw)
+        wrap_kw = {k: rcfg[k] for k in ("int_coef", "int_coef_final", "update_predictor")
+                   if k in rcfg}
+        venv = rnd_mod.wrap_venv(venv, rnd_model, total_steps=total_steps, **wrap_kw)
+        rnd_wrapper = venv
 
     # CPU-learner thread policy (the sharded single-game-throughput fix — see
     # SHARD_TORCH_THREADS). Explicit `torch_num_threads` always wins; else the SHARDED path
@@ -458,10 +485,19 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     model = (_build_dqn(algo_cls, venv, hp, seed) if method == "dqn"
              else _build_onpolicy(method, algo_cls, venv, hp, seed))
 
-    callback = _build_callback_cls()(hp, log=log,
+    curve_cb = _build_callback_cls()(hp, log=log,
                                      wall_clock_budget_s=wall_clock_budget_s,
                                      best_model_path=best_model_path, eval_fn=eval_fn,
                                      eval_freq_updates=eval_freq_updates)
+    callback = curve_cb
+    # WITNESS-WARMSTART (OPT-IN): append the curriculum-annealing callback so finished
+    # episodes step the prefix down. Composed via CallbackList so the curve/plateau/best-ckpt
+    # callback (`curve_cb`, whose attributes the return dict reads) is untouched; only built
+    # when warmstart is enabled (vanilla path unchanged).
+    if warmstart is not None:
+        from stable_baselines3.common.callbacks import CallbackList
+        from harness.rl.warmstart import build_warmstart_callback
+        callback = CallbackList([curve_cb, build_warmstart_callback(warmstart, log=log)])
     start = time.time()
     model.learn(total_timesteps=total_steps, callback=callback, progress_bar=False)
     train_wall = time.time() - start
@@ -470,22 +506,28 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     return {
         "agent": model,
         "method": method,
-        "curve_return": callback.curve_return,
-        "curve_latched": callback.curve_latched,
-        "curve_success": callback.curve_success,
-        "steps_to_first_success": callback.steps_to_first_success,
+        "curve_return": curve_cb.curve_return,
+        "curve_latched": curve_cb.curve_latched,
+        "curve_success": curve_cb.curve_success,
+        "steps_to_first_success": curve_cb.steps_to_first_success,
         "global_steps": int(model.num_timesteps),
-        "updates": callback.updates,
-        "stopped_early": callback.stopped_early,
-        "plateau_stopped": callback.plateau_stopped,
-        "best_success_rate_train": round(callback.best_success, 3),
+        "updates": curve_cb.updates,
+        "stopped_early": curve_cb.stopped_early,
+        "plateau_stopped": curve_cb.plateau_stopped,
+        "best_success_rate_train": round(curve_cb.best_success, 3),
         # BEST-CHECKPOINT provenance (eval-keyed; None-safe when no snapshot was saved).
-        "best_model_path": (best_model_path if callback.best_ckpt_saved else None),
-        "best_ckpt_update": callback.best_ckpt_update,
-        "best_ckpt_greedy_sr": callback.best_ckpt_greedy,
-        "best_ckpt_stochastic_sr": callback.best_ckpt_stochastic,
+        "best_model_path": (best_model_path if curve_cb.best_ckpt_saved else None),
+        "best_ckpt_update": curve_cb.best_ckpt_update,
+        "best_ckpt_greedy_sr": curve_cb.best_ckpt_greedy,
+        "best_ckpt_stochastic_sr": curve_cb.best_ckpt_stochastic,
         "train_wall_s": round(train_wall, 1),
         "hp": hp,
+        # EXPLORATION-ARM diagnostics (present only when the arm is enabled).
+        "warmstart_summary": (warmstart.summary() if warmstart is not None else None),
+        "rnd_mean_intrinsic": (round(float(rnd_wrapper.mean_intrinsic), 5)
+                               if rnd_wrapper is not None else None),
+        "rnd_final_coef": (round(float(rnd_wrapper.last_coef), 5)
+                           if rnd_wrapper is not None else None),
     }
 
 

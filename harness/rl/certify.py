@@ -391,6 +391,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              best_checkpoint: bool = True,
              chord_mode: bool = False, allow_idle: bool | None = None,
              ban_contradictions: bool = True,
+             warmstart=None, rnd=None,
              **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
@@ -587,6 +588,34 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
                     "stochastic_sr": sum(1 for e in st if e["success"]) / float(_n_ps)}
 
         method_kw["eval_fn"] = _eval_fn
+
+    # --- EXPLORATION ARMS (bake-off, OPT-IN, SB3 lane) --------------------------------- #
+    # WITNESS-WARMSTART (Backplay reverse curriculum): build a WarmstartCurriculum from the
+    # game's certified witness and hand it to the trainer, which injects it into the TRAINING
+    # envs only (eval envs above are untouched -> eval SR stays pure-extrinsic from the true
+    # start). `warmstart` accepts True (defaults) or a config dict (start_frac, step_frac,
+    # success_threshold, roll_window, band_frac, witness_path, ...). RND is forwarded as a
+    # config the trainer turns into a VecEnvWrapper. Both are SB3-lane seams (rejected on the
+    # vendored lane, which has no such params).
+    _warmstart_obj = None
+    if warmstart is not None and warmstart is not False:
+        if trainer == "vendored":
+            raise ValueError("warmstart (Backplay reverse curriculum) is an sb3-lane feature")
+        from harness.rl.warmstart import WarmstartCurriculum
+        wcfg = dict(warmstart) if isinstance(warmstart, dict) else {}
+        _wpath = wcfg.pop("witness_path", None) or os.path.join(
+            os.path.dirname(os.path.abspath(game_path)), "witness.json")
+        with open(_wpath, "r", encoding="utf-8") as _wf:
+            _witness_actions = list((json.load(_wf) or {}).get("actions") or [])
+        if not _witness_actions:
+            raise ValueError(f"warmstart needs a non-empty witness at {_wpath}")
+        _warmstart_obj = WarmstartCurriculum(_witness_actions, **wcfg)
+        method_kw["warmstart"] = _warmstart_obj
+    if rnd is not None and rnd is not False:
+        if trainer == "vendored":
+            raise ValueError("rnd (Random Network Distillation) is an sb3-lane feature")
+        method_kw["rnd"] = (dict(rnd) if isinstance(rnd, dict) else {})
+
     train_res = trainer_mod.train(make_env, obs_dim, n_actions,
                                   total_steps=budget_steps, seed=seed, log=log,
                                   wall_clock_budget_s=wall_clock_budget_s,
@@ -798,6 +827,12 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "obs_dim": obs_dim,
         "checkpoint_keys": cp_keys,
         "throughput_sps": int(train_res["global_steps"] / max(1e-6, train_res["train_wall_s"])),
+        # --- exploration-arm diagnostics (bake-off; None unless the arm was enabled) ---
+        "warmstart": (_warmstart_obj.summary() if _warmstart_obj is not None else None),
+        "warmstart_final_prefix_len": (_warmstart_obj.cap_len()
+                                       if _warmstart_obj is not None else None),
+        "rnd_mean_intrinsic": train_res.get("rnd_mean_intrinsic"),
+        "rnd_final_coef": train_res.get("rnd_final_coef"),
     }
 
 
