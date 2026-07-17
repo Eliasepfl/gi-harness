@@ -743,7 +743,7 @@ def test_openrouter_complete_success_request_shape(monkeypatch):
 
     out = GG._openrouter_complete("SYS", [{"role": "user", "content": "seed"}])
 
-    assert out == "hi there"
+    assert out == ("hi there", None)
     call = fake.calls[0]
     assert call["url"] == GG._OPENROUTER_URL
     assert call["headers"]["Authorization"] == f"Bearer {_FAKE_KEY}"
@@ -767,7 +767,7 @@ def test_openrouter_retries_on_429_then_succeeds(monkeypatch):
     monkeypatch.setattr(GG.time, "sleep", lambda s: None)  # no real backoff wait
 
     out = GG._openrouter_complete("SYS", [])
-    assert out == "recovered"
+    assert out == ("recovered", None)
     assert len(fake.calls) == 3  # 429 -> 503 -> 200
 
 
@@ -1103,7 +1103,7 @@ def test_null_content_salvage_disables_thinking_once(monkeypatch):
 
     out = GG._openrouter_complete("SYS", [])
 
-    assert out == "recovered"
+    assert out == ("recovered", None)
     assert len(fake.calls) == 2
     cap = GG._OPENROUTER_REASONING_DEFAULT
     assert fake.calls[0]["json"]["reasoning"] == {"max_tokens": cap}
@@ -1131,7 +1131,7 @@ def test_null_content_cap_zero_still_salvages_with_thinking_off(monkeypatch):
                           _FakeResp(200, _chat("recovered"))])
     monkeypatch.setattr(GG, "requests", fake)
 
-    assert GG._openrouter_complete("SYS", []) == "recovered"
+    assert GG._openrouter_complete("SYS", []) == ("recovered", None)
     assert len(fake.calls) == 2
     assert "reasoning" not in fake.calls[0]["json"]
     assert fake.calls[1]["json"]["reasoning"] == {"enabled": False}
@@ -1156,7 +1156,7 @@ def test_blank_content_treated_as_null(monkeypatch):
                           _FakeResp(200, _chat("real text"))])
     monkeypatch.setattr(GG, "requests", fake)
 
-    assert GG._openrouter_complete("SYS", []) == "real text"
+    assert GG._openrouter_complete("SYS", []) == ("real text", None)
     assert len(fake.calls) == 2
 
 
