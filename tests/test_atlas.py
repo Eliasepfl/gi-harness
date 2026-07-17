@@ -19,6 +19,7 @@ from harness.atlas import descriptors as D  # noqa: E402
 from harness.atlas.descriptors import DESCRIPTOR_KEYS, describe_game, slug_of  # noqa: E402
 from harness.atlas import render as R  # noqa: E402
 from harness.atlas import build as B  # noqa: E402
+from harness.atlas import composites as C  # noqa: E402
 from harness.atlas import ghosts as G  # noqa: E402
 from harness.atlas import frontier as F  # noqa: E402
 
@@ -278,7 +279,10 @@ def test_render_atlas_end_to_end_writes_svg(tmp_path):
                          space_util_linear_ratio=1.0 + i * 2,
                          n_checkpoints=i % 4, dimension="2D" if i % 2 else "3D"))
     out = tmp_path / "atlas.svg"
-    summary = R.render_atlas(rows, str(out), n_bins=4)
+    # Explicit legacy-style cut: these rows carry only the behavioural descriptors, so name
+    # the axes under test rather than relying on the (composite) flagship default.
+    summary = R.render_atlas(rows, str(out), n_bins=4,
+                             x="witness_entropy", y="space_util_linear_ratio")
     assert out.exists()
     svg = out.read_text(encoding="utf-8")
     assert svg.startswith("<svg") and svg.rstrip().endswith("</svg>")
@@ -471,7 +475,11 @@ def test_render_includes_both_legend_classes(tmp_path):
     frontier[0]["descriptors"].update(dimension="3D", solver_expansions=5856,
                                       space_util_linear_ratio=3.0)
     out = tmp_path / "atlas.svg"
-    summary = R.render_atlas(rows, str(out), n_bins=4, ghosts=ghosts, frontier=frontier)
+    # This test pins the OVERLAY classes, not axis selection: name the cut explicitly so
+    # these rows (which carry only the legacy behavioural descriptors) are placed by the
+    # axes under test rather than by whatever the flagship default happens to be.
+    summary = R.render_atlas(rows, str(out), n_bins=4, ghosts=ghosts, frontier=frontier,
+                             x="witness_entropy", y="space_util_linear_ratio")
     svg = out.read_text(encoding="utf-8")
     # both distinct classes appear in the legend
     assert "reference (geometry only)" in svg
@@ -680,6 +688,406 @@ def test_l1_descriptors_all_none_with_no_artifacts():
     for k in ("n_mechanics", "structural_sections", "n_static_footprint",
               "gating_depth", "autonomous_bodies"):
         assert d[k] is None, f"{k} should be None with no artifacts"
+
+
+# ================================================================ WITNESS PROVENANCE
+# Solver effort is DUAL-CURRENCY (tree expansions vs RL sample complexity), which is why it
+# is demoted to an annotation and why its source must travel with it.
+def test_witness_source_read_from_g3_solver():
+    rep = fab_report(actions=["a", "b"], episodes=10, nodes=42)
+    d = describe_game("scenes/games/x/x.gd", rep)
+    assert d["witness_source"] == "tree"
+
+
+def test_witness_source_rl_and_none():
+    rep = fab_report(actions=["a", "b"], episodes=10, nodes=42)
+    rep["layers"]["G3_solve"]["checks"]["episodes"]["solver"] = "rl"
+    assert describe_game("scenes/games/x/x.gd", rep)["witness_source"] == "rl"
+    # no solver stats at all -> None, never a fabricated default
+    assert describe_game("scenes/games/x/x.gd", fab_report(actions=["a"]))[
+        "witness_source"] is None
+    assert describe_game("scenes/games/x/x.gd", None, None)["witness_source"] is None
+
+
+# ================================================================ COMPOSITES: WORLD × PLAY
+def _cx_row(slug, **desc):
+    return _row(slug, **desc)
+
+
+# ---- the published weighting is a contract ----
+def test_composite_weights_are_a_partition_of_one():
+    for comp in C.COMPOSITES.values():
+        assert sum(c.weight for c in comp.components) == pytest.approx(1.0)
+
+
+def test_structural_richness_keeps_weight_on_guarded_channels():
+    """The anti-gaming argument in one assertion: X's weight must stay concentrated on
+    channels that resist declaration-only inflation, so a future re-weighting cannot
+    quietly hand the axis to the raw body count."""
+    x = C.STRUCTURAL_RICHNESS
+    assert x.guarded_weight == pytest.approx(0.90)
+    unguarded = [c for c in x.components if not c.guarded]
+    assert [c.key for c in unguarded] == ["n_bodies"]
+    assert unguarded[0].weight <= 0.10
+    assert unguarded[0].transform == "log1p"
+    # the per-class splits must NOT be separate components (redundant re-counts of the
+    # same geometry = extra inflation paths)
+    keys = {c.key for c in x.components}
+    assert not ({"n_static", "n_dynamic", "n_sensor", "n_controlled"} & keys)
+
+
+def test_behavioural_richness_keeps_entropy_and_weights_witness_proven():
+    y = C.BEHAVIOURAL_RICHNESS
+    keys = {c.key for c in y.components}
+    assert "witness_entropy" in keys          # Elias: entropy is KEPT, inside the composite
+    assert keys == {"witness_entropy", "distinct_actions", "n_checkpoints", "witness_ticks"}
+    # the witness-PROVEN channels (cannot be faked without really playing) carry the most
+    proven = sum(c.weight for c in y.components
+                 if c.key in ("witness_entropy", "distinct_actions"))
+    assert proven >= 0.60
+
+
+# ---- normalisation ----
+def test_normalise_minmax_known_values():
+    out, degen = C.normalise_column([0.0, 5.0, 10.0], "minmax")
+    assert out == [0.0, 0.5, 1.0]
+    assert degen is False
+
+
+def test_normalise_rank_uses_midrank_so_ties_share_a_cell():
+    # ties must NOT be spread apart: a true monoculture stays stacked in one cell
+    out, _ = C.normalise_column([1.0, 1.0, 9.0], "rank")
+    assert out[0] == out[1]
+    assert out[2] == 1.0
+
+
+def test_normalise_preserves_none_never_imputes():
+    out, _ = C.normalise_column([0.0, None, 10.0], "minmax")
+    assert out == [0.0, None, 1.0]
+    out_r, _ = C.normalise_column([0.0, None, 10.0], "rank")
+    assert out_r[1] is None
+
+
+def test_normalise_degenerate_column_is_neutral_half_in_both_modes():
+    # every game identical -> no information -> neutral 0.5, not 0 (punish) or 1 (reward)
+    for mode in ("minmax", "rank"):
+        out, degen = C.normalise_column([4.0, 4.0, 4.0], mode)
+        assert out == [0.5, 0.5, 0.5], mode
+        if mode == "minmax":
+            assert degen is True
+
+
+def test_normalise_all_none_column():
+    out, degen = C.normalise_column([None, None], "minmax")
+    assert out == [None, None] and degen is False
+
+
+def test_normalise_rejects_unknown_mode():
+    with pytest.raises(ValueError):
+        C.normalise_column([1.0, 2.0], "zscore")
+
+
+# ---- aggregation: the weighted mean over PRESENT components ----
+def test_composite_is_weighted_mean_over_present_components():
+    rows = [
+        _cx_row("lo", n_mechanics=0, structural_sections=0, gating_depth=0,
+                n_static_footprint=0, autonomous_bodies=0, n_bodies=0),
+        _cx_row("hi", n_mechanics=10, structural_sections=10, gating_depth=10,
+                n_static_footprint=10, autonomous_bodies=10, n_bodies=10),
+    ]
+    vals, audit = C.STRUCTURAL_RICHNESS.evaluate(rows, min_evidence=0.0)
+    assert vals == [0.0, 1.0]                      # full evidence, min and max of library
+    assert audit[0]["evidence"] == pytest.approx(1.0)
+    assert audit[1]["components_missing"] == []
+
+
+def test_composite_missing_component_is_dropped_not_scored_zero():
+    """THE None-vs-0 CONTRACT (a bug fixed earlier; pinned here for composites).
+
+    Two games identical on every measured channel, differing only in whether gating_depth
+    is UNMEASURED (None) or MEASURED AS ZERO. Silently scoring None as 0 would collapse
+    them to the same number and punish the first game for OUR missing instrumentation."""
+    rows = [
+        _cx_row("unmeasured", n_mechanics=10, gating_depth=None, n_bodies=100),
+        _cx_row("measured_zero", n_mechanics=10, gating_depth=0, n_bodies=100),
+        _cx_row("floor", n_mechanics=0, gating_depth=10, n_bodies=0),
+    ]
+    vals, audit = C.STRUCTURAL_RICHNESS.evaluate(rows, min_evidence=0.0)
+    # the unmeasured game is scored on what IS known: top of mechanics + top of bodies
+    assert vals[0] == pytest.approx(1.0)
+    # the measured-zero game is genuinely penalised for its real zero
+    assert vals[1] < vals[0]
+    # ... and the two are NOT equal: None and 0 are different facts about the world
+    assert vals[0] != vals[1]
+    # the audit records exactly which channels backed each number (declaration order)
+    assert audit[0]["components_missing"] == ["structural_sections", "gating_depth",
+                                             "n_static_footprint", "autonomous_bodies"]
+    assert "gating_depth" in audit[1]["components_present"]
+    assert audit[0]["evidence"] == pytest.approx(0.40)   # mechanics .30 + bodies .10
+
+
+def test_composite_thin_evidence_yields_none_not_a_fabricated_point():
+    # one lone component is not a composite -> no coordinate, the game goes off-map
+    rows = [_cx_row("thin", n_bodies=5), _cx_row("thin2", n_bodies=50)]
+    vals, audit = C.STRUCTURAL_RICHNESS.evaluate(rows, min_evidence=0.0)
+    assert vals == [None, None]                   # blocked by MIN_COMPONENTS
+    assert audit[0]["evidence"] == pytest.approx(0.10)
+
+
+def test_composite_min_evidence_threshold_gates_placement():
+    rows = [
+        _cx_row("a", n_mechanics=1, n_bodies=5),      # evidence 0.40
+        _cx_row("b", n_mechanics=9, n_bodies=50),     # evidence 0.40
+    ]
+    lax, _ = C.STRUCTURAL_RICHNESS.evaluate(rows, min_evidence=0.4)
+    assert lax[0] is not None and lax[1] is not None
+    strict, _ = C.STRUCTURAL_RICHNESS.evaluate(rows, min_evidence=0.5)
+    assert strict == [None, None]                 # 0.40 evidence < 0.5 -> off-map, honestly
+
+
+# ---- ANTI-GAMING: the composite must not open a new inflation path ----
+def test_composite_spam_bodies_cannot_top_structural_richness():
+    """A game spamming 200 footprint-less bodies must not out-rank an honest world.
+
+    This is the composite-level companion to the 50-marker inflation test: that one pins
+    that markers cannot move ``structural_sections``; this one pins that routing the raw
+    count into X did not re-open the door around the guard."""
+    honest = _cx_row("honest", n_mechanics=5, structural_sections=3, gating_depth=4,
+                     n_static_footprint=6, autonomous_bodies=2, n_bodies=12)
+    spammer = _cx_row("spammer", n_mechanics=1, structural_sections=0, gating_depth=0,
+                      n_static_footprint=0, autonomous_bodies=0, n_bodies=200)
+    rows = [honest, spammer]
+    vals, _ = C.STRUCTURAL_RICHNESS.evaluate(rows)
+    assert vals[0] > vals[1]
+    # the spammer TOPS the raw-count component (normalises to 1.0) yet still cannot buy
+    # more than that channel's capped share of the axis
+    assert vals[1] <= 0.10 + 1e-9
+
+
+def test_composite_spam_cannot_top_x_under_todays_data_gap():
+    """The same guarantee under the REAL library's channel: with the host emitting no
+    per-body extents, sections/footprints/autonomous are all None, so the raw count's
+    share is amplified by renormalisation (0.10/0.58 ~ 17%) — it must STILL not win."""
+    honest = _cx_row("honest", n_mechanics=5, gating_depth=4, n_bodies=12,
+                     structural_sections=None, n_static_footprint=None,
+                     autonomous_bodies=None)
+    spammer = _cx_row("spammer", n_mechanics=1, gating_depth=0, n_bodies=200,
+                      structural_sections=None, n_static_footprint=None,
+                      autonomous_bodies=None)
+    vals, audit = C.STRUCTURAL_RICHNESS.evaluate([honest, spammer])
+    assert audit[0]["evidence"] == pytest.approx(0.58)   # today's ceiling, documented
+    assert vals[0] > vals[1]
+    assert vals[1] < 0.2
+
+
+# ---- coverage reporting must be TRUTHFUL ----
+def test_composite_coverage_reports_the_real_gap():
+    rows = [
+        _cx_row("a", n_mechanics=4, gating_depth=2, n_bodies=6),
+        _cx_row("b", n_mechanics=2, gating_depth=1, n_bodies=9),
+    ]
+    cov = C.STRUCTURAL_RICHNESS.coverage(rows)
+    assert cov["n_total"] == 2
+    assert cov["n_placed"] == 2
+    assert cov["n_full_evidence"] == 0            # nothing has full evidence today
+    assert cov["max_evidence"] == pytest.approx(0.58)
+    # the components the host does not emit are reported as flatly absent, not as zeros
+    assert cov["components"]["structural_sections"]["n_present"] == 0
+    assert cov["components"]["n_static_footprint"]["n_present"] == 0
+    assert cov["components"]["n_mechanics"]["n_present"] == 2
+    assert cov["components"]["n_bodies"]["guarded"] is False
+
+
+def test_axis_space_incomplete_rows_is_truthful():
+    rows = [
+        # full evidence on BOTH axes
+        _cx_row("full", n_mechanics=4, structural_sections=2, gating_depth=2,
+                n_static_footprint=3, autonomous_bodies=1, n_bodies=6,
+                witness_entropy=1.0, distinct_actions=3, n_checkpoints=2, witness_ticks=30),
+        _cx_row("partial", n_mechanics=2, gating_depth=1, n_bodies=9,
+                witness_entropy=2.0, distinct_actions=4, n_checkpoints=3, witness_ticks=60),
+    ]
+    space = C.AxisSpace(rows)
+    assert space.incomplete_rows((C.DEFAULT_X, C.DEFAULT_Y)) == 1
+
+
+# ---- AxisSpace resolves BOTH composites and raw descriptors ----
+def test_axis_space_resolves_composite_and_raw():
+    rows = [_cx_row("a", n_mechanics=1, gating_depth=1, n_bodies=2, witness_entropy=0.5),
+            _cx_row("b", n_mechanics=9, gating_depth=9, n_bodies=99, witness_entropy=2.5)]
+    space = C.AxisSpace(rows)
+    assert space.is_composite("structural_richness")
+    assert not space.is_composite("witness_entropy")
+    # raw descriptors pass straight through, unnormalised
+    assert space.column("witness_entropy") == [0.5, 2.5]
+    comp = space.column("structural_richness")
+    assert comp[0] == pytest.approx(0.0) and comp[1] == pytest.approx(1.0)
+
+
+def test_axis_space_excludes_nothing_silently_and_validates():
+    assert C.validate_axis("auto") == "auto"
+    assert C.validate_axis("structural_richness") == "structural_richness"
+    assert C.validate_axis("witness_entropy") == "witness_entropy"
+    with pytest.raises(ValueError):
+        C.validate_axis("not_a_real_axis")
+
+
+def test_composite_rows_audit_trail_carries_provenance():
+    rows = [_cx_row("a", n_mechanics=1, gating_depth=1, n_bodies=2),
+            _cx_row("b", n_mechanics=9, gating_depth=9, n_bodies=99)]
+    blocks = C.AxisSpace(rows, norm="rank", min_evidence=0.5).composite_rows()
+    blk = blocks[0]["structural_richness"]
+    # a library-relative number is meaningless without HOW it was made
+    assert blk["norm"] == "rank" and blk["min_evidence"] == 0.5
+    assert blk["evidence"] == pytest.approx(0.58)
+    assert "n_mechanics" in blk["components_present"]
+    assert "structural_sections" in blk["components_missing"]
+
+
+# ================================================================ RE-CUT: the map is a CHOICE
+def _worldplay_rows(n=8):
+    rows = []
+    for i in range(n):
+        rows.append(_row(f"g{i}", n_mechanics=1 + i, gating_depth=i % 5,
+                         n_bodies=2 + i * 3, witness_entropy=float(i) / 3.0,
+                         distinct_actions=1 + i % 4, n_checkpoints=i % 5,
+                         witness_ticks=20 + i * 11, solver_expansions=50 * i,
+                         space_util_linear_ratio=1.0 + i,
+                         witness_source="tree" if i % 3 else "rl",
+                         dimension="2D" if i % 2 else "3D"))
+    return rows
+
+
+def test_flagship_default_cut_is_world_x_play(tmp_path):
+    out = tmp_path / "atlas.svg"
+    summary = R.render_atlas(_worldplay_rows(), str(out), n_bins=4)
+    assert summary["axes"] == ("structural_richness", "behavioural_richness")
+    # solver effort is DEMOTED to an annotation, never an axis
+    assert summary["size_axis"] == "solver_expansions"
+    assert "solver_expansions" not in summary["axes"]
+    svg = out.read_text(encoding="utf-8")
+    assert "WORLD × PLAY" in svg
+    assert summary["n_placed"] > 0
+
+
+def test_legacy_cut_still_renders(tmp_path):
+    out = tmp_path / "legacy.svg"
+    summary = R.render_atlas(_worldplay_rows(), str(out), n_bins=4,
+                             x=C.LEGACY_X, y=C.LEGACY_Y)
+    assert summary["axes"] == ("solver_expansions", "witness_entropy")
+    svg = out.read_text(encoding="utf-8")
+    assert svg.startswith("<svg")
+    assert "solver effort (tree node expansions)" in svg   # the old axis label, verbatim
+    assert summary["n_placed"] == 8
+
+
+def test_recut_to_any_raw_descriptor(tmp_path):
+    summary = R.render_atlas(_worldplay_rows(), None, n_bins=4,
+                             x="n_mechanics", y="witness_entropy")
+    assert summary["axes"] == ("n_mechanics", "witness_entropy")
+    assert summary["n_placed"] == 8
+
+
+def test_recut_auto_preserves_original_axis_selection():
+    rows = _worldplay_rows()
+    summary = R.render_atlas(rows, None, n_bins=4, x="auto", y="auto")
+    auto_x, auto_y, _size, _scores = R.select_axes(rows, n_bins=4)
+    assert summary["axes"] == (auto_x, auto_y)
+    assert summary["axis_scores"]                # the old spread x coverage scores survive
+
+
+def test_mixed_cut_composite_x_raw_y():
+    summary = R.render_atlas(_worldplay_rows(), None, n_bins=4,
+                             x="structural_richness", y="witness_entropy")
+    assert summary["axes"] == ("structural_richness", "witness_entropy")
+
+
+def test_render_rejects_unknown_axis():
+    with pytest.raises(ValueError):
+        R.render_atlas(_worldplay_rows(), None, n_bins=4, x="bogus_axis")
+
+
+def test_composite_axis_uses_fixed_unit_domain_not_zoomed_bounds():
+    """A composite axis is drawn on its full [0,1] domain. Zooming to the data would
+    re-spread a tight cluster across the whole map and manufacture coverage — which is
+    exactly the monoculture the map must expose."""
+    # a MONOCULTURE: eight near-identical games
+    rows = [_row(f"m{i}", n_mechanics=4, gating_depth=2, n_bodies=10 + (i % 2),
+                 witness_entropy=1.5, distinct_actions=3, n_checkpoints=2,
+                 witness_ticks=40) for i in range(8)]
+    info = R.compute_grid(rows, C.DEFAULT_X, C.DEFAULT_Y, n_bins=6,
+                          space=C.AxisSpace(rows))
+    assert info["xbounds"] == [0.0, 1.0]
+    assert info["ybounds"] == [0.0, 1.0]
+    # the whole monoculture collapses into very few cells -> visibly low coverage
+    assert info["n_colonized"] <= 2
+    assert info["coverage"] < 0.1
+
+
+def test_render_marks_witness_provenance(tmp_path):
+    out = tmp_path / "atlas.svg"
+    R.render_atlas(_worldplay_rows(), str(out), n_bins=4)
+    svg = out.read_text(encoding="utf-8")
+    assert "witness source" in svg
+    assert R.WITNESS_RL in svg                    # the rl ring is actually drawn
+
+
+def test_render_publishes_its_weighting_and_gap(tmp_path):
+    out = tmp_path / "atlas.svg"
+    R.render_atlas(_worldplay_rows(), str(out), n_bins=4)
+    svg = out.read_text(encoding="utf-8")
+    assert "axis weighting (published)" in svg
+    assert "0.30" in svg and "mechanics" in svg   # the weights are ON the artifact
+    assert "incomplete descriptors" in svg        # the gap is stated, not hidden
+
+
+def test_summary_carries_axis_coverage_for_the_report():
+    summary = R.render_atlas(_worldplay_rows(), None, n_bins=4)
+    xc = summary["axis_coverage"]["x"]
+    assert xc["name"] == "structural_richness"
+    assert xc["components"]["structural_sections"]["n_present"] == 0
+    assert summary["norm"] == "minmax"
+    assert summary["n_incomplete"] == 8
+
+
+def test_norm_rank_is_available_as_an_alternative_cut():
+    rows = _worldplay_rows()
+    mm = R.render_atlas(rows, None, n_bins=4, norm="minmax")
+    rk = R.render_atlas(rows, None, n_bins=4, norm="rank")
+    assert mm["norm"] == "minmax" and rk["norm"] == "rank"
+    # rank spreads by construction -> it must not be silently the default
+    assert rk["coverage"] >= mm["coverage"]
+
+
+# ================================================================ BUILD: jsonl keeps RAW
+def test_build_jsonl_keeps_raw_components_and_adds_audit_trail(tmp_path):
+    g = tmp_path / "scenes" / "games" / "myslug"
+    g.mkdir(parents=True)
+    (g / "myslug.gd").write_text("extends Node2D\nvar x = Vector2(1,1)\n", encoding="utf-8")
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    rep = _with_efficacy(fab_report(actions=["a", "a", "b"], witness_ticks=3, episodes=10,
+                                    nodes=42, checkpoints_n=2,
+                                    witness_checkpoints={"cp1": 1, "cp2": 3}),
+                         {"a": 1.0, "b": 2.0})
+    (runs / "gen_0.json").write_text(json.dumps(
+        {"game_path": "scenes/games/myslug/myslug.gd", "verdict": "COMPLETED",
+         "attempts": [{"report": rep}]}), encoding="utf-8")
+    out = tmp_path / "atlas"
+    rows, summary = B.build_atlas([str(g)], str(out),
+                                  reports_glob=[str(runs / "gen_*.json")])
+    back = B.load_rows(str(out / "atlas.jsonl"))
+    assert len(back) == 1
+    # EVERY raw descriptor survives in the jsonl -> any claim is re-derivable
+    assert set(back[0]["descriptors"].keys()) == set(DESCRIPTOR_KEYS)
+    assert back[0]["descriptors"]["n_mechanics"] == 2
+    assert back[0]["descriptors"]["gating_depth"] == 2
+    # ... and the composite is an ADDITIVE audit trail beside it, with its provenance
+    blk = back[0]["composites"]["structural_richness"]
+    assert blk["norm"] == "minmax"
+    assert "n_mechanics" in blk["components_present"]
+    assert "structural_sections" in blk["components_missing"]
+    assert summary["axes"] == ("structural_richness", "behavioural_richness")
 
 
 if __name__ == "__main__":

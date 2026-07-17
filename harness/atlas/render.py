@@ -1,16 +1,37 @@
 """Render the ATLAS map: a 2D chart of certified game-space where the EMPTY territory
 is the point (ATLAS D1, read-only).
 
+THE FLAGSHIP CUT IS **WORLD × PLAY**: X = STRUCTURAL RICHNESS ("how much world is there"),
+Y = BEHAVIOURAL RICHNESS ("how much play is there") — two coherent composite concepts
+defined and justified in :mod:`harness.atlas.composites`. Solver effort, which used to be
+the X axis, is DEMOTED to an annotation (point size) for two reasons:
+
+  * it dies as an axis — as games get harder the tree solves nothing, so the axis goes
+    blank exactly where the interesting games are; and
+  * it is DUAL-CURRENCY under the chord-pivot / witness-RL escalade (tree node expansions
+    vs RL sample complexity are not the same unit), so one "effort" number would silently
+    mix scales. Its provenance (``witness_source``: tree | rl) is therefore drawn ON the
+    map beside it.
+
+THE MAP IS A CHOICE OF CUT, NOT DOGMA. ``render_atlas(rows, x=..., y=..., size=...)`` takes
+ANY descriptor or composite name (see ``composites.axis_choices()``), so every claim this
+map makes can be re-cut against the raw descriptors that stay in ``atlas.jsonl``:
+
+  * flagship  : ``x="structural_richness", y="behavioural_richness"``  (the default)
+  * legacy    : ``x="solver_expansions",   y="witness_entropy"``       (kept verbatim)
+  * automatic : ``x="auto", y="auto"`` — the original spread × coverage axis selection
+
 Given the descriptor rows ``build`` produced, :func:`render_atlas`
 
-  1. picks the two MOST-DISCRIMINATING numeric descriptor axes for THIS dataset
-     (spread × coverage, de-correlated), encoding dimension as colour and a third
-     descriptor as point size;
+  1. resolves the requested axes (composite | descriptor | auto) through an
+     :class:`~harness.atlas.composites.AxisSpace`, encoding dimension as colour, solver
+     effort as point size, and witness provenance as a ring;
   2. grids the two axes into cells, shades the COLONISED cells lightly and leaves the
      empty cells dark, so the uncolonised regions are visually obvious;
   3. writes a hand-built, self-contained SVG (dark panel, mono labels, one green accent
-     — theme-consistent with the site) and returns the coverage math + the emptiest
-     regions phrased as candidate generation targets.
+     — theme-consistent with the site) and returns the coverage math, the axis WEIGHTING
+     and EVIDENCE coverage, and the emptiest regions phrased as candidate generation
+     targets.
 
 Pure Python + stdlib (no PIL / cairosvg / matplotlib): the SVG is emitted as text.
 """
@@ -21,6 +42,10 @@ import html
 import math
 
 from harness.atlas.descriptors import DESCRIPTOR_KEYS  # noqa: F401  (schema anchor)
+from harness.atlas.composites import (  # noqa: F401  (axis vocabulary)
+    AUTO, AxisSpace, DEFAULT_MIN_EVIDENCE, DEFAULT_NORM, DEFAULT_SIZE, DEFAULT_X, DEFAULT_Y,
+    LEGACY_X, LEGACY_Y, desc_of, num_or_none, validate_axis,
+)
 
 # --- Theme (GitHub-dark; ONE green accent) -------------------------------- #
 BG = "#0d1117"
@@ -39,6 +64,12 @@ FRONTIER = "#f85149"         # red — OVER-BUDGET FRONTIER (hollow; unsolved-bu
 FRONTIER_WASH = "#2a1517"    # faint red band behind the frontier ring
 COMPLEXITY = "#e3b341"       # gold — the L1 STRUCTURAL-COMPLEXITY panel (opt-in, additive)
 COMPLEXITY_WASH = "#241d10"  # faint gold band behind the complexity strip
+WITNESS_RL = "#ffa657"       # orange ring — witness produced by RL, not the tree solver
+
+# Witness PROVENANCE as a ring around the point. Solver effort is dual-currency across
+# these sources (tree expansions vs RL samples), so wherever effort is shown its source is
+# shown with it. "tree" keeps the plain BG ring (today's look), so this is additive.
+_WITNESS_RINGS = {"rl": WITNESS_RL}
 
 # Candidate numeric axes, in a FIXED tie-break priority (most behaviourally meaningful
 # first). Discrimination is measured on the data; ties fall back to this order.
@@ -110,19 +141,35 @@ _AXIS_SHORT = {
 # ======================================================================== #
 # Row access + small stats
 # ======================================================================== #
-def _desc(row):
-    """The descriptor dict of a row (accepts nested ``{descriptors:{...}}`` or a flat row)."""
-    if isinstance(row, dict) and isinstance(row.get("descriptors"), dict):
-        return row["descriptors"]
-    return row if isinstance(row, dict) else {}
-
-
-def _num(v):
-    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+# Row access lives in composites.py (the schema-level layer both modules share); these are
+# the names the rest of this module has always used.
+_desc = desc_of
+_num = num_or_none
 
 
 def _values(rows, key):
+    """RAW per-row values for a descriptor key (no composite resolution) — used by the
+    panels that report raw geometry. Axis values go through an :class:`AxisSpace`."""
     return [_num(_desc(r).get(key)) for r in rows]
+
+
+def _space_for(rows, space):
+    """The given :class:`AxisSpace`, or a default one over ``rows``. Lets every helper be
+    called standalone (raw descriptor keys resolve identically either way)."""
+    return space if space is not None else AxisSpace(rows)
+
+
+def _axis_label(space, key):
+    """The axis caption: composites publish their own label, descriptors use the map."""
+    if space is not None and space.is_composite(key):
+        return space.label(key)
+    return _AXIS_LABEL.get(key, key)
+
+
+def _axis_short(space, key):
+    if space is not None and space.is_composite(key):
+        return space.short(key)
+    return _AXIS_SHORT.get(key, key)
 
 
 def _pearson(xs, ys):
@@ -207,8 +254,24 @@ def select_axes(rows, n_bins=6):
 # ======================================================================== #
 # Grid + coverage
 # ======================================================================== #
-def _axis_bounds(rows, key):
-    present = [v for v in _values(rows, key) if v is not None]
+def _axis_bounds(rows, key, space=None):
+    """The axis's drawn domain.
+
+    A COMPOSITE axis is always drawn on its full, fixed [0, 1] domain — never zoomed to the
+    data. This is a deliberate honesty choice: data-driven bounds would re-stretch a tight
+    cluster of near-identical games across the whole map and manufacture apparent coverage,
+    hiding exactly the monoculture the map exists to expose. On a fixed domain, a library
+    that is all one kind of game STAYS a blob in one corner, and the empty margin ("nothing
+    here is rich on every channel at once") is a true statement rather than a rendering
+    artefact.
+
+    A RAW descriptor axis keeps the original data-driven, padded bounds — the legacy cut
+    renders exactly as it always did.
+    """
+    if space is not None and space.is_composite(key):
+        return (0.0, 1.0)
+    present = [v for v in (space.column(key) if space is not None else _values(rows, key))
+               if v is not None]
     if not present:
         return (0.0, 1.0)
     lo, hi = min(present), max(present)
@@ -230,28 +293,36 @@ def _tercile_label(v, lo, hi):
     return "low" if frac < 1 / 3 else ("high" if frac > 2 / 3 else "mid")
 
 
-def _describe_cell(x_key, y_key, cx, cy, xb, yb):
+def _describe_cell(x_key, y_key, cx, cy, xb, yb, space=None):
     """A qualitative brief for an empty cell — a candidate generation target."""
     xl = _tercile_label(cx, *xb)
     yl = _tercile_label(cy, *yb)
-    return f"{xl} {_AXIS_SHORT.get(x_key, x_key)} × {yl} {_AXIS_SHORT.get(y_key, y_key)}"
+    return f"{xl} {_axis_short(space, x_key)} × {yl} {_axis_short(space, y_key)}"
 
 
-def compute_grid(rows, x_key, y_key, n_bins=6):
+def compute_grid(rows, x_key, y_key, n_bins=6, space=None):
     """Grid the two axes and compute coverage. Returns a dict with the occupancy grid,
     coverage math, the placed/unplaced split, and the emptiest cells (ranked by depth
-    into empty territory) phrased as candidate briefs."""
+    into empty territory) phrased as candidate briefs.
+
+    ``space`` (an :class:`AxisSpace`) resolves the axis keys; without one a default is
+    built over ``rows``, so raw descriptor keys behave exactly as they always have. A row
+    whose axis value is ``None`` — including a composite with too little evidence to place
+    honestly — is counted as UNPLACED, never coerced onto the grid.
+    """
     if not x_key or not y_key:
         return {"coverage": 0.0, "n_cells": 0, "n_colonized": 0, "n_placed": 0,
                 "n_unplaced": len(rows), "grid": [], "empty_cells": [],
                 "xbounds": None, "ybounds": None, "n_bins": n_bins}
-    xb = _axis_bounds(rows, x_key)
-    yb = _axis_bounds(rows, y_key)
+    space = _space_for(rows, space)
+    xb = _axis_bounds(rows, x_key, space)
+    yb = _axis_bounds(rows, y_key, space)
+    xcol, ycol = space.column(x_key), space.column(y_key)
     grid = [[0] * n_bins for _ in range(n_bins)]     # grid[iy][ix] = point count
     placed = unplaced = 0
-    for r in rows:
-        x = _num(_desc(r).get(x_key))
-        y = _num(_desc(r).get(y_key))
+    for i, r in enumerate(rows):
+        x = xcol[i]
+        y = ycol[i]
         if x is None or y is None:
             unplaced += 1
             continue
@@ -279,7 +350,7 @@ def compute_grid(rows, x_key, y_key, n_bins=6):
             cy = yb[0] + (iy + 0.5) * (yb[1] - yb[0]) / n_bins
             empties.append({
                 "ix": ix, "iy": iy, "depth": depth, "extremity": round(extremity, 2),
-                "brief": _describe_cell(x_key, y_key, cx, cy, xb, yb),
+                "brief": _describe_cell(x_key, y_key, cx, cy, xb, yb, space),
                 "x_range": [round(xb[0] + ix * (xb[1] - xb[0]) / n_bins, 3),
                             round(xb[0] + (ix + 1) * (xb[1] - xb[0]) / n_bins, 3)],
                 "y_range": [round(yb[0] + iy * (yb[1] - yb[0]) / n_bins, 3),
@@ -310,6 +381,73 @@ _FONT = "'SFMono-Regular','Consolas','Liberation Mono',monospace"
 _COMPLEXITY_KEYS = ("n_mechanics", "structural_sections", "gating_depth", "autonomous_bodies")
 _COMPLEXITY_SHORT = {"n_mechanics": "mech", "structural_sections": "sections",
                      "gating_depth": "gating", "autonomous_bodies": "autonomous"}
+
+
+# Compact names for the weighting panel (the legend column is 300px).
+_COMPONENT_SHORT = {
+    "n_mechanics": "mechanics", "structural_sections": "sections",
+    "gating_depth": "gating", "n_static_footprint": "footprints",
+    "autonomous_bodies": "autonomous", "n_bodies": "bodies",
+    "witness_entropy": "entropy", "distinct_actions": "distinct-acts",
+    "n_checkpoints": "checkpoints", "witness_ticks": "ticks",
+}
+
+
+def _weighting_blocks(space, keys):
+    """The published weighting + per-component coverage for the COMPOSITE axes in ``keys``.
+
+    Returns ``[(axis_label, [(weight, short, n_present, n_total, guarded)], coverage)]``.
+    Empty for raw-descriptor axes (nothing composite to disclose). This is what makes the
+    map self-documenting: the weights are ON the artifact, not only in a docstring, and
+    each component reports how much of the library actually backs it."""
+    out = []
+    for key in keys:
+        if key is None or not space.is_composite(key):
+            continue
+        cov = space.coverage(key)
+        comp = space.composites[key]
+        rows = [(c.weight, _COMPONENT_SHORT.get(c.key, c.key),
+                 cov["components"][c.key]["n_present"], cov["n_total"], c.guarded)
+                for c in comp.components]
+        out.append((space.short(key), rows, cov))
+    return out
+
+
+def _weighting_height(blocks):
+    return sum(15 + 11 * len(rows) for _lab, rows, _cov in blocks) + (14 if blocks else 0)
+
+
+def _draw_weighting(S, blocks, lx, yy):
+    """Draw the weighting panel; returns the new y cursor."""
+    if not blocks:
+        return yy
+    S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
+             f'font-weight="bold">axis weighting (published)</text>')
+    yy += 14
+    for label, rows, cov in blocks:
+        S.append(f'<text x="{lx}" y="{yy}" fill="{ACCENT}" font-size="9" '
+                 f'font-weight="bold">{_esc(label)} — evidence ≤ '
+                 f'{cov["max_evidence"]:.2f} · {cov["n_placed"]}/{cov["n_total"]} placed'
+                 f'</text>')
+        yy += 12
+        for w, short, n_present, n_total, guarded in rows:
+            # an unguarded channel is named as such, right on the map
+            mark = "" if guarded else " ⚠"
+            col = MUTED if n_present else "#6e4a4a"      # dim red-grey = no data at all
+            S.append(f'<text x="{lx + 6}" y="{yy}" fill="{col}" font-size="8.5">'
+                     f'{w:.2f}  {_esc(short)}{mark}</text>')
+            S.append(f'<text x="{lx + 190}" y="{yy}" fill="{col}" font-size="8.5" '
+                     f'text-anchor="end">{n_present}/{n_total}</text>')
+            yy += 11
+        yy += 3
+    return yy + 11
+
+
+def _witness_sources(rows):
+    """The distinct witness provenances present ("tree", "rl", ...) — drives the ring
+    legend, which only appears when there is provenance to disclose."""
+    return sorted({str(_desc(r).get("witness_source")) for r in rows
+                   if _desc(r).get("witness_source")})
 
 
 def _complexity_present(row):
@@ -506,9 +644,10 @@ def _draw_complexity_strip(S, rows, px0, px1, pw, sy0, sh):
 
 
 def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, frontier=None,
-               complexity_panel=False):
+               complexity_panel=False, space=None):
     ghosts = list(ghosts or [])
     frontier = list(frontier or [])
+    space = _space_for(rows, space)
     has_gh, has_fr = bool(ghosts), bool(frontier)
     n_bins = grid_info["n_bins"]
     xb, yb = grid_info["xbounds"], grid_info["ybounds"]
@@ -532,6 +671,12 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     cx_y = _below + 16
     cx_h = _COMPLEXITY_STRIP_H if has_cx else 0
     H = int((cx_y + cx_h + 24) if has_cx else (_below + 24))
+    # The legend column can now run taller than the plot (the weighting panel is drawn
+    # there), so the canvas must grow to fit it rather than clipping the disclosure.
+    wblocks = _weighting_blocks(space, (x_key, y_key))
+    _legend_h = (100 + 83 + (47 if (has_gh or has_fr) else 0) + (26 if size_key else 0)
+                 + _weighting_height(wblocks) + (30 if _witness_sources(rows) else 0) + 78)
+    H = int(max(H, py0 + 14 + _legend_h + 24))
 
     def sx(x):
         return px0 + (x - xb[0]) / (xb[1] - xb[0]) * pw
@@ -539,9 +684,11 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     def sy(y):
         return py1 - (y - yb[0]) / (yb[1] - yb[0]) * ph      # y grows upward
 
-    size_vals = [v for v in _values(rows, size_key) if v is not None] if size_key else []
+    size_col = space.column(size_key) if size_key else [None] * len(rows)
+    size_vals = [v for v in size_col if v is not None]
     s_lo = min(size_vals) if size_vals else 0.0
     s_hi = max(size_vals) if size_vals else 1.0
+    xcol, ycol = space.column(x_key), space.column(y_key)
 
     S = []
     S.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
@@ -550,9 +697,11 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     # Title + subtitle.
     S.append(f'<text x="{_ML}" y="34" fill="{TEXT}" font-size="21" '
              f'font-weight="bold">THE ATLAS — certified game-space</text>')
+    _cut = "WORLD × PLAY" if (space.is_composite(x_key) and space.is_composite(y_key)) \
+        else f"{_axis_short(space, x_key)} × {_axis_short(space, y_key)}"
     S.append(f'<text x="{_ML}" y="56" fill="{MUTED}" font-size="12">'
-             f'each point is a certified game; axes are its deterministic behaviour '
-             f'descriptors; dark cells are unexplored territory</text>')
+             f'{_esc(_cut)} · each point is a certified game; dark cells are unexplored '
+             f'territory · weights published (right), raw components in atlas.jsonl</text>')
     # Optional off-map frontier ring (above the plot).
     if has_fr:
         _draw_frontier_band(S, frontier, px0, px1, pw, fr_band_y, fr_band_h)
@@ -590,10 +739,10 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
         S.append(f'<text x="{px0 - 8}" y="{gy + 3:.1f}" fill="{MUTED}" font-size="10" '
                  f'text-anchor="end">{vy:.2g}</text>')
     S.append(f'<text x="{px0 + pw / 2:.0f}" y="{py1 + 44:.0f}" fill="{TEXT}" font-size="13" '
-             f'text-anchor="middle">{_esc(_AXIS_LABEL.get(x_key, x_key))} →</text>')
+             f'text-anchor="middle">{_esc(_axis_label(space, x_key))} →</text>')
     S.append(f'<text x="26" y="{py0 + ph / 2:.0f}" fill="{TEXT}" font-size="13" '
              f'text-anchor="middle" transform="rotate(-90 26 {py0 + ph / 2:.0f})">'
-             f'{_esc(_AXIS_LABEL.get(y_key, y_key))} →</text>')
+             f'{_esc(_axis_label(space, y_key))} →</text>')
 
     # Points + labels.
     # Draw densest cells' labels last so they sit on top; alternate the label's vertical
@@ -601,16 +750,20 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     placed_pts = []
     for i, r in enumerate(rows):
         d = _desc(r)
-        x = _num(d.get(x_key))
-        y = _num(d.get(y_key))
+        x = xcol[i]
+        y = ycol[i]
         if x is None or y is None:
             continue
         cx, cy = sx(x), sy(y)
-        rad = _size_for(_num(d.get(size_key)) if size_key else None, s_lo, s_hi)
+        rad = _size_for(size_col[i], s_lo, s_hi)
         col = _color_for_dim(d.get("dimension"))
         slug = r.get("slug") if isinstance(r, dict) else None
+        # Witness PROVENANCE ring: an RL-sourced witness is marked, because the solver
+        # effort encoded in the point's SIZE is a different currency for tree vs RL.
+        ring = _WITNESS_RINGS.get(d.get("witness_source"))
         S.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{rad:.1f}" fill="{col}" '
-                 f'fill-opacity="0.82" stroke="{BG}" stroke-width="1"/>')
+                 f'fill-opacity="0.82" stroke="{ring or BG}" '
+                 f'stroke-width="{2 if ring else 1}"/>')
         placed_pts.append((i, cx, cy, rad, slug))
     for i, cx, cy, rad, slug in placed_pts:
         if not slug:
@@ -645,8 +798,12 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
              f'({n_bins}×{n_bins} grid)</text>')
     S.append(f'<text x="{lx}" y="{yy + 58}" fill="{MUTED}" font-size="10.5">'
              f'{grid_info["n_placed"]} games placed, {grid_info["n_unplaced"]} off-map</text>')
+    # Incomplete-descriptor disclosure: how many games are NOT fully backed on these axes.
+    n_incomplete = space.incomplete_rows((x_key, y_key))
+    S.append(f'<text x="{lx}" y="{yy + 74}" fill="{MUTED}" font-size="10.5">'
+             f'{n_incomplete}/{len(rows)} have incomplete descriptors</text>')
     if has_gh or has_fr:
-        S.append(f'<text x="{lx}" y="{yy + 74}" fill="{MUTED}" font-size="10.5">'
+        S.append(f'<text x="{lx}" y="{yy + 90}" fill="{MUTED}" font-size="10.5">'
                  f'coverage is over CERTIFIED games only</text>')
     yy += 100
 
@@ -677,10 +834,22 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
             yy += 17
         yy += 12
 
+    # witness PROVENANCE ring (only when there is any provenance to disclose)
+    wsrc = _witness_sources(rows)
+    if wsrc:
+        S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
+                 f'font-weight="bold">witness source</text>')
+        yy += 17
+        S.append(f'<text x="{lx}" y="{yy}" fill="{MUTED}" font-size="10">'
+                 f'{_esc(" · ".join(wsrc))}'
+                 f'{" (orange ring = rl)" if "rl" in wsrc else " (tree solver)"}</text>')
+        yy += 13
+
     if size_key:
         S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
-                 f'font-weight="bold">size = {_esc(_AXIS_SHORT.get(size_key, size_key))}</text>')
+                 f'font-weight="bold">size = {_esc(_axis_short(space, size_key))}</text>')
         yy += 26
+    yy = _draw_weighting(S, wblocks, lx, yy)
 
     # emptiest-region briefs
     S.append(f'<text x="{lx}" y="{yy}" fill="{TEXT}" font-size="12" '
@@ -702,24 +871,60 @@ def render_svg(rows, x_key, y_key, size_key, grid_info, scores, ghosts=None, fro
     return "\n".join(S)
 
 
+def _resolve_cut(rows, x, y, size, n_bins):
+    """Resolve the requested cut into ``(x_key, y_key, size_key, scores)``.
+
+    ``x``/``y`` accept a composite name, a descriptor key, or ``"auto"`` (the original
+    spread × coverage selection, kept intact). ``auto`` is resolved FIRST so an explicit
+    axis is never silently overridden by the heuristic. An unknown axis raises rather than
+    quietly rendering the wrong map."""
+    x = validate_axis(DEFAULT_X if x is None else x)
+    y = validate_axis(DEFAULT_Y if y is None else y)
+    size = None if size is None else validate_axis(size)
+    scores = {}
+    if AUTO in (x, y, size):
+        ax, ay, asize, scores = select_axes(rows, n_bins=n_bins)
+        x = ax if x == AUTO else x
+        y = ay if y == AUTO else y
+        size = asize if size == AUTO else size
+    return x, y, size, scores
+
+
 def render_atlas(rows, out_svg_path=None, *, n_bins=6, ghosts=None, frontier=None,
-                 complexity_panel=False):
-    """The public entry point. Selects axes, computes the grid + coverage over the
-    CERTIFIED ``rows``, renders the SVG (written to ``out_svg_path`` if given), and
-    returns a summary dict. ``ghosts`` (geometry-only reference games) and ``frontier``
-    (unsolved-but-progressing games) are OVERLAYS — they render as their own distinct
-    marker classes and never contribute to the coverage math. ``complexity_panel``
-    (opt-in, default off) adds the additive L1 STRUCTURAL-COMPLEXITY strip below the
-    map WITHOUT touching axis selection or the existing layout.
+                 complexity_panel=False, x=None, y=None, size=DEFAULT_SIZE,
+                 norm=DEFAULT_NORM, min_evidence=DEFAULT_MIN_EVIDENCE):
+    """The public entry point. Resolves the requested cut, computes the grid + coverage
+    over the CERTIFIED ``rows``, renders the SVG (written to ``out_svg_path`` if given),
+    and returns a summary dict.
+
+    THE CUT (``x`` / ``y`` / ``size``) is a CHOICE, defaulting to the flagship WORLD × PLAY
+    composites with solver effort demoted to point size:
+
+      * ``x=None, y=None``                         -> structural × behavioural richness
+      * ``x="solver_expansions", y="witness_entropy"`` -> the legacy cut, verbatim
+      * ``x="auto", y="auto"``                     -> the original spread × coverage pick
+
+    ``norm`` (``minmax`` | ``rank``) and ``min_evidence`` control composite construction —
+    see :mod:`harness.atlas.composites` for the formula and why ``minmax`` is the default.
+
+    ``ghosts`` (geometry-only reference games) and ``frontier`` (unsolved-but-progressing
+    games) are OVERLAYS — they render as their own distinct marker classes and never
+    contribute to the coverage math OR to the composite normalisation. ``complexity_panel``
+    (opt-in, default off) adds the additive L1 STRUCTURAL-COMPLEXITY strip below the map
+    WITHOUT touching axis selection or the existing layout.
 
     Returns ``{axes, size_axis, coverage, n_cells, n_colonized, n_placed, n_unplaced,
-    n_ghosts, n_frontier, empty_cells, axis_scores, svg}``."""
+    n_ghosts, n_frontier, empty_cells, axis_scores, axis_labels, axis_coverage,
+    n_incomplete, norm, min_evidence, svg}``."""
     ghosts = list(ghosts or [])
     frontier = list(frontier or [])
-    x_key, y_key, size_key, scores = select_axes(rows, n_bins=n_bins)
-    grid_info = compute_grid(rows, x_key, y_key, n_bins=n_bins)
+    x_key, y_key, size_key, scores = _resolve_cut(rows, x, y, size, n_bins)
+    # The row set defines the normalisation: overlays are excluded, exactly as they are
+    # excluded from the coverage math.
+    space = AxisSpace(rows, norm=norm, min_evidence=min_evidence)
+    grid_info = compute_grid(rows, x_key, y_key, n_bins=n_bins, space=space)
     svg = (render_svg(rows, x_key, y_key, size_key, grid_info, scores,
-                      ghosts=ghosts, frontier=frontier,
+                      ghosts=ghosts, frontier=frontier, space=space,
                       complexity_panel=complexity_panel) if x_key and y_key else "")
     if out_svg_path and svg:
         with open(out_svg_path, "w", encoding="utf-8") as fh:
@@ -730,6 +935,10 @@ def render_atlas(rows, out_svg_path=None, *, n_bins=6, ghosts=None, frontier=Non
             "n_unplaced": grid_info["n_unplaced"],
             "n_ghosts": len(ghosts), "n_frontier": len(frontier),
             "empty_cells": grid_info["empty_cells"], "axis_scores": scores,
-            "axis_labels": {"x": _AXIS_LABEL.get(x_key, x_key),
-                            "y": _AXIS_LABEL.get(y_key, y_key)},
+            "axis_labels": {"x": _axis_label(space, x_key),
+                            "y": _axis_label(space, y_key)},
+            # the truthful disclosure block: what backs each axis, and what does not
+            "axis_coverage": {"x": space.coverage(x_key), "y": space.coverage(y_key)},
+            "n_incomplete": space.incomplete_rows((x_key, y_key)),
+            "norm": norm, "min_evidence": min_evidence,
             "svg": svg}

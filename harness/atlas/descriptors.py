@@ -33,6 +33,7 @@ DESCRIPTOR_KEYS = (
     "solver_episodes",       # G3 tree-solver episodes run
     "solver_expansions",     # G3 tree-solver node expansions (search effort)
     "solver_ticks",          # G3 tree-solver total ticks explored
+    "witness_source",        # which solver produced the run/witness ("tree" | "rl" | ...)
     "space_util_linear_ratio",   # per-axis playfield/span ratio (HIGHER = emptier world)
     "space_util_measure_ratio",  # area (2D) / volume (3D) playfield/span ratio
     "dead_space",            # bool: linear ratio over the harness threshold
@@ -170,6 +171,22 @@ def _solver(report, key):
     epi = _g3_checks(report).get("episodes")
     if isinstance(epi, dict) and isinstance(epi.get(key), (int, float)):
         return int(epi[key])
+    return None
+
+
+def _witness_source(report):
+    """The PROVENANCE of the solve — which solver produced the run/witness, read from G3's
+    ``episodes.solver`` (``"tree"`` today; ``"rl"`` once the witness-RL escalade lands).
+
+    This is the reason solver effort cannot stay an axis: expansions and RL sample
+    complexity are DIFFERENT CURRENCIES, so a single "effort" axis silently mixes units the
+    moment both solvers are in play. Effort demotes to an annotation and its provenance is
+    carried alongside it, visibly. ``None`` when no solver stats exist."""
+    epi = _g3_checks(report).get("episodes")
+    if isinstance(epi, dict):
+        s = epi.get("solver")
+        if isinstance(s, str) and s:
+            return s
     return None
 
 
@@ -609,6 +626,7 @@ def describe_game(game_path, verify_report=None, extras=None) -> dict:
         "solver_episodes": _solver(report, "run"),
         "solver_expansions": _solver(report, "nodes"),
         "solver_ticks": _solver(report, "ticks"),
+        "witness_source": _witness_source(report),
         "space_util_linear_ratio": lin,
         "space_util_measure_ratio": meas,
         "dead_space": dead,
