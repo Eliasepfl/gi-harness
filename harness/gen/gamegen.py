@@ -555,6 +555,49 @@ def _openrouter_content(resp):
     return None
 
 
+def _reasoning_from(data) -> str | None:
+    """The model's chain-of-thought from a parsed OpenRouter body, if any.
+
+    Providers surface it under ``message.reasoning`` (unified field) or
+    ``message.reasoning_content``; some ship structured ``reasoning_details``
+    (a list of {text,...} blocks). Elias's ask (2026-07-17): KEEP these traces —
+    analysing WHICH instruction bends the model's design vision needs the
+    thinking, not just the artifact. Returns a plain string or None; never raises."""
+    try:
+        msg = data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    for key in ("reasoning", "reasoning_content"):
+        r = msg.get(key) if isinstance(msg, dict) else None
+        if isinstance(r, str) and r.strip():
+            return r
+    details = msg.get("reasoning_details") if isinstance(msg, dict) else None
+    if isinstance(details, list):
+        parts = [d.get("text") for d in details
+                 if isinstance(d, dict) and isinstance(d.get("text"), str)]
+        joined = "\n".join(p for p in parts if p.strip())
+        if joined.strip():
+            return joined
+    return None
+
+
+def _write_trace(run_dir, attempt_no: int, reasoning, meta: dict) -> None:
+    """Persist one attempt's thinking next to its code: ``a<N>.trace.json``.
+
+    Additive observability for the ambition analysis — the artifact (a<N>.gd)
+    shows WHAT changed, the trace shows WHY the model chose it (and which
+    injected instruction it was reacting to). Never raises: a failed trace
+    write must not cost a generation."""
+    try:
+        payload = dict(meta)
+        payload["reasoning"] = reasoning
+        path = os.path.join(run_dir, f"a{attempt_no}.trace.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=1)
+    except OSError:
+        pass
+
+
 def _reasoning_cap() -> int:
     """Resolve the reasoning-token cap (secret > default).
 
@@ -653,7 +696,7 @@ def _openrouter_complete(system, messages):
         resp = _openrouter_request(key, model, system, messages, cap)
         content = _openrouter_content(resp)
         if content is not None:
-            return content
+            return content, _reasoning_from(_openrouter_json(resp))
         # 200 with null/blank content: the model spent the whole completion
         # budget thinking (providers routinely ignore reasoning caps, and the
         # think length varies run-to-run — measured 14.5k-24k+ tokens on the
@@ -1021,11 +1064,26 @@ def _run_openrouter(prompt, run_dir, max_repairs, engine="py", system=None,
     first = first_user if first_user is not None else _first_user_msg(prompt, engine)
     messages = [{"role": "user", "content": first}]
 
+    attempt_counter = {"n": 0}
+
     def produce(feedback):
+        attempt_counter["n"] += 1
+        repair_msg = None
         if feedback is not None:
-            messages.append({"role": "user", "content": _repair_user_msg(feedback)})
-        text = _openrouter_complete(system, messages)
+            repair_msg = _repair_user_msg(feedback)
+            messages.append({"role": "user", "content": repair_msg})
+        text, reasoning = _openrouter_complete(system, messages)
         messages.append({"role": "assistant", "content": text})
+        # CoT observability (Elias 2026-07-17): the trace shows WHY the model
+        # designed what a<N>.gd shows; repair_hint ties it to the instruction
+        # it was reacting to.
+        _write_trace(run_dir, attempt_counter["n"], reasoning, {
+            "model": _resolve_secret("OPENROUTER_MODEL"),
+            "engine": engine,
+            "attempt": attempt_counter["n"],
+            "repair_hint": (repair_msg[:600] if repair_msg else None),
+            "content_chars": len(text) if isinstance(text, str) else 0,
+        })
         return _extract_code(text, engine), _extract_design(text)
 
     return _repair_loop(run_dir, produce, "openrouter", max_repairs, None,

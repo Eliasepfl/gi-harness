@@ -166,6 +166,7 @@ import tempfile
 from dataclasses import dataclass
 
 import numpy as np
+from harness.core import wire
 
 # --- Constants ([eng.] = engineering choice) ---------------------------------
 HORIZON = 300              # decision ticks per episode (matches PROBE_HORIZON) [eng.]
@@ -532,7 +533,7 @@ def _build_obs_2d(obs_state, latched, body_order, cp_keys, w, h, tick, horizon):
         if q is not None:
             px, py = q.get("pos", (0.0, 0.0))
             vx, vy = q.get("vel", (0.0, 0.0))
-            ang = float(q.get("angle", 0.0))
+            ang = wire.angle_yaw(q.get("angle", 0.0))
             vec[i + 0] = 1.0                              # present
             vec[i + 1] = px / w
             vec[i + 2] = py / h
@@ -562,7 +563,7 @@ def _orientation_quat(q) -> tuple[float, float, float, float]:
         x, y, z, wq = (_finite(quat[0]), _finite(quat[1]),
                        _finite(quat[2]), _finite(quat[3]))
     else:
-        half = _finite(q.get("angle", 0.0)) * 0.5       # yaw about world up-axis Y
+        half = _finite(wire.angle_yaw(q.get("angle", 0.0))) * 0.5       # yaw about world up-axis Y
         x, y, z, wq = 0.0, math.sin(half), 0.0, math.cos(half)
     nrm = math.sqrt(x * x + y * y + z * z + wq * wq)
     if nrm < 1e-12:
@@ -685,7 +686,7 @@ def _build_obs_pure(obs_state, latched, body_order, cp_keys, tick, horizon, dim)
             vec[5] = qz
             vec[6] = qw
         else:
-            ang = _finite(q.get("angle", 0.0))
+            ang = _finite(wire.angle_yaw(q.get("angle", 0.0)))
             vec[0] = vx / VEL_SCALE
             vec[1] = vy / VEL_SCALE
             vec[2] = math.sin(ang)
