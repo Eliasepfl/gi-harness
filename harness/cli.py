@@ -299,6 +299,85 @@ def _game_witness(game_path: str) -> dict:
     return report.get("witness") or {}
 
 
+# --- demo-trajectory routing (the capture lane's default witness) ----------- #
+DEMO_TRAJECTORY_NAME = "demo_trajectory.json"
+DEMO_SOURCE_TOKEN = "g3_demo"       # export_demo_trajectory's self-declared provenance
+
+
+def _demo_trajectory_candidates(game_path: str) -> list:
+    """Where g3' leaves a trained-policy demo for a game, nearest first.
+
+    ``g3_prime`` writes it beside the MODEL artifact, not beside the game: harden lays a round
+    out as ``<slug>/round_N/game/<slug>.gd`` next to ``<slug>/round_N/g3/{policy.zip,
+    demo_trajectory.json}`` (harness/gen/harden.py). A demo dropped straight beside the game is
+    honoured too, so a hand-placed one works without a harden tree."""
+    game_dir = Path(game_path).resolve().parent
+    return [game_dir / DEMO_TRAJECTORY_NAME,
+            game_dir.parent / "g3" / DEMO_TRAJECTORY_NAME]
+
+
+def _read_witness_json(path) -> dict:
+    """Load a witness/demo JSON ({seed, actions, ...}), or {} if it is not a usable witness.
+
+    Unusable = missing, unreadable, not JSON, not an object, or no non-empty ``actions`` list.
+    Returning {} rather than raising is what lets an absent//broken demo trajectory fall back to
+    the tree witness silently -- a cosmetic upgrade must never break a capture that would
+    otherwise have worked."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    actions = doc.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return {}
+    return doc
+
+
+def _witness_source_of(doc: dict) -> str:
+    """"rl" for a trained-policy demo (it self-declares ``source: "g3_demo"`` -- see
+    certify.py::export_demo_trajectory), else "tree". Matches the vocabulary the verify reports
+    already stamp (certify.py::rescue_certify)."""
+    return "rl" if str(doc.get("source", "")) == DEMO_SOURCE_TOKEN else "tree"
+
+
+def _resolve_capture_witness(game_path: str, *, actions_arg=None, seed_default: int = 0,
+                             auto_demo: bool = True, tree_witness=None) -> dict:
+    """Resolve WHAT the capture lane replays, and record honestly where it came from.
+
+    Order of precedence:
+      1. an explicit ``--actions`` file  -- always wins;
+      2. the trained policy's demo trajectory, when g3' left one (THE DEFAULT). The tree
+         solver's first-solution witness is measurably hesitant -- it changes action every ~2.6
+         ticks and burns 82% of its vertical thrust on oscillation -- so a demo that CAN show
+         the certified reliable agent should;
+      3. a fresh verify's tree witness -- the previous behaviour, unchanged, and still what runs
+         for every game with no demo trajectory.
+
+    ``tree_witness`` is an injectable resolver (defaults to ``_game_witness``) so the routing is
+    testable without an engine. Returns ``{actions, seed, witness_source: "rl"|"tree",
+    witness_path: str|None}``; ``witness_path`` is None for a freshly-verified tree witness,
+    which exists only in memory. Raises ValueError on an unusable explicit ``--actions`` file:
+    an explicit request must fail loudly, never silently play something else."""
+    if actions_arg:
+        doc = _read_witness_json(actions_arg)
+        if not doc:
+            raise ValueError("unusable --actions witness (want a JSON object with a "
+                             "non-empty 'actions' list): %s" % actions_arg)
+        return {"actions": doc["actions"], "seed": int(doc.get("seed", seed_default)),
+                "witness_source": _witness_source_of(doc), "witness_path": str(actions_arg)}
+    if auto_demo:
+        for cand in _demo_trajectory_candidates(game_path):
+            doc = _read_witness_json(cand)
+            if doc:
+                return {"actions": doc["actions"], "seed": int(doc.get("seed", seed_default)),
+                        "witness_source": _witness_source_of(doc), "witness_path": str(cand)}
+    w = (tree_witness or _game_witness)(game_path)
+    return {"actions": w.get("actions", []), "seed": int(w.get("seed", seed_default)),
+            "witness_source": "tree", "witness_path": None}
+
+
 def cmd_game_replay(args) -> int:
     """Replay a game's witness to a GIF and/or a scrubbable frames-JSON substrate.
 
@@ -408,34 +487,33 @@ def cmd_game_replay(args) -> int:
 def cmd_game_capture(args) -> int:
     """Render a REAL in-engine GIF of a certified game's witness replay.
 
-    Resolves the witness (a supplied ``--actions`` JSON, else a fresh verify), then drives
-    ``godotworld/capture_host.gd`` through the software-GL capture lane (dressed by the
-    zero-contact overlay) and assembles the PNG sequence into a GIF with PIL. Untouched by
-    certification -- what it draws is provably the certified witness."""
+    Resolves the witness (an explicit ``--actions`` JSON, else the trained policy's demo
+    trajectory when g3' left one, else a fresh verify's tree witness -- see
+    ``_resolve_capture_witness``), then drives ``godotworld/capture_host.gd`` through the
+    software-GL capture lane (dressed by the zero-contact overlay) and assembles the PNG
+    sequence into a GIF with PIL. Untouched by certification -- what it draws is provably a
+    certified winning replay, and ``witness_source`` says which one."""
     try:
         from harness.verify.capture import capture_gif, CaptureError
     except Exception as exc:  # noqa: BLE001
         return _module_missing("capture", exc, args.json)
 
-    if args.actions:
-        try:
-            w = json.loads(Path(args.actions).read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            return _call_error("game capture (--actions)", exc, args.json)
-        actions, seed = w.get("actions", []), int(w.get("seed", args.seed))
-    else:
-        try:
-            w = _game_witness(args.game_path)
-        except Exception as exc:  # noqa: BLE001
-            return _call_error("game capture (verify)", exc, args.json)
-        actions, seed = w.get("actions", []), int(w.get("seed", args.seed))
-        if not actions:
-            msg = "no witness found (game does not certify?) -- nothing to capture"
-            if args.json:
-                _emit_json({"error": msg})
-            else:
-                print(msg, file=sys.stderr)
-            return 1
+    try:
+        wit = _resolve_capture_witness(
+            args.game_path, actions_arg=args.actions, seed_default=args.seed,
+            auto_demo=(getattr(args, "witness", "auto") != "tree"))
+    except ValueError as exc:
+        return _call_error("game capture (--actions)", exc, args.json)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game capture (witness)", exc, args.json)
+    actions, seed = wit["actions"], wit["seed"]
+    if not actions:
+        msg = "no witness found (game does not certify?) -- nothing to capture"
+        if args.json:
+            _emit_json({"error": msg})
+        else:
+            print(msg, file=sys.stderr)
+        return 1
 
     out_gif = args.out or str(Path(args.game_path).with_suffix(".gif"))
     try:
@@ -449,12 +527,20 @@ def cmd_game_capture(args) -> int:
     except Exception as exc:  # noqa: BLE001
         return _call_error("game capture", exc, args.json)
 
+    # A demo must never lie about what is playing: rl = the trained policy's own winning
+    # rollout, tree = the G3 solver's first-solution witness.
+    res["witness_source"] = wit["witness_source"]
+    res["witness_path"] = wit["witness_path"]
+
     if args.json:
         _emit_json(res)
     else:
         print(f"{str(res.get('result')).upper()}  {args.game_path}")
         print(f"  ticks : {res.get('ticks')}   frames : {res.get('n_frames')}")
         print(f"  gif   : {res.get('out_path')}")
+        src_note = "trained policy" if wit["witness_source"] == "rl" else "tree solver witness"
+        print(f"  played: {wit['witness_source']} ({src_note})"
+              + (f"  <- {wit['witness_path']}" if wit["witness_path"] else ""))
         if res.get("frames_dir"):
             print(f"  pngs  : {res.get('frames_dir')}")
     return 0 if res.get("result") in ("success", "failure", "exhausted") else 1
@@ -1123,7 +1209,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="3D chase-cam distance multiplier (body-lengths back; default ~3.0, "
                          "floored by an absolute minimum). Only affects --follow.")
     gc.add_argument("--actions", default=None,
-                    help="witness JSON ({seed,actions}) to replay; default: a fresh verify")
+                    help="witness JSON ({seed,actions}) to replay; overrides the default "
+                         "pick-up of a trained-policy demo_trajectory.json")
+    gc.add_argument("--witness", choices=("auto", "tree"), default="auto",
+                    help="auto (default): replay the trained policy's demo_trajectory.json "
+                         "when g3' left one beside the game (or in the round's g3/ dir), else "
+                         "the tree solver's witness. tree: always re-verify for a tree witness. "
+                         "The chosen source is reported as witness_source (rl|tree).")
     gc.add_argument("--frames-dir", default=None,
                     help="also keep the raw PNG frame sequence in this directory")
     gc.add_argument("--width", type=int, default=960)
