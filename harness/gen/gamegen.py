@@ -23,6 +23,7 @@ mid-run the verdict is forced to INVALIDATED (OBJECTIVES hard rule).
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -30,6 +31,7 @@ import re
 import shutil
 import time
 
+from harness.repair_language import PRESERVE_CLAUSE, PRINCIPLE, REACHABILITY_FIXES
 from harness.core import integrity
 from harness.gen import prompts
 from harness.gen import retrieval
@@ -48,7 +50,41 @@ except ImportError:  # pragma: no cover - environment dependent
 
 _MODEL = "claude-opus-4-8"
 _MAX_TOKENS = 16000
-_COMPILE_CAP = 5  # max attempts for env/compile errors (G0 load/build) -> discard
+
+# --- Repair budget ([eng.], 2026-07-16 free-model rebudget) ------------------
+# The old ceilings (compile cap 5, max_repairs 4) were COST caps, not correctness caps:
+# the OMNI-EPIC "discard, don't grind" pattern, sized when every attempt burned paid
+# tokens. Generation now runs a FREE model (OPENROUTER_MODEL=tencent/hy3:free), so the
+# binding question is no longer "how many attempts can we afford" but "is this loop
+# still making progress" — which is what `_REPAIR_STALL_CAP` answers directly, rather
+# than a low count answering it by proxy.
+#
+# The knobs move in OPPOSITE directions on purpose:
+#   * a PROGRESSING repair gets far more room (5 -> 12 compile attempts, 4 -> 8 repairs),
+#     which is exactly what an AMBITIOUS multi-stage game needs — keeping the mechanic
+#     AND fixing it takes more rounds than flattening it, so the old tight budget was
+#     itself a standing argument for demolition;
+#   * a STALLED repair gets LESS room than before (cut at 4 identical defects, was 5),
+#     because grinding an unchanged error is the waste the old cap was really aiming at.
+#
+# So the effective budget by case, old -> new:
+#   identical defect every round   5 -> 4 attempts   (CHEAPER than today)
+#   varying env/compile errors     5 -> 12 attempts  (room to converge)
+#   varying verify defects         5 -> 9 attempts   (max_repairs 8 + 1)
+# Progress buys room; spinning does not. That is the whole trade.
+#
+# Why 4 and not 2 (the harden loop cuts on the FIRST repeat, harden.py:419): that guard
+# keys on a fully-typed directive from the post-cert oracle suite (row + checkpoints),
+# whereas `_report_fingerprint` below is necessarily coarser. A coarser key needs more
+# evidence before it calls a stall, so 4 leaves three genuine swings at one defect while
+# still cutting below every other ceiling.
+#
+# All three are overridable (HARNESS_COMPILE_CAP / HARNESS_MAX_REPAIRS /
+# HARNESS_REPAIR_STALL_CAP), read at CALL time so a test or a run can retune without
+# reimporting. An explicit `max_repairs=` argument always wins over the env.
+_COMPILE_CAP_DEFAULT = 12      # max attempts on env/compile errors (G0 load/build)
+_MAX_REPAIRS_DEFAULT = 8       # repairs after the initial attempt (max_attempts = +1)
+_REPAIR_STALL_CAP_DEFAULT = 4  # identical defect fingerprints seen -> stop, don't grind
 
 # OpenRouter backend ([eng.] = engineering choices)
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -71,8 +107,17 @@ _OPENROUTER_REASONING_DEFAULT = 24000
 # Telemetry ledger (harness.telemetry) — one JSON line appended per run.
 _LEDGER_PATH = "runs/ledger.jsonl"
 
-_UNSOLVED_HINT = ("no random rollout reached success - make the goal easier to "
-                  "reach or actions more effective")
+# The UNSOLVED repair preamble. Until the 2026-07-16 ambition audit this read "make the
+# goal easier to reach or actions more effective" — the single most-fired ambition
+# launderer in the loop (every UNSOLVED repair leads with it). "Easier" is an instruction
+# a language model can only obey by DEMOLISHING: unlock the doors, drop the timer,
+# collapse the stages onto one axis. An unsolved game is a REACHABILITY defect; say so,
+# and name the local fix. See `harness.repair_language`.
+_UNSOLVED_HINT = (
+    "no random rollout reached success - " + PRINCIPLE + ": bring the first objective "
+    "within reach of the starting state and verify the ACTIONS actually move the agent "
+    "toward it (adjust " + REACHABILITY_FIXES + "), WITHOUT removing the goal. If "
+    "nothing can be reached, the game is broken, not merely hard. " + PRESERVE_CLAUSE)
 
 
 class _BackendUnavailable(Exception):
@@ -716,12 +761,95 @@ def _is_verify_error(report) -> bool:
     return isinstance(report, dict) and "error" in report and "layers" not in report
 
 
+def _env_int(name: str, default: int) -> int:
+    """An int knob from the environment, read at CALL time; the default on anything
+    unparseable or non-positive. House style (cf. `_resolve_engine`, `_g3_solver`):
+    HARNESS_*, env overrides a module default, never fails a run over a bad string."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _compile_cap() -> int:
+    """Max attempts on env/compile errors before discarding (HARNESS_COMPILE_CAP)."""
+    return _env_int("HARNESS_COMPILE_CAP", _COMPILE_CAP_DEFAULT)
+
+
+def _repair_stall_cap() -> int:
+    """How many times the SAME defect may recur before the loop stops (HARNESS_REPAIR_STALL_CAP)."""
+    return _env_int("HARNESS_REPAIR_STALL_CAP", _REPAIR_STALL_CAP_DEFAULT)
+
+
+def _max_repairs(explicit=None) -> int:
+    """Resolve the repair budget: an explicit argument wins, then HARNESS_MAX_REPAIRS,
+    then `_MAX_REPAIRS_DEFAULT`. Mirrors `_resolve_engine`'s explicit > env > default
+    precedence so a caller that passes a number always gets exactly that number."""
+    if explicit is not None:
+        return int(explicit)
+    return _env_int("HARNESS_MAX_REPAIRS", _MAX_REPAIRS_DEFAULT)
+
+
+def _failing_checks(report) -> list:
+    """The ids ("<layer>.<check>") of every check the report marks failed, sorted.
+
+    This is the STABLE identity of a verify failure — which checks broke — as opposed to
+    the volatile numbers the hint quotes around them (episode counts, latch rates, tick
+    indices, coordinates)."""
+    out = []
+    for layer_name, layer in sorted(((report or {}).get("layers") or {}).items()):
+        if not isinstance(layer, dict):
+            continue
+        for check_name, chk in sorted((layer.get("checks") or {}).items()):
+            if isinstance(chk, dict) and not chk.get("pass", True):
+                out.append(f"{layer_name}.{check_name}")
+    return out
+
+
+def _report_fingerprint(report) -> str:
+    """A STABLE dedup id for a verify FAILURE — the convergence guard's key.
+
+    Mirrors `feedback._fingerprint` (the harden loop's guard) on purpose: key on the
+    DEFECT IDENTITY, never on volatile run data. Here that identity is the failure class
+    + which checks failed + the milestone the probe stalls after.
+
+    Including `progress.stuck_after` is what keeps the guard HONEST rather than
+    trigger-happy: a game repaired from "stalls after m1" to "stalls after m3" fails the
+    SAME `solvable` check every round, yet it is genuinely progressing — a coarser
+    fingerprint would read that as a stall and cut a run that is working. Keying on the
+    stall BOUNDARY (exactly as `feedback`'s plateau row keys on its checkpoint pair)
+    means real progress mints a new fingerprint and buys back the full budget, while a
+    loop truly spinning on one defect repeats and gets cut."""
+    error = (report or {}).get("error")
+    if isinstance(error, dict) and "layers" not in (report or {}):
+        ident = f"error|{error.get('type', 'unknown')}"
+    else:
+        parts = [str((report or {}).get("failure_class") or "unknown")]
+        parts.extend(_failing_checks(report))
+        stuck = ((report or {}).get("progress") or {}).get("stuck_after")
+        if stuck is not None:
+            parts.append(f"stuck_after={stuck}")
+        ident = "|".join(parts)
+    return "fp_" + hashlib.sha1(ident.encode("utf-8")).hexdigest()[:12]
+
+
 def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
     """Shared write -> verify -> repair loop for every backend.
 
     Attempts are written ONLY into `run_dir` (the per-run sandbox), one file
     per attempt (a1<ext>, a2<ext>, ...). The winning/final attempt is later
     promoted to <slug><ext> by generate_game. verify_game routes by extension.
+
+    Bounded by THREE independent stops: the compile cap (env/compile errors),
+    `max_repairs` (total attempts), and the CONVERGENCE GUARD — the same defect
+    fingerprint recurring `_repair_stall_cap()` times ends the run rather than spending
+    the (now much larger) budget re-sending an identical error the model has already
+    failed to fix. The guard is what makes the raised ceilings safe: before it existed
+    this loop only COUNTED, so a bigger cap would have meant more identical attempts.
     """
     attempts = []
     feedback = None
@@ -729,6 +857,10 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
     game_path = None
     verdict = None
     design = ""
+    compile_cap = _compile_cap()
+    stall_cap = _repair_stall_cap()
+    seen_fingerprints: dict = {}
+    stalled_fingerprint = None
     max_attempts = max_repairs + 1  # 1 initial attempt + max_repairs repairs
 
     n = 0
@@ -774,9 +906,26 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
 
         if report.get("failure_class") == "ENV_ERROR":
             env_failures += 1
-            if env_failures >= _COMPILE_CAP:
+            if env_failures >= compile_cap:
                 verdict = "ENV_ERROR"  # OMNI-EPIC: discard, don't grind
                 break
+
+        # Convergence guard: this exact defect has now survived `stall_cap` attempts, so
+        # the model is not converging on it — stop rather than spend the rest of the
+        # budget re-sending an error it has already failed to fix. The verdict stays the
+        # honest failure_class (same as budget exhaustion below), so no downstream
+        # consumer sees a new verdict string; the stall is recorded in the note and in
+        # `stalled_fingerprint` for telemetry.
+        fp = _report_fingerprint(report)
+        seen_fingerprints[fp] = seen_fingerprints.get(fp, 0) + 1
+        if seen_fingerprints[fp] >= stall_cap:
+            verdict = report.get("failure_class") or "ENV_ERROR"
+            stalled_fingerprint = fp
+            note = (note + "; " if note else "") + (
+                f"repair stalled: the same defect ({report.get('failure_class')}) "
+                f"survived {seen_fingerprints[fp]} attempts unchanged - stopped at "
+                f"attempt {n} of {max_attempts}")
+            break
 
         if n >= max_attempts:
             verdict = report.get("failure_class") or "ENV_ERROR"
@@ -791,6 +940,8 @@ def _repair_loop(run_dir, produce, backend_used, max_repairs, note, ext=".py"):
         "backend": backend_used,
         "design": design,
     }
+    if stalled_fingerprint:
+        result["stalled_fingerprint"] = stalled_fingerprint
     if note:
         result["note"] = note
     return result
@@ -1035,7 +1186,7 @@ def _read_source(path):
     return ""
 
 
-def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
+def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=None,
                   engine=None, use_bank=True):
     """Generate an original game for `prompt` and return the loop report.
 
@@ -1073,7 +1224,7 @@ def generate_game(prompt, out_dir="scenes/games", backend="auto", max_repairs=4,
 
 
 def revise_game(source, directive, out_dir="scenes/games", backend="auto",
-                max_repairs=4, engine=None, use_bank=True, skill_context=None):
+                max_repairs=None, engine=None, use_bank=True, skill_context=None):
     """Revise a CERTIFIED game by the SMALLEST edit that applies `directive`.
 
     This is generate_game's twin for the curriculum loop's *revise* mode: instead
@@ -1129,7 +1280,7 @@ def _humanize_slug(path):
 
 
 def breed_game(parent_a_path, parent_b_path, arm="A", out_dir="scenes/games",
-               backend="auto", max_repairs=4, engine=None, use_bank=True,
+               backend="auto", max_repairs=None, engine=None, use_bank=True,
                prompt_a=None, prompt_b=None):
     """Breed TWO certified parent games into one child (the atlas D1 experiment).
 
@@ -1206,6 +1357,10 @@ def _generate_core(prompt, *, out_dir, backend, max_repairs, engine, use_bank,
     if backend not in ("auto", "anthropic", "openrouter", "template"):
         backend = "auto"
     engine = _resolve_engine(engine)
+    # The single resolution point for the repair budget: every public entry
+    # (generate_game / revise_game / breed_games) funnels here, and passes None to mean
+    # "use the configured default". An explicit number from the caller always wins.
+    max_repairs = _max_repairs(max_repairs)
     os.makedirs(out_dir, exist_ok=True)
 
     slug = _slug(prompt)

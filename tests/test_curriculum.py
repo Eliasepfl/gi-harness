@@ -16,6 +16,7 @@ import json
 import pytest
 
 from harness.gen import curriculum as C
+from harness.repair_language import PRESERVE_CLAUSE
 
 
 # ======================================================================== #
@@ -182,7 +183,7 @@ def test_per_milestone_mastery_tapers_at_stall():
 # ======================================================================== #
 # Directive — anchored to the stalling milestone
 # ======================================================================== #
-def test_directive_hard_names_stalling_milestone_and_eases_it():
+def test_directive_hard_names_stalling_milestone_and_makes_it_reachable():
     keys = ["switch_a", "cleared_gap1", "switch_b", "cleared_gap2"]
     p = C.difficulty_profile(
         vreport(witness_ticks=102,
@@ -192,7 +193,8 @@ def test_directive_hard_names_stalling_milestone_and_eases_it():
     d = C.directive(p)
     assert "grade: hard" in d
     assert "cleared_gap1" in d              # names the stalling milestone
-    assert "EASE" in d                      # ease exactly that stage
+    assert "REACHABLE" in d                 # make exactly that stage reachable...
+    assert PRESERVE_CLAUSE in d             # ...NOT shallower (ambition audit)
     assert "switch_a" in d                  # names the last mastered stage
 
 

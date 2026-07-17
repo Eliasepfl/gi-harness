@@ -42,6 +42,8 @@ import re
 import time
 from datetime import datetime, timezone
 
+from harness.repair_language import PRESERVE_CLAUSE, REACHABILITY_FIXES
+
 # --- Grade thresholds ([eng.] — calibrated on the 3 G3' spike datapoints) ----
 # The graded learnability signal is the STOCHASTIC (sampled) success rate: on the
 # fully-deterministic showcase games the GREEDY rate is degenerate/binary (0 or 1),
@@ -331,18 +333,20 @@ def directive(profile: dict) -> str:
         mastered = f" (it reliably reaches '{last_mastered}')" if last_mastered else ""
         body = (
             f"The agent plateaus BEFORE '{stall}': success rate {sr}{mastered}, but "
-            f"it rarely gets past '{stall}'. EASE exactly that stage — widen the "
-            f"platform, slow or steady the hazard, enlarge the target, or relax the "
-            f"timing at '{stall}' — and KEEP every later stage intact. Change only "
-            f"the '{stall}' gate; do not touch the stages the agent already clears.")
+            f"it rarely gets past '{stall}'. Make exactly that stage REACHABLE — widen "
+            f"the platform, steady the hazard, enlarge the target, or relax the timing "
+            f"at '{stall}' — and KEEP every later stage intact. Change only the "
+            f"'{stall}' gate; do not touch the stages the agent already clears. "
+            + PRESERVE_CLAUSE)
     else:  # not_learnable
         stall = stalling or _first(milestones)
         body = (
             f"No policy learned to win within budget (success rate {sr}; the agent "
-            f"never gets reliably past '{stall}'). Ease the EARLIEST blocking stage "
-            f"'{stall}': make its gate reachable — wider gap, slower/steadier "
-            f"hazard, a closer checkpoint — WITHOUT changing the goal. If it stalls "
-            f"at the very first milestone, ease the opening so play can begin.")
+            f"never gets reliably past '{stall}'). Make the EARLIEST blocking stage "
+            f"'{stall}' reachable — wider gap, steadier hazard, a closer checkpoint — "
+            f"WITHOUT changing the goal. If it stalls at the very first milestone, "
+            f"bring that opening within reach of the starting state so play can begin "
+            f"(adjust {REACHABILITY_FIXES}). " + PRESERVE_CLAUSE)
 
     return f"{head}\n{body}"
 

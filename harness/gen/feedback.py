@@ -82,6 +82,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
+from harness.repair_language import PRESERVE_CLAUSE, REACHABILITY_FIXES
+
 
 # --- Thresholds ([eng.]) -----------------------------------------------------
 LATCH_RELIABLE = 0.5   # per-checkpoint eval latch rate >= this == "reliably reached"
@@ -227,6 +229,11 @@ def _compile_g3(g3: dict) -> list:
     if not keys or max_rate <= UNREACHED_MAX:
         first = keys[0] if keys else None
         gate = f"the first objective '{first}'" if first else "the first objective"
+        # The REFERENCE directive: this row already got the shape right before the
+        # 2026-07-16 ambition audit (name the reachability fix, forbid the demolition,
+        # "broken, not merely hard"). Its wording is what every other reachability row
+        # now mirrors; the shared clause is appended so the whole family speaks with one
+        # voice and one testable constant. See `harness.repair_language`.
         text = (
             "UNSOLVABLE BY THE TRAINED AGENT: after the full "
             f"{budget}-env-step budget the RL policy never latched ANY declared "
@@ -234,7 +241,8 @@ def _compile_g3(g3: dict) -> list:
             "unreachable, or the controls cannot make progress at all. Make the opening "
             "playable — bring the first objective within reach of the starting state and "
             "verify the ACTIONS actually move the agent toward it — WITHOUT removing the "
-            "goal. If nothing can be reached, the game is broken, not merely hard.")
+            "goal. If nothing can be reached, the game is broken, not merely hard. "
+            + PRESERVE_CLAUSE)
         return [_mk("g3_unsolvable", "g3_prime", [first] if first else [], text,
                     {"success_rate": round(success, 3), "budget_steps": budget,
                      "per_checkpoint_latch_rate": rates})]
@@ -249,10 +257,12 @@ def _compile_g3(g3: dict) -> list:
             "REACHES EVERY MILESTONE BUT NEVER WINS: over the eval episodes the agent "
             f"reliably latches every declared checkpoint (through '{gate}') yet its "
             f"success rate stays {round(success, 3)} after the full budget. The final win "
-            "condition is mis-gated or too strict — loosen the success test just past "
-            f"'{gate}' (widen the goal region, relax the final tolerance/timing) so "
-            "reaching the last milestone can actually convert into a win. KEEP every "
-            "earlier stage intact.")
+            f"condition is mis-gated or unreachable — make the win CONVERTIBLE from "
+            f"'{gate}': widen the goal region, or relax the final tolerance/timing at "
+            f"that last step ALONE, so reaching the last milestone can actually turn "
+            f"into a win. Do NOT reach the win by deleting the final gate or any stage "
+            f"before it. KEEP every earlier stage and its gating intact. "
+            + PRESERVE_CLAUSE)
         return [_mk("g3_difficulty", "g3_prime", [gate], text,
                     {"success_rate": round(success, 3), "n_eval": n_eval,
                      "per_checkpoint_latch_rate": rates})]
@@ -266,18 +276,20 @@ def _compile_g3(g3: dict) -> list:
         text = (
             f"STALLS AT THE VERY FIRST OBJECTIVE: the agent rarely even reaches "
             f"'{first_stuck}' (latch rate {rates.get(first_stuck, 0.0)}, success "
-            f"{round(success, 3)}). Ease the opening so play can begin — bring "
-            f"'{first_stuck}' closer to the start, widen its trigger, or slow/steady any "
-            "hazard before it — WITHOUT changing the goal or any later stage.")
+            f"{round(success, 3)}). Make the opening REACHABLE so play can begin — bring "
+            f"'{first_stuck}' within reach of the starting state and verify the ACTIONS "
+            f"actually move the agent toward it (adjust {REACHABILITY_FIXES}), or steady "
+            f"any hazard standing before it — WITHOUT changing the goal or any later "
+            f"stage. " + PRESERVE_CLAUSE)
     else:
         text = (
             f"THE AGENT PLATEAUS BETWEEN '{last_reliable}' AND '{first_stuck}': it "
             f"reliably reaches '{last_reliable}' (latch rate {rates.get(last_reliable, 0.0)}) "
             f"but rarely gets past to '{first_stuck}' (latch rate {rates.get(first_stuck, 0.0)}; "
-            f"overall success {round(success, 3)}). EASE exactly the '{last_reliable}' -> "
-            f"'{first_stuck}' segment — widen the gap, slow or steady the hazard, enlarge "
-            f"the target, or relax the timing there — and KEEP every stage the agent already "
-            "clears, and every stage after, intact.")
+            f"overall success {round(success, 3)}). Make exactly the '{last_reliable}' -> "
+            f"'{first_stuck}' step REACHABLE — widen the gap, steady the hazard, enlarge "
+            f"the target, or relax the timing at that ONE step — and KEEP every stage the "
+            f"agent already clears, and every stage after, intact. " + PRESERVE_CLAUSE)
     return [_mk("g3_plateau", "g3_prime", [k for k in (last_reliable, first_stuck) if k],
                 text, {"last_reliable": last_reliable, "first_stuck": first_stuck,
                        "success_rate": round(success, 3),
