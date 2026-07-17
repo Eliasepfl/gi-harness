@@ -32,6 +32,10 @@
 
 extends SceneTree
 
+# Preloaded by PATH, not by global class_name (see chord_util.gd): the class-name
+# registry lives in the gitignored .godot cache, so a fresh checkout would fail to parse.
+const ChordUtil = preload("res://chord_util.gd")
+
 const K_STEPS := 6
 const VMAX := 1.0e5
 const REQUIRED_METHODS := ["build", "act", "state", "checkpoints",

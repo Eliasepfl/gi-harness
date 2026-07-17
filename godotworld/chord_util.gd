@@ -21,7 +21,13 @@
 # ONE HELPER PER SIDE. Both hosts -- serve_game.gd (certification) and capture_host.gd
 # (render/replay) -- call ChordUtil.apply(). Keeping the rule in exactly one place is
 # why serve and capture cannot drift: capture parity is structural, not coincidental.
-class_name ChordUtil
+#
+# NO `class_name`. A global class name resolves through Godot's EDITOR-GENERATED
+# `.godot/global_script_class_cache.cfg`, which is gitignored -- so a warm worktree
+# resolves `ChordUtil` while a fresh checkout does not, and the host dies with
+# "Identifier ChordUtil not declared" at parse time. The hosts preload this file by
+# path instead (`const ChordUtil = preload("res://chord_util.gd")`), which is explicit
+# and cache-independent -- the same idiom runner.gd already uses for its sensors.
 extends RefCounted
 
 
