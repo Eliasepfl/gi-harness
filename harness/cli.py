@@ -546,6 +546,41 @@ def cmd_game_capture(args) -> int:
     return 0 if res.get("result") in ("success", "failure", "exhausted") else 1
 
 
+def cmd_game_export(args) -> int:
+    """Export a certified game's witness replay to an EPISODE PACKAGE (the GI bullet-3
+    reward-model substrate): ``<out>/<slug>/<seed>/`` with episode.json + steps.jsonl +
+    frames/t%05d.png, and a top-level manifest.jsonl line. Bridges code-defined truth
+    (per-tick state + step_reward labels) and the pixel channel (the rendered frame)."""
+    try:
+        from harness.export.episode import append_manifest, export_episode
+    except Exception as exc:  # noqa: BLE001
+        return _module_missing("export", exc, args.json)
+
+    try:
+        record = export_episode(
+            args.game_path, args.out, actions_arg=args.actions,
+            witness_mode=getattr(args, "witness", "auto"), seed_default=args.seed,
+            follow=(True if args.follow else None), width=args.width, height=args.height,
+            fps=args.fps, cam_dist=getattr(args, "cam_dist", None),
+            render_frames=not args.no_frames)
+    except ValueError as exc:
+        return _call_error("game export", exc, args.json)
+    except Exception as exc:  # noqa: BLE001
+        return _call_error("game export", exc, args.json)
+
+    append_manifest(args.out, record)
+
+    if args.json:
+        _emit_json(record)
+    else:
+        print(f"EXPORTED  {record['slug']}  [{record['dim']}]  {record['outcome']}")
+        print(f"  ticks  : {record['ticks']}   steps : {record['n_steps']}   "
+              f"frames : {record['n_frames']}")
+        print(f"  witness: {record['witness_source']}   return : {record['episode_return']}")
+        print(f"  dir    : {record['paths']['dir']}")
+    return 0
+
+
 def cmd_game_attack(args) -> int:
     """Run the adversarial G4 suite on a certified game (g4.attack_game)."""
     try:
@@ -1233,6 +1268,37 @@ def build_parser() -> argparse.ArgumentParser:
     gc.add_argument("--seed", type=int, default=0)
     gc.add_argument("--json", action="store_true")
     gc.set_defaults(func=cmd_game_capture)
+
+    ge = gmsub.add_parser(
+        "export",
+        help="export a certified game's witness replay to an EPISODE PACKAGE "
+             "(episode.json + steps.jsonl + frames/) -- the GI bullet-3 reward-model "
+             "substrate bridging code-defined truth and the pixel channel")
+    ge.add_argument("game_path")
+    ge.add_argument("--out", required=True,
+                    help="dataset root; the episode is written to <out>/<slug>/<seed>/ "
+                         "and a line is appended to <out>/manifest.jsonl")
+    ge.add_argument("--actions", default=None,
+                    help="witness JSON ({seed,actions}) to replay; overrides the default "
+                         "pick-up of a trained-policy demo_trajectory.json")
+    ge.add_argument("--witness", choices=("auto", "tree"), default="auto",
+                    help="auto (default): trained demo_trajectory.json when present, else "
+                         "the tree solver's witness. tree: always re-verify for a tree "
+                         "witness. The chosen source is stamped as witness_source (rl|tree).")
+    ge.add_argument("--follow", action="store_true",
+                    help="chase-cam trailing the controlled body (default: 3D games follow, "
+                         "2D games use the fit-to-scene overview)")
+    ge.add_argument("--cam-dist", type=float, default=None,
+                    help="3D chase-cam distance multiplier (only with --follow)")
+    ge.add_argument("--width", type=int, default=960)
+    ge.add_argument("--height", type=int, default=540)
+    ge.add_argument("--fps", type=int, default=20, help="companion GIF playback fps")
+    ge.add_argument("--seed", type=int, default=0)
+    ge.add_argument("--no-frames", action="store_true",
+                    help="skip the pixel channel (state + reward labels only) -- the "
+                         "offline path for environments without a display/Godot render lane")
+    ge.add_argument("--json", action="store_true")
+    ge.set_defaults(func=cmd_game_export)
 
     ga = gmsub.add_parser(
         "attack", help="adversarial G4 suite on a certified game (tier 0/1)")
