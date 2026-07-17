@@ -161,6 +161,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -919,10 +920,18 @@ def _gym_env_cls():
 
         metadata = {"render_modes": []}
 
-        def __init__(self, planck_env: "PlanckEnv"):
+        def __init__(self, planck_env: "PlanckEnv", *, warmstart=None, ws_seed: int = 0):
             super().__init__()
             self._env = planck_env
             self._seed = 0                         # latched seed (see class docstring)
+            # WITNESS-WARMSTART (Backplay reverse curriculum, OPT-IN — harness.rl.warmstart).
+            # When a WarmstartCurriculum is injected, reset() Backplay-replays a witness
+            # PREFIX (drawn per slot, annealed as success rises) through this env's own
+            # serve stepping before handing control to the learner — reusing the exact
+            # adversary.rollout idiom. None -> byte-identical vanilla reset. Each vec slot
+            # gets its OWN rng (ws_seed) so slots draw independent prefix lengths.
+            self._warmstart = warmstart
+            self._ws_rng = random.Random(int(ws_seed)) if warmstart is not None else None
             obs_dim = int(planck_env.observation_space.shape[0])
             self.observation_space = spaces.Box(
                 low=-OBS_CLIP, high=OBS_CLIP, shape=(obs_dim,), dtype=np.float32)
@@ -945,6 +954,14 @@ def _gym_env_cls():
         def reset(self, *, seed=None, options=None):
             if seed is not None:
                 self._seed = int(seed)            # remember it for autoreset
+            if self._warmstart is not None:
+                # Backplay-warmstarted reset: draw a prefix for this slot, replay it, hand
+                # off. Empty prefix (fully-annealed curriculum) short-circuits to the plain
+                # reset below -> byte-identical (see warmstart.warmstart_reset).
+                from harness.rl.warmstart import warmstart_reset
+                obs, info = warmstart_reset(self._env, self._warmstart, self._ws_rng,
+                                            seed=self._seed)
+                return obs, info
             obs, info = self._env.reset(seed=self._seed)
             return obs, info
 
@@ -962,9 +979,13 @@ def _gym_env_cls():
     return _GYM_ENV_CLS
 
 
-def wrap_gym(planck_env: "PlanckEnv"):
-    """Wrap a live PlanckEnv in the gymnasium.Env adapter (see ``_gym_env_cls``)."""
-    return _gym_env_cls()(planck_env)
+def wrap_gym(planck_env: "PlanckEnv", *, warmstart=None, ws_seed: int = 0):
+    """Wrap a live PlanckEnv in the gymnasium.Env adapter (see ``_gym_env_cls``).
+
+    ``warmstart`` (a :class:`harness.rl.warmstart.WarmstartCurriculum`, OPT-IN) makes each
+    reset Backplay-replay a witness prefix; ``ws_seed`` seeds this slot's prefix-draw rng.
+    The defaults (``None``) keep the wrapper byte-identical to the pre-warmstart adapter."""
+    return _gym_env_cls()(planck_env, warmstart=warmstart, ws_seed=ws_seed)
 
 
 def make_gym_env(game_path: str, **kwargs):
