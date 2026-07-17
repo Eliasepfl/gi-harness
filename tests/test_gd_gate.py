@@ -27,11 +27,75 @@ from harness.verify.gameverify import detect_engine, run_g0_gd, verify_game  # n
 from harness.verify.gd_gate import (  # noqa: E402
     GD_REQUIRED_METHODS, is_failure_constant_false, scan_gd_source, scan_violations,
 )
+from harness.verify.gd_exec import classify_check_output  # noqa: E402
 from harness.verify.godot_exec import scrubbed_env  # noqa: E402
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _GD_DIR = os.path.join(_ROOT, "tests", "fixtures", "gd_games")
 _MINI = os.path.join(_GD_DIR, "mini_collect.gd")
+
+
+# ====================================================================== #
+# 0. WARNING-as-error reclassification at G0 (2026-07-17 parser-friction, item 1)
+# ====================================================================== #
+# The exact stdout Godot v4.7.stable emits from `--check-only` for each class, captured
+# in-image. classify_check_output must admit ONLY the benign warning class and keep every
+# genuine parse/type/syntax error fatal, so an untyped `:=`-inference warning stops sinking
+# att1 while a real error still fails.
+
+# Class A: a type-inference/Variant WARNING promoted to an error (BENIGN). MUST become ok.
+_OUT_WARNING_ONLY = (
+    "Godot Engine v4.7.stable.official.5b4e0cb0f - https://godotengine.org\n\n"
+    "SCRIPT ERROR: Parse Error: The variable type is being inferred from a Variant value, "
+    "so it will be typed as Variant. (Warning treated as error.)\n"
+    "          at: GDScript::reload (/tmp/probe_5k2vfy22.gd:4)\n"
+    'ERROR: Failed to load script "/tmp/probe_5k2vfy22.gd" with error "Parse error".\n'
+    "   at: load (modules/gdscript/gdscript_resource_format.cpp:46)\n")
+
+# Class B: a GENUINE hard type-inference error (fails even with warnings off). MUST stay fatal.
+_OUT_HARD_INFER = (
+    "Godot Engine v4.7.stable.official.5b4e0cb0f - https://godotengine.org\n\n"
+    'SCRIPT ERROR: Parse Error: Cannot infer the type of "first" variable because the '
+    "value doesn't have a set type.\n"
+    "          at: GDScript::reload (/tmp/probe_fjvzw4ld.gd:4)\n"
+    'ERROR: Failed to load script "/tmp/probe_fjvzw4ld.gd" with error "Parse error".\n')
+
+# Class C: a GENUINE syntax error. MUST stay fatal.
+_OUT_SYNTAX = (
+    "Godot Engine v4.7.stable.official.5b4e0cb0f - https://godotengine.org\n\n"
+    'SCRIPT ERROR: Parse Error: Unexpected "Indent" in class body.\n'
+    "          at: GDScript::reload (/tmp/probe_xb6t8lk8.gd:3)\n"
+    'ERROR: Failed to load script "/tmp/probe_xb6t8lk8.gd" with error "Parse error".\n')
+
+
+def test_warning_only_check_output_is_reclassified_nonfatal():
+    v = classify_check_output(_OUT_WARNING_ONLY)
+    assert v["ok"] is True and v["error"] is None
+    # the benign warning is recorded (stripped of the escalation tag) for observability
+    assert v["warnings"] and "inferred from a Variant value" in v["warnings"][0]
+    assert "Warning treated as error" not in v["warnings"][0]
+
+
+@pytest.mark.parametrize("out,label", [(_OUT_HARD_INFER, "hard-infer"),
+                                       (_OUT_SYNTAX, "syntax")])
+def test_genuine_parse_errors_stay_fatal(out, label):
+    v = classify_check_output(out)
+    assert v["ok"] is False, label
+    assert v["error"] and "Parse Error" in v["error"]
+
+
+def test_a_real_error_alongside_a_warning_stays_fatal():
+    # Conservative: if ANY SCRIPT ERROR diagnostic lacks the warning tag, the whole load is
+    # fatal — a warning can never launder a genuine error into a pass.
+    mixed = _OUT_WARNING_ONLY + _OUT_SYNTAX
+    v = classify_check_output(mixed)
+    assert v["ok"] is False
+
+
+def test_nonzero_with_no_script_error_diagnostic_stays_fatal():
+    # rc!=0 but no SCRIPT ERROR line (timeout, missing file, engine abort) -> fatal.
+    assert classify_check_output("ERROR: something else went wrong\n")["ok"] is False
+    assert classify_check_output("")["ok"] is False
 
 
 # ====================================================================== #

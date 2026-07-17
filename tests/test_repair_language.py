@@ -108,8 +108,56 @@ def test_gate_allows_removal_as_a_prohibition_and_as_a_defect_fix():
 # The vocabulary itself
 # ======================================================================== #
 def test_the_shared_clauses_are_not_themselves_laundering():
-    for name in ("PRINCIPLE", "PRESERVE_CLAUSE", "PRESERVE_SHORT", "REACHABILITY_FIXES"):
+    for name in ("PRINCIPLE", "PRESERVE_CLAUSE", "PRESERVE_SHORT", "REACHABILITY_FIXES",
+                 "CONTAINMENT_REFRAME"):
         assert_not_laundering(getattr(RL, name), f"repair_language.{name}")
+
+
+# ======================================================================== #
+# REFRAME-ON-REPEAT vocabulary (2026-07-17 parser-friction, items 3 + 4)
+# ======================================================================== #
+def test_reframe_kind_classifies_only_the_two_eligible_families():
+    # containment: named by a failed in_bounds/no_escape check OR by the hint text.
+    assert RL.reframe_kind("ENV_ERROR", ["G1_rollout.no_escape"], "", None) == "containment"
+    assert RL.reframe_kind("ENV_ERROR", [], "dynamic body out of bounds: puck",
+                           None) == "containment"
+    # last_mile: an UNSOLVED run that reaches milestones but stalls one step short.
+    prog = {"reach_counts": {"m1": 40, "m2": 39}, "stuck_after": "m2"}
+    assert RL.reframe_kind("UNSOLVED", [], "stuck between m2 and success", prog) == "last_mile"
+    # NOT eligible: everything else keeps the pure "N identical -> stop" invariant.
+    assert RL.reframe_kind("GOAL_ERROR", [], "success true at t=0", None) is None
+    assert RL.reframe_kind("ENV_ERROR", [], "module failed to load", None) is None
+    assert RL.reframe_kind("UNSOLVED", [], "0/40 reached success", None) is None   # no reach
+
+
+def test_containment_reframe_changes_the_approach_and_preserves():
+    c = RL.CONTAINMENT_REFRAME
+    assert_not_laundering(c, "CONTAINMENT_REFRAME")
+    assert "_physics_process" in c and "act()" in c        # the concrete clamp site
+    assert "tunnel" in c.lower()                            # names WHY (mid-step overshoot)
+    assert "keep the mechanic" in c.lower()                 # preserves the design
+
+
+def test_last_mile_telemetry_carries_the_reach_numbers_targeted():
+    prog = {"reach_counts": {"start": 360, "past_left": 360, "past_right": 359},
+            "stuck_after": "past_right"}
+    t = RL.last_mile_telemetry(prog)
+    assert_not_laundering(t, "last_mile_telemetry")
+    assert "Closest-approach telemetry" in t
+    assert "'past_right' 359/360" in t                      # the exact reach numbers
+    assert "'past_right' -> 'success'" in t                 # the single stuck step named
+    assert "leave it untouched" in t                        # preserve the cleared stages
+    # No reach data -> empty (fires ONLY on the last-mile family).
+    assert RL.last_mile_telemetry(None) == ""
+    assert RL.last_mile_telemetry({"reach_counts": {}, "stuck_after": None}) == ""
+
+
+def test_reframe_clause_dispatches_by_kind():
+    prog = {"reach_counts": {"m1": 10, "m2": 9}, "stuck_after": "m2"}
+    assert RL.reframe_clause("containment", {}) == RL.CONTAINMENT_REFRAME
+    assert "Closest-approach telemetry" in RL.reframe_clause("last_mile",
+                                                             {"progress": prog})
+    assert RL.reframe_clause("nope", {}) == ""
 
 
 def test_preserve_clause_names_every_structure_the_model_must_keep():

@@ -165,6 +165,55 @@ def _parse_error_line(check_only_output: str) -> str:
         else "parse/compile failed (--check-only)"
 
 
+# --------------------------------------------------------------------------- #
+# WARNING-as-error reclassification (2026-07-17 parser-friction lever, item 1).
+#
+# Godot 4.7's standalone ``--check-only`` runs GDScript with the type-inference/Variant
+# WARNINGS promoted to hard errors, so a game whose only fault is e.g.
+#   Parse Error: The variable type is being inferred from a Variant value, so it will be
+#                typed as Variant. (Warning treated as error.)
+# aborts the parse gate on att1 — even though the code is VALID GDScript. A warning is
+# NEITHER a determinism nor a sandbox violation (both of those are enforced by the banned-
+# API scanner + the pinned physics, never by a style/type warning), so it must not sink a
+# G0 load. This reclassifier lets a WARNING-ONLY ``--check-only`` failure through; the
+# companion project setting (godotworld/project.godot: gdscript/warnings/
+# inference_on_variant + treat_warnings_as_errors=false) relaxes the SAME warning at the
+# serve host, so the game the parse gate now admits also loads + runs there byte-identically.
+#
+# GROUND TRUTH (in-image probe, Godot v4.7.stable, 2026-07-17):
+#   * ``var v := d.get("x")``  -> "... (Warning treated as error.)"   [BENIGN warning]
+#   * ``var x := arr[0]``      -> "Cannot infer the type ... doesn't have a set type."
+#                                                                     [GENUINE hard error]
+#   * missing ``:``            -> "Unexpected \"Indent\" in class body." [GENUINE syntax]
+# Only the FIRST carries the "(Warning treated as error.)" tag; the other two are real
+# parse errors with no such tag. So keying on that exact tag makes exactly the benign
+# warning class non-fatal while every genuine parse/type/syntax error stays fatal.
+_WARNING_AS_ERROR_TAG = "(Warning treated as error.)"
+_SCRIPT_ERROR_LINE_RE = re.compile(r"SCRIPT ERROR:\s*(.*)")
+
+
+def classify_check_output(output: str) -> dict:
+    """Turn a NON-zero ``--check-only`` run into a G0 load verdict.
+
+    Returns ``{"ok": True, "error": None, "warnings": [...]}`` IFF EVERY primary
+    ``SCRIPT ERROR:`` diagnostic Godot printed is a warning-treated-as-error escalation
+    (the type-inference/Variant warning class); otherwise ``{"ok": False, "error": <line>}``
+    with the genuine parse-error line. Conservative by construction: a single diagnostic
+    WITHOUT the ``(Warning treated as error.)`` tag — a real syntax error, an unresolved
+    identifier, a hard ``Cannot infer ... doesn't have a set type`` — keeps the whole load
+    FATAL, so no real parse error is ever laundered into a pass. Only the ``SCRIPT ERROR:``
+    diagnostic lines are inspected; the generic ``ERROR: Failed to load script ...``/``at:``
+    follow-ups (mere consequences of the abort) are ignored."""
+    diagnostics = [m.group(1).strip()
+                   for ln in (output or "").splitlines()
+                   for m in (_SCRIPT_ERROR_LINE_RE.search(ln),) if m]
+    if diagnostics and all(_WARNING_AS_ERROR_TAG in d for d in diagnostics):
+        return {"ok": True, "error": None,
+                "warnings": [d.replace(_WARNING_AS_ERROR_TAG, "").strip()
+                             for d in diagnostics]}
+    return {"ok": False, "error": _parse_error_line(output)}
+
+
 class GdExecutor:
     """Out-of-process executor spawning one ``serve_game.gd`` per instance and
     reusing it across ``run_check`` + every ``run_batch`` of the funnel run."""
@@ -399,7 +448,12 @@ class GdExecutor:
             if proc.returncode == 0:
                 return {"ok": True, "error": None}
             out = (proc.stdout or b"").decode("utf-8", "replace")
-            return {"ok": False, "error": _parse_error_line(out)}
+            # A benign type-inference/Variant WARNING that Godot's strict --check-only
+            # promoted to an error is not a real parse failure (nor a determinism/sandbox
+            # one) — reclassify a warning-ONLY abort as a pass so the game reaches the
+            # serve host, which relaxes the same warning via project.godot. Genuine
+            # syntax/type errors keep ok=False. See classify_check_output.
+            return classify_check_output(out)
         finally:
             try:
                 os.unlink(path)

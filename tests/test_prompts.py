@@ -104,6 +104,30 @@ def test_gdscript_banned_list_states_determinism_and_sandbox_reasons():
     assert "seed it from world_seed" in flat or "seed your own" in flat
 
 
+def test_gdscript_names_godot4_runtime_and_bans_godot3_ghosts():
+    # 2026-07-17 parser-friction lever: the free model half-remembers Godot 3 and invents
+    # symbols the strict parser rejects. ONE runtime hard-rule line (anti-hallucination,
+    # NOT a design menu) names the runtime as Godot 4.x and the real API surface, and calls
+    # out the Godot-3 ghosts the A/B traces caught. Sits in the BANNED/determinism-adjacent
+    # runtime area, BEFORE the "Common gate failures" section.
+    sp = P.compose("gdscript")
+    flat = " ".join(sp.lower().split())
+    assert "runtime is godot 4" in flat                 # the runtime is named
+    # The REAL Godot-4 API names the model must reach for.
+    for real in ("apply_central_force", "apply_torque_impulse", "overlaps_body",
+                 "limit_length", "CharacterBody2/3D"):
+        assert real in sp, real
+    # The Godot-3 GHOSTS, each named as non-existent so the model unlearns it.
+    for ghost in ("add_central_force", "apply_angular_impulse", "has_overlapping_body",
+                  "Vector2.limited", "KinematicBody", "FixedJoint3D", "PolygonShape2D",
+                  "MODE_"):
+        assert ghost in sp, ghost
+    # It is a RUNTIME rule, not steering about the game: it lands before the gate-failure
+    # reminders and after the BANNED table (the determinism/sandbox runtime area).
+    assert sp.index("BANNED") < sp.index("RUNTIME IS GODOT 4")
+    assert sp.index("RUNTIME IS GODOT 4") < sp.index("Common gate failures")
+
+
 def test_gdscript_gravity_is_the_games_own_choice():
     # View guidance: gravity/view is the GAME's to set - and the contract offers NO menu.
     # (2026-07-16 de-bias: enumerating "side elevation or topdown" was itself a two-item

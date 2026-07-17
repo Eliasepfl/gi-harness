@@ -51,3 +51,14 @@ common/physics_interpolation=false
 [debug]
 
 settings/stdout/verbose_stdout=false
+; GDScript warnings are NOT determinism or sandbox controls (those are the banned-API
+; scanner + the pinned physics); they are style/type hints. Godot 4.7 defaults the
+; type-inference/Variant warning `inference_on_variant` to ERROR level, so a generated game
+; with an untyped `var v := <Variant expr>` aborts at BOTH the standalone --check-only parse
+; gate AND this serve host (Error 43) even though the code is valid GDScript that runs
+; byte-identically (the value is simply typed Variant). Demote it (and clear the
+; warnings-as-errors master) so a benign warning never sinks a G0 load. GENUINE parse/type
+; errors (e.g. `Cannot infer the type ... doesn't have a set type`) have no warning level and
+; stay fatal. 2026-07-17 parser-friction lever; verified in-image (Godot v4.7.stable).
+gdscript/warnings/treat_warnings_as_errors=false
+gdscript/warnings/inference_on_variant=0

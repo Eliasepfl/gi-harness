@@ -36,6 +36,8 @@ _GD = os.path.join(_ROOT, "tests", "fixtures", "gd_games")
 _MINI = os.path.join(_GD, "mini_collect.gd")
 _RUNTIME_CRASH = os.path.join(_GD, "runtime_crash.gd")
 _BUILD_CRASH = os.path.join(_GD, "build_crash.gd")
+_WARNING_INFERENCE = os.path.join(_GD, "warning_inference.gd")   # item 1: benign warning
+_SYNTAX_ERROR = os.path.join(_GD, "syntax_error.gd")             # item 1: genuine error
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -301,6 +303,46 @@ def test_run_check_clean_game_build_ok_true():
         assert facts["build"]["ok"] is True
         assert "runtime_error" not in facts
         assert ex.runtime_errors == []
+    finally:
+        ex.close()
+
+
+@requires_godot
+def test_inference_warning_game_passes_g0_load_end_to_end():
+    """Item 1 (2026-07-17 parser-friction), END TO END: a game whose ONLY parse-time fault
+    is a benign type-inference/Variant WARNING must pass the G0 load through BOTH stages —
+    the standalone --check-only parse gate (reclassified by classify_check_output) AND the
+    serve host (which relaxes the SAME warning via godotworld/project.godot's
+    inference_on_variant setting). Before the fix the serve host rejected it with Error 43."""
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        facts = ex.run_check(_src(_WARNING_INFERENCE))
+        # parse gate: the warning-only --check-only abort is reclassified to a pass
+        assert facts["load"]["ok"] is True
+        # serve host actually loaded it: the contract probe ran with all 7 methods present
+        methods = (facts.get("contract") or {}).get("methods") or {}
+        assert all(methods.get(m) for m in ("build", "act", "state", "checkpoints",
+                                            "is_success", "is_failure", "actions"))
+        assert facts["build"]["ok"] is True                 # build() ran (no Error 43)
+        # and it EXECUTES deterministically through the serve host (no init/runtime crash)
+        rec = ex.run_batch(_src(_WARNING_INFERENCE),
+                           [{"seed": 0, "actions": ["up", "right"]}], 2)[0]
+        assert rec.get("result") is not None
+        assert not rec.get("error")
+    finally:
+        ex.close()
+
+
+@requires_godot
+def test_genuine_syntax_error_game_stays_fatal_at_g0():
+    """The other half of item 1's HARD CONSTRAINT: a real syntax error (missing ':') is NOT
+    laundered into a pass — the load fails and the serve host is never even spawned."""
+    ex = GdExecutor(port_base=_free_port())
+    try:
+        facts = ex.run_check(_src(_SYNTAX_ERROR))
+        assert facts["load"]["ok"] is False
+        assert "Parse Error" in (facts["load"].get("error") or "")
+        assert "contract" not in facts        # short-circuited: code never reached the host
     finally:
         ex.close()
 
