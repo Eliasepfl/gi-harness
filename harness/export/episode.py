@@ -333,6 +333,7 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
 
     # -- PIXEL trail (capture; sized so PNG ordinal == tick) -------------------------
     n_png = 0
+    frame_surplus = 0
     capture_meta = {}
     n_actions = len(actions)
     follow_flag = bool(follow) if follow is not None else (dimension == "3D")
@@ -345,21 +346,31 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
             follow=follow_flag, width=width, height=height, fps=fps,
             max_frames=n_actions + 8, cam_dist=cam_dist)
         pngs = sorted(raw_frames_dir.glob("frame_*.png"))
-        # Contract: the capture host emits t=0 (settle) + one PNG per tick 1..T, ordinal
-        # == tick. len(pngs) must equal len(state_frames) (both tick 0..T).
-        if len(pngs) != len(state_frames):
+        # The code-STATE trail (with the reward labels) is authoritative for T: it is tick 0..T,
+        # so n_state = T + 1 and the pixel channel must supply a frame for every tick 1..T. The
+        # capture host emits t=0 (settle) + one PNG per tick, ordinal == tick. For a clean WIN both
+        # channels stop at the same terminal tick (exact match). For a NON-terminating NEGATIVE the
+        # capture host can render a SMALL trailing SURPLUS -- it and the serve host detect the
+        # terminal one tick apart. The replay is byte-faithful up to that divergence (the winning
+        # witness matches exactly), so frames 1..T align with the reward trail regardless; we KEEP
+        # 1..T and DROP the settle frame + any surplus tail. A DEFICIT (fewer PNGs than the reward
+        # trail -> a tick 1..T has no pixel, e.g. real subsampling) is a hard error.
+        n_state = len(state_frames)            # tick 0..T
+        if len(pngs) < n_state:
             shutil.rmtree(raw_frames_dir, ignore_errors=True)
             raise ValueError(
-                f"pixel/state tick-count mismatch for {slug}: {len(pngs)} PNG frames vs "
-                f"{len(state_frames)} state frames (subsampling? capture result="
+                f"pixel/state tick-count DEFICIT for {slug}: {len(pngs)} PNG frames < "
+                f"{n_state} state frames (subsampling? capture result="
                 f"{capture_meta.get('result')})")
-        # Drop the t=0 settle frame; rename frame_0000t.png -> frames/t%05d.png (t=1..T).
+        frame_surplus = len(pngs) - n_state    # trailing frames past the reward trail's terminal
         for png in pngs:
             ordinal = int(png.stem.split("_")[-1])
-            if ordinal == 0:
-                continue                       # the settle/build frame lives in build_state
+            if ordinal <= 0 or ordinal >= n_state:
+                continue                       # settle frame (0) + surplus tail (>= n_state)
             shutil.move(str(png), str(frames_dir / f"t{ordinal:05d}.png"))
         shutil.rmtree(raw_frames_dir, ignore_errors=True)
+        # Every tick 1..T must now have exactly one PNG (a subsampled trail leaves a gap ->
+        # n_png < T -> the frame/step check below fires).
         n_png = len(sorted(frames_dir.glob("t*.png")))
 
     # -- steps.jsonl (one line per decision tick t=1..T) -----------------------------
@@ -415,6 +426,7 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
             "rendered": bool(render_frames),
             "result": capture_meta.get("result"),
             "width": width, "height": height, "follow": follow_flag,
+            "trailing_frames_dropped": frame_surplus,
         },
         "paths": {"steps": "steps.jsonl", "frames": "frames"},
     }

@@ -47,11 +47,13 @@ def _dir_bytes(path):
     return total
 
 
-def _fresh_build(game_file):
-    """Tick-0 entities from a FRESH 0-action deterministic replay (the game's build)."""
+def _fresh_build(game_file, seed=0):
+    """Tick-0 entities from a FRESH 0-action deterministic replay at ``seed`` (the game's build
+    for THAT world seed). The build can be seed-dependent (e.g. randomized hole/pane placement),
+    so a random rollout at seed s must be checked against the seed-s build, not seed 0."""
     src = open(game_file, encoding="utf-8").read()
     engine = detect_engine(game_file, src)
-    trail = X._state_trail(src, engine, [], 0, max_ticks=1)
+    trail = X._state_trail(src, engine, [], int(seed), max_ticks=1)
     return X._entities_of(trail["frames"][0])
 
 
@@ -87,9 +89,9 @@ def validate_episode(ep):
         assert abs(s["reward"]["total"] - expect) < 1e-9, \
             f"{slug}: tick {s['t']} label {s['reward']['total']} != env {expect}"
         assert c_after == s["n_latched"], f"{slug}: tick {s['t']} n_latched mismatch"
-    # 3. t=0 build equals a fresh 0-action replay
+    # 3. t=0 build equals a fresh 0-action replay AT THE EPISODE'S OWN SEED
     build = ep.meta["build_state"]
-    fresh = _fresh_build(ep.meta["game_file"])
+    fresh = _fresh_build(ep.meta["game_file"], seed=ep.seed)
     assert set(build.keys()) == set(fresh.keys()), \
         f"{slug}: build_state bodies {set(build)} != fresh {set(fresh)}"
     controlled = [n for n, q in build.items() if q.get("controlled")]
@@ -123,16 +125,22 @@ def validate_dataset(out, rows):
         for slug, kind, oc, ret in negs:
             if not (ret < min_win):
                 problems.append(f"{slug} [{kind}] {oc} return {ret} NOT < min win return {min_win}")
-    # 7. KIND FILTER -- wins vs negatives round-trip through the loader (state-only aware)
+    # 7. KIND FILTER -- wins vs negatives PARTITION the dataset (disjoint, exhaustive) and every
+    # filtered episode round-trips through the loader (state-only aware). Partition-based, so it is
+    # orthogonal to per-episode validation above.
     ds = EpisodeDataset(out)
-    n_win = sum(1 for _ in ds.filter_by_kind(("demo", "witness")))
-    n_neg = sum(1 for _ in ds.filter_by_kind(("random", "perturbed")))
-    exp_win = sum(1 for r in rows if r["kind"] in ("demo", "witness"))
-    exp_neg = sum(1 for r in rows if r["kind"] in ("random", "perturbed"))
-    if n_win != exp_win or n_neg != exp_neg:
-        problems.append(f"filter_by_kind count mismatch: wins {n_win}!={exp_win} or "
-                        f"negs {n_neg}!={exp_neg}")
-    for ep in ds.filter_by_kind(("demo", "witness", "random", "perturbed")):
+    total = len(ds)
+    wins_eps = list(ds.filter_by_kind(("demo", "witness")))
+    negs_eps = list(ds.filter_by_kind(("random", "perturbed")))
+    win_keys = {(e.slug, e.meta.get("episode_key")) for e in wins_eps}
+    neg_keys = {(e.slug, e.meta.get("episode_key")) for e in negs_eps}
+    if len(wins_eps) + len(negs_eps) != total or (win_keys & neg_keys):
+        problems.append(f"filter_by_kind does not partition the dataset: "
+                        f"wins {len(wins_eps)} + negs {len(negs_eps)} != {total} "
+                        f"(overlap {len(win_keys & neg_keys)})")
+    if not negs_eps:
+        problems.append("no NEGATIVE episodes (random|perturbed) in the dataset")
+    for ep in wins_eps + negs_eps:
         ep.validate(require_frames=int(ep.meta.get("n_frames", 0)) > 0)
     return problems
 
