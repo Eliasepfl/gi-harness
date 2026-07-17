@@ -1039,6 +1039,13 @@ def cmd_rl_probe(args) -> int:
         probe_kw["num_envs"] = args.num_envs
     if getattr(args, "shards", None) is not None:
         probe_kw["num_shards"] = args.shards
+    if getattr(args, "chord", False):
+        # CHORD (Phase 2): MultiBinary action space (multiple keys per tick). allow_idle is
+        # left to its default (the chord env turns the empty-chord IDLE tick ON).
+        probe_kw["chord_mode"] = True
+        if getattr(args, "no_chord_ban", False):
+            # A/B knob: disable the measured contradictory-chord projection (default ON).
+            probe_kw["ban_contradictions"] = False
     try:
         result = g3_prime(args.game_path, budget_steps=args.budget,
                           trainer=args.trainer, method=args.method, **probe_kw)
@@ -1357,6 +1364,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "M*K logical envs stepped concurrently to use M*K cores "
                          "(default 1 = single process, byte-identical). See "
                          "notes/rl_agent/SHARDED_VEC_ENV.md for the farm presets.")
+    rp.add_argument("--chord", action="store_true",
+                    help="CHORD Phase 2 (Godot lane): give the policy a MultiBinary "
+                         "action space (press MULTIPLE keys per tick); the empty-chord "
+                         "IDLE tick is enabled. Default off = Discrete, byte-identical.")
+    rp.add_argument("--no-chord-ban", dest="no_chord_ban", action="store_true",
+                    help="A/B knob (with --chord): DISABLE the measured contradictory-chord "
+                         "projection (default ON — a both-pressed near-antiparallel action "
+                         "pair, discovered mechanically from effect-vector probes, drops both).")
     rp.add_argument("--json", action="store_true")
     rp.set_defaults(func=cmd_rl_probe)
 

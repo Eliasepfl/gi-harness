@@ -230,7 +230,13 @@ def _shard_vec_env_cls():
             return obs
 
         def step_async(self, actions) -> None:
-            acts = np.asarray(actions).reshape(-1)
+            acts = np.asarray(actions)
+            # DISCRETE actions arrive as a flat (M*K,) index vector; CHORD (MultiBinary)
+            # actions as (M*K, n_actions) rows. Flatten ONLY the discrete case so a
+            # per-shard slice ``acts[i*K:(i+1)*K]`` yields K indices (discrete) or K rows
+            # (chord) -- flattening the chord case would shred the per-key bits.
+            if acts.ndim <= 1:
+                acts = acts.reshape(-1)
             K = self.num_envs_per_shard
             # Pure fan-out: each shard's step_async only stashes its K action strings (no
             # IO), so slicing + dispatch here is cheap and needs no threads — the overlap

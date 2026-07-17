@@ -46,6 +46,7 @@ import os
 import time
 
 from harness.rl.env import PlanckEnv
+from harness.verify.chord import wire_actions
 
 # --- Constants ([eng.]) ------------------------------------------------------
 DEFAULT_BUDGET = 2_000_000       # env-steps per game (LLM_RL_SYSTEMS §4.1) [eng.]
@@ -128,8 +129,14 @@ def export_demo_trajectory(trajectory: dict, path: str) -> str:
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
+    # Canonicalize each action to its WIRE form through the ONE chord boundary: a single
+    # verb stays a plain str (byte-identical legacy demo), a chord is a sorted list, and an
+    # all-off IDLE tick is the empty list []. Routing through wire_actions (never str(a),
+    # which would flatten a chord list into "['a','b']") keeps a Phase-2 demo replayable.
+    _raw = list(trajectory["actions"])
+    _has_idle = any(isinstance(a, (list, tuple)) and len(a) == 0 for a in _raw)
     payload = {"seed": int(trajectory["seed"]),
-               "actions": [str(a) for a in trajectory["actions"]],
+               "actions": wire_actions(_raw, allow_empty=_has_idle),
                "ticks": trajectory.get("ticks"),
                "greedy": bool(trajectory.get("greedy", True)),
                "source": "g3_demo"}       # provenance: the trained-policy demo (not a witness)
@@ -227,30 +234,74 @@ def _axis_of(action_name: str):
     return None
 
 
+def _wire_action_verbs(a) -> list:
+    """The verbs a single WIRE action pressed this tick (a diagnostic COUNT lens, not the
+    canonicalization boundary): a plain str -> ``[str]`` (a noop ``""`` -> ``[]``); a chord
+    list/tuple -> its elements (an empty chord [] -> ``[]``, the IDLE tick). Anything else
+    is stringified into a single bucket so the histogram never crashes on odd data."""
+    if isinstance(a, str):
+        return [] if a == "" else [a]
+    if isinstance(a, (list, tuple)):
+        return [str(v) for v in a]
+    return [str(a)]
+
+
 def action_histogram(episodes: list[dict], action_names: list[str],
-                     with_axes: bool = False) -> dict:
-    """Action-usage histogram over a pool of eval episodes (each carrying an ``actions`` list
-    of action-name strings). Returns ``per_action`` counts (every declared action seeded to 0)
-    and ``total_ticks``; ``per_action`` ALWAYS sums to ``total_ticks``. When ``with_axes`` (set
-    for 3D games) it also returns ``per_axis`` — vertical / lateral / forward_brake / other —
-    derived GENERICALLY from action names (see ``_AXIS_KEYWORDS``), plus ``per_axis_frac``. The
-    axis buckets are EXCLUSIVE (first-match) and also sum to ``total_ticks``, so a 3D policy's
-    altitude usage is directly visible (ground truth fly witness: ~37% vertical / 26% lateral /
-    38% forward_brake). Pure + JSON-serializable."""
+                     with_axes: bool = False, chord: bool = False) -> dict:
+    """Action-usage histogram over a pool of eval episodes (each carrying an ``actions`` list).
+
+    DISCRETE (default): each tick is one action-name string. Returns ``per_action`` counts
+    (every declared action seeded to 0) and ``total_ticks``; ``per_action`` ALWAYS sums to
+    ``total_ticks``. When ``with_axes`` (3D games) it also returns ``per_axis`` — vertical /
+    lateral / forward_brake / other — derived GENERICALLY from action names (``_AXIS_KEYWORDS``),
+    plus ``per_axis_frac``; the exclusive (first-match) axis buckets also sum to ``total_ticks``.
+
+    CHORD (``chord=True``, Phase 2): each tick is a WIRE action — a str (single key), a sorted
+    list (a chord), or ``[]`` (an IDLE tick). ``per_action`` becomes per-KEY PRESS frequency (a
+    2-key tick increments two keys), so it sums to ``total_key_presses`` (>= total_ticks), NOT
+    total_ticks. It ALSO returns the CHORD-SIZE distribution ``chord_size`` (``0``/``1``/``2``/``3+``
+    keys per tick) + ``chord_size_frac`` + ``mean_chord_size`` — the signal that tells us whether
+    the policy actually uses SIMULTANEITY or degenerates to single keys (or idle-spam, which STAKES
+    punishes). ``with_axes`` aggregates the per-key counts by axis. Pure + JSON-serializable."""
     counts = {str(a): 0 for a in (action_names or [])}
-    total = 0
-    for ep in (episodes or []):
-        for a in ep.get("actions", []):
-            key = str(a)
-            counts[key] = counts.get(key, 0) + 1
-            total += 1
-    hist = {"per_action": counts, "total_ticks": total}
+    if not chord:
+        total = 0
+        for ep in (episodes or []):
+            for a in ep.get("actions", []):
+                key = str(a)
+                counts[key] = counts.get(key, 0) + 1
+                total += 1
+        hist = {"per_action": counts, "total_ticks": total}
+        axis_denom = total
+    else:
+        total_ticks = 0
+        key_presses = 0
+        size_counts = {"0": 0, "1": 0, "2": 0, "3+": 0}
+        for ep in (episodes or []):
+            for a in ep.get("actions", []):
+                verbs = _wire_action_verbs(a)
+                total_ticks += 1
+                n = len(verbs)
+                size_counts["3+" if n >= 3 else str(n)] += 1
+                for v in verbs:
+                    counts[v] = counts.get(v, 0) + 1
+                    key_presses += 1
+        hist = {
+            "per_action": counts,                 # per-KEY press frequency (sums to key_presses)
+            "total_ticks": total_ticks,
+            "total_key_presses": key_presses,
+            "chord_size": size_counts,            # 0/1/2/3+ keys pressed per tick
+            "chord_size_frac": {k: (round(v / total_ticks, 3) if total_ticks else 0.0)
+                                for k, v in size_counts.items()},
+            "mean_chord_size": (round(key_presses / total_ticks, 3) if total_ticks else 0.0),
+        }
+        axis_denom = key_presses
     if with_axes:
         axes = {"vertical": 0, "lateral": 0, "forward_brake": 0, "other": 0}
         for a, c in counts.items():
             axes[_axis_of(a) or "other"] += c
         hist["per_axis"] = axes
-        hist["per_axis_frac"] = {k: (round(v / total, 3) if total else 0.0)
+        hist["per_axis_frac"] = {k: (round(v / axis_denom, 3) if axis_denom else 0.0)
                                  for k, v in axes.items()}
     return hist
 
@@ -338,6 +389,8 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              demo_stochastic_floor: float = DEMO_STOCHASTIC_FLOOR,
              rays: dict | None = None, obs_profile: str = "positions",
              best_checkpoint: bool = True,
+             chord_mode: bool = False, allow_idle: bool | None = None,
+             ban_contradictions: bool = True,
              **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
@@ -401,8 +454,23 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         game_source = fh.read()
     engine = detect_engine(game_path, game_source)
 
+    # CHORD (Phase 2) is a Godot-lane feature: the MultiBinary action space + the empty-chord
+    # IDLE capability live in GodotServeEnv/serve_game.gd. The js/py PlanckEnv lane has no such
+    # seam, so reject chord_mode there up front rather than silently degrading to Discrete.
+    if chord_mode and engine not in ("godot", "gdscript"):
+        raise ValueError(
+            f"chord_mode (MultiBinary Phase 2) is a Godot-lane feature; engine "
+            f"{engine!r} is not supported")
+
     make_batch_venv = None
     make_shard_venv = None
+    # CONTRADICTORY-CHORD projection (Phase 2, Elias): the ONE single-instance probe env
+    # (the `probe = make_env()` below) mechanically discovers near-antiparallel action pairs;
+    # they are shared to every training/eval env via this holder so the whole run uses ONE
+    # measured opposition set (the batched host never self-probes). None -> "discover" (the
+    # probe env); a list -> "use these" (every later env). Empty when chord_mode/ban is off.
+    _oppose = {"pairs": None, "named": []}
+
     if engine in ("godot", "gdscript"):
         import itertools
         from harness.rl.godot_env import GodotServeEnv
@@ -414,9 +482,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
             # `obs_profile` (positions | positions+rays | rays) + `rays` (the egocentric
             # raycast grid config) are additive kwargs; the default "positions" keeps the
             # env byte-identical to the pre-rays obs. Captured here so the probe, training,
-            # and eval envs all size the obs identically.
+            # and eval envs all size the obs identically. `oppose_pairs=None` on the FIRST
+            # (probe) call -> that env self-discovers; later calls receive the shared list.
             return GodotServeEnv(game_path, port_offset=next(_port_seq), rays=rays,
-                                 obs_profile=obs_profile)
+                                 obs_profile=obs_profile,
+                                 chord_mode=chord_mode, allow_idle=allow_idle,
+                                 ban_contradictions=ban_contradictions,
+                                 oppose_pairs=_oppose["pairs"])
 
         # MULTI-CPU PER GAME: the GDScript lane (serve_game.gd) can serve N in-scene
         # instances over ONE process/socket, so hand the SB3 trainer a batch-vec-env
@@ -428,7 +500,10 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
                 from harness.rl.godot_vec_env import GodotBatchVecEnv
                 return GodotBatchVecEnv(game_path, n_instances,
                                         port_offset=next(_port_seq), seed=seed,
-                                        rays=rays, obs_profile=obs_profile)
+                                        rays=rays, obs_profile=obs_profile,
+                                        chord_mode=chord_mode, allow_idle=allow_idle,
+                                        ban_contradictions=ban_contradictions,
+                                        oppose_pairs=_oppose["pairs"])
 
             # SHARDING (Elias, 2026-07-16: "32 cores per run"): M INDEPENDENT batch
             # shards stepped concurrently = M*K logical envs, so ONE learner saturates
@@ -443,7 +518,11 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
                                         base_seed=seed,
                                         port_offset_base=next(_port_seq),
                                         env_kwargs={"rays": rays,
-                                                    "obs_profile": obs_profile})
+                                                    "obs_profile": obs_profile,
+                                                    "chord_mode": chord_mode,
+                                                    "allow_idle": allow_idle,
+                                                    "ban_contradictions": ban_contradictions,
+                                                    "oppose_pairs": _oppose["pairs"]})
     else:
         def make_env():
             return PlanckEnv(game_path)
@@ -457,6 +536,13 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     cp_keys = list(probe._cp_keys)
     action_names = list(getattr(probe, "actions", []) or [])   # for the eval action histogram
     is_3d = int(getattr(probe, "_dim", 2)) == 3    # per-axis aggregates are for 3D games
+    # The probe env self-discovered the MEASURED contradictory-chord pairs (chord mode + ban);
+    # share them to every training/eval env via the holder and record them (index + action-name
+    # pairs) for the eval artifact — transparency (Elias reads these) and reproducibility.
+    _disc = [tuple(p) for p in (getattr(probe, "oppose_pairs", []) or [])]
+    _oppose["pairs"] = _disc
+    _oppose["named"] = [[action_names[i], action_names[j]] for (i, j) in _disc
+                        if i < len(action_names) and j < len(action_names)]
     probe.close()
 
     # --- Train ---
@@ -590,9 +676,14 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # rounds — per-action counts for the greedy and stochastic pools separately, plus (3D only)
     # generic vertical/lateral/forward_brake axis aggregates, so we can see whether a 3D policy
     # uses altitude or collapses to planar movement. Persisted in this eval artifact (result).
+    # CHORD (Phase 2): per-KEY press frequency + the chord-size distribution (0/1/2/3+ keys per
+    # tick) — the signal that says whether the policy uses SIMULTANEITY or collapses to single
+    # keys / idle-spam. Discrete keeps the per-action-string counts byte-identical.
     action_hist = {
-        "greedy": action_histogram(greedy_eps, action_names, with_axes=is_3d),
-        "stochastic": action_histogram(sampled_eps, action_names, with_axes=is_3d),
+        "greedy": action_histogram(greedy_eps, action_names, with_axes=is_3d,
+                                   chord=chord_mode),
+        "stochastic": action_histogram(sampled_eps, action_names, with_axes=is_3d,
+                                       chord=chord_mode),
     }
 
     # --- RL witness + the certificate bridge (assert it replays via JsExecutor) ---
@@ -685,6 +776,9 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "game_path": game_path,
         "trainer": trainer,
         "method": method,                                     # algo (ledger key)
+        "chord_mode": bool(chord_mode),                       # Phase-2 MultiBinary action space
+        "chord_ban_contradictions": bool(chord_mode and ban_contradictions),
+        "chord_opposition_pairs": _oppose["named"],           # MEASURED near-antiparallel pairs
         "stochastic_success_rate": stochastic_success_rate,   # graded learnability
         "budget_steps": budget_steps,
         "trained_steps": train_res["global_steps"],

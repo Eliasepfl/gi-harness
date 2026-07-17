@@ -12,6 +12,15 @@
 # tick's K physics frames (the caller runs the physics burst after apply() returns). A
 # single verb is exactly one act() call.
 #
+# PHASE 2 -- the IDLE tick. An EMPTY Array [] is a well-formed "press nothing" tick:
+# apply() makes ZERO act() calls and the caller steps physics as normal. That is the
+# natural fall-through of the per-verb loop (no verbs -> no calls). Whether an empty
+# chord is LEGAL on the wire is a CAPABILITY the serve host guards (its `allow_idle`
+# init flag): with the capability off the host rejects [] as a protocol error BEFORE
+# calling apply(); with it on the host lets [] through to apply() as an idle tick. The
+# policy therefore lives at the host boundary; apply() itself only executes verbs.
+# `is_empty_chord()` is the shared predicate the host uses for that guard.
+#
 # CANONICAL ORDER. Sorting means ["a","b"] and ["b","a"] produce the identical act()
 # sequence, so the sender's element order never matters -> determinism. The flip side
 # (documented, not hidden -- see notes/engines/CHORD_PIVOT.md): order-SENSITIVE game
@@ -31,12 +40,22 @@
 extends RefCounted
 
 
+# True IFF `action` is the Phase-2 IDLE tick: an empty Array (press nothing). The serve
+# host uses this to guard the empty chord against its `allow_idle` init capability BEFORE
+# stepping. A String (even "") is never an idle chord -- only an empty Array is.
+static func is_empty_chord(action) -> bool:
+	return typeof(action) == TYPE_ARRAY and (action as Array).is_empty()
+
+
 # Apply one decision-tick action to `game`. `action` is a String (single verb) or an
-# Array of verb Strings (a chord). Never awaits: every act() lands before the caller's
-# physics frames, exactly as a lone verb does today.
+# Array of verb Strings (a chord; an EMPTY Array is the idle tick -> zero act() calls).
+# Never awaits: every act() lands before the caller's physics frames, exactly as a lone
+# verb does today.
 static func apply(game: Node, action) -> void:
 	if typeof(action) == TYPE_ARRAY:
-		# Canonicalize on a LOCAL copy so the caller's array is never mutated.
+		# Canonicalize on a LOCAL copy so the caller's array is never mutated. An empty
+		# Array iterates zero times -> ZERO act() calls (the idle tick); a lone verb is
+		# one call, byte-identical to the single-verb String path below.
 		var verbs := []
 		for v in action:
 			verbs.append(str(v))

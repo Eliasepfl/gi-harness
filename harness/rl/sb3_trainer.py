@@ -43,6 +43,7 @@ import torch
 
 from harness.rl.env import wrap_gym
 from harness.rl.ppo import DEFAULTS
+from harness.verify.chord import chord_from_mask
 
 
 # --- Algorithm registry ------------------------------------------------------
@@ -489,25 +490,43 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
 
 
 def _rollout(env, model, seed: int, *, greedy: bool, torch_seed=None) -> dict:
-    """Roll out an SB3 `model` on a fresh `env.reset(seed)`, recording the action
-    STRING sequence so the result replays bit-exactly through JsExecutor.run_batch
-    (identical shape to `ppo._rollout`). `greedy=True` -> `predict(deterministic=
-    True)` (argmax); `greedy=False` -> sampled (seed torch for reproducibility).
-    The recorded (seed, actions) pair IS the witness — the batch executor replays
-    the list."""
+    """Roll out an SB3 `model` on a fresh `env.reset(seed)`, recording the WIRE-action
+    sequence so the result replays bit-exactly through the batch executor (identical
+    shape to `ppo._rollout`). `greedy=True` -> `predict(deterministic=True)`; `greedy=
+    False` -> sampled (seed torch for reproducibility). The recorded (seed, actions) pair
+    IS the witness — the batch executor replays the list.
+
+    DISCRETE: each recorded action is the single verb STRING ``env.actions[a]`` (byte-
+    identical to the pre-chord witness). CHORD (MultiBinary): ``predict`` returns a per-key
+    0/1 vector (deterministic -> per-key argmax, prob>0.5); it is reduced through
+    :func:`chord_from_mask` to the WIRE form — a plain str for a lone key (legacy singleton),
+    a sorted list for a real chord, or ``[]`` for an all-off IDLE tick (only when the env's
+    ``allow_idle`` is on). Phase-1 capture/replay already accepts arrays, so the witness list
+    replays unchanged through GdExecutor.run_batch."""
     if torch_seed is not None:
         torch.manual_seed(torch_seed)
+    chord = bool(getattr(env, "chord_mode", False))
+    allow_idle = bool(getattr(env, "allow_idle", False))
+    oppose_pairs = getattr(env, "oppose_pairs", None)   # measured contradictory-chord pairs
     obs, _ = env.reset(seed=seed)
-    action_strings: list[str] = []
+    action_strings: list = []
     total = 0.0
     result = None
     latched = {}
     for _ in range(env.horizon):
         action, _ = model.predict(np.asarray(obs, dtype=np.float32),
                                   deterministic=greedy)
-        a = int(np.asarray(action).reshape(-1)[0])
-        action_strings.append(env.actions[a])
-        obs, r, term, trunc, info = env.step(a)
+        if chord:
+            mask = np.asarray(action).reshape(-1)
+            action_strings.append(
+                chord_from_mask(mask, env.actions, allow_empty=allow_idle,
+                                oppose_pairs=oppose_pairs))
+            step_action = mask
+        else:
+            a = int(np.asarray(action).reshape(-1)[0])
+            action_strings.append(env.actions[a])
+            step_action = a
+        obs, r, term, trunc, info = env.step(step_action)
         total += r
         result = info["result"]
         latched = info["latched"]

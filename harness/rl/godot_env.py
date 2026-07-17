@@ -72,9 +72,10 @@ import numpy as np
 from harness.rl.env import (
     OBS_CLIP, HORIZON,
     DEFAULT_RAYS, OBS_PROFILES, RAYS_PROFILES,
-    Box, Discrete, build_obs_vector, detect_dim, normalize_rays, obs_dim_for,
-    rays_obs_width, step_reward,
+    Box, Discrete, MultiBinary, build_obs_vector, detect_dim, normalize_rays,
+    obs_dim_for, rays_obs_width, step_reward,
 )
+from harness.verify.chord import chord_from_mask
 from harness.verify.gd_exec import parse_runtime_errors, read_stderr_delta
 
 # --- Constants ([eng.] = engineering choice) ---------------------------------
@@ -157,7 +158,9 @@ class GodotServeEnv:
                  project: str | None = None, horizon: int = HORIZON,
                  timeout_s: float = SERVE_TIMEOUT_S,
                  connect_timeout_s: float = CONNECT_TIMEOUT_S,
-                 rays: dict | None = None, obs_profile: str = "positions"):
+                 rays: dict | None = None, obs_profile: str = "positions",
+                 chord_mode: bool = False, allow_idle: bool | None = None,
+                 ban_contradictions: bool = True, oppose_pairs=None):
         # Set teardown-relevant handles first so close() is safe on any early raise.
         self._listener = None
         self._conn = None
@@ -180,6 +183,19 @@ class GodotServeEnv:
         self.game_path = game_path
         self.horizon = int(horizon)
         self.timeout_s = float(timeout_s)
+        # CHORD mode (Phase 2, opt-in). OFF (default) -> Discrete action space + a single verb
+        # string per tick on the wire: byte-identical to every pre-chord run. ON -> a
+        # MultiBinary(n_actions) space; step() maps the 0/1 vector to the sorted chord wire
+        # form (a lone pressed key stays a plain str -> the legacy singleton wire is preserved).
+        # allow_idle is the serve-init capability that legalises the all-keys-off IDLE tick
+        # (empty chord []): default None -> the chord env turns it ON (General Intuition's own
+        # controller can output all-keys-off, so parity argues for idle; STAKES/game pressure,
+        # not the action-space shape, is what punishes idling). Idle is meaningless without
+        # chords, so it is force-OFF outside chord mode -> the discrete wire stays untouched.
+        self.chord_mode = bool(chord_mode)
+        if allow_idle is None:
+            allow_idle = self.chord_mode
+        self.allow_idle = self.chord_mode and bool(allow_idle)
         # Obs profile (Elias 2026-07-16): "positions" (default; byte-identical to today) |
         # "positions+rays" | "rays" (pure, proprioception-only + rays). The two rays
         # profiles cast an egocentric fan/grid (the examples' RaycastSensor pattern, no
@@ -258,6 +274,8 @@ class GodotServeEnv:
                    "horizon": self.horizon}
         if self._rays is not None:       # only include the key when opted in (wire stays
             init_op["rays"] = self._rays  # byte-identical to the pre-rays init otherwise)
+        if self.allow_idle:              # opt-in capability: legalise the empty-chord IDLE
+            init_op["allow_idle"] = True  # tick (absent -> host rejects [] as a protocol error)
         ready = self._exchange(init_op)
         if not ready.get("ok", False) or ready.get("error"):
             self.close()
@@ -272,7 +290,10 @@ class GodotServeEnv:
         self._body_order: list[str] | None = None
         self._cp_keys: list[str] | None = None
         self._dim: int = 2                          # pinned in _freeze_layout (2 or 3)
-        self.action_space = Discrete(len(self.actions))
+        # MultiBinary(n) in chord mode (per-key Bernoulli policy); Discrete(n) otherwise --
+        # both expose ``.n`` (the declared-verb count) uniformly.
+        self.action_space = (MultiBinary(len(self.actions)) if self.chord_mode
+                             else Discrete(len(self.actions)))
         self.observation_space: Box | None = None
         self._freeze_layout(ready)
 
@@ -282,6 +303,50 @@ class GodotServeEnv:
         # Current world pose ({name:{pos,vel,angle}}); kept fresh on reset/step for the
         # inverse-value attacker's fingerprint trail (harness.rl.adversary). Read-only.
         self.last_snapshot: dict = self._snapshot_of(ready)
+
+        # CONTRADICTORY-CHORD projection (Phase 2, Elias). In chord mode, mechanically probe
+        # each action's effect vector on the controlled body and record near-antiparallel pairs
+        # (chord_probe.antiparallel_pairs) so a both-pressed self-cancelling combo projects to
+        # NEITHER key in the mask->wire mapping (see chord_from_mask/oppose_pairs). Opposition is
+        # derived from MEASURED physics, NEVER action names. Explicit `oppose_pairs` (from
+        # g3_prime's ONE shared probe) skips the per-env probe; ban_contradictions=False or a
+        # non-chord env -> no pairs (byte-identical to before).
+        self.ban_contradictions = bool(ban_contradictions)
+        if oppose_pairs is not None:
+            self.oppose_pairs = [tuple(p) for p in oppose_pairs]
+        elif self.chord_mode and self.ban_contradictions:
+            self.oppose_pairs = self._discover_opposition()
+        else:
+            self.oppose_pairs = []
+
+    # -- contradictory-chord probe / discovery ----------------------------
+    def probe_effect_vectors(self, *, k_ticks: int = 8, seed: int = 0) -> list:
+        """Measure each action's EFFECT VECTOR: from a fresh reset at ``seed``, apply the
+        action ALONE for ``k_ticks`` decision ticks and record the controlled body's net
+        displacement (one 3-vector per action). Bypasses ``step``/the chord projection (raw
+        single-verb wire), so it is safe to call before ``oppose_pairs`` exists. It leaves the
+        serve world dirty -- the caller restores a clean build (``_discover_opposition`` does)."""
+        from harness.rl.env import _controlled_pos
+        vecs = []
+        for verb in self.actions:
+            f0 = self._exchange({"op": "reset", "seed": int(seed)})
+            p0 = np.asarray(_controlled_pos(f0.get("obs_state", {}), self._body_order),
+                            dtype=float)
+            fn = self._exchange({"op": "act", "actions": [verb], "n_ticks": int(k_ticks)})
+            p1 = np.asarray(_controlled_pos(fn.get("obs_state", {}), self._body_order),
+                            dtype=float)
+            vecs.append(p1 - p0)
+        return vecs
+
+    def _discover_opposition(self, *, k_ticks: int = 8, seed: int = 0) -> list:
+        """Probe effect vectors and return the mechanically-discovered near-antiparallel
+        action-index pairs, then RESTORE a clean seed-``seed`` build (the probe stepped the
+        world). Names are never consulted -- only the measured physics."""
+        from harness.rl.chord_probe import antiparallel_pairs
+        vecs = self.probe_effect_vectors(k_ticks=k_ticks, seed=seed)
+        pairs = antiparallel_pairs(vecs)
+        self.reset(seed=int(seed))              # discard the probe's dirty world
+        return pairs
 
     # -- provisioning -----------------------------------------------------
     def _ensure_provisioned(self) -> None:
@@ -474,13 +539,21 @@ class GodotServeEnv:
         self.last_snapshot = self._snapshot_of(frame)
         return self._observe(frame), {"latched": dict(frame.get("checkpoints") or {})}
 
-    def step(self, action_idx: int):
+    def step(self, action):
         if self._done:
             raise RuntimeError("step() after episode end — call reset() first")
-        action = self.actions[int(action_idx)]
+        # CHORD: `action` is a MultiBinary 0/1 vector -> the sorted chord wire form (a lone
+        # pressed key stays a plain str; all-keys-off -> [] idle when allow_idle). A both-pressed
+        # measured-antiparallel pair projects to neither (oppose_pairs). DISCRETE: `action` is an
+        # index -> the single verb string (byte-identical to the pre-chord wire).
+        if self.chord_mode:
+            wire = chord_from_mask(action, self.actions, allow_empty=self.allow_idle,
+                                   oppose_pairs=self.oppose_pairs)
+        else:
+            wire = self.actions[int(action)]
         # One decision tick per step (n_ticks=1) — keeps per-step semantics identical
         # to the batch witness replay (one action per tick through run_batch).
-        frame = self._exchange({"op": "act", "actions": [action], "n_ticks": 1})
+        frame = self._exchange({"op": "act", "actions": [wire], "n_ticks": 1})
         self._tick = int(frame.get("tick", self._tick + 1))
         result = frame.get("result")
 
