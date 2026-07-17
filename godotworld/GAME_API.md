@@ -48,20 +48,27 @@ a predicate.
 
 ## Determinism + randomness (a hard rule)
 
-Physics is pinned (a fixed step, single thread, jitter-fix off). The ONLY randomness is
-an rng the game seeds FROM `world_seed`; the global `randi`/`randf`/`randomize` are
-unseeded and BANNED. G1 gates a two-run drift check per game — determinism is tested,
-not assumed.
+Physics is pinned (a fixed step, single thread, jitter-fix off). Draw ALL randomness
+from an rng the game seeds FROM `world_seed`; the global `randi`/`randf`/`randomize`/
+`seed` are unseeded — the scanner flags them as an ADVISORY (a warning, not a reject),
+and G1 gates a two-run drift check per game — determinism is tested, not assumed.
 
-## Bans (hard G0 fail — static scanner, `harness/verify/gd_gate.py`)
+## Bans (G0 static scanner, `harness/verify/gd_gate.py`)
 
-`OS.*`, `FileAccess`, `DirAccess`, `HTTP*`, `TCPServer`, `StreamPeer*`, `PacketPeer*`,
-`Thread`, `Mutex`, `Engine.get_singleton`, `ClassDB`, `Expression`, `load()` /
-`preload()`, `Time.*` (wall clock), `randi/randf/randomize` (seed your own
-`RandomNumberGenerator` instead), `get_tree().quit`. The scanner is a HARD fail with
-line numbers. Generated code additionally runs ONLY in-container, in a process whose
-environment is SCRUBBED of every credential. `PhysicsServer3D.set_active(true)` in a 3D
-`build()` is the one allowed PhysicsServer call.
+HARD (a hit fails G0 with a line number): `OS.*`, `FileAccess`, `DirAccess`,
+`ResourceSaver`, `HTTP*`, `TCPServer`, `StreamPeer*`, `PacketPeer*`, `Thread`, `Mutex`,
+`Engine.get_singleton`, `ClassDB`, `Expression`, `GDScript`, `set_script`, `Time.*`
+(wall clock), `get_tree().quit`.
+
+ADVISORY (warned, never fails G0): the global `randi`/`randf`/`randomize`/`seed`
+family — seed your own `RandomNumberGenerator` from `world_seed` instead; the G1
+two-run drift gate empirically rejects any nondeterminism they cause.
+
+ALLOWED (guardrails v2): `load()`/`preload()`/`ResourceLoader` — reads confined to
+`res://` (the sandboxed project) + an empty `user://`; no network backend, no OS
+paths, deterministic. Generated code additionally runs ONLY in-container, in a process
+whose environment is SCRUBBED of every credential. `PhysicsServer3D.set_active(true)`
+in a 3D `build()` is the one allowed PhysicsServer call.
 
 ## How it is verified
 

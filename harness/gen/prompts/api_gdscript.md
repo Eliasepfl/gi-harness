@@ -47,11 +47,11 @@ Any milestone or win defined by WHERE something is must be anchored to a REAL no
 
 # Visuals - WELCOME but never required (render-only, verification-blind)
 
-Certification is pixel-blind: it reads only `state()`, so nothing you add for looks can help OR hurt the verdict, and a separate demo lane already auto-dresses every certified game (colored proxies matched to your collision shapes, a fit-to-scene camera, a light) - you need add NOTHING. But if you want the demo to look its best, you MAY attach render-only nodes, built in code from primitives the same way you build the rest: a `Polygon2D`/`Sprite2D` or a `MeshInstance3D` + `StandardMaterial3D` on a body, a `Camera2D`/`Camera3D`, a `DirectionalLight3D`, a `WorldEnvironment`. There is deliberately NO prescribed node list, size, or colour - choose what your fiction wants, or nothing. What still binds: visuals stay PURELY cosmetic (never a physics body, collision shape, or joint, and never mutate game state - `state()` remains the single source of truth); no external assets and no `load()`/`preload()` (both banned - construct any mesh/material in code).
+Certification is pixel-blind: it reads only `state()`, so nothing you add for looks can help OR hurt the verdict, and a separate demo lane already auto-dresses every certified game (colored proxies matched to your collision shapes, a fit-to-scene camera, a light) - you need add NOTHING. But if you want the demo to look its best, you MAY attach render-only nodes, built in code from primitives the same way you build the rest: a `Polygon2D`/`Sprite2D` or a `MeshInstance3D` + `StandardMaterial3D` on a body, a `Camera2D`/`Camera3D`, a `DirectionalLight3D`, a `WorldEnvironment`. There is deliberately NO prescribed node list, size, or colour - choose what your fiction wants, or nothing. What still binds: visuals stay PURELY cosmetic (never a physics body, collision shape, or joint, and never mutate game state - `state()` remains the single source of truth). `load()`/`preload()` of `res://` resources are ALLOWED (they resolve only inside the sandboxed project - no OS paths, no network); constructing meshes/materials in code stays the most portable path, since a `res://` path that does not exist in the project fails the parse gate or returns null at runtime.
 
 # Determinism + randomness - a hard rule
 
-The verifier REPLAYS your run and must reproduce it byte-for-byte. The ONLY randomness allowed is an rng you seed FROM `world_seed`; the global `randi()`/`randf()`/`randomize()` are unseeded and BANNED. Physics is pinned (a fixed step, single thread); never touch the loop, the clock, or the physics/time pins.
+The verifier REPLAYS your run and must reproduce it byte-for-byte. Draw ALL randomness from an rng you seed FROM `world_seed`: the global `randi()`/`randf()`/`randomize()`/`seed()` are unseeded - the code gate only WARNS on them now, but any drift they cause FAILS the two-run replay gate, so seed your own `RandomNumberGenerator` from `world_seed` for anything random. Physics is pinned (a fixed step, single thread); never touch the loop, the clock, or the physics/time pins.
 
 # BANNED - hard constraints, not style. Every one is a determinism OR a sandbox rule
 
@@ -60,15 +60,16 @@ Your code runs untrusted, in-container. Using anything below is an automatic rej
 | banned | why |
 |---|---|
 | `OS.*` (`OS.execute`, `OS.get_environment`, ...) | shells out / reads host env + wall-clock -> sandbox escape AND nondeterminism |
-| `FileAccess`, `DirAccess`, `ResourceSaver`, `ResourceLoader` | reads/writes the host filesystem -> sandbox escape |
+| `FileAccess`, `DirAccess`, `ResourceSaver` | reads/writes the host filesystem -> sandbox escape (`res://` READS via `load()`/`preload()` are allowed; writes are not) |
 | `HTTPRequest`, `HTTPClient`, `StreamPeerTCP`, `PacketPeerUDP`, `TCPServer`, `WebSocketPeer`, `ENet*` | network egress -> sandbox escape; the wire belongs to the host |
 | `Thread`, `WorkerThreadPool`, `Mutex`, `Semaphore` | the PhysicsServer is not thread-safe and thread scheduling is nondeterministic -> voids replay |
 | `Time.*`, `Engine.get_ticks_msec` | wall-clock reads make the trajectory depend on how fast the machine ran -> nondeterminism |
-| global `randi()`, `randf()`, `randi_range()`, `randomize()` | unseeded global RNG is not replayable; seed your own `RandomNumberGenerator` for ANY randomness |
-| `load()`, `preload()`, `set_script`, `GDScript.new`, `Expression`, `ClassDB`, `Engine.get_singleton` | reflection / dynamic code loads escape the whitelist -> sandbox escape |
+| `set_script`, `GDScript.new`, `Expression`, `ClassDB`, `Engine.get_singleton` | reflection / dynamic code compile escapes the whitelist -> sandbox escape |
 | `get_tree().quit`, direct writes to the physics/time pins | the host owns the process, the loop, and the determinism pins; touching them voids witness replay |
 
-Write ordinary GDScript: `func`, `var`, `if`/`for`/`match`, arithmetic, vector math, `abs`/`min`/`max`/`clamp`/`sqrt`, real Godot nodes, and a `RandomNumberGenerator` you seed. `PhysicsServer3D.set_active(true)` in a 3D `build()` is allowed and required; it is the ONE PhysicsServer call you make.
+Not banned, only warned: the global `randi()`/`randf()`/`randomize()`/`seed()` - the scanner flags them as an ADVISORY, and unseeded drift still fails the replay gate, so treat the warning as a fix-it hint.
+
+Write ordinary GDScript: `func`, `var`, `if`/`for`/`match`, arithmetic, vector math, `abs`/`min`/`max`/`clamp`/`sqrt`, real Godot nodes, `load()`/`preload()` of `res://` resources, and a `RandomNumberGenerator` you seed. `PhysicsServer3D.set_active(true)` in a 3D `build()` is allowed and required; it is the ONE PhysicsServer call you make.
 
 # RUNTIME IS GODOT 4.x, not Godot 3 - a hard rule (anti-hallucination, not style)
 

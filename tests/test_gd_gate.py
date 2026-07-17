@@ -2,9 +2,13 @@
 
 Always run (no Godot binary needed):
 
-* the BANNED-API scanner catches every forbidden construct (parameterized negative
-  fixtures as inline strings) and passes the clean ``mini_collect.gd`` fixture, and
-  distinguishes a method call on ``self.rng`` from the banned GLOBAL rng;
+* the BANNED-API scanner catches every HARD forbidden construct (parameterized
+  negative fixtures as inline strings) and passes the clean ``mini_collect.gd``
+  fixture; the unseeded GLOBAL rng family is an ADVISORY (a warning, never a G0
+  fail — the G1 two-run drift gate judges determinism empirically) while a method
+  call on ``self.rng`` stays clean; ``load``/``preload``/``ResourceLoader`` scan
+  CLEAN since guardrails v2 (res://-confined, sandbox-contained reads) and
+  ``ResourceSaver`` (the write vector into the source-project res://) stays HARD;
 * ``detect_engine`` routes ``.gd`` (and the ``# engine: gdscript`` marker) to the
   ``gdscript`` engine;
 * a banned ``.gd`` game fails G0 through ``verify_game`` WITHOUT ever spawning Godot
@@ -25,7 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.verify.gameverify import detect_engine, run_g0_gd, verify_game  # noqa: E402
 from harness.verify.gd_gate import (  # noqa: E402
-    GD_REQUIRED_METHODS, is_failure_constant_false, scan_gd_source, scan_violations,
+    GD_REQUIRED_METHODS, is_failure_constant_false, is_hard, scan_advisories,
+    scan_gd_source, scan_violations,
 )
 from harness.verify.gd_exec import classify_check_output  # noqa: E402
 from harness.verify.godot_exec import scrubbed_env  # noqa: E402
@@ -99,7 +104,7 @@ def test_nonzero_with_no_script_error_diagnostic_stays_fatal():
 
 
 # ====================================================================== #
-# 1. Banned-API scanner
+# 1. Banned-API scanner — the HARD core (a hit fails G0)
 # ====================================================================== #
 _BANNED = [
     ("os", 'func act(a): OS.execute("ls", [])'),
@@ -118,15 +123,10 @@ _BANNED = [
     ("engine_singleton", 'func build(s): var e = Engine.get_singleton("OS")'),
     ("class_db", 'func build(s): ClassDB.instantiate("OS")'),
     ("expression", "func build(s): var e = Expression.new()"),
-    ("resource_loader", 'func build(s): ResourceLoader.load("x")'),
+    ("resource_saver", 'func build(s): ResourceSaver.save(r, "res://x.tres")'),
     ("gdscript_class", "func build(s): var g = GDScript.new()"),
     ("set_script", "func build(s): node.set_script(x)"),
-    ("load", 'func build(s): var r = load("res://x.gd")'),
-    ("preload", 'func build(s): var r = preload("res://x.gd")'),
     ("time", "func build(s): var t = Time.get_ticks_msec()"),
-    ("randomize", "func build(s): randomize()"),
-    ("global_rng", "func build(s): var x = randf()"),
-    ("global_seed", "func build(s): seed(5)"),
     ("scene_tree", "func build(s): get_tree().quit()"),
 ]
 
@@ -136,16 +136,48 @@ def test_scanner_catches_each_banned_api(rule, src):
     findings = scan_gd_source("extends Node2D\n" + src)
     rules = {f["rule"] for f in findings}
     assert rule in rules, (rule, rules, src)
-    # every finding carries a 1-based line and a token
+    # every HARD finding carries a 1-based line, a token, and hard severity...
     for f in findings:
         assert f["line"] >= 1 and f["token"]
+        assert is_hard(f), f
+    # ...and lands in the violations payload the G0 gate hard-fails on.
+    assert scan_violations("extends Node2D\n" + src), src
+
+
+# ---------------------------------------------------------------------- #
+# 1a. ADVISORY rules — found + surfaced as hints, NEVER a hard violation
+#     (guardrails v2: the G1 two-run drift gate empirically catches RNG
+#     nondeterminism, so the lexical rules only warn).
+# ---------------------------------------------------------------------- #
+_ADVISORY = [
+    ("randomize", "func build(s): randomize()"),
+    ("global_rng", "func build(s): var x = randf()"),
+    ("global_seed", "func build(s): seed(5)"),
+]
+
+
+@pytest.mark.parametrize("rule,src", _ADVISORY, ids=[r for r, _ in _ADVISORY])
+def test_global_rng_family_is_advisory_not_hard(rule, src):
+    full = "extends Node2D\n" + src
+    findings = scan_gd_source(full)
+    hits = [f for f in findings if f["rule"] == rule]
+    assert hits, (rule, findings)                        # still FOUND (a hint)
+    for f in hits:
+        assert f["severity"] == "advisory" and not is_hard(f), f
+        assert "advisory" in str(f) and "banned" not in str(f)
+        assert "world_seed" in f["message"]              # the teachable fix
+    assert scan_violations(full) == []                   # NOT a hard violation
+    assert any(rule in a for a in scan_advisories(full))  # routed to warnings
 
 
 def test_scanner_catches_global_randi_and_randf_range():
+    # The whole unseeded family is still FOUND — as an advisory, not a violation.
     for bad in ("var x = randi()", "var y = randi_range(0, 3)",
                 "var z = randf_range(0.0, 1.0)"):
-        assert any(f["rule"] == "global_rng"
-                   for f in scan_gd_source("extends Node2D\nfunc build(s): " + bad)), bad
+        src = "extends Node2D\nfunc build(s): " + bad
+        assert any(f["rule"] == "global_rng" and not is_hard(f)
+                   for f in scan_gd_source(src)), bad
+        assert scan_violations(src) == [], bad
 
 
 def test_scanner_allows_self_rng_methods():
@@ -156,9 +188,35 @@ def test_scanner_allows_self_rng_methods():
 
 
 def test_scanner_flags_rng_randomize_even_on_receiver():
-    # randomize() reseeds from the wall clock -> banned even as rng.randomize().
+    # randomize() reseeds from the wall clock -> flagged even as rng.randomize()
+    # (advisory: the two-run drift gate is the hard judge).
     assert any(f["rule"] == "randomize"
                for f in scan_gd_source("extends Node2D\nfunc build(s): rng.randomize()"))
+
+
+# ---------------------------------------------------------------------- #
+# 1b. ALLOWED since guardrails v2 — load/preload/ResourceLoader scan CLEAN
+#     (res://-confined reads; the sandbox + still-hard FileAccess/network/
+#     GDScript rules contain everything else).
+# ---------------------------------------------------------------------- #
+def test_load_preload_and_resource_loader_scan_clean():
+    for allowed in ('var r = load("res://x.gd")',
+                    'var r = preload("res://chord_util.gd")',
+                    'var r = ResourceLoader.load("res://x.tres")',
+                    "var r = load(path)"):                 # computed arg: still res://-confined
+        src = "extends Node2D\nfunc build(s): " + allowed
+        assert scan_gd_source(src) == [], (allowed, scan_gd_source(src))
+        assert scan_violations(src) == [] and scan_advisories(src) == []
+
+
+def test_resource_saver_stays_hard_when_loader_is_free():
+    # The ONE narrow guard kept from the old Resource(Loader|Saver) rule: the host
+    # runs from a SOURCE project, so res:// is writable — ResourceSaver is the
+    # write vector and stays a hard violation.
+    src = 'extends Node2D\nfunc build(s): ResourceSaver.save(r, "res://serve_game.gd")'
+    assert any(f["rule"] == "resource_saver" and is_hard(f)
+               for f in scan_gd_source(src))
+    assert scan_violations(src)
 
 
 def test_scanner_ignores_banned_token_in_comment_or_string():
@@ -257,6 +315,17 @@ def test_run_g0_gd_scan_violation_short_circuits():
     assert g0["passed"] is False
     assert g0["checks"]["sandbox_scan"]["pass"] is False
     assert "loads" not in g0["checks"]  # never reached the parse gate
+
+
+def test_run_g0_gd_advisory_findings_do_not_fail():
+    # Guardrails v2: advisory findings (unseeded global RNG) ride along in the
+    # sandbox_scan check for observability but NEVER fail the gate.
+    adv = ["line 4: advisory global_rng (...) — 'randf('"]
+    g0 = run_g0_gd(_wellformed_gd_facts(), [], adv)
+    assert g0["passed"] is True, g0
+    assert g0["checks"]["sandbox_scan"]["pass"] is True
+    assert g0["checks"]["sandbox_scan"]["advisories"] == adv
+    assert g0["checks"]["sandbox_scan"]["violations"] == []
 
 
 def test_run_g0_gd_parse_gate_failure():

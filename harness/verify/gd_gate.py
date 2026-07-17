@@ -10,11 +10,21 @@ code is compiled or executed:
 
 It is a coarse, high-recall token/regex net (comments stripped so a banned name in
 prose is not a false positive) over the escape hatches the GameAPI contract forbids:
-``OS.*``, ``FileAccess``/``DirAccess``, network peers, threads, reflection escapes
-(``ClassDB``/``Expression``/``Engine.get_singleton``/``set_script``/``GDScript``),
-``load``/``preload``, wall-clock ``Time.*``, the unseeded global RNG
-(``randi``/``randf``/``randomize`` — a game MUST draw from ``self.rng``), and
-``get_tree().quit``. Any hit is a HARD G0 fail with a line number.
+``OS.*``, ``FileAccess``/``DirAccess``, ``ResourceSaver``, network peers, threads,
+reflection escapes (``ClassDB``/``Expression``/``Engine.get_singleton``/
+``set_script``/``GDScript``), wall-clock ``Time.*``, and ``get_tree().quit``.
+Every rule carries a SEVERITY: a HARD hit fails G0 with a line number; an ADVISORY
+hit (the unseeded global RNG family — ``randi``/``randf``/``randomize``/``seed``)
+only surfaces as a warning/hint, because the G1 two-run drift gate empirically
+catches RNG-stream nondeterminism (guardrails v2, 2026-07: the lexical RNG ban was
+redundant with the dynamic gate and it strangled generation).
+
+ALLOWED since guardrails v2: ``load()``/``preload()``/``ResourceLoader``. They are
+builtins confined to ``res://`` (the harness's own godotworld project) + an empty
+``user://`` in the disposable sandbox — no network backend, no OS paths, and byte-
+identical reads across runs (no G1 drift). The WRITE half stays hard: the serve
+host runs from a SOURCE project (``--path godotworld``), so ``res://`` is a real
+writable directory and ``ResourceSaver`` keeps its own hard rule.
 
 The other two G0 gates: (a) the parse gate — a STANDALONE ``godot --headless
 --check-only --script <file>`` compile-check (a duck-typed plain-Node game has no base
@@ -41,77 +51,101 @@ GD_REQUIRED_METHODS = ("build", "act", "state", "checkpoints",
 
 
 # --- Banned-API rule table -------------------------------------------------- #
-# Each rule: (name, compiled regex, human message). Regexes run on comment-stripped
-# source lines. Negative lookbehind ``(?<![\w.])`` lets a method call on an allowed
-# receiver through (e.g. ``self.rng.randf(...)`` is fine; bare ``randf(...)`` is not).
-_RULES: list[tuple[str, re.Pattern, str]] = [
+# Each rule: (name, compiled regex, human message, severity). Regexes run on
+# comment-stripped source lines. Negative lookbehind ``(?<![\w.])`` lets a method
+# call on an allowed receiver through (e.g. ``self.rng.randf(...)`` is fine; bare
+# ``randf(...)`` is not).
+#
+# Severity: HARD findings fail the G0 gate (sandbox/determinism boundaries the
+# dynamic gates cannot re-derive); ADVISORY findings are hints only — the unseeded
+# global RNG family is empirically covered by the G1 two-run drift gate, so its
+# lexical rules warn ("prefer a RandomNumberGenerator seeded from world_seed")
+# without rejecting the game.
+HARD = "hard"
+ADVISORY = "advisory"
+
+_RULES: list[tuple[str, re.Pattern, str, str]] = [
     ("os", re.compile(r"(?<![\w])OS\s*\."),
-     "OS.* is banned (no process/env/clipboard/shell access)"),
+     "OS.* is banned (no process/env/clipboard/shell access)", HARD),
     ("file_access", re.compile(r"(?<![\w])FileAccess\b"),
-     "FileAccess is banned (no filesystem)"),
+     "FileAccess is banned (no filesystem)", HARD),
     ("dir_access", re.compile(r"(?<![\w])DirAccess\b"),
-     "DirAccess is banned (no filesystem)"),
+     "DirAccess is banned (no filesystem)", HARD),
     ("http", re.compile(r"(?<![\w])HTTP[A-Za-z]*"),
-     "HTTP* is banned (no network)"),
+     "HTTP* is banned (no network)", HARD),
     ("tcp", re.compile(r"(?<![\w])TCPServer\b"),
-     "TCPServer is banned (no network)"),
+     "TCPServer is banned (no network)", HARD),
     ("udp", re.compile(r"(?<![\w])UDPServer\b"),
-     "UDPServer is banned (no network)"),
+     "UDPServer is banned (no network)", HARD),
     ("stream_peer", re.compile(r"(?<![\w])StreamPeer[A-Za-z]*"),
-     "StreamPeer* is banned (no sockets)"),
+     "StreamPeer* is banned (no sockets)", HARD),
     ("packet_peer", re.compile(r"(?<![\w])PacketPeer[A-Za-z]*"),
-     "PacketPeer* is banned (no sockets)"),
+     "PacketPeer* is banned (no sockets)", HARD),
     ("websocket", re.compile(r"(?<![\w])WebSocket[A-Za-z]*"),
-     "WebSocket* is banned (no network)"),
+     "WebSocket* is banned (no network)", HARD),
     ("enet", re.compile(r"(?<![\w])ENet[A-Za-z]*"),
-     "ENet* is banned (no network)"),
+     "ENet* is banned (no network)", HARD),
     ("thread", re.compile(r"(?<![\w])Thread\b"),
-     "Thread is banned (single-thread determinism)"),
+     "Thread is banned (single-thread determinism)", HARD),
     ("mutex", re.compile(r"(?<![\w])Mutex\b"),
-     "Mutex is banned (single-thread determinism)"),
+     "Mutex is banned (single-thread determinism)", HARD),
     ("semaphore", re.compile(r"(?<![\w])Semaphore\b"),
-     "Semaphore is banned (single-thread determinism)"),
+     "Semaphore is banned (single-thread determinism)", HARD),
     ("worker_pool", re.compile(r"(?<![\w])WorkerThreadPool\b"),
-     "WorkerThreadPool is banned (single-thread determinism)"),
+     "WorkerThreadPool is banned (single-thread determinism)", HARD),
     ("engine_singleton", re.compile(r"(?<![\w])Engine\s*\.\s*get_singleton\b"),
-     "Engine.get_singleton is banned (reflection escape)"),
+     "Engine.get_singleton is banned (reflection escape)", HARD),
     ("class_db", re.compile(r"(?<![\w])ClassDB\b"),
-     "ClassDB is banned (reflection escape)"),
+     "ClassDB is banned (reflection escape)", HARD),
     ("expression", re.compile(r"(?<![\w])Expression\b"),
-     "Expression is banned (dynamic eval)"),
-    ("resource_loader", re.compile(r"(?<![\w])Resource(Loader|Saver)\b"),
-     "ResourceLoader/ResourceSaver is banned (arbitrary resource I/O)"),
+     "Expression is banned (dynamic eval)", HARD),
+    # Guardrails v2: ResourceLoader (a READ, equivalent to the now-allowed load())
+    # dropped; ResourceSaver stays — the serve host runs from a SOURCE project, so
+    # res:// is a real writable directory and ResourceSaver is the write vector.
+    ("resource_saver", re.compile(r"(?<![\w])ResourceSaver\b"),
+     "ResourceSaver is banned (writes into the host's res:// source dir)", HARD),
     ("gdscript_class", re.compile(r"(?<![\w])GDScript\b"),
-     "GDScript is banned (dynamic script compile)"),
+     "GDScript is banned (dynamic script compile)", HARD),
     ("set_script", re.compile(r"(?<![\w])set_script\s*\("),
-     "set_script() is banned (dynamic script swap)"),
-    ("load", re.compile(r"(?<![\w.])load\s*\("),
-     "load() is banned (only self's own scene; no dynamic resource loads)"),
-    ("preload", re.compile(r"(?<![\w.])preload\s*\("),
-     "preload() is banned (the game is a self-contained node; no dynamic resource loads)"),
+     "set_script() is banned (dynamic script swap)", HARD),
+    # Guardrails v2: 'load'/'preload' rules removed — res://-confined reads, sandbox-
+    # contained and deterministic; a broken/dynamic load still fails the parse gate
+    # or crashes at the serve host (and any drift fails the G1 two-run gate).
     ("time", re.compile(r"(?<![\w])Time\s*\."),
-     "Time.* (wall clock) is banned (nondeterminism)"),
+     "Time.* (wall clock) is banned (nondeterminism)", HARD),
     ("randomize", re.compile(r"(?<![\w])randomize\s*\("),
-     "randomize() is banned (reseeds from wall clock) — use self.rng"),
+     "randomize() reseeds from the wall clock — prefer a RandomNumberGenerator "
+     "seeded from world_seed (unseeded drift fails the G1 two-run gate)", ADVISORY),
     ("global_rng", re.compile(r"(?<![\w.])(randi|randf|randi_range|randf_range|randfn)\b\s*\("),
-     "the global randi/randf family is banned (unseeded) — use self.rng"),
+     "the global randi/randf family is unseeded — prefer a RandomNumberGenerator "
+     "seeded from world_seed (unseeded drift fails the G1 two-run gate)", ADVISORY),
     ("global_seed", re.compile(r"(?<![\w.])seed\s*\("),
-     "the global seed() is banned — the harness seeds self.rng"),
+     "the global seed() — prefer a RandomNumberGenerator seeded from world_seed "
+     "(the harness seeds self.rng)", ADVISORY),
     ("scene_tree", re.compile(r"(?<![\w])get_tree\s*\("),
-     "get_tree() is banned (get_tree().quit / timers escape determinism)"),
+     "get_tree() is banned (get_tree().quit / timers escape determinism)", HARD),
     ("quit", re.compile(r"\.\s*quit\s*\("),
-     ".quit() is banned (the host owns process lifetime)"),
+     ".quit() is banned (the host owns process lifetime)", HARD),
 ]
 
 
 class Finding(dict):
-    """A single banned-API hit. A dict subclass so it JSON-serialises and reads as a
-    plain record: ``rule`` / ``line`` / ``col`` / ``token`` / ``message`` / ``source``.
+    """A single scanner hit. A dict subclass so it JSON-serialises and reads as a
+    plain record: ``rule`` / ``line`` / ``col`` / ``token`` / ``message`` /
+    ``source`` / ``severity`` (``"hard"`` fails G0; ``"advisory"`` only warns).
     ``str(finding)`` renders the one-line report the sandbox_scan check surfaces."""
 
     def __str__(self) -> str:  # noqa: D105
-        return "line %d: banned %s (%s) — '%s'" % (
-            self["line"], self["rule"], self["message"], self["token"])
+        kind = "advisory" if self.get("severity") == ADVISORY else "banned"
+        return "line %d: %s %s (%s) — '%s'" % (
+            self["line"], kind, self["rule"], self["message"], self["token"])
+
+
+def is_hard(finding) -> bool:
+    """True iff this finding FAILS the G0 gate. The severity predicate the gate
+    plumbing keys on: hard findings reject the game; advisory findings are routed
+    to warnings/hints (mcp_server's ``verify_game`` payload) and never fail."""
+    return (finding.get("severity") or HARD) == HARD
 
 
 def _strip_noncode(line: str) -> str:
@@ -156,18 +190,29 @@ def scan_gd_source(source: str) -> list[Finding]:
         code = _strip_noncode(raw)
         if not code.strip():
             continue
-        for name, pattern, message in _RULES:
+        for name, pattern, message, severity in _RULES:
             for m in pattern.finditer(code):
                 findings.append(Finding(
                     rule=name, line=lineno, col=m.start() + 1,
-                    token=m.group(0), message=message, source=raw.rstrip()))
+                    token=m.group(0), message=message, source=raw.rstrip(),
+                    severity=severity))
     return findings
 
 
 def scan_violations(source: str) -> list[str]:
-    """The scan as a flat list of one-line strings (the ``violations`` payload the
-    shared G0 ``sandbox_scan`` check carries, mirroring ``sandbox.scan_source``)."""
-    return [str(f) for f in scan_gd_source(source)]
+    """The HARD findings as a flat list of one-line strings (the ``violations``
+    payload the shared G0 ``sandbox_scan`` check carries, mirroring
+    ``sandbox.scan_source``). Advisory findings are NOT violations — they go
+    through ``scan_advisories`` into the report's warnings instead."""
+    return [str(f) for f in scan_gd_source(source) if is_hard(f)]
+
+
+def scan_advisories(source: str) -> list[str]:
+    """The ADVISORY findings as one-line strings — non-fatal hints (e.g. 'prefer a
+    RandomNumberGenerator seeded from world_seed') the funnel surfaces in the
+    report's ``warnings`` (and mcp_server's ``verify_game`` payload) while the
+    G1 two-run drift gate stays the empirical judge of determinism."""
+    return [str(f) for f in scan_gd_source(source) if not is_hard(f)]
 
 
 # ======================================================================== #

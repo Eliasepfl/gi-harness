@@ -91,11 +91,17 @@ def test_gdscript_grants_2d_and_3d_dimension_freedom():
 def test_gdscript_banned_list_states_determinism_and_sandbox_reasons():
     sp = P.compose("gdscript")
     assert "BANNED" in sp
-    # The banned families, each named so the G0 scanner's finding is teachable.
-    for banned in ("OS.", "FileAccess", "HTTPRequest", "StreamPeerTCP", "Thread",
-                   "WorkerThreadPool", "Time.", "randi()", "randf()", "preload(",
+    # The HARD banned families, each named so the G0 scanner's finding is teachable.
+    for banned in ("OS.", "FileAccess", "ResourceSaver", "HTTPRequest",
+                   "StreamPeerTCP", "Thread", "WorkerThreadPool", "Time.",
                    "set_script", "Expression", "get_tree()"):
         assert banned in sp, banned
+    # Guardrails v2: res:// asset loads are ALLOWED (sandbox-contained reads)...
+    assert "`load()`/`preload()` of `res://` resources are ALLOWED" in sp
+    # ...and the unseeded global RNG family is an ADVISORY hint, never a G0 reject
+    # (the two-run replay gate stays the hard judge of determinism).
+    assert "randi()" in sp and "randf()" in sp
+    assert "ADVISORY" in sp
     # The WHY is the two hard rules, not style.
     flat = " ".join(sp.lower().split())
     assert "sandbox escape" in flat

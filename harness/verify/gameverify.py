@@ -1155,27 +1155,32 @@ def run_g0_js(facts: dict) -> dict:
 # ======================================================================== #
 # The GDScript lane (engine=gdscript) is the NEW static species (GDSCRIPT_LANE.md):
 # generated CODE, not data. Its G0 fuses the three code gates —
-#   (b) the python-side banned-API scan  (harness/verify/gd_gate.scan_gd_source),
+#   (b) the python-side banned-API scan  (harness/verify/gd_gate.scan_gd_source;
+#       HARD findings fail, ADVISORY findings ride along as warnings),
 #   (a) the parse gate                    (facts["load"], serve_game.gd's compile),
 #   (c) the contract probe                (facts["contract"].methods, has_method) —
 # with the SAME structural checks the data lanes use (actions 2..8, one controlled
 # dynamic body, >=2 bodies, in bounds). The check keys mirror run_g0_js so
 # `_hint_g0` renders identical hints across engines.
 
-def run_g0_gd(facts: dict, violations) -> dict:
+def run_g0_gd(facts: dict, violations, advisories=None) -> dict:
     """G0 static layer for a GDScript (GameAPI) game.
 
-    ``violations`` is the python banned-API scan result (list of strings); ``facts``
-    is the serve host's ``check`` payload (parse gate + contract probe + t=0 facts).
-    Stops at the first failing gate, so the code never runs if the scan or parse
-    gate rejects it."""
+    ``violations`` is the python banned-API scan's HARD findings (list of strings);
+    ``advisories`` its non-fatal ADVISORY findings (severity split in
+    ``gd_gate._RULES`` — advisory findings NEVER fail the gate, they ride along in
+    the ``sandbox_scan`` check for observability and are surfaced as report
+    warnings by ``_verify_gdscript``). ``facts`` is the serve host's ``check``
+    payload (parse gate + contract probe + t=0 facts). Stops at the first failing
+    gate, so the code never runs if the scan or parse gate rejects it."""
     from harness.verify.gd_gate import GD_REQUIRED_METHODS
     layer = {"passed": False, "checks": {}}
     checks = layer["checks"]
 
-    # (b) banned-API scan (a hard fail; the code was NOT compiled/run).
+    # (b) banned-API scan (HARD findings fail; the code was NOT compiled/run).
     violations = list(violations or [])
-    checks["sandbox_scan"] = check(not violations, violations=violations)
+    checks["sandbox_scan"] = check(not violations, violations=violations,
+                                   advisories=list(advisories or []))
     if violations:
         return layer
 
@@ -1563,14 +1568,20 @@ def _verify_gdscript(source: str, report: dict) -> dict:
     goal facts (is_success/is_failure/checkpoints share the JS check shape). The code
     is NEVER compiled or run until the static scan passes. Adds ``"engine": "gdscript"``."""
     from harness.verify.gd_exec import GdExecutor
-    from harness.verify.gd_gate import scan_violations
+    from harness.verify.gd_gate import scan_advisories, scan_violations
     report["engine"] = "gdscript"
 
-    # (b) banned-API scan FIRST — a hard fail short-circuits BEFORE any Godot spawn,
-    # so unscanned code is never compiled or executed.
+    # (b) banned-API scan FIRST — a HARD finding short-circuits BEFORE any Godot
+    # spawn, so unscanned code is never compiled or executed. ADVISORY findings
+    # (unseeded global RNG family) never fail: they surface as report warnings —
+    # the G1 two-run drift gate is the empirical judge of determinism.
     violations = scan_violations(source)
+    advisories = scan_advisories(source)
+    if advisories:
+        report.setdefault("warnings", []).extend(
+            "ADVISORY: " + a for a in advisories)
     if violations:
-        g0 = run_g0_gd({}, violations)
+        g0 = run_g0_gd({}, violations, advisories)
         report["layers"]["G0_static"] = g0
         report["failure_class"] = "ENV_ERROR"
         report["hint"] = _hint_g0(g0["checks"])
@@ -1581,7 +1592,7 @@ def _verify_gdscript(source: str, report: dict) -> dict:
         # G0 (parse gate + contract probe + structural) + G2 facts: ONE check op.
         facts = executor.run_check(source)
 
-        g0 = run_g0_gd(facts, [])
+        g0 = run_g0_gd(facts, [], advisories)
         report["layers"]["G0_static"] = g0
         if not g0["passed"]:
             report["failure_class"] = "ENV_ERROR"
