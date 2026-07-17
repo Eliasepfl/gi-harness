@@ -39,15 +39,19 @@ one (forward-compatible — obs picks it up at zero layout change); else derived
 from the scalar ``angle`` games emit today as a yaw about the world up-axis Y
 (q = [0, sin(a/2), 0, cos(a/2)] — faithful to Godot ``rotation.y``/``euler().y``).
 
-3D EGOCENTRIC HINTS (fixed 16-float block, appended once after the per-body
+3D EGOCENTRIC HINTS (fixed 12-float block, appended once after the per-body
 block; 3D ONLY so the 2D vector stays byte-identical): for the controlled body,
 the relative position (other - controlled, world-normalized) of the K_EGO_NEIGHBORS
-NEAREST non-controlled bodies (each slot: present, dx/W, dy/H, dz/D), then ONE
-next-unlatched-checkpoint relative vector (present, dx/W, dy/H, dz/D). The
-checkpoint target is INFERRED honestly from data already in the frame — a
-non-controlled body whose name is associated (case-insensitive substring) with the
-first unlatched checkpoint key (e.g. body ``ring_2`` <- cp ``threaded_ring_2``),
-else the nearest non-controlled sensor body; zero when nothing is inferable.
+NEAREST non-controlled bodies (each slot: present, dx/W, dy/H, dz/D). Pure geometry —
+"what is near me, and where" — with NO notion of which body is the goal.
+
+REMOVED (Elias 2026-07-16): the former next-unlatched-checkpoint direction hint (a
+13th..16th float pointing at a body inferred by case-insensitive NAME-MATCHING a body
+to a checkpoint key, e.g. ``ring_2`` <- ``threaded_ring_2``). It was cut from EVERY obs
+profile because (a) it is a CHEAT — the name-match hands the policy the target it is
+supposed to learn to find, and (b) it CLASS-FORCES games whose bodies happen to be named
+like their checkpoints. The K-nearest ego block stays; only the name-matched hint is gone,
+so the 3D ego block shrinks 16 -> 12 floats.
 
 Appended once at the end (both dims): the latched-checkpoint one-hot (declared
 order) and the normalized tick — the stateful progress signal that makes gated
@@ -80,10 +84,51 @@ Rays are DERIVED from body positions, so they are deliberately EXCLUDED from the
 softlock fingerprint (``fingerprint_from_obs`` stops before the tail; the pure profile falls
 back to the raw serve snapshot). See ``godotworld/serve_game.gd`` for the fan/grid layout.
 
-REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1): `+1.0 per NEWLY latched
-checkpoint + 5.0 on success - 1.0 on failure`. `success` stays the unshaped binary
-certificate — the "solved?" decision never reads this shaped reward. Episode ends
-on a terminal `result` or at HORIZON (300) decision ticks.
+REWARD (the OMNI-EPIC lesson, LLM_RL_SYSTEMS §4.1 — REALIGNED 2026-07-16; see :func:`step_reward`).
+The old `+1.0/checkpoint + 5.0/success - 1.0/failure` converged to a NEVER-WINNING policy on
+mini_collect (a 400k probe: farming first-checkpoint shaping beat finishing). The reward is the
+SUM of a bounded CHECKPOINT SHAPING term (mode-selected, below) + the (default-off) per-tick
+living cost + a terminal payoff kept OUTSIDE the shaping. The two shaping modes (``REWARD_MODE``):
+
+  1a. ADDITIVE shaping (DEFAULT — the one that CONVERGES). Each newly-latched checkpoint pays
+      ``SHAPING_MASS / n_cp``, sticky, so cumulative shaping is capped at ``SHAPING_MASS``. It is
+      NON-potential: it genuinely biases the policy toward reaching checkpoints (a real GUIDING
+      gradient), and the bounded mass + dominant terminal keep it clear of the farming/camping
+      trap. Convergence probe (mini_collect, sb3, 8 envs): stochastic SR 0.69 @ 400k, demo_ready
+      (greedy 1.0) @ 1.5M.
+
+  1b. POTENTIAL-BASED shaping (``REWARD_MODE="pbrs"`` — invariant but NON-guiding, OPT-IN).
+      ``F = γ·Φ(s') − Φ(s)``, ``Φ(s) = SHAPING_MASS·(latched/n_cp)``, ``Φ≡0`` at an absorbing
+      terminal (Ng, Harada & Russell 1999). The PBRS theorem makes the optimal policy INVARIANT
+      (discounted shaping telescopes to ``γ^T·Φ_end − Φ_0``), so farming/do-nothing basins are
+      impossible by construction. But the SAME invariance means the shaping adds ~ZERO net
+      advantage — it does not GUIDE PPO — and on mini_collect it collapses to the sparse-terminal
+      problem (greedy SR 0 across a 1.5M probe, the policy degenerating to a single action). So it
+      is documented and selectable but NOT the default: invariance is elegant, a guiding gradient
+      is what demo_ready consumes. ``γ = PBRS_GAMMA`` must match the trainer.
+
+  2. TEMPORAL PRESSURE — a time-DECAYED success bonus (Elias's explicit "decaying reward" ask),
+     OUTSIDE the shaping (part of the true objective). On ``success`` the payoff is
+     ``R_SUCCESS * (SUCCESS_TIME_FLOOR + (1 - SUCCESS_TIME_FLOOR) * remaining_frac)``,
+     ``remaining_frac = clip((horizon - tick)/horizon, 0, 1)`` — full ``R_SUCCESS`` for an instant
+     win down to the FLOOR ``R_SUCCESS*SUCCESS_TIME_FLOOR`` at the buzzer, biasing toward FASTER
+     wins with no mid-trajectory trap.
+
+  3. A per-tick LIVING COST ``R_TICK = -LIVING_COST_TOTAL / horizon`` — AVAILABLE but DISABLED by
+     default (``LIVING_COST_TOTAL = 0.0``): a non-potential unconditional cost destabilized
+     convergence (the policy fled the stepping stone to a do-nothing basin). The decaying bonus
+     supplies the temporal pressure instead.
+
+  4. A clearly-negative terminal ``R_FAILURE`` on ``failure``/``error`` (also outside the shaping).
+
+Sizing (see the constants): the shaping mass is BOUNDED by ``SHAPING_MASS``, and
+``R_SUCCESS*SUCCESS_TIME_FLOOR`` (the MINIMUM success payoff, 5.0) > ``SHAPING_MASS`` (1.0), so the
+reward invariants hold with margin in BOTH modes: (a) the whole shaping mass < the success payoff
+at ANY tick; (b) an earlier success yields a strictly greater return than a later one; (c) any
+success return > any no-success return; (d) for equal progress a failure return < a timeout
+(no-success) return; PLUS, for pbrs mode, the telescoping identity ``Σ γ^t F_t = γ^T·Φ_end − Φ_0``.
+``success`` STAYS the unshaped binary certificate — the "solved?" decision never reads this shaped
+reward (hack-resistant by construction). Episode ends on a terminal ``result`` or at HORIZON (300).
 
 ======================================================================
 godot_rl_agents AIController mapping  (GODOT_RL_MERGE.md §2 — pin this)
@@ -130,7 +175,7 @@ PER_BODY_3D = 14          # 3D obs features per body (+z,+vz, quat vs sin/cos) [
 PER_BODY = PER_BODY_2D    # backward-compat alias (importers pin the 2D width)
 K_EGO_NEIGHBORS = 3       # nearest non-controlled bodies to hint egocentrically (3D) [eng.]
 EGO_SLOT = 4              # floats per egocentric hint: present, dx/W, dy/H, dz/D
-EGO_BLOCK_3D = (K_EGO_NEIGHBORS + 1) * EGO_SLOT  # K neighbours + 1 checkpoint hint = 16
+EGO_BLOCK_3D = K_EGO_NEIGHBORS * EGO_SLOT  # K nearest-body hints (name-match cp hint REMOVED) = 12
 # --- Obs profiles (Elias 2026-07-16): one knob, three exteroception regimes -------
 # "positions"       -> today's obs (global per-body block, +3D ego hints). DEFAULT, and
 #                      byte-for-byte the pre-rays vector.
@@ -158,10 +203,121 @@ DEFAULT_RAYS = {"n": 16, "fov_deg": 180.0,
 RAY_CLASS_BITS = 3        # {static, dynamic, sensor} one-hot per ray when class_bits on [eng.]
 VEL_SCALE = 1000.0        # px/s velocity normalizer [eng.]
 OBS_CLIP = 10.0           # clip normalized obs into [-OBS_CLIP, OBS_CLIP] [eng.]
-R_CHECKPOINT = 1.0        # reward per newly latched checkpoint [eng.]
-R_SUCCESS = 5.0           # terminal bonus on the unshaped success certificate [eng.]
-R_FAILURE = -1.0          # terminal penalty on failure/error [eng.]
+# --- Reward scheme (PBRS, 2026-07-16; see the module docstring "REWARD") ----------------
+# Two checkpoint-shaping schemes, selected by REWARD_MODE (see :func:`step_reward`):
+#  * "additive" (DEFAULT) — each newly-latched checkpoint pays SHAPING_MASS/n_cp, sticky, so
+#    cumulative shaping is capped at SHAPING_MASS. NON-potential: it genuinely biases the policy
+#    toward reaching checkpoints (a real guiding gradient), the bounded mass + dominant terminal
+#    keeping it clear of the farming/camping pathology. This is what CONVERGES on the showcase
+#    games (mini_collect: stochastic 0.69 @ 400k, demo_ready @ 1.5M).
+#  * "pbrs" — potential-based (Ng, Harada & Russell 1999): F = γ·Φ(s') − Φ(s), Φ(s) =
+#    SHAPING_MASS·(latched/n_cp). Provably leaves the optimal policy UNCHANGED (its discounted
+#    sum telescopes to γ^T·Φ_end − Φ_0), so farming/do-nothing basins are impossible BY
+#    CONSTRUCTION. But that invariance means the shaping adds ~ZERO net advantage, so it does
+#    NOT guide PPO — on mini_collect it collapses to the sparse-terminal problem (greedy SR 0
+#    across a 1.5M probe). Kept as a documented, opt-in option; NOT the default.
+# The terminal success/failure payoffs stay OUTSIDE the shaping in BOTH modes.
+REWARD_MODE = "additive"  # "additive" (default, converges) | "pbrs" (invariant but non-guiding)
+SHAPING_MASS = 1.0        # shaping scale: total additive shaping (all n_cp latched), and the max
+                          # PBRS potential Φ. Bounded, so shaping can never rival the terminal [eng.]
+PBRS_GAMMA = 0.99         # discount for the PBRS shaping term γ·Φ(s')−Φ(s) (pbrs mode only); MUST
+                          # match the trainer's gamma (ppo.DEFAULTS["gamma"]) for exact policy
+                          # invariance — a guard test pins the equality (tests/test_rl_reward.py) [eng.]
+R_SUCCESS = 10.0          # BASE terminal success bonus, before the time-decay below [eng.]
+SUCCESS_TIME_FLOOR = 0.5  # decayed success payoff never drops below this fraction of R_SUCCESS
+                          # (a buzzer-beater win still pays 0.5*R_SUCCESS >> the shaping mass) [eng.]
+R_FAILURE = -2.0          # terminal penalty on failure/error (clearly negative) [eng.]
+LIVING_COST_TOTAL = 0.0   # per-tick living cost R_TICK = -LIVING_COST_TOTAL/horizon. DISABLED
+                          # (0.0): a non-potential unconditional cost destabilized convergence
+                          # (the 400k probe: policy fled the stepping stone to a do-nothing basin).
+                          # PBRS supplies the built-in, policy-neutral anti-dither instead; the
+                          # decaying success bonus supplies the temporal pressure [eng.]
+R_CHECKPOINT = SHAPING_MASS  # backward-compat alias (the potential scale for a 1-checkpoint game)
 SERVE_TIMEOUT_S = 60.0    # per-op read budget before declaring the node dead [eng.]
+
+
+# --- Reward function (single source of truth; the 3 env step() paths call this) ---------
+def additive_shaping(c_before: int, c_after: int, n_cp: int) -> float:
+    """DEFAULT (converging) shaping: each NEWLY latched checkpoint pays ``SHAPING_MASS / n_cp``.
+    Sticky/latch-once, so an episode that latches all ``n_cp`` accrues exactly ``SHAPING_MASS``
+    — bounded, so the terminal payoff dominates. Unlike PBRS this is NOT policy-invariant: it
+    genuinely biases the policy toward reaching checkpoints (a real guiding gradient), which is
+    what lets PPO CONVERGE on the showcase games where the policy-neutral PBRS shaping stalls.
+    ``n_cp <= 0`` -> 0.0."""
+    if n_cp <= 0:
+        return 0.0
+    return (SHAPING_MASS / float(n_cp)) * float(int(c_after) - int(c_before))
+
+
+def potential(n_latched: int, n_cp: int) -> float:
+    """PBRS potential ``Φ(s) = SHAPING_MASS · (n_latched / n_cp)`` — the shaping's "height" at
+    a state, proportional to the fraction of declared checkpoints latched. Bounded in
+    ``[0, SHAPING_MASS]``: 0 at episode start (nothing latched), SHAPING_MASS with all latched.
+    ``n_cp <= 0`` (no declared checkpoints) -> 0.0 (no shaping)."""
+    if n_cp <= 0:
+        return 0.0
+    return SHAPING_MASS * (float(n_latched) / float(n_cp))
+
+
+def shaping_reward(c_before: int, c_after: int, n_cp: int, terminal: bool,
+                   gamma: float = PBRS_GAMMA) -> float:
+    """POTENTIAL-BASED shaping ``F = γ·Φ(s') − Φ(s)`` (Ng, Harada & Russell 1999).
+
+    ``c_before``/``c_after`` = latched-checkpoint count BEFORE/AFTER the step. At an ABSORBING
+    terminal (``terminal=True``: success/failure/error) ``Φ(s')`` is 0 — the PBRS convention
+    under which the discounted shaping over a whole episode telescopes to ``γ^T·Φ_end − Φ_0``
+    and the optimal policy is provably UNCHANGED. A truncation (time limit) is NOT absorbing,
+    so it keeps ``Φ(s') = Φ(c_after)`` (SB3 bootstraps its value). Because the discounted
+    shaping is policy-neutral, no shaping-farming or do-nothing basin can exist."""
+    phi_before = potential(c_before, n_cp)
+    phi_after = 0.0 if terminal else potential(c_after, n_cp)
+    return float(gamma) * phi_after - phi_before
+
+
+def success_payoff(tick: int, horizon: int) -> float:
+    """Time-DECAYED terminal success bonus (Elias's "decaying reward"): the earlier the win,
+    the larger the payoff, with a floor so late wins still dominate the shaping mass::
+
+        R_SUCCESS * (SUCCESS_TIME_FLOOR + (1 - SUCCESS_TIME_FLOOR) * remaining_frac)
+
+    ``remaining_frac = clip((horizon - tick)/horizon, 0, 1)`` — 1.0 at ``tick==0`` (instant
+    win, full ``R_SUCCESS``) down to 0.0 at ``tick==horizon`` (floor ``R_SUCCESS*FLOOR``)."""
+    h = float(horizon) if horizon and horizon > 0 else 1.0
+    remaining = (h - float(tick)) / h
+    remaining = min(1.0, max(0.0, remaining))
+    return R_SUCCESS * (SUCCESS_TIME_FLOOR + (1.0 - SUCCESS_TIME_FLOOR) * remaining)
+
+
+def tick_cost(horizon: int) -> float:
+    """The small per-tick living cost ``R_TICK = -LIVING_COST_TOTAL / horizon`` (a negative
+    number), applied EVERY step. Over a full-horizon episode it totals ``-LIVING_COST_TOTAL``."""
+    h = float(horizon) if horizon and horizon > 0 else 1.0
+    return -LIVING_COST_TOTAL / h
+
+
+def step_reward(c_before: int, c_after: int, n_cp: int, result, tick: int, horizon: int,
+                gamma: float = PBRS_GAMMA, mode: str | None = None) -> float:
+    """The per-step reward (single source of truth for ALL env step() paths): checkpoint shaping
+    + the (default-off) per-tick living cost, PLUS the terminal payoff kept OUTSIDE the shaping —
+    the time-decayed :func:`success_payoff` on ``success`` or the flat negative ``R_FAILURE`` on
+    ``failure``/``error``. ``c_before``/``c_after`` = latched count before/after the step.
+
+    ``mode`` selects the shaping (default :data:`REWARD_MODE` = ``"additive"``):
+    ``"additive"`` (:func:`additive_shaping`, the converging default) or ``"pbrs"``
+    (:func:`shaping_reward`, potential-based / invariant but non-guiding). See the module
+    docstring "REWARD" for the scheme and the reward invariants."""
+    mode = mode or REWARD_MODE
+    terminal = result in ("success", "failure", "error")
+    if mode == "pbrs":
+        shp = shaping_reward(c_before, c_after, n_cp, terminal, gamma)
+    else:
+        shp = additive_shaping(c_before, c_after, n_cp)
+    r = shp + tick_cost(horizon)
+    if result == "success":
+        r += success_payoff(tick, horizon)
+    elif result in ("failure", "error"):
+        r += R_FAILURE
+    return float(r)
 
 
 # --- Minimal Gymnasium-compatible spaces (duck types; no gymnasium dep) ------
@@ -445,39 +601,10 @@ def _controlled_pos(obs_state, body_order) -> tuple[float, float, float]:
     return (0.0, 0.0, 0.0)
 
 
-def _next_checkpoint_target(obs_state, body_order, cp_keys, latched):
-    """3D position of the next-checkpoint target, inferred WITHOUT any new wire
-    field, or None. (1) a non-controlled body whose name is associated
-    (case-insensitive substring, either direction) with the FIRST unlatched
-    checkpoint key; else (2) the nearest non-controlled sensor body (goal pad)."""
-    for key in cp_keys:                                  # first unlatched cp only
-        if latched.get(key) is not None:
-            continue
-        kl = str(key).lower()
-        for name in body_order:
-            q = obs_state.get(name)
-            if q is None or q.get("controlled"):
-                continue
-            nl = str(name).lower()
-            if nl and (nl in kl or kl in nl):
-                return _vec3(q.get("pos"))
-        break                                            # no match -> sensor fallback
-    cx, cy, cz = _controlled_pos(obs_state, body_order)
-    best = None
-    for name in body_order:
-        q = obs_state.get(name)
-        if q is None or q.get("controlled") or not q.get("sensor"):
-            continue
-        px, py, pz = _vec3(q.get("pos"))
-        dist2 = (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2
-        if best is None or dist2 < best[0]:
-            best = (dist2, (px, py, pz))
-    return best[1] if best else None
-
-
 def _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d, tick, horizon):
-    """The 3D layout: per-body (z, vz, quaternion) block + a fixed egocentric-hint
-    block + the shared checkpoint one-hot and tick tail."""
+    """The 3D layout: per-body (z, vz, quaternion) block + a fixed K-nearest egocentric
+    block (relative positions only, no goal hint) + the shared checkpoint one-hot and tick
+    tail."""
     n = len(body_order)
     obs_dim = n * PER_BODY_3D + EGO_BLOCK_3D + len(cp_keys) + 1
     vec = np.zeros(obs_dim, dtype=np.float32)
@@ -525,13 +652,8 @@ def _build_obs_3d(obs_state, latched, body_order, cp_keys, w, h, d, tick, horizo
             vec[i + 2] = dy / h
             vec[i + 3] = dz / d
         i += EGO_SLOT
-    tgt = _next_checkpoint_target(obs_state, body_order, cp_keys, latched)
-    if tgt is not None:
-        vec[i + 0] = 1.0
-        vec[i + 1] = (tgt[0] - cx) / w
-        vec[i + 2] = (tgt[1] - cy) / h
-        vec[i + 3] = (tgt[2] - cz) / d
-    i += EGO_SLOT
+    # (the name-matched next-checkpoint direction hint was REMOVED here — see the module
+    # docstring; the ego block is now the K-nearest-body slots only, no goal hint.)
 
     for key in cp_keys:                                  # latched one-hot
         vec[i] = 1.0 if latched.get(key) is not None else 0.0
@@ -695,21 +817,23 @@ class PlanckEnv:
         result = frame.get("result")
 
         latched_now = self._latched_set(frame)
-        new_latches = len(latched_now - self._prev_latched)
+        c_before = len(self._prev_latched)
+        c_after = len(latched_now)
         self._prev_latched = latched_now
-        reward = R_CHECKPOINT * new_latches
 
         terminated = False
         truncated = False
         if result == "success":
-            reward += R_SUCCESS
             terminated = True
         elif result in ("failure", "error"):
-            reward += R_FAILURE
             terminated = True
         elif self._tick >= self.horizon:
             truncated = True
         self._done = terminated or truncated
+        # Realigned reward (single source of truth): PBRS checkpoint shaping + the (off-by-
+        # default) living cost + the time-decayed terminal. See step_reward / the docstring.
+        reward = step_reward(c_before, c_after, len(self._cp_keys or []), result,
+                             self._tick, self.horizon)
 
         info = {
             "result": result,

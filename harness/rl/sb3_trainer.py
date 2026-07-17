@@ -54,6 +54,11 @@ from harness.rl.ppo import DEFAULTS
 ALGO_METHODS = ("ppo", "a2c", "dqn")
 DEFAULT_METHOD = "ppo"
 
+# BEST-CHECKPOINT eval cadence: how many PPO updates between greedy evals of the live policy
+# (the best-by-eval-success snapshot the certifier reloads). One update ~= num_envs*num_steps
+# env-steps; at the 8x128 default that is ~25k steps/eval, a few % overhead. [eng.]
+EVAL_FREQ_UPDATES = 25
+
 
 def _algo_registry() -> dict:
     """Map method name -> SB3 algorithm class (imported lazily; base sb3 only)."""
@@ -115,7 +120,8 @@ def _build_callback_cls():
         (SB3 ignores ``_on_rollout_end``'s return), so a plateau trip sets a flag
         that the next ``_on_step`` observes to return False."""
 
-        def __init__(self, hp, log=None, wall_clock_budget_s=None):
+        def __init__(self, hp, log=None, wall_clock_budget_s=None, best_model_path=None,
+                     eval_fn=None, eval_freq_updates=EVAL_FREQ_UPDATES):
             super().__init__()
             self.hp = hp
             self._log = log
@@ -126,6 +132,8 @@ def _build_callback_cls():
             self.steps_to_first_success = None
             self.updates = 0
             self.best_return = -1e9
+            self.best_latched = -1e9        # plateau also tracks checkpoint + success progress
+            self.best_success_smoothed = -1e9  # (PBRS makes episodic RETURN flat — see below)
             self.best_success = 0.0
             self.updates_since_best = 0
             self.stopped_early = False
@@ -133,6 +141,23 @@ def _build_callback_cls():
             self._pending: list[dict] = []   # episodes finished since last rollout end
             self._stop = False
             self._t0 = 0.0
+            # BEST-CHECKPOINT (Elias, 2026-07-16). Godot-serve training is high variance / non
+            # deterministic (a run can solve mid-training then DEGRADE to a do-nothing policy),
+            # so evaluating the LAST policy under-reports the run. When `best_model_path` AND an
+            # `eval_fn` are given, every `eval_freq_updates` we run a GREEDY EVAL of the current
+            # policy and snapshot it whenever the (greedy_sr, stochastic_sr) score reaches a new
+            # best. Keying on the EVAL (not rollout) success is deliberate: a near-random early
+            # policy scores high ROLLOUT success by exploration luck but ~0 on a greedy eval, so
+            # only a genuinely competent policy is ever saved. Default None -> no snapshot,
+            # byte-identical to before.
+            self.best_model_path = best_model_path
+            self._eval_fn = eval_fn
+            self._eval_freq_updates = max(1, int(eval_freq_updates))
+            self.best_ckpt_score = (-1.0, -1.0)   # (greedy_sr, stochastic_sr)
+            self.best_ckpt_greedy = None
+            self.best_ckpt_stochastic = None
+            self.best_ckpt_update = None
+            self.best_ckpt_saved = False
 
         def _on_training_start(self) -> None:
             self._t0 = time.time()
@@ -163,15 +188,67 @@ def _build_callback_cls():
             self.curve_success.append(round(succ, 3))
             self.best_success = max(self.best_success, succ)
 
-            # Plateau on the SMOOTHED mean return (rolling mean over plateau_window
-            # updates) — a single lucky update no longer freezes `best` (== ppo.py).
+            # Plateau on SMOOTHED PROGRESS (rolling mean over plateau_window updates). We treat
+            # a new best in the episodic RETURN, the mean LATCHED-checkpoint count, OR the
+            # success rate as "still improving" and reset the patience counter. Keying on return
+            # ALONE breaks under POTENTIAL-BASED shaping: PBRS is discounted-neutral, so a
+            # non-winning episode's return is ~0 and the return curve stays FLAT until a win —
+            # which would trip the plateau (and stop training) while the policy is still climbing
+            # the checkpoint ladder. Latched/success rise as the policy makes real progress, so
+            # the combined signal keeps a genuinely-improving run alive; a truly stuck run (no
+            # return, no new checkpoints, no wins) still plateaus and stops.
             window = self.hp["plateau_window"]
+            min_delta = self.hp["min_delta"]
             smoothed = float(np.mean(self.curve_return[-window:]))
-            if smoothed > self.best_return + self.hp["min_delta"]:
+            smoothed_lat = float(np.mean(self.curve_latched[-window:]))
+            smoothed_succ = float(np.mean(self.curve_success[-window:]))
+            improved = False
+            if smoothed > self.best_return + min_delta:
                 self.best_return = smoothed
+                improved = True
+            if smoothed_lat > self.best_latched + min_delta:
+                self.best_latched = smoothed_lat
+                improved = True
+            if smoothed_succ > self.best_success_smoothed + min_delta:
+                self.best_success_smoothed = smoothed_succ
+                improved = True
+            if improved:
                 self.updates_since_best = 0
             else:
                 self.updates_since_best += 1
+
+            # BEST-CHECKPOINT snapshot (EVAL-keyed): every eval_freq_updates, greedily evaluate
+            # the current policy and keep the snapshot with the best (greedy_sr, stochastic_sr).
+            # Greedy eval — not rollout success — so early exploration luck is never mistaken for
+            # competence. A crash in eval must not kill training (skip, log).
+            if self.best_model_path is not None and self._eval_fn is not None \
+                    and self.updates % self._eval_freq_updates == 0:
+                # Save/restore the global torch RNG around the eval: sample_episode reseeds
+                # torch (for reproducible sampled rollouts), which would otherwise perturb the
+                # trainer's own action sampling and change the run. This keeps the eval a pure
+                # OBSERVER of training.
+                _rng = torch.get_rng_state()
+                try:
+                    ev = self._eval_fn(self.model) or {}
+                    g = float(ev.get("greedy_sr", 0.0))
+                    s = float(ev.get("stochastic_sr", 0.0))
+                except Exception as exc:  # noqa: BLE001
+                    g = s = None
+                    if self._log is not None:
+                        self._log(f"  [best-ckpt] eval skipped: {type(exc).__name__}: {exc}")
+                finally:
+                    torch.set_rng_state(_rng)
+                if g is not None:
+                    new_best = (g, s) > self.best_ckpt_score and (g > 0.0 or s > 0.0)
+                    if new_best:
+                        self.best_ckpt_score = (g, s)
+                        self.best_ckpt_greedy, self.best_ckpt_stochastic = g, s
+                        self.best_ckpt_update = self.updates
+                        self.model.save(self.best_model_path)   # SB3 .zip snapshot
+                        self.best_ckpt_saved = True
+                    if self._log is not None:
+                        self._log(f"  [best-ckpt] upd {self.updates} eval greedy={g:.2f} "
+                                  f"stochastic={s:.2f}" + (" -> SAVED new best" if new_best else ""))
 
             if self._log is not None:
                 sps = int(self.num_timesteps / max(1e-6, time.time() - self._t0))
@@ -287,7 +364,8 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           seed: int = 0, device: str = "cpu", log=None, wall_clock_budget_s=None,
           method: str = DEFAULT_METHOD, make_batch_venv=None, num_shards: int = 1,
           make_shard_venv=None, torch_num_threads: int | None = None,
-          **overrides) -> dict:
+          best_model_path: str | None = None, eval_fn=None,
+          eval_freq_updates: int = EVAL_FREQ_UPDATES, **overrides) -> dict:
     """Train an SB3 learner on `make_env` (a 0-arg PlanckEnv factory) for
     ~`total_steps` env-steps and return the same dict shape as `ppo.train` (agent +
     curves + steps_to_first_success + bookkeeping, plus the resolved `method`).
@@ -380,7 +458,9 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
              else _build_onpolicy(method, algo_cls, venv, hp, seed))
 
     callback = _build_callback_cls()(hp, log=log,
-                                     wall_clock_budget_s=wall_clock_budget_s)
+                                     wall_clock_budget_s=wall_clock_budget_s,
+                                     best_model_path=best_model_path, eval_fn=eval_fn,
+                                     eval_freq_updates=eval_freq_updates)
     start = time.time()
     model.learn(total_timesteps=total_steps, callback=callback, progress_bar=False)
     train_wall = time.time() - start
@@ -398,6 +478,11 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
         "stopped_early": callback.stopped_early,
         "plateau_stopped": callback.plateau_stopped,
         "best_success_rate_train": round(callback.best_success, 3),
+        # BEST-CHECKPOINT provenance (eval-keyed; None-safe when no snapshot was saved).
+        "best_model_path": (best_model_path if callback.best_ckpt_saved else None),
+        "best_ckpt_update": callback.best_ckpt_update,
+        "best_ckpt_greedy_sr": callback.best_ckpt_greedy,
+        "best_ckpt_stochastic_sr": callback.best_ckpt_stochastic,
         "train_wall_s": round(train_wall, 1),
         "hp": hp,
     }

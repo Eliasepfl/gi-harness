@@ -205,6 +205,56 @@ def _per_checkpoint_latch_rate(eval_eps: list[dict], cp_keys: list[str]) -> dict
     return rates
 
 
+# GENERIC movement-axis keywords (substring match on the lowercased action NAME — never a
+# game-specific list). A game whose actions use these common words gets per-axis aggregates;
+# any action that matches none lands in "other", so the axis buckets always sum to the tick
+# total. This is a DIAGNOSTIC lens (does a 3D policy actually use altitude, or collapse to a
+# plane?), not a control surface — the raw per-action counts are always the ground truth.
+_AXIS_KEYWORDS = {
+    "vertical": ("up", "down", "rise", "fall", "ascend", "descend", "climb", "lift", "drop", "hover"),
+    "lateral": ("left", "right", "strafe", "bank", "yaw", "roll"),
+    "forward_brake": ("forward", "fwd", "ahead", "thrust", "accel", "throttle", "boost",
+                      "back", "reverse", "brake", "decel", "coast", "stop"),
+}
+
+
+def _axis_of(action_name: str):
+    """The movement axis an action name trivially maps to (first match), or ``None``."""
+    al = str(action_name).lower()
+    for axis, kws in _AXIS_KEYWORDS.items():
+        if any(kw in al for kw in kws):
+            return axis
+    return None
+
+
+def action_histogram(episodes: list[dict], action_names: list[str],
+                     with_axes: bool = False) -> dict:
+    """Action-usage histogram over a pool of eval episodes (each carrying an ``actions`` list
+    of action-name strings). Returns ``per_action`` counts (every declared action seeded to 0)
+    and ``total_ticks``; ``per_action`` ALWAYS sums to ``total_ticks``. When ``with_axes`` (set
+    for 3D games) it also returns ``per_axis`` — vertical / lateral / forward_brake / other —
+    derived GENERICALLY from action names (see ``_AXIS_KEYWORDS``), plus ``per_axis_frac``. The
+    axis buckets are EXCLUSIVE (first-match) and also sum to ``total_ticks``, so a 3D policy's
+    altitude usage is directly visible (ground truth fly witness: ~37% vertical / 26% lateral /
+    38% forward_brake). Pure + JSON-serializable."""
+    counts = {str(a): 0 for a in (action_names or [])}
+    total = 0
+    for ep in (episodes or []):
+        for a in ep.get("actions", []):
+            key = str(a)
+            counts[key] = counts.get(key, 0) + 1
+            total += 1
+    hist = {"per_action": counts, "total_ticks": total}
+    if with_axes:
+        axes = {"vertical": 0, "lateral": 0, "forward_brake": 0, "other": 0}
+        for a, c in counts.items():
+            axes[_axis_of(a) or "other"] += c
+        hist["per_axis"] = axes
+        hist["per_axis_frac"] = {k: (round(v / total, 3) if total else 0.0)
+                                 for k, v in axes.items()}
+    return hist
+
+
 def _resolve_trainer(trainer: str):
     """Return the trainer module exposing ``train`` / ``greedy_episode`` /
     ``sample_episode``. ``vendored`` is the CleanRL-mirror PPO (`harness.rl.ppo`,
@@ -287,6 +337,7 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
              demo_out: str | None = None, demo_sr_min: float = DEMO_SR_MIN,
              demo_stochastic_floor: float = DEMO_STOCHASTIC_FLOOR,
              rays: dict | None = None, obs_profile: str = "positions",
+             best_checkpoint: bool = True,
              **train_kwargs) -> dict:
     """Train, greedily evaluate, and emit the learnability certificate for one game.
 
@@ -300,6 +351,14 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     a pass-through to the SB3 trainer ONLY — the algo registry is an sb3-lane seam,
     so a non-default `method` on ``trainer="vendored"`` is rejected with a clear
     error. It is recorded in the result dict (``method``) for the ledger.
+
+    `best_checkpoint` (default True, SB3 lane) makes the trainer snapshot the best-by-success
+    policy during training and evaluates THAT (reloaded from disk) for the demo-readiness gate
+    + witness — not the final policy, which the high-variance Godot-serve training can degrade
+    (Elias, 2026-07-16). It also records the final policy's rates (``last_greedy_sr`` /
+    ``last_stochastic_sr``) and a from-disk reload-parity flag (``reload_parity_ok``). With no
+    snapshot saved (nothing beat 0 success) or on the vendored lane it is a no-op: the final
+    in-memory agent is evaluated exactly as before.
 
     Returns (task-required keys + provenance extras):
         learnable, steps_to_first_success, checkpoints_curve (per-update mean
@@ -396,6 +455,8 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     title = probe.title
     n_bodies = len(probe._body_order)
     cp_keys = list(probe._cp_keys)
+    action_names = list(getattr(probe, "actions", []) or [])   # for the eval action histogram
+    is_3d = int(getattr(probe, "_dim", 2)) == 3    # per-axis aggregates are for 3D games
     probe.close()
 
     # --- Train ---
@@ -414,18 +475,59 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # itself rides in via **train_kwargs -> sb3_trainer.train's explicit num_shards param.
     if trainer != "vendored" and make_shard_venv is not None:
         method_kw["make_shard_venv"] = make_shard_venv
+    # BEST-CHECKPOINT (Elias, 2026-07-16): the Godot-serve training is high-variance, so the
+    # LAST policy under-reports the run. Ask the SB3 trainer to snapshot the best-by-success
+    # policy to a temp .zip; we evaluate THAT below (falling back to the final agent when no
+    # snapshot beat 0 success). SB3-lane only, and off unless `best_checkpoint`. The temp dir
+    # lives until after eval (we reload from it), then is cleaned in the finally.
+    import tempfile
+    _best_dir = None
+    _eval_probe_env = None
+    if best_checkpoint and trainer != "vendored":
+        _best_dir = tempfile.mkdtemp(prefix="g3_bestckpt_")
+        method_kw["best_model_path"] = os.path.join(_best_dir, "best_policy.zip")
+        # Dedicated eval env for the periodic best-checkpoint GREEDY eval. Created BEFORE the
+        # trainer builds its (batch/shard) venv so it takes a LOWER loopback offset, disjoint
+        # from the training env's port band (the shard cluster reserves a contiguous higher
+        # block). Stepped only inside the callback (single-threaded), closed after training.
+        _eval_probe_env = make_env()
+        _n_pg, _n_ps = 8, 4
+
+        def _eval_fn(model):
+            g = [trainer_mod.greedy_episode(_eval_probe_env, model, seed=s) for s in range(_n_pg)]
+            st = [trainer_mod.sample_episode(_eval_probe_env, model, seed=s, torch_seed=2000 + s)
+                  for s in range(_n_ps)]
+            return {"greedy_sr": sum(1 for e in g if e["success"]) / float(_n_pg),
+                    "stochastic_sr": sum(1 for e in st if e["success"]) / float(_n_ps)}
+
+        method_kw["eval_fn"] = _eval_fn
     train_res = trainer_mod.train(make_env, obs_dim, n_actions,
                                   total_steps=budget_steps, seed=seed, log=log,
                                   wall_clock_budget_s=wall_clock_budget_s,
                                   **method_kw, **train_kwargs)
+    if _eval_probe_env is not None:
+        _eval_probe_env.close()
     agent = train_res["agent"]
 
-    # Optional: persist the trained model cheaply (SB3 .zip) so the G4 inverse-value
-    # attacker (harness.rl.adversary) can reload the critic/policy artifact without
-    # retraining. Only the SB3 lane exposes .save(); vendored is skipped with a note.
+    # BEST-CHECKPOINT: the policy we certify is the best-by-success snapshot the trainer saved
+    # (reloaded FROM DISK), falling back to the final in-memory agent when no snapshot beat 0
+    # success. The demo-readiness gate, the witness, AND the saved artifact therefore reflect the
+    # BEST policy the run reached, not the last (which the high-variance Godot training can
+    # degrade). `eval_agent` may be the final agent, so everything downstream is unchanged when
+    # best_checkpoint is off / nothing was saved.
+    best_ckpt_path = train_res.get("best_model_path")
+    used_best_checkpoint = bool(best_ckpt_path)
+    if used_best_checkpoint:
+        eval_agent = type(agent).load(best_ckpt_path)     # SB3 .load — a from-disk reload
+    else:
+        eval_agent = agent
+
+    # Optional: persist the certified policy cheaply (SB3 .zip) so the G4 inverse-value attacker
+    # (harness.rl.adversary) can reload the critic/policy artifact without retraining — the BEST
+    # snapshot, so its critic matches the demo_ready verdict. Only the SB3 lane exposes .save().
     saved_model_path = None
     if save_model:
-        _save = getattr(agent, "save", None)
+        _save = getattr(eval_agent, "save", None)
         if callable(_save):
             _save(save_model)
             saved_model_path = save_model
@@ -437,16 +539,45 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # STOCHASTIC (sampled) rollouts; greedy is reported too (it is the witness's
     # preferred form and the determinism-first certificate).
     eval_env = make_env()
-    greedy_eps = [trainer_mod.greedy_episode(eval_env, agent, seed=s)
+    greedy_eps = [trainer_mod.greedy_episode(eval_env, eval_agent, seed=s)
                   for s in range(n_eval)]
-    sampled_eps = [trainer_mod.sample_episode(eval_env, agent, seed=s,
+    sampled_eps = [trainer_mod.sample_episode(eval_env, eval_agent, seed=s,
                                               torch_seed=1000 + s)
                    for s in range(n_eval)]
-    eval_env.close()
     n_greedy = sum(1 for e in greedy_eps if e["success"])
     n_sampled = sum(1 for e in sampled_eps if e["success"])
     final_success_rate = round(n_greedy / float(n_eval), 3)     # greedy (task key)
     stochastic_success_rate = round(n_sampled / float(n_eval), 3)  # graded signal
+
+    # best-vs-last provenance + from-disk RELOAD PARITY (Elias's checkpoint-loading suspicion):
+    # when a best snapshot is in play, also evaluate the FINAL (in-memory) policy AND a
+    # from-disk reload of those same final weights — the two MUST match (a mismatch would mean
+    # a low greedy SR was a reload bug, not true divergence). last_* records the final policy.
+    last_greedy_sr = last_stochastic_sr = reload_parity_ok = None
+    if used_best_checkpoint and callable(getattr(agent, "save", None)):
+        last_greedy = [trainer_mod.greedy_episode(eval_env, agent, seed=s)
+                       for s in range(n_eval)]
+        last_sampled = [trainer_mod.sample_episode(eval_env, agent, seed=s,
+                                                   torch_seed=1000 + s) for s in range(n_eval)]
+        last_greedy_sr = round(sum(1 for e in last_greedy if e["success"]) / float(n_eval), 3)
+        last_stochastic_sr = round(sum(1 for e in last_sampled if e["success"]) / float(n_eval), 3)
+        _rl_dir = tempfile.mkdtemp(prefix="g3_reload_")
+        try:
+            _rl_path = os.path.join(_rl_dir, "final.zip")
+            agent.save(_rl_path)
+            reloaded = type(agent).load(_rl_path)
+            rel_greedy = [trainer_mod.greedy_episode(eval_env, reloaded, seed=s)
+                          for s in range(n_eval)]
+            # identical greedy action strings in-memory vs from-disk == byte-faithful reload.
+            reload_parity_ok = all(a["actions"] == b["actions"]
+                                   for a, b in zip(last_greedy, rel_greedy))
+        finally:
+            import shutil
+            shutil.rmtree(_rl_dir, ignore_errors=True)
+    eval_env.close()
+    if _best_dir is not None:
+        import shutil
+        shutil.rmtree(_best_dir, ignore_errors=True)
 
     # Per-checkpoint latch rate over ALL eval episodes (greedy + sampled) — WHICH
     # declared milestones the trained policy actually reaches. The feedback compiler
@@ -454,6 +585,15 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
     # pair (a stalled agent) or to detect that NOTHING ever latched (unsolvable).
     per_checkpoint_latch_rate = _per_checkpoint_latch_rate(
         greedy_eps + sampled_eps, cp_keys)
+
+    # ACTION HISTOGRAM (Elias, 2026-07-16): what the trained policy actually DOES over the eval
+    # rounds — per-action counts for the greedy and stochastic pools separately, plus (3D only)
+    # generic vertical/lateral/forward_brake axis aggregates, so we can see whether a 3D policy
+    # uses altitude or collapses to planar movement. Persisted in this eval artifact (result).
+    action_hist = {
+        "greedy": action_histogram(greedy_eps, action_names, with_axes=is_3d),
+        "stochastic": action_histogram(sampled_eps, action_names, with_axes=is_3d),
+    }
 
     # --- RL witness + the certificate bridge (assert it replays via JsExecutor) ---
     witness = _pick_witness(greedy_eps, sampled_eps)
@@ -529,6 +669,17 @@ def g3_prime(game_path: str, budget_steps: int = DEFAULT_BUDGET, *,
         "stochastic_sr": stochastic_sr,                # stochastic (robustness) demo-gate rate
         "demo_trajectory": demo_trajectory,            # {seed, actions, ticks, greedy} | None
         "demo_trajectory_path": demo_trajectory_path,  # capture --actions target (or None)
+        # --- best-checkpoint provenance (Elias): the eval above is the BEST snapshot; these
+        #     record whether one was used, when, and how the LAST (final) policy compared ---
+        "used_best_checkpoint": used_best_checkpoint,
+        "best_ckpt_update": train_res.get("best_ckpt_update"),
+        "best_ckpt_greedy_train": train_res.get("best_ckpt_greedy_sr"),    # eval greedy at snapshot
+        "best_ckpt_stochastic_train": train_res.get("best_ckpt_stochastic_sr"),
+        "last_greedy_sr": last_greedy_sr,              # final policy greedy SR (best-vs-last)
+        "last_stochastic_sr": last_stochastic_sr,      # final policy stochastic SR
+        "reload_parity_ok": reload_parity_ok,          # in-memory eval == from-disk reload eval
+        # WHAT the policy does over the eval rounds (per-action counts + 3D axis aggregates).
+        "action_histogram": action_hist,
         # --- provenance / diagnostics ---
         "title": title,
         "game_path": game_path,
