@@ -273,9 +273,11 @@ func _fingerprint(tick_no: int) -> void:
 			for b in bodies:
 				if typeof(b) != TYPE_DICTIONARY:
 					continue
-				parts.append("%s:%s:%s:%.17f" % [
+				# angle may be a scalar OR an [x,y,z] vector (see serve_game._angle_json);
+				# scalar keeps the exact old "%.17f" rendering for fingerprint stability.
+				parts.append("%s:%s:%s:%s" % [
 					str(b.get("name", "")), _vecstr(b.get("pos", [])),
-					_vecstr(b.get("vel", [])), float(b.get("angle", 0.0))])
+					_vecstr(b.get("vel", [])), _angstr(b.get("angle", 0.0))])
 	_fp_lines.append("%d|%s" % [tick_no, ";".join(parts)])
 
 
@@ -285,6 +287,13 @@ func _vecstr(a) -> String:
 		for x in a:
 			parts.append("%.17f" % float(x))
 	return ",".join(parts)
+
+
+func _angstr(a) -> String:
+	# Scalar angle -> the exact old "%.17f" rendering; [x,y,z] angle -> _vecstr form.
+	if typeof(a) == TYPE_ARRAY:
+		return _vecstr(a)
+	return "%.17f" % float(a)
 
 
 func _write_fingerprint() -> void:

@@ -1421,8 +1421,20 @@ func _tick_frame_json(tick_no: int) -> String:
 func _body_obs_json(b: Dictionary) -> String:
 	return ('{"pos":%s,"vel":%s,"angle":%s,"controlled":%s,"static":%s}') % [
 		_vec_json(b.get("pos", [])), _vec_json(b.get("vel", [])),
-		_f(float(b.get("angle", 0.0))),
+		_angle_json(b.get("angle", 0.0)),
 		_b(bool(b.get("controlled", false))), _b(bool(b.get("static", false)))]
+
+
+func _angle_json(a) -> String:
+	# `angle` is the body's rotation in the game's own dimension: a scalar in 2D,
+	# and in 3D either a scalar yaw or the natural [x,y,z] Euler vector. The old
+	# `float(angle)` coercion CRASHED the frame builder on a vector (SCRIPT ERROR
+	# mid-string -> truncated frame -> "unparseable" VERIFY_ERROR; it cost the
+	# 2026-07-17 ambition probe all three of its 3D games). Scalar output is
+	# byte-identical to the old path.
+	if typeof(a) == TYPE_ARRAY:
+		return _vec_json(a)
+	return _f(float(a))
 
 
 func _vec_json(a) -> String:

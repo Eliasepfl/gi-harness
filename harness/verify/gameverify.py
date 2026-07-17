@@ -31,6 +31,7 @@ import random
 import re
 import traceback
 
+from harness.core import wire
 from harness.core.sandbox import (
     SandboxViolation, load_scene_namespace, scan_source,
 )
@@ -232,7 +233,7 @@ def _snapshot_delta(a: dict, b: dict) -> float:
         for key in ("pos", "vel"):
             for x, y in zip(sa.get(key, []), sb.get(key, [])):
                 worst = max(worst, abs(float(x) - float(y)))
-        worst = max(worst, abs(float(sa.get("angle", 0.0)) - float(sb.get("angle", 0.0))))
+        worst = max(worst, wire.angle_delta(sa.get("angle", 0.0), sb.get("angle", 0.0)))
     return worst
 
 
@@ -751,7 +752,7 @@ def _aabb_reliable(q: dict) -> bool:
         return True
     if shape != "box":
         return False
-    ang = float(q.get("angle") or 0.0)
+    ang = wire.angle_yaw(q.get("angle") or 0.0)
     a = ang % (math.pi / 2.0)
     return min(a, math.pi / 2.0 - a) < 0.10  # within ~5.7deg of axis-aligned
 
