@@ -39,6 +39,7 @@ Env contract (duck-typed, so a fake env unit-tests this with no engine — mirro
 
 from __future__ import annotations
 
+import os
 from collections import deque
 
 # --- Curriculum defaults ([eng.] = calibrated engineering choice) --------- #
@@ -75,7 +76,9 @@ def replay_prefix(env, prefix, *, seed: int = 0):
     if not prefix:
         return obs, info, False
     fast = getattr(env, "serve_replay", None)
-    if callable(fast):
+    if callable(fast) and os.environ.get("HARNESS_WARMSTART_BULK_REPLAY", "1") != "0":
+        # HARNESS_WARMSTART_BULK_REPLAY=0 forces the generic per-step path (the A/B control
+        # that isolates the one-round-trip fix's end-to-end sps effect; default on).
         res = fast(list(prefix))                  # ONE round-trip; None -> nothing valid, fall back
         if res is not None:
             return res

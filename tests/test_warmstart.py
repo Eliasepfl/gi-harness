@@ -112,6 +112,21 @@ def test_serve_replay_none_falls_back_to_generic():
     assert obs == [0.0] and term is False
 
 
+def test_bulk_replay_env_toggle_forces_generic(monkeypatch):
+    # HARNESS_WARMSTART_BULK_REPLAY=0 is the A/B control: the fast path is skipped even when
+    # serve_replay exists, and the generic per-step path lands in the identical state.
+    prefix = ["up", "up", "up", "down", "up"]
+    monkeypatch.setenv("HARNESS_WARMSTART_BULK_REPLAY", "0")
+    fast = FakeServeLadderEnv()
+    obs_off, _i, _t = replay_prefix(fast, prefix, seed=1)
+    assert fast.serve_replay_calls == 0                 # fast path skipped
+    monkeypatch.setenv("HARNESS_WARMSTART_BULK_REPLAY", "1")
+    fast2 = FakeServeLadderEnv()
+    obs_on, _i2, _t2 = replay_prefix(fast2, prefix, seed=1)
+    assert fast2.serve_replay_calls == 1                 # fast path taken
+    assert obs_off == obs_on                             # identical end state either way
+
+
 # ====================================================================== #
 # 1) Prefix-replay determinism
 # ====================================================================== #
