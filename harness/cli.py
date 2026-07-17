@@ -552,7 +552,9 @@ def cmd_game_export(args) -> int:
     frames/t%05d.png, and a top-level manifest.jsonl line. Bridges code-defined truth
     (per-tick state + step_reward labels) and the pixel channel (the rendered frame)."""
     try:
-        from harness.export.episode import append_manifest, export_episode
+        from harness.export.episode import (
+            append_manifest, ensure_readme, export_episode,
+        )
     except Exception as exc:  # noqa: BLE001
         return _module_missing("export", exc, args.json)
 
@@ -569,6 +571,7 @@ def cmd_game_export(args) -> int:
         return _call_error("game export", exc, args.json)
 
     append_manifest(args.out, record)
+    ensure_readme(args.out)
 
     if args.json:
         _emit_json(record)

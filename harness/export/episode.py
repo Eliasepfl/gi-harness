@@ -427,6 +427,120 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
     }
 
 
+DATASET_README = r"""# GI Episode Dataset -- code-defined truth bridged to pixels
+
+Produced by **THE EXPORTER** (`harness/export`, `python -m harness game export`). This is
+the training substrate for the General Intuition challenge's bullet 3: *generate many
+environments in code space, train a reward model on the programmatic signals, then apply
+that reward model to pixel-based observations -- bridging code-defined truth and visual
+understanding.*
+
+Every episode is ONE deterministic replay of a certified game's winning witness, recorded
+in TWO aligned channels: the **code-state / reward truth** the harness certifies against, and
+the **pixel frame** rendered by the in-engine capture host at the very same tick.
+
+## Layout
+
+```
+<root>/
+  manifest.jsonl              one line per episode (slug, dim, outcome, ticks, paths, ...)
+  README.md                   this file
+  <slug>/<seed>/
+    episode.json              episode meta (objective_text, dimension, reward scheme, build)
+    steps.jsonl               one line per decision tick t (action, state, reward, done)
+    frames/t%05d.png          the rendered pixel frame at tick t (t = 1..ticks)
+```
+
+`len(steps) == len(frames) == episode.json:ticks`. The pixel `frames/t00001.png` and the
+`steps.jsonl` line with `t == 1` describe the SAME tick of the SAME replay (the exporter
+asserts the two channels' tick counts match before writing the package).
+
+## `episode.json`
+
+| field | meaning |
+|-------|---------|
+| `slug` / `game_id` | game directory name (the sanitized generation prompt) |
+| `game_file` | absolute path to the `.gd` game source |
+| `engine` | `gdscript` / `godot` / `js` / `py` |
+| `dimension` | `2D` or `3D` (from the runtime pos arity -- `env.detect_dim`) |
+| `objective_text` | the generation prompt + the ordered checkpoint names (the reward-model text conditioning) |
+| `checkpoint_names` / `checkpoints_latch` | declared checkpoints and the tick each latched (`null` = never) |
+| `seed` | world seed of the replay |
+| `witness_source` | `rl` (trained-policy demo) or `tree` (solver witness) -- honest provenance |
+| `ticks` / `n_steps` / `n_frames` | decision ticks (all three equal) |
+| `outcome` | `success` / `failure` / `timeout` |
+| `horizon` | reward horizon (env.HORIZON) used for the decayed terminal payoff |
+| `reward_scheme` | the exact env constants (mode, shaping mass, R_success, floor, ...) |
+| `episode_return` | sum of per-tick `reward.total` |
+| `world_size` | `[W, H]` |
+| `harness_version` | git sha of the harness that produced the package |
+| `build_state` | the tick-0 body dict (the game's build, before any action) |
+
+## `steps.jsonl` (one JSON object per decision tick)
+
+| field | meaning |
+|-------|---------|
+| `t` | 1-based decision tick |
+| `action` | the wire action (a string verb, or an array chord) |
+| `state` | the wire body dict `{name: {pos, vel, angle, controlled, static}}` after tick t |
+| `checkpoints` | per-tick LATCHED map `{name: bool}` (sticky) |
+| `reward` | `{shaping, terminal, total}` |
+| `done` | terminal tick flag |
+| `n_latched` | number of checkpoints latched by tick t |
+
+**Reward labels are training truth.** `reward.total` is recomputed per tick by importing
+`harness.rl.env.step_reward` -- the SINGLE function the three RL env `step()` paths call --
+so a label here is byte-identical to the RL training signal. `total = shaping + terminal`:
+`shaping` is the bounded checkpoint-shaping (+ the default-off living cost), `terminal` is the
+time-decayed success payoff / failure penalty, attached ONLY to the terminal tick (`step_reward`
+keeps the terminal OUTSIDE the shaping). The exporter never reimplements the reward math.
+
+## Loader (torch-free, numpy-free)
+
+```python
+from harness.export.loader import EpisodeDataset
+ds = EpisodeDataset("<root>")
+train, test = ds.split_by_game(frac=0.8, seed=0)   # split BY GAME slug
+for ep in ds.episodes(slugs=test):                 # a held-out game the model never saw
+    ep.validate()                                  # len(steps)==n_steps==ticks, 1 frame/step
+    for s in ep.steps:
+        frame = ep.frame_path(s["t"])              # -> <root>/<slug>/0/frames/t00001.png
+        y = s["reward"]["total"]                   # the training label
+```
+
+## The intended experiment (the reward-model bridge)
+
+Train a reward model `R(frame_t, objective_text) -> reward_t` (or cumulative progress) on
+episodes from a **TRAIN split of games**, and evaluate calibration on **HELD-OUT GAMES**
+(split by game slug via `split_by_game`, NEVER by episode -- cross-game generalization IS the
+"general intuition" claim). A held-out game is one the model has never seen a single frame of.
+
+Metrics:
+  * **reward correlation** per held-out game -- Pearson/Spearman of `R(frame_t, objective)` vs
+    the stored `reward.total` (and vs cumulative return);
+  * **checkpoint-latch detection AUC** from pixels alone -- can `R`'s features tell, from the
+    frame, that a checkpoint just latched? (labels: the per-tick `checkpoints` map deltas).
+
+The programmatic signal is the ground truth; the reward model learns to read it off pixels. The
+model's encoder is the transferable "intuition" that survives the code->pixel gap.
+
+**Roadmap extension.** The same package supports a dynamics / world-model consumer
+(`(frame_t, action_t) -> frame_t+1`, with `action` and `state` already in `steps.jsonl`) as an
+auxiliary objective; sharing the encoder with the reward model is the intended transfer path.
+
+All labels are mechanical (from the engine's programmatic state + `step_reward`) -- there is NO
+LLM anywhere in the data path.
+"""
+
+
+def ensure_readme(out_dir: str) -> None:
+    """Write the dataset ``README.md`` (schema + experiment design) at the export root.
+    Static and self-describing; rewritten on each export so the doc tracks the schema."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "README.md").write_text(DATASET_README, encoding="utf-8")
+
+
 def append_manifest(out_dir: str, record: dict) -> None:
     """Append ONE episode record as a line to ``<out_dir>/manifest.jsonl`` (relative paths).
     Idempotent per (slug, seed): a re-export of the same episode replaces its prior line."""
