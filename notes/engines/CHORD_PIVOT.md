@@ -262,52 +262,54 @@ Discrete path never carries the capability key.
 Tree-solver chords (single-key subspace by doctrine — the first-instance judge), G4
 attackers in chord space (Phase 3), the contract prompt text, every GameAPI game file.
 
-### Bench — Discrete vs MultiBinary (mini_collect, same 400k budget)
+### Bench — mini_collect (axis-aligned), same 400k budget, 3-way
 
-One comparison run, identical proven config both arms (additive reward, eval-keyed
-best-checkpoint, `patience 200`, `num_envs 8`, `HARNESS_GODOT_SPEEDUP 8`); the ONLY
-difference is `chord_mode`. mini_collect is a 2-D 4-verb collect game (`up/down/left/right`,
-two gems). n_eval = 32 greedy + 32 stochastic seeds. (SLURM 18121678 disc / 18121679 mb.)
+Identical proven config every arm (additive reward, eval-keyed best-checkpoint, `patience 200`,
+`num_envs 8`, `HARNESS_GODOT_SPEEDUP 8`); the only difference is `chord_mode` and, for the third
+arm, the measured-opposition projection (cbd83df). mini_collect is a 2-D 4-verb collect game
+(`up/down/left/right`, two gems). n_eval = 32 greedy + 32 stochastic seeds.
+(SLURM 18121678 disc / 18121679 mb / 18124671 mb+projection.)
 
-| metric | Discrete (baseline) | MultiBinary (chords) |
-|---|---|---|
-| action space | `Discrete(4)` | `MultiBinary(4)` |
-| **greedy success rate** | **1.0** | **0.0** |
-| **stochastic success rate** | **0.312** | **0.344** |
-| **steps to first success** | **1,048** | **72,664** |
-| learnable / demo-ready | true / no | false / no |
-| witness→batch bridge replays | yes (`bridge_ok`) | **yes (`bridge_ok`)** |
-| throughput (steps/s) | 2,196 | 1,838 |
-| trained steps / updates | 400,384 / 391 | 400,384 / 391 |
+| metric | Discrete | MultiBinary | MultiBinary + projection |
+|---|---|---|---|
+| action space | `Discrete(4)` | `MultiBinary(4)` | `MultiBinary(4)` + opp-projection |
+| **greedy success rate** | **1.0** | 0.0 | 0.0 |
+| **stochastic success rate** | 0.312 | 0.344 | **0.0** |
+| **steps to first success** | **1,048** | 72,664 | 72,664 |
+| learnable / demo-ready | true / no | false / no | false / no |
+| greedy chord-size 0/1/2/3+ | — (single) | 0 / 0 / .746 / .254 | **.790 / .073 / .137 / 0** |
+| greedy mean keys/tick | 1.0 | 2.258 | 0.347 |
+| greedy per-key u/d/l/r | 256/384/0/512 | 1190/1284/**9600/9600** | 0/1638/**40/1658** |
+| throughput (steps/s) | 2,196 | 1,838 | 858 |
 
-**Chord-size distribution** (fraction of ticks pressing 0 / 1 / 2 / 3+ keys):
+Discovered opposition pairs (mb+projection; MEASURED from each action's physical effect vector at
+init, NOT from names): `[[up, down], [left, right]]`.
 
-| pool | 0 (idle) | 1 | 2 | 3+ | mean |
-|---|---|---|---|---|---|
-| MultiBinary greedy | 0.000 | 0.000 | 0.746 | 0.254 | 2.258 |
-| MultiBinary stochastic | 0.045 | 0.232 | 0.369 | 0.354 | — |
+**Honest read.** On mini_collect chords simply **do not help** — single keys already solve it, so
+simultaneity buys nothing and the 2^n action space is pure exploration tax. The three arms:
+1. **Discrete wins** greedily every time (1.0), first win ~1k steps.
+2. **MultiBinary (no projection)** never consolidates a greedy win (0.0) and **degenerates into
+   the chord-thrash attractor**: it presses `left`+`right` on *every* one of the 9,600 greedy
+   ticks (opposing, self-cancelling), a 2+-key chord 100 % of the time (mean 2.26 keys/tick). Its
+   0.344 stochastic SR is noise off that degenerate policy.
+3. **MultiBinary + projection** does exactly what it should MECHANICALLY: the self-probe discovers
+   `[[up,down],[left,right]]` and collapses the thrash — greedy per-key drops from `left 9600 /
+   right 9600` to `left 40 / right 1658`, and 79 % of ticks become idle instead of 74.6 % thrash.
+   But removing the crutch **cannot make chords useful where they aren't**: on a game single keys
+   solve, projecting the opposing pairs to idle biases the policy toward *doing nothing* (79 %
+   idle) and its stochastic SR falls to 0.0. Greedy stays 0.0.
 
-**Per-key press counts** (greedy pool): Discrete `up 256 / down 384 / left 0 / right 512`;
-MultiBinary `up 1190 / down 1284 / left 9600 / right 9600`.
+So on THIS game the projection is a correct-but-inert mechanism — it removes a pathology without
+creating a benefit, because the benefit (simultaneity) is not there to be had. Its real test is a
+game whose feasibility NEEDS chords (3-D thrust composition, forced diagonals); the diagonal arm
+below is the first, partial, preview (there MultiBinary+projection reaches first success ~1.6x
+sooner in steps than Discrete). The one unambiguous positive: the MultiBinary (no-projection)
+chord *witness* — 2-key chords and all — replays bit-exactly to success through
+`GdExecutor.run_batch` (`bridge_ok`), so the Phase-2 export→replay path is proven end-to-end in a
+real training run, not just unit tests.
 
-**Honest read (a negative on this game — as expected).** On mini_collect the MultiBinary
-policy **loses**: Discrete wins greedily every time (1.0) and finds its first win in ~1k
-steps; MultiBinary never consolidates a greedy win (0.0) and needs ~70× more steps to its
-first stochastic success (72,664 vs 1,048). The chord-size + per-key numbers say WHY — the
-greedy chord policy **degenerated**: it presses `left`+`right` on *every* one of the 9,600
-greedy ticks (two opposing, cancelling keys), uses a 2+-key chord 100 % of the time and a
-single key or idle 0 % of the time (mean 2.26 keys/tick). For a game single keys already
-solve, the 2ⁿ action space is pure exploration tax and the Bernoulli heads saturate toward
-"press everything". The stochastic SR edging Discrete (0.344 vs 0.312) is noise off a
-degenerate policy, and neither arm is demo-ready.
-
-This is the doctrine, confirmed empirically: **chords are a per-game capability, not a free
-win.** The expected payoff is on games whose feasibility genuinely needs simultaneity
-(3-D thrust composition, forced diagonals), NOT a 2-D game the single-key subspace already
-solves. So the **default stays Discrete and `chord_mode` is opt-in** — exactly as built. The
-one unambiguous positive: the MultiBinary chord *witness* (2-key chords and all) replayed
-bit-exactly to success through `GdExecutor.run_batch` (`bridge_ok = true`), so the Phase-2
-export→replay path is proven end-to-end in a real training run, not just in unit tests.
+This is the doctrine, confirmed empirically: **chords are a per-game capability, not a free win.**
+The **default stays Discrete and `chord_mode` (with its projection) is opt-in** — exactly as built.
 
 ### Arm 2 — diag_collect (diagonal-advantage fairness control)
 
