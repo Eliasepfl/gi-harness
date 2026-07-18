@@ -113,6 +113,20 @@ const FOLLOW_FOV := 65.0            # wider than the overview so the craft AND t
 const FOLLOW_CLAMP_MARGIN := 0.75   # keep the cam this far inside the flyable box (anti-ceiling-pop)
 const WALL_LINE_WIDTH := 6.0
 const MARGIN_FRAC := 0.12           # fit-to-scene padding (fraction of extent)
+# ---- gameplay-content framing (3D overview/param camera) ------------------- #
+# The default overview frames the whole collision AABB, so a game whose author placed a
+# WORLD-BOUNDS ground slab (e.g. an 80x0.1x80 floor) or fired a projectile off to the world edge
+# gets zoomed all the way out until the actual gameplay is a distant speck under the game's own
+# sky -- the "authored game renders gray" symptom. We instead frame on a CONTENT box that drops
+# outsized static ground/backdrop slabs: a STATIC body whose largest horizontal collision extent
+# exceeds GROUND_EXTENT_FACTOR times the largest extent among the controlled+dynamic movers reads
+# as world floor/backdrop and no longer drives the zoom (it still RENDERS -- its own art or a
+# proxy is untouched). The trajectory union is clamped to TRAJ_CONTENT_MARGIN times the content
+# span so an escaping body cannot re-inflate the zoom back to full-scene. When there is no such
+# split (no movers, or no outsized static), the content box equals the full box and framing is
+# byte-identical to before -- the bare/hand-sim path is unaffected.
+const GROUND_EXTENT_FACTOR := 4.0
+const TRAJ_CONTENT_MARGIN := 1.5
 const SENSOR_ALPHA := 0.28
 const Z_BG := -100
 const Z_STATIC := -10
@@ -148,6 +162,14 @@ var _stage3d: Node3D = null
 # world-space bounds of the whole scene at t=0 (for fit-to-scene framing)
 var _min := Vector3(INF, INF, INF)
 var _max := Vector3(-INF, -INF, -INF)
+# world-space bounds of the GAMEPLAY CONTENT only (full box minus outsized static ground/backdrop
+# slabs) -- what the 3D overview/param camera frames on so a world-bounds floor does not dwarf the
+# play area. Populated by _compute_content_box (3D build only); left invalid (=> full box used) when
+# there is no meaningful content/ground split, keeping the bare/legacy framing byte-identical.
+var _content_min := Vector3(INF, INF, INF)
+var _content_max := Vector3(-INF, -INF, -INF)
+var _content_has := false            # at least one gameplay-content shape was accumulated
+var _ground_dropped := false         # at least one outsized static ground/backdrop was excluded
 var _base_zoom := 1.0
 var _view_w := 960.0
 var _view_h := 540.0
@@ -938,6 +960,10 @@ func _build_3d(shapes: Array) -> void:
 		if rec["role"] == "controlled" and _controlled_proxy == null:
 			_controlled_proxy = proxy
 
+	# The gameplay-content framing box (full box minus outsized static ground/backdrop). Render-only
+	# camera math over the SAME t=0 collision AABBs already read above -- never touches the game tree.
+	_compute_content_box(shapes)
+
 	if not _bounds_valid():
 		_min = Vector3(0, 0, 0)
 		_max = Vector3(_view_w, _view_h, 100)
@@ -1058,6 +1084,69 @@ func _shape_half_extent_3d(shape) -> Vector3:
 		var rr: float = shape.radius
 		return Vector3(rr, shape.height * 0.5, rr)
 	return Vector3(10, 10, 10)
+
+
+# ---- gameplay-content framing box (render-only; reads t=0 collision AABBs) ---- #
+func _compute_content_box(shapes: Array) -> void:
+	# Accumulate the GAMEPLAY-CONTENT AABB into _content_min/_content_max: every shape EXCEPT a
+	# static ground/backdrop slab so oversized it dwarfs the play area. A static body counts as
+	# ground/backdrop when its largest horizontal collision extent exceeds GROUND_EXTENT_FACTOR
+	# times the largest extent among the controlled+dynamic movers (the world floor vs. the
+	# gameplay bodies). The full _min/_max box is untouched -- a dropped ground still RENDERS, it
+	# just no longer drives the zoom. No movers to scale against -> we leave the content box invalid
+	# so framing falls back to the full box (byte-identical to today).
+	var content_scale := 0.0
+	for rec in shapes:
+		var role := String(rec.get("role", ""))
+		if role != "controlled" and role != "dynamic":
+			continue
+		var ext := _shape_half_extent_3d(rec["shape"].shape)
+		content_scale = maxf(content_scale, maxf(ext.x, maxf(ext.y, ext.z)))
+	if content_scale <= 0.0:
+		return
+	var thresh := content_scale * GROUND_EXTENT_FACTOR
+	for rec in shapes:
+		var ext2 := _shape_half_extent_3d(rec["shape"].shape)
+		if String(rec.get("role", "")) == "static" and maxf(ext2.x, ext2.z) > thresh:
+			_ground_dropped = true       # an outsized floor/backdrop -> excluded from framing
+			continue
+		_expand_content_bounds(rec)
+		_content_has = true
+
+
+func _expand_content_bounds(rec: Dictionary) -> void:
+	# Union one shape's t=0 world corners into the content box (same corner math as
+	# _expand_bounds_3d, a separate accumulator). Read-only.
+	var xf: Transform3D = rec["shape"].global_transform
+	var ext := _shape_half_extent_3d(rec["shape"].shape)
+	for sx in [-1.0, 1.0]:
+		for sy in [-1.0, 1.0]:
+			for sz in [-1.0, 1.0]:
+				var wp: Vector3 = xf * Vector3(ext.x * sx, ext.y * sy, ext.z * sz)
+				_content_min.x = minf(_content_min.x, wp.x)
+				_content_min.y = minf(_content_min.y, wp.y)
+				_content_min.z = minf(_content_min.z, wp.z)
+				_content_max.x = maxf(_content_max.x, wp.x)
+				_content_max.y = maxf(_content_max.y, wp.y)
+				_content_max.z = maxf(_content_max.z, wp.z)
+
+
+func _content_box() -> Array:
+	# The gameplay-content framing box, or [] to signal "use the full box". Valid ONLY when a
+	# ground/backdrop was actually dropped, at least one content shape remains, AND the result is
+	# STRICTLY tighter than the full box (else the full box already frames the play area and we keep
+	# it, byte-identical). Because the content set is a subset of the full set, _content_min >= _min
+	# and _content_max <= _max componentwise, so an exact inequality on any axis proves a genuine
+	# ground was cropped away.
+	if not (_content_has and _ground_dropped):
+		return []
+	if not (_content_min.x <= _content_max.x and is_finite(_content_min.x)):
+		return []
+	var tighter := _content_min.x > _min.x or _content_min.y > _min.y or _content_min.z > _min.z \
+		or _content_max.x < _max.x or _content_max.y < _max.y or _content_max.z < _max.z
+	if not tighter:
+		return []
+	return [_content_min, _content_max]
 
 
 # =========================================================================== #
@@ -1233,6 +1322,12 @@ func _synthesize_bodies(state_bodies: Array) -> void:
 			(proxy as Node2D).global_transform = _trail_pose_2d(sb)
 		_pairs.append({"src": null, "proxy": proxy, "state_name": nm, "synth": true})
 		_expand_bounds_synth(pos, ext)
+		# A synthesized hand-sim body is always gameplay (never an outsized ground slab), so it
+		# belongs in the 3D content-framing box too -- otherwise a hand-sim agent sharing a scene
+		# with an authored world-bounds ground would frame out. No-op for a pure hand-sim (the
+		# content box stays gated behind _ground_dropped, so framing is byte-identical there).
+		if _is_3d:
+			_expand_content_synth(pos, ext)
 		# A shapeless CONTROLLED body becomes the follow target when no shaped one was found.
 		if bool(sb.get("controlled", false)) \
 				and (_controlled_body == null or not is_instance_valid(_controlled_body)):
@@ -1287,6 +1382,23 @@ func _expand_bounds_synth(pos: Vector3, ext: Vector3) -> void:
 				var wp := pos + Vector3(ext.x * sx, ext.y * sy, ext.z * sz)
 				_min.x = minf(_min.x, wp.x); _min.y = minf(_min.y, wp.y); _min.z = minf(_min.z, wp.z)
 				_max.x = maxf(_max.x, wp.x); _max.y = maxf(_max.y, wp.y); _max.z = maxf(_max.z, wp.z)
+
+
+func _expand_content_synth(pos: Vector3, ext: Vector3) -> void:
+	# Union a synthesized (shapeless) gameplay body's box into the CONTENT framing box (3D only).
+	# Mirrors _expand_bounds_synth on the content accumulator; marks content present so a scene of
+	# hand-sim bodies over an authored ground still frames on the gameplay, not the whole floor.
+	for sx in [-1.0, 1.0]:
+		for sy in [-1.0, 1.0]:
+			for sz in [-1.0, 1.0]:
+				var wp := pos + Vector3(ext.x * sx, ext.y * sy, ext.z * sz)
+				_content_min.x = minf(_content_min.x, wp.x)
+				_content_min.y = minf(_content_min.y, wp.y)
+				_content_min.z = minf(_content_min.z, wp.z)
+				_content_max.x = maxf(_content_max.x, wp.x)
+				_content_max.y = maxf(_content_max.y, wp.y)
+				_content_max.z = maxf(_content_max.z, wp.z)
+	_content_has = true
 
 
 func _precompute_trail(state_bodies: Array) -> void:
@@ -1487,17 +1599,40 @@ func _setup_camera_3d() -> void:
 		_setup_overview_cam_3d()
 
 
-func _overview_box() -> Array:
-	# The framing box for the elevated overview: the t=0 static AABB UNION the witness
-	# trajectory's box, so a craft that flies well past its start frame stays on screen (the
-	# fly-through fix -- the old t=0-only box lost the craft after ~2 frames). No trajectory
-	# supplied (e.g. the desktop player) -> the t=0 box, unchanged.
+func _full_frame_box() -> Array:
+	# The WHOLE-SCENE framing box: the t=0 static AABB UNION the witness trajectory's box, so a
+	# craft that flies well past its start frame stays on screen (the fly-through fix -- the old
+	# t=0-only box lost the craft after ~2 frames). No trajectory supplied (e.g. the desktop player)
+	# -> the t=0 box. This is the LEGACY overview box, kept unchanged for far-plane sizing and as the
+	# fallback when there is no gameplay/ground split to tighten onto.
 	var lo := _min
 	var hi := _max
 	if _traj_valid():
 		lo = Vector3(minf(lo.x, _traj_min.x), minf(lo.y, _traj_min.y), minf(lo.z, _traj_min.z))
 		hi = Vector3(maxf(hi.x, _traj_max.x), maxf(hi.y, _traj_max.y), maxf(hi.z, _traj_max.z))
 	return [lo, hi]
+
+
+func _overview_box() -> Array:
+	# The framing box for the elevated overview (and, via _param_box, the parametric camera). Frames
+	# on the GAMEPLAY-CONTENT box when the scene has an outsized static ground/backdrop a mover is
+	# dwarfed by (_content_box) -- the ground still RENDERS, it just no longer drives the zoom -- and
+	# clamps the trajectory union to a bounded margin around that content so a body escaping to the
+	# world edge cannot re-inflate the zoom. No content split -> the full-scene box, byte-identical.
+	var cb := _content_box()
+	if cb.is_empty():
+		return _full_frame_box()
+	var clo: Vector3 = cb[0]
+	var chi: Vector3 = cb[1]
+	if _traj_valid():
+		var m: Vector3 = (chi - clo) * TRAJ_CONTENT_MARGIN
+		var tlo := Vector3(maxf(_traj_min.x, clo.x - m.x), maxf(_traj_min.y, clo.y - m.y),
+			maxf(_traj_min.z, clo.z - m.z))
+		var thi := Vector3(minf(_traj_max.x, chi.x + m.x), minf(_traj_max.y, chi.y + m.y),
+			minf(_traj_max.z, chi.z + m.z))
+		clo = Vector3(minf(clo.x, tlo.x), minf(clo.y, tlo.y), minf(clo.z, tlo.z))
+		chi = Vector3(maxf(chi.x, thi.x), maxf(chi.y, thi.y), maxf(chi.z, thi.z))
+	return [clo, chi]
 
 
 func _traj_valid() -> bool:
@@ -1520,8 +1655,14 @@ func _setup_overview_cam_3d() -> void:
 	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
 	cam.fov = 50.0
 	# The thin axis is the scene's "up" (out of the play plane); pull back along an in-plane
-	# axis and rise by the elevation angle so we look DOWN onto the plane at a tilt.
-	var normal := _thin_axis_dir(span)
+	# axis and rise by the elevation angle so we look DOWN onto the plane at a tilt. The ORIENTATION
+	# comes from the WHOLE-SCENE span (the authored ground plane is the reliable "flat" axis), so a
+	# tightened content box cannot flip the play-plane normal -- e.g. a knockdown scene whose content
+	# is thin in Z (blocks stack in Y, the shot spans X) would otherwise pick a sideways/underground
+	# view. Only the center + zoom tighten to the content box. No content split -> box == full box,
+	# so orient_span == span and the framing stays byte-identical.
+	var orient_span: Vector3 = _full_frame_box()[1] - _full_frame_box()[0]
+	var normal := _thin_axis_dir(orient_span)
 	var back := _up_for(normal)
 	var el := deg_to_rad(ELEV_3D)
 	var dir := (back * cos(el) + normal * sin(el)).normalized()
@@ -1616,7 +1757,9 @@ func _setup_follow_cam_3d() -> void:
 	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
 	cam.fov = _cam_fov if _cam_fov_set else FOLLOW_FOV
 	cam.near = 0.5
-	var span_len: float = (_overview_box()[1] - _overview_box()[0]).length()
+	# Far plane spans the WHOLE scene (not the tightened content box), so a distant authored
+	# ground/backdrop is never clipped out of a chase shot.
+	var span_len: float = (_full_frame_box()[1] - _full_frame_box()[0]).length()
 	cam.far = maxf(span_len * 2.0 + _follow_offset.length() * 2.0, 2000.0)
 	_stage3d.add_child(cam)              # in-tree BEFORE global_transform (needs a scenario)
 	var look_dir := follow_look_dir(fwd)

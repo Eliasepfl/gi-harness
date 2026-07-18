@@ -7,8 +7,12 @@ current camera); this module is the pytest seam that runs it and surfaces the fa
 The audited bug: the dresser read ONLY collision geometry, so it recoloured every body from a
 fixed 4-role palette, stamped one procedural sky + gray ground + sun on every 3D game, and
 make_current()'d its own camera -- discarding the fiction-specific visuals 14 of the 22
-certified games author for themselves. See godotworld/tests/test_dress_census.gd for the five
-properties pinned here.
+certified games author for themselves. A related symptom on a game that DID author its visuals
+but no camera (KNOCKDOWN): nothing was hidden, but the dresser's own overview camera framed the
+entire collision AABB -- an 80-wide world-bounds ground slab -- so the gameplay near the origin
+rendered as a distant speck under the game's own sky ("authored game renders gray"). The fix
+frames on a gameplay-content box that drops outsized static ground/backdrop from the zoom. See
+godotworld/tests/test_dress_census.gd for the six properties pinned here.
 """
 from __future__ import annotations
 
@@ -30,6 +34,7 @@ _GD = os.path.join(_ROOT, "tests", "fixtures", "gd_games")
 _BARE_3D = os.path.join(_GD, "mini_collect_3d.gd")          # authors NOTHING (the fallback path)
 _AUTHORED_3D = os.path.join(_GD, "dressed_arena_3d.gd")     # meshes + camera + sun + sky
 _AUTHORED_2D = os.path.join(_GD, "dressed_lander_2d.gd")    # polygons + camera
+_AUTHORED_NOCAM_3D = os.path.join(_GD, "dressed_ground_3d.gd")  # meshes+sun+sky, NO camera, big floor
 
 GODOT_EXE = find_godot_exe()
 requires_godot = pytest.mark.skipif(GODOT_EXE is None, reason="Godot binary not present")
@@ -43,7 +48,7 @@ def _run_census() -> str:
         logf = os.path.join(work, "census.log")
         argv = [GODOT_EXE, "--headless", "--path", project,
                 "--script", "res://tests/test_dress_census.gd", "--",
-                _BARE_3D, _AUTHORED_3D, _AUTHORED_2D, logf]
+                _BARE_3D, _AUTHORED_3D, _AUTHORED_2D, _AUTHORED_NOCAM_3D, logf]
         env = scrubbed_env()
         env["HARNESS_GODOT_EXE"] = GODOT_EXE
         # The dresser must not be steered by an inherited knob: this suite pins the DEFAULT.
@@ -74,8 +79,8 @@ def test_dress_census_all_pass(census_log):
     passed, failed = int(m.group(1)), int(m.group(2))
     fails = [ln for ln in census_log.splitlines() if ln.startswith("CENSUS_FAIL")]
     assert failed == 0, "dresser census failures:\n  " + "\n  ".join(fails)
-    # Non-vacuous: all 21 checks ran (a fixture that silently failed to build would pass 0).
-    assert passed == 21, "expected 21 census checks, got %d:\n%s" % (passed, census_log[-3000:])
+    # Non-vacuous: all 28 checks ran (a fixture that silently failed to build would pass 0).
+    assert passed == 28, "expected 28 census checks, got %d:\n%s" % (passed, census_log[-3000:])
 
 
 @requires_godot
@@ -92,6 +97,11 @@ def test_dress_census_all_pass(census_log):
     "no slate backdrop over the authored terrain",
     "bare game: auto == proxy",
     "proxy mode: the dresser's camera is current again",
+    "authored block is NOT proxied",
+    "un-authored zone IS still proxied",
+    "no generic sky over the authored env (no-camera game)",
+    "no generic sun over the authored light (no-camera game)",
+    "dresser owns the overview camera when the game authored none",
 ])
 def test_named_property_holds(census_log, marker):
     """Each headline property, named individually so a regression report says WHICH one broke."""

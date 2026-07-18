@@ -17,6 +17,10 @@
 #      The ~8 bare library games depend on this being a no-op.
 #   5. THE KNOB -- dress_mode="proxy" restores the old behaviour on an AUTHORED game (everything
 #      proxied, our camera current), so the old look is one flag away.
+#   6. AUTHORED, NO CAMERA -- a game that authored its meshes/sun/sky but NO Camera3D (the
+#      KNOCKDOWN shape): the dresser owns the overview camera AND frames the GAMEPLAY CONTENT, not
+#      the world-bounds ground slab -- the fix for the "authored game renders gray" symptom, where
+#      nothing was hidden but the play area was dwarfed by a fit-everything overview of the floor.
 #
 # Everything is loaded BY PATH (load("res://visual_dress.gd"), GDScript.new() + source_code):
 # no class_name global registration, which resolves in a warm worktree and fails in a fresh
@@ -65,19 +69,22 @@ func _initialize() -> void:
 
 func _run() -> void:
 	var args := OS.get_cmdline_user_args()
-	if args.size() < 3:
-		push_error("test_dress_census: need <bare_3d.gd> <authored_3d.gd> <authored_2d.gd>")
+	if args.size() < 4:
+		push_error("test_dress_census: need <bare_3d.gd> <authored_3d.gd> <authored_2d.gd>"
+			+ " <authored_nocam_3d.gd>")
 		quit(2)
 		return
 	var bare_3d: String = args[0]
 	var authored_3d: String = args[1]
 	var authored_2d: String = args[2]
-	if args.size() >= 4:
-		_logf = args[3]
+	var authored_nocam_3d: String = args[3]
+	if args.size() >= 5:
+		_logf = args[4]
 
 	_log("CENSUS_MARK start")
 	await _test_authored_3d(authored_3d)
 	await _test_authored_2d(authored_2d)
+	await _test_authored_no_camera_frames_content(authored_nocam_3d)
 	await _test_bare_fallback_identical(bare_3d)
 	await _test_proxy_knob_restores_legacy(authored_3d)
 	_log("CENSUS_DONE pass=" + str(_passed) + " fail=" + str(_failed))
@@ -218,6 +225,53 @@ func _test_proxy_knob_restores_legacy(path: String) -> void:
 	_check(_count_class(dresser, "DirectionalLight3D") == 1, "proxy mode: generic sun stamped")
 	_check(dresser._camera != null and root.get_camera_3d() == dresser._camera,
 		"proxy mode: the dresser's camera is current again")
+
+	_free(inst, dresser)
+	await physics_frame
+
+
+# =========================================================================== #
+# 6. A game that authored its VISUALS but NO camera: the dresser owns the overview
+#    camera, and it frames the GAMEPLAY CONTENT, not the world-bounds ground slab.
+#    (The KNOCKDOWN shape -- the "authored game renders gray" regression: nothing was
+#    hidden, the play area was just dwarfed by a fit-everything overview of the 80-wide floor.)
+# =========================================================================== #
+func _test_authored_no_camera_frames_content(path: String) -> void:
+	var inst = _instantiate(path)
+	if inst == null:
+		return
+	root.add_child(inst)
+	inst.build(0)
+	await physics_frame
+	var dresser = _dress(inst, {})
+
+	var c: Dictionary = dresser.census()
+	# Authored per-body meshes + sun + sky, but NO Camera3D -- exactly what triggers our own cam.
+	_check(bool(c["light"]) and bool(c["env"]) and not bool(c["camera"])
+		and int(c["authored_bodies"]) == 5,
+		"no-camera census: authored art+light+env, camera absent: " + str(c))
+
+	# Authored bodies keep their own meshes; the un-authored zone still gets its proxy.
+	_check(_pairs_for_body(dresser, inst, "block_a") == 0, "authored block is NOT proxied")
+	_check(_pairs_for_body(dresser, inst, "zone") == 1, "un-authored zone IS still proxied")
+	_check(_count_class(dresser, "WorldEnvironment") == 0,
+		"no generic sky over the authored env (no-camera game)")
+	_check(_count_class(dresser, "DirectionalLight3D") == 0,
+		"no generic sun over the authored light (no-camera game)")
+
+	# The game authored NO camera -> the dresser builds its OWN overview camera and it is current.
+	_check(dresser._camera != null and root.get_camera_3d() == dresser._camera,
+		"dresser owns the overview camera when the game authored none")
+
+	# ... and that camera frames the GAMEPLAY CONTENT: the overview box is strictly tighter than the
+	# full collision AABB, i.e. the 80-wide static ground was dropped from the framing (it still
+	# renders). Without the fix the two spans are equal and the gameplay is a distant speck.
+	var b: Dictionary = dresser.bounds()
+	var full_span: float = ((b["max"] as Vector3) - (b["min"] as Vector3)).length()
+	var ob: Array = dresser._overview_box()
+	var ov_span: float = ((ob[1] as Vector3) - (ob[0] as Vector3)).length()
+	_check(full_span > 0.0 and ov_span < full_span * 0.6,
+		"overview frames content span=%.2f, not the full ground box span=%.2f" % [ov_span, full_span])
 
 	_free(inst, dresser)
 	await physics_frame
