@@ -43,6 +43,10 @@ RENDER_DRIVER = os.environ.get("HARNESS_CAPTURE_RENDER_DRIVER", "opengl3")
 DEFAULT_WIDTH = 960
 DEFAULT_HEIGHT = 540
 DEFAULT_FPS = 20            # GIF playback fps (one captured frame == one decision tick)
+GIF_MAX_FRAMES = 120        # demo GIF frame cap: long episodes are strided to this (COSMETIC
+                            # only — the dataset keeps every per-tick PNG in frames_dir) [eng.]
+GIF_COLORS = 96             # demo GIF palette size (shared adaptive palette) — the dominant
+                            # size lever for a palette-based format [eng.]
 DEFAULT_MAX_FRAMES = 300    # auto-subsample longer witnesses to keep the GIF light
 HOLD_FRAMES = 12            # duplicate the final frame so the end reads
 
@@ -591,17 +595,38 @@ def _read_meta(frames_out: str) -> dict:
     return {}
 
 
-def _assemble_gif(pngs, out_gif, *, fps: int, downscale_to: int | None) -> dict:
+def _assemble_gif(pngs, out_gif, *, fps: int, downscale_to: int | None,
+                  max_frames: int = GIF_MAX_FRAMES, colors: int = GIF_COLORS) -> dict:
     from PIL import Image
 
+    # The demo GIF is a COSMETIC artifact — the mother dataset keeps EVERY per-tick PNG
+    # in frames_dir untouched, so a long episode's GIF may be strided down to `max_frames`
+    # for a watchable, small file without ever touching the pixel trail the exporter reads.
+    sel = pngs
+    if max_frames and len(pngs) > max_frames:
+        sel = [pngs[int(i * len(pngs) / max_frames)] for i in range(max_frames)]
     frames = []
-    for p in pngs:
+    for p in sel:
         im = Image.open(p).convert("RGB")
         if downscale_to and im.width > downscale_to:
             h = int(im.height * downscale_to / im.width)
             im = im.resize((downscale_to, h), Image.LANCZOS)
         frames.append(im)
     frames.extend([frames[-1]] * HOLD_FRAMES)
+    # Palette quantization is the dominant GIF-size lever (GIF is palette-based). Build ONE
+    # shared palette from a MONTAGE of frames sampled across the whole episode (a single-frame
+    # palette can miss colours other frames need and collapse the animation), then remap every
+    # frame onto it — small file, no inter-frame flicker.
+    if colors and frames:
+        step = max(1, len(frames) // 12)
+        sample = frames[::step] or frames[:1]
+        montage = Image.new("RGB", (sum(f.width for f in sample),
+                                    max(f.height for f in sample)))
+        x = 0
+        for f in sample:
+            montage.paste(f, (x, 0)); x += f.width
+        base = montage.quantize(colors=colors, method=Image.MEDIANCUT)
+        frames = [f.quantize(palette=base, dither=Image.FLOYDSTEINBERG) for f in frames]
     out = Path(out_gif)
     if out.parent and not out.parent.exists():
         out.parent.mkdir(parents=True, exist_ok=True)
