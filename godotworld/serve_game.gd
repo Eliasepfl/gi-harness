@@ -1651,12 +1651,25 @@ func _geometry_of(b: Dictionary) -> Dictionary:
 
 
 func _center_in_bounds(b: Dictionary) -> bool:
-	# Bounds are the [0,w]x[0,h] plane of the FIRST TWO position components (x, y);
-	# a 3D game keeps that plane in bounds (extra components -- depth/height -- are not
-	# boxed here, only checked finite by _sane). Accept >= 2 components (2D or 3D).
+	# Dimension-aware start-position sanity on a body's reported center.
+	#   * 2D game (pos = [x, y]): the arena is the [0,w]x[0,h] rectangle, so the body
+	#     center must sit inside it (UNCHANGED 2D check).
+	#   * 3D game (pos = [x, y, z], >= 3 components): 3D worlds are commonly built
+	#     CENTERED ON THE ORIGIN, so negative coords are legitimate and the 2D
+	#     [0,w]x[0,h] box is wrong (it rejected every origin-centered 3D game). Use a
+	#     SYMMETRIC bound around the origin sized to the world instead -- every
+	#     component within [-span, +span], span = max(w, h) -- which admits
+	#     origin-centered layouts while still rejecting an absurd spawn. Finiteness is
+	#     _sane's job. Accept >= 2 components (2D or 3D).
 	var p = b.get("pos", [0.0, 0.0])
 	if typeof(p) != TYPE_ARRAY or p.size() < 2:
 		return false
+	if p.size() >= 3:
+		var span := maxf(_world_w, _world_h)
+		for i in range(p.size()):
+			if absf(float(p[i])) > span:
+				return false
+		return true
 	var px := float(p[0]); var py := float(p[1])
 	return px >= 0.0 and py >= 0.0 and px <= _world_w and py <= _world_h
 

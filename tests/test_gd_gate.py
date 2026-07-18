@@ -382,6 +382,51 @@ def test_run_g0_gd_catches_too_many_actions():
 
 
 # ====================================================================== #
+# 4b. Dimension-aware in-bounds (3D games centered on the origin)
+# ====================================================================== #
+# serve_game.gd's _center_in_bounds no longer boxes a 3D body into the 2D
+# [0,w]x[0,h] arena: 3D worlds are built CENTERED ON THE ORIGIN (negative coords),
+# so it now uses a symmetric bound around the origin for >=3-component positions and
+# keeps the 2D rectangle for 2D. That host logic is verified IN-IMAGE (deferred);
+# these tests guard the PYTHON gate side: it trusts the host's in_bounds verdict and
+# imposes no second 2D bound of its own, so the load-bearing boolean fully controls
+# whether an origin-centered 3D game certifies.
+def _gd_facts_3d_origin(in_bounds: bool) -> dict:
+    f = _wellformed_gd_facts()
+    f["entities"] = ["ship", "ring_a", "ring_b"]
+    f["queries"] = {
+        "ship":   {"static": False, "sensor": False, "controlled": True,  "in_bounds": in_bounds},
+        "ring_a": {"static": True,  "sensor": False, "controlled": False, "in_bounds": in_bounds},
+        "ring_b": {"static": True,  "sensor": False, "controlled": False, "in_bounds": in_bounds},
+    }
+    # 3D positions with negative components (an origin-centered layout).
+    f["geometry"] = [
+        {"name": "ship",   "pos": [-40.0, 10.0, -120.0], "controlled": True, "static": False},
+        {"name": "ring_a", "pos": [-200.0, 0.0, 150.0], "static": True},
+        {"name": "ring_b", "pos": [220.0, -30.0, -80.0], "static": True},
+    ]
+    return f
+
+
+def test_run_g0_gd_certifies_3d_origin_game():
+    # Post-fix: the host reports in_bounds=True for origin-centered 3D bodies and G0
+    # certifies -- the Python gate imposes no 2D arena bound of its own.
+    g0 = run_g0_gd(_gd_facts_3d_origin(True), [])
+    assert g0["passed"] is True, g0
+    assert g0["checks"]["in_bounds"]["pass"] is True
+
+
+def test_run_g0_gd_in_bounds_boolean_is_load_bearing():
+    # Under the OLD 2D box the host reported in_bounds=False for those negative-coord
+    # bodies and the DYNAMIC controlled body failed the gate -- which is exactly why
+    # the fix lives host-side (serve_game.gd _center_in_bounds).
+    g0 = run_g0_gd(_gd_facts_3d_origin(False), [])
+    assert g0["passed"] is False
+    assert g0["checks"]["in_bounds"]["pass"] is False
+    assert g0["checks"]["in_bounds"]["offenders"] == ["ship"]
+
+
+# ====================================================================== #
 # 5. Env scrub (GDSCRIPT_LANE.md security)
 # ====================================================================== #
 def test_scrubbed_env_drops_credentials_keeps_essentials():
