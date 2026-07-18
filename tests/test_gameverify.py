@@ -24,6 +24,7 @@ from harness.verify import gameverify as gv  # noqa: E402
 from harness.verify.gameverify import (  # noqa: E402
     GUIDED_SEED_BASE, K_STEPS, load_game, run_episode, verify_game,
 )
+from harness.verify.executors import PyExecutor  # noqa: E402
 
 DT = 1.0 / 60.0
 
@@ -1085,6 +1086,150 @@ def test_run_reachability_passes_open_and_footprint_free_scenes():
     open_box = _walled_geometry_facts()
     open_box["geometry"] = [b for b in open_box["geometry"] if b["name"] != "wall_right"]
     assert _run_reachability(open_box)["passed"] is True
+
+
+# ====================================================================== #
+# One-action games (MIN_ACTIONS=1) x the single-action anti-triviality gate
+# ====================================================================== #
+# MIN_ACTIONS was lowered 2 -> 1 so a legit one-button game (flappy-style timed
+# taps) is well-formed. The anti-degeneracy job is done ORTHOGONALLY by the POLICY
+# gates, which are independent of the action COUNT:
+#   * G1 "agency": the NOOP rollout must not win -> a win-by-IDLE game hard-fails.
+#   * single_action gate: holding any one action must not win -> a win-by-HOLD game
+#     hard-fails to GOAL_ERROR.
+# These tests show a 1-action game passes G0, and that the two policy gates still
+# bite for a 1-action game (trivial) while leaving a game where holding the one
+# action does NOT win (skill/timing required) certified.
+
+# Holding the single action "right" drives the block to the goal -> a TRIVIAL
+# 1-action game (win by holding one input); the single-action gate must reject it.
+GAME_ONE_ACTION_TRIVIAL = '''
+TITLE = "Slide Right"
+PROMPT = "hold right to reach the marker"
+ACTIONS = ["right"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(1000, 10), size=(4000, 20), static=True)
+    world.add("player", shape="box", pos=(100, 60), size=(20, 20))
+    world.control("player")
+
+def act(world, action):
+    if action == "right":
+        world.impulse("player", (60, 0))
+
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    return {"halfway": world.query("player")["pos"][0] > 200}
+'''
+
+# "dash" advances the runner but banks HEAT; heat bleeds off only between dashes.
+# Dashing every tick (the constant-hold policy the single-action probe runs)
+# OVERHEATS and LOSES (is_failure) before reaching the goal, so holding the one
+# action does NOT win -> the single-action gate must leave a cert intact. (The
+# winning policy needs rests, which the G3 solver's noop-free alphabet cannot
+# emit, so this fixture is used ONLY for the gate/probe unit checks, not end-to-end.)
+GAME_ONE_ACTION_SKILL = '''
+TITLE = "Sprint"
+PROMPT = "advance in bursts; sprinting non-stop overheats"
+ACTIONS = ["dash"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(1000, 10), size=(4000, 20), static=True)
+    world.add("runner", shape="box", pos=(100, 60), size=(20, 20))
+    world.control("runner")
+
+def act(world, action):
+    if action == "dash":
+        world.impulse("runner", (40, 0))
+        world.set_flag("heat", world.flag("heat", 0.0) + 2.0)
+
+def on_step(world):
+    h = world.flag("heat", 0.0)
+    if h > 0.0:
+        world.set_flag("heat", max(0.0, h - 0.05))
+
+def failure(world):
+    return world.flag("heat", 0.0) >= 5.0
+
+def success(world):
+    return world.query("runner")["pos"][0] > 300
+
+def checkpoints(world):
+    return {"midway": world.query("runner")["pos"][0] > 200}
+'''
+
+# The player starts with a rightward velocity and coasts to the goal on its own:
+# the NOOP rollout wins, so this 1-action game must fail G1 "agency".
+GAME_ONE_ACTION_IDLE_WIN = '''
+TITLE = "Drift"
+PROMPT = "it wins itself"
+ACTIONS = ["nudge"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(1000, 10), size=(4000, 20), static=True)
+    world.add("player", shape="box", pos=(100, 60), size=(20, 20), velocity=(80, 0))
+    world.control("player")
+
+def act(world, action):
+    if action == "nudge":
+        world.impulse("player", (5, 0))
+
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    return {"halfway": world.query("player")["pos"][0] > 200}
+'''
+
+
+def test_one_action_game_passes_g0(tmp_path):
+    # MIN_ACTIONS=1: a single-action ACTIONS list is well-formed at G0.
+    path = _write(tmp_path, "one.py", GAME_ONE_ACTION_TRIVIAL)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    g0 = rep["layers"]["G0_static"]
+    assert g0["checks"]["actions"]["pass"] is True, g0
+    assert g0["checks"]["actions"]["n"] == 1
+
+
+def test_one_action_hold_to_win_flagged_by_single_action_gate():
+    # A game won by HOLDING the single action is degenerate: the probe finds the win
+    # and the gate flips a certified report to GOAL_ERROR.
+    ex = PyExecutor(world_factory=factory())
+    wins = gv.single_action_probe(ex, GAME_ONE_ACTION_TRIVIAL, ["right"])
+    assert wins and wins[0][0] == "right"
+    report = {"passed": True, "failure_class": None, "hint": "ok",
+              "layers": {"G3_solve": {"passed": True, "checks": {}}}}
+    out = gv._single_action_gate(ex, GAME_ONE_ACTION_TRIVIAL, ["right"], report)
+    assert out["passed"] is False
+    assert out["failure_class"] == "GOAL_ERROR"
+    assert out["layers"]["G3_solve"]["checks"]["single_action"]["pass"] is False
+
+
+def test_one_action_skill_hold_loses_leaves_cert_intact():
+    # Holding the one action OVERHEATS (loses), so no single action wins: the probe is
+    # empty and the gate must leave a certified report untouched. This is the property
+    # that keeps a SKILLFUL 1-action game (timing required) certifiable.
+    ex = PyExecutor(world_factory=factory())
+    wins = gv.single_action_probe(ex, GAME_ONE_ACTION_SKILL, ["dash"])
+    assert wins == []
+    report = {"passed": True, "failure_class": None, "hint": "ok",
+              "layers": {"G3_solve": {"passed": True, "checks": {}}}}
+    out = gv._single_action_gate(ex, GAME_ONE_ACTION_SKILL, ["dash"], report)
+    assert out["passed"] is True
+    assert out["failure_class"] is None
+    assert out["layers"]["G3_solve"]["checks"]["single_action"]["pass"] is True
+
+
+def test_one_action_win_by_idle_fails_agency(tmp_path):
+    # A 1-action game whose NOOP rollout already wins hard-fails G1 agency (win-by-idle
+    # is caught by the policy gate, independent of the action count).
+    path = _write(tmp_path, "idle.py", GAME_ONE_ACTION_IDLE_WIN)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    assert rep["layers"]["G1_rollout"]["checks"]["agency"]["pass"] is False
+    assert rep["failure_class"] == "ENV_ERROR"
+    assert "noop" in rep["hint"]
 
 
 if __name__ == "__main__":

@@ -355,9 +355,27 @@ def test_run_g0_gd_catches_two_controlled():
     assert g0["checks"]["controlled"]["pass"] is False
 
 
-def test_run_g0_gd_catches_too_few_actions():
+def test_run_g0_gd_accepts_one_action():
+    # MIN_ACTIONS=1 (2026-07-17): a single-action ("one button") game is well-formed.
     facts = _wellformed_gd_facts()
-    facts["actions"] = {"is_list": True, "length": 1, "all_str": True, "values": ["go"]}
+    facts["actions"] = {"is_list": True, "length": 1, "all_str": True, "values": ["flap"]}
+    g0 = run_g0_gd(facts, [])
+    assert g0["passed"] is True, g0
+    assert g0["checks"]["actions"]["pass"] is True
+
+
+def test_run_g0_gd_catches_zero_actions():
+    facts = _wellformed_gd_facts()
+    facts["actions"] = {"is_list": True, "length": 0, "all_str": True, "values": []}
+    g0 = run_g0_gd(facts, [])
+    assert g0["passed"] is False
+    assert g0["checks"]["actions"]["pass"] is False
+
+
+def test_run_g0_gd_catches_too_many_actions():
+    facts = _wellformed_gd_facts()
+    facts["actions"] = {"is_list": True, "length": 9, "all_str": True,
+                        "values": [f"a{i}" for i in range(9)]}
     g0 = run_g0_gd(facts, [])
     assert g0["passed"] is False
     assert g0["checks"]["actions"]["pass"] is False

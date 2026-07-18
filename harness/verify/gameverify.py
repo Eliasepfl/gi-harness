@@ -47,7 +47,23 @@ GAMEVERIFY_TIMEOUT_S = 480  # sandbox subprocess budget for a full G0-G3 run [en
                             # UNSOLVED search now legitimately runs ~3x longer)
 
 # G0
-MIN_ACTIONS, MAX_ACTIONS = 2, 8         # declared action-set size
+MIN_ACTIONS, MAX_ACTIONS = 1, 8         # declared action-set size
+# MIN_ACTIONS is the declared ACTION-SET SIZE only — a WELL-FORMEDNESS bar, not a
+# non-triviality bar. A one-button game (flappy: timed taps, a single "flap") is a
+# legitimate design, so the floor is 1 (raised from 2 on 2026-07-17, Elias). The
+# anti-degeneracy job is done ORTHOGONALLY, by the POLICY gates, which are
+# independent of the action COUNT and still bite for a 1-action game:
+#   * G1 "agency" (run_g1): the NOOP rollout must NOT reach success -> a game won by
+#     IDLING (the constant-None policy) hard-fails, whatever its action count.
+#   * single_action_probe / _single_action_gate: holding ANY one declared action for
+#     the whole horizon must NOT win -> a game won by HOLDING one input (the
+#     constant-action policy) hard-fails to GOAL_ERROR, whatever its action count.
+# For a 1-action game these two together reject exactly the trivial policies (win by
+# idle / win by holding the one button) while a SKILLFUL 1-action game — success needs
+# TIMING, so neither the all-noop nor the all-hold constant policy wins — passes both
+# and is solved by the G3 search over timed action/noop sequences. So MIN_ACTIONS=1 is
+# safe: it does NOT make the single-action gate reject all 1-action games; the gate
+# rejects a 1-action game iff the single held action alone wins (a true degeneracy).
 MIN_ENTITIES = 2
 PEN_INIT_TOL = 1.5          # px: max tolerated initial dynamic-pair penetration [eng.]
 
@@ -340,7 +356,7 @@ def run_g0(factory, source: str):
     if missing or not_callable:
         return layer, game
 
-    # ACTIONS is a list[str] of size 2..8.
+    # ACTIONS is a list[str] of size MIN_ACTIONS..MAX_ACTIONS (1..8).
     actions = game.actions
     actions_ok = (isinstance(actions, list) and actions
                   and all(isinstance(a, str) for a in actions)
@@ -891,7 +907,8 @@ def _hint_g0(checks: dict) -> str:
         return (f"missing/invalid game symbols: "
                 f"{', '.join(s.get('missing', []) + s.get('not_callable', [])) or 'unknown'}")
     if not checks.get("actions", {}).get("pass", True):
-        return f"ACTIONS must be a list of 2..8 strings (got {checks['actions'].get('n')})"
+        return (f"ACTIONS must be a list of {MIN_ACTIONS}..{MAX_ACTIONS} strings "
+                f"(got {checks['actions'].get('n')})")
     if not checks.get("builds", {}).get("pass", True):
         return f"build(world) failed: {checks['builds'].get('error', 'unknown error')}"
     if not checks.get("controlled", {}).get("pass", True):
@@ -1159,7 +1176,7 @@ def run_g0_js(facts: dict) -> dict:
 #       HARD findings fail, ADVISORY findings ride along as warnings),
 #   (a) the parse gate                    (facts["load"], serve_game.gd's compile),
 #   (c) the contract probe                (facts["contract"].methods, has_method) —
-# with the SAME structural checks the data lanes use (actions 2..8, one controlled
+# with the SAME structural checks the data lanes use (actions 1..8, one controlled
 # dynamic body, >=2 bodies, in bounds). The check keys mirror run_g0_js so
 # `_hint_g0` renders identical hints across engines.
 
@@ -1198,7 +1215,7 @@ def run_g0_gd(facts: dict, violations, advisories=None) -> dict:
     if missing:
         return layer
 
-    # actions() is a list[str] of size 2..8.
+    # actions() is a list[str] of size MIN_ACTIONS..MAX_ACTIONS (1..8).
     actions = facts.get("actions") or {}
     n = actions.get("length")
     actions_ok = (bool(actions.get("is_list")) and isinstance(n, int) and n
@@ -1721,6 +1738,15 @@ def _finish_g3(report: dict, g3: dict) -> dict:
 # len(actions) episodes) and rejects a certified game if any single action wins. It
 # rides the SAME executor seam as G1/G3, so it is engine-agnostic; the gdscript funnel
 # wires it after G3 so the generation repair loop gets an actionable hint.
+#
+# NON-TRIVIALITY, NOT ACTION COUNT (MIN_ACTIONS=1 reconciliation). This gate is about
+# the POLICY, not the size of the action set: it flags a game iff SOME single held
+# action wins on its own. For a 1-action game (MIN_ACTIONS=1) the one action IS the
+# whole action set, so the gate asks exactly "is the game won by holding the one
+# button?" — YES for a trivial hold-to-win game (correctly rejected), NO for a skillful
+# one where success needs TIMING (holding overshoots / never satisfies the goal), so it
+# passes and G3 certifies it via a timed action/noop plan. Thus lowering MIN_ACTIONS to
+# 1 does NOT make this gate reject all 1-action games — only the degenerate ones.
 
 def single_action_probe(executor, game_source, actions, horizon=SINGLE_ACTION_HORIZON):
     """Probe whether the game is winnable by repeating ONE action. Holds each declared
