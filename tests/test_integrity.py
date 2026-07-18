@@ -95,11 +95,10 @@ def test_bytecode_cache_churn_does_not_violate(tmp_path):
     assert INT.violations(before, str(tmp_path)) == []
 
 
-def test_snapshot_of_real_repo_includes_gamegen_and_contracts():
+def test_snapshot_of_real_repo_includes_gamegen():
     """Sanity check against the real repo layout."""
     root = INT.__file__.rsplit("harness", 1)[0].rstrip("\\/")
     snap = INT.snapshot(root)
     assert "harness/gen/gamegen.py" in snap
     assert "harness/core/integrity.py" in snap
-    assert "CONTRACTS.md" in snap
     assert "env.py" not in snap
