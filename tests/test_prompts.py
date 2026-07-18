@@ -94,20 +94,22 @@ def test_gdscript_banned_list_states_determinism_and_sandbox_reasons():
     # The HARD banned families, each named so the G0 scanner's finding is teachable.
     for banned in ("OS.", "FileAccess", "ResourceSaver", "HTTPRequest",
                    "StreamPeerTCP", "Thread", "WorkerThreadPool", "Time.",
-                   "set_script", "Expression", "get_tree()"):
+                   "set_script", "Expression", "get_tree()", "randomize()"):
         assert banned in sp, banned
     # Guardrails v2: res:// asset loads are ALLOWED (sandbox-contained reads)...
     assert "`load()`/`preload()` of `res://` resources are ALLOWED" in sp
-    # ...and the unseeded global RNG family is an ADVISORY hint, never a G0 reject
-    # (the two-run replay gate stays the hard judge of determinism).
+    # ...and guardrails v2 round 2: the global RNG read family is ALLOWED and
+    # deterministic because the host pins the global RNG from world_seed each reset;
+    # only randomize() (wall-clock reseed) stays banned.
     assert "randi()" in sp and "randf()" in sp
-    assert "ADVISORY" in sp
-    # The WHY is the two hard rules, not style.
     flat = " ".join(sp.lower().split())
+    assert "pins the global rng" in flat or "seeds the global rng" in flat
+    assert "randomize()" in sp                            # the one banned RNG call
+    # The WHY is the two hard rules, not style.
     assert "sandbox escape" in flat
     assert "nondeterministic" in flat or "nondeterminism" in flat
-    # The sanctioned randomness path: seed your own generator, not the global rng.
-    assert "seed it from world_seed" in flat or "seed your own" in flat
+    # A self-seeded RandomNumberGenerator is still an offered path.
+    assert "randomnumbergenerator" in flat
 
 
 def test_gdscript_names_godot4_runtime_and_bans_godot3_ghosts():

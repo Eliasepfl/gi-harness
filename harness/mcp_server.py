@@ -710,8 +710,9 @@ async def verify_game(game_source: str, level: int | None = None) -> dict:
     ``CERTIFIED`` == a passing (COMPLETED) run through the Godot host. G0 runs the harness's
     own sandbox scanner (rejects ``OS.*``/``FileAccess``/``ResourceSaver``/network etc.)
     before anything is compiled; ``load``/``preload`` of ``res://`` resources are ALLOWED,
-    and the unseeded ``randomize``/``randi`` family is ADVISORY-only (surfaced in
-    ``warnings`` -- the two-run replay gate still fails real drift).
+    and the global ``randi``/``randf``/``seed`` family is ALLOWED and deterministic (the
+    serve host pins the global RNG with ``seed(world_seed)`` before every ``build()``).
+    ``randomize()`` stays HARD-banned -- it reseeds from the wall clock and defeats the pin.
 
     Args:
         game_source: the full GameAPI GDScript implementing the 7 methods (build/act/state/

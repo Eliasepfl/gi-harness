@@ -14,10 +14,8 @@ prose is not a false positive) over the escape hatches the GameAPI contract forb
 reflection escapes (``ClassDB``/``Expression``/``Engine.get_singleton``/
 ``set_script``/``GDScript``), wall-clock ``Time.*``, and ``get_tree().quit``.
 Every rule carries a SEVERITY: a HARD hit fails G0 with a line number; an ADVISORY
-hit (the unseeded global RNG family — ``randi``/``randf``/``randomize``/``seed``)
-only surfaces as a warning/hint, because the G1 two-run drift gate empirically
-catches RNG-stream nondeterminism (guardrails v2, 2026-07: the lexical RNG ban was
-redundant with the dynamic gate and it strangled generation).
+hit only surfaces as a warning/hint. The ADVISORY machinery (is_hard / scan_advisories)
+is retained for future use, but NO rule currently uses it (see the RNG note below).
 
 ALLOWED since guardrails v2: ``load()``/``preload()``/``ResourceLoader``. They are
 builtins confined to ``res://`` (the harness's own godotworld project) + an empty
@@ -25,6 +23,18 @@ builtins confined to ``res://`` (the harness's own godotworld project) + an empt
 identical reads across runs (no G1 drift). The WRITE half stays hard: the serve
 host runs from a SOURCE project (``--path godotworld``), so ``res://`` is a real
 writable directory and ``ResourceSaver`` keeps its own hard rule.
+
+ALLOWED since guardrails v2 (round 2): the global RNG READ family —
+``randi``/``randf``/``randi_range``/``randf_range``/``randfn`` — and bare ``seed()``.
+The serve HOST now PINS the global RNG: it calls ``seed(world_seed)`` immediately
+before every ``build()`` (both the single-instance ``_rebuild`` and the batched/vec
+``_batch_build_game`` paths in ``godotworld/serve_game.gd``), so the ``@GlobalScope``
+generator those functions draw from is a deterministic stream keyed by ``world_seed``,
+re-run on every reset. Their lexical rules are GONE. ``randomize()`` stays HARD: it
+reseeds that same generator from the WALL CLOCK, defeating the host pin — pure
+nondeterminism no legit game needs (the earlier round's red-team confirmed a bare
+``randi()`` in ``act()``/a success-predicate certified GREEN while nondeterministic,
+because the host did not pin the RNG and G1 only twins the NOOP rollout).
 
 The other two G0 gates: (a) the parse gate — a STANDALONE ``godot --headless
 --check-only --script <file>`` compile-check (a duck-typed plain-Node game has no base
@@ -57,10 +67,11 @@ GD_REQUIRED_METHODS = ("build", "act", "state", "checkpoints",
 # ``randf(...)`` is not).
 #
 # Severity: HARD findings fail the G0 gate (sandbox/determinism boundaries the
-# dynamic gates cannot re-derive); ADVISORY findings are hints only — the unseeded
-# global RNG family is empirically covered by the G1 two-run drift gate, so its
-# lexical rules warn ("prefer a RandomNumberGenerator seeded from world_seed")
-# without rejecting the game.
+# dynamic gates cannot re-derive); ADVISORY findings are hints only. The ADVISORY
+# severity is retained for future use, but as of guardrails v2 round 2 NO rule uses
+# it: the global RNG READ family (randi/randf/.../seed) is now DETERMINISTIC because
+# the serve host pins the global RNG (seed(world_seed) before every build()), so those
+# rules are removed outright rather than downgraded to advisory.
 HARD = "hard"
 ADVISORY = "advisory"
 
@@ -113,15 +124,15 @@ _RULES: list[tuple[str, re.Pattern, str, str]] = [
     # or crashes at the serve host (and any drift fails the G1 two-run gate).
     ("time", re.compile(r"(?<![\w])Time\s*\."),
      "Time.* (wall clock) is banned (nondeterminism)", HARD),
+    # Guardrails v2 round 2: the global RNG READ family (randi/randf/randi_range/
+    # randf_range/randfn) and bare seed() are now ALLOWED and their rules removed —
+    # the serve host pins the global RNG with seed(world_seed) before every build()
+    # (single-instance _rebuild + batched _batch_build_game), so their stream is
+    # deterministic. randomize() stays HARD: it reseeds the global RNG from the WALL
+    # CLOCK, defeating the host pin -> pure nondeterminism no legit game needs.
     ("randomize", re.compile(r"(?<![\w])randomize\s*\("),
-     "randomize() reseeds from the wall clock — prefer a RandomNumberGenerator "
-     "seeded from world_seed (unseeded drift fails the G1 two-run gate)", ADVISORY),
-    ("global_rng", re.compile(r"(?<![\w.])(randi|randf|randi_range|randf_range|randfn)\b\s*\("),
-     "the global randi/randf family is unseeded — prefer a RandomNumberGenerator "
-     "seeded from world_seed (unseeded drift fails the G1 two-run gate)", ADVISORY),
-    ("global_seed", re.compile(r"(?<![\w.])seed\s*\("),
-     "the global seed() — prefer a RandomNumberGenerator seeded from world_seed "
-     "(the harness seeds self.rng)", ADVISORY),
+     "randomize() reseeds the global RNG from the wall clock, defeating the host's "
+     "seed(world_seed) pin — banned (global randi/randf are already deterministic)", HARD),
     ("scene_tree", re.compile(r"(?<![\w])get_tree\s*\("),
      "get_tree() is banned (get_tree().quit / timers escape determinism)", HARD),
     ("quit", re.compile(r"\.\s*quit\s*\("),

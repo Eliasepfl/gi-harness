@@ -51,7 +51,7 @@ Certification is pixel-blind: it reads only `state()`, so nothing you add for lo
 
 # Determinism + randomness - a hard rule
 
-The verifier REPLAYS your run and must reproduce it byte-for-byte. Draw ALL randomness from an rng you seed FROM `world_seed`: the global `randi()`/`randf()`/`randomize()`/`seed()` are unseeded - the code gate only WARNS on them now, but any drift they cause FAILS the two-run replay gate, so seed your own `RandomNumberGenerator` from `world_seed` for anything random. Physics is pinned (a fixed step, single thread); never touch the loop, the clock, or the physics/time pins.
+The verifier REPLAYS your run and must reproduce it byte-for-byte. Randomness is fine and deterministic: the host seeds the global RNG from `world_seed` before every `build()` (each reset), so `randi()`/`randf()`/`randi_range()`/`randf_range()`/`randfn()`/`seed()` draw a fixed stream keyed by the seed and replay identically. (You may also seed your own `RandomNumberGenerator` from `world_seed` - both work.) The ONE randomness call that is BANNED is `randomize()`: it reseeds the global RNG from the wall clock and defeats the host's pin. Physics is pinned (a fixed step, single thread); never touch the loop, the clock, or the physics/time pins.
 
 # BANNED - hard constraints, not style. Every one is a determinism OR a sandbox rule
 
@@ -64,10 +64,11 @@ Your code runs untrusted, in-container. Using anything below is an automatic rej
 | `HTTPRequest`, `HTTPClient`, `StreamPeerTCP`, `PacketPeerUDP`, `TCPServer`, `WebSocketPeer`, `ENet*` | network egress -> sandbox escape; the wire belongs to the host |
 | `Thread`, `WorkerThreadPool`, `Mutex`, `Semaphore` | the PhysicsServer is not thread-safe and thread scheduling is nondeterministic -> voids replay |
 | `Time.*`, `Engine.get_ticks_msec` | wall-clock reads make the trajectory depend on how fast the machine ran -> nondeterminism |
+| `randomize()` | reseeds the global RNG from the wall clock, defeating the host's `seed(world_seed)` pin -> nondeterminism |
 | `set_script`, `GDScript.new`, `Expression`, `ClassDB`, `Engine.get_singleton` | reflection / dynamic code compile escapes the whitelist -> sandbox escape |
 | `get_tree().quit`, direct writes to the physics/time pins | the host owns the process, the loop, and the determinism pins; touching them voids witness replay |
 
-Not banned, only warned: the global `randi()`/`randf()`/`randomize()`/`seed()` - the scanner flags them as an ADVISORY, and unseeded drift still fails the replay gate, so treat the warning as a fix-it hint.
+Allowed and deterministic: the global `randi()`/`randf()`/`randi_range()`/`randf_range()`/`randfn()`/`seed()` - the host pins the global RNG from `world_seed` on every reset, so they replay identically. Only `randomize()` (in the banned table above) is off-limits, because it reseeds from the wall clock.
 
 Write ordinary GDScript: `func`, `var`, `if`/`for`/`match`, arithmetic, vector math, `abs`/`min`/`max`/`clamp`/`sqrt`, real Godot nodes, `load()`/`preload()` of `res://` resources, and a `RandomNumberGenerator` you seed. `PhysicsServer3D.set_active(true)` in a 3D `build()` is allowed and required; it is the ONE PhysicsServer call you make.
 

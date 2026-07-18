@@ -1572,9 +1572,10 @@ def _verify_gdscript(source: str, report: dict) -> dict:
     report["engine"] = "gdscript"
 
     # (b) banned-API scan FIRST — a HARD finding short-circuits BEFORE any Godot
-    # spawn, so unscanned code is never compiled or executed. ADVISORY findings
-    # (unseeded global RNG family) never fail: they surface as report warnings —
-    # the G1 two-run drift gate is the empirical judge of determinism.
+    # spawn, so unscanned code is never compiled or executed. ADVISORY findings never
+    # fail: they surface as report warnings. (As of guardrails v2 round 2 no rule is
+    # advisory — the global RNG family is deterministic now that the host pins it with
+    # seed(world_seed) — but the pass-through is kept for future use.)
     violations = scan_violations(source)
     advisories = scan_advisories(source)
     if advisories:

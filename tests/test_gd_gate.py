@@ -4,11 +4,14 @@ Always run (no Godot binary needed):
 
 * the BANNED-API scanner catches every HARD forbidden construct (parameterized
   negative fixtures as inline strings) and passes the clean ``mini_collect.gd``
-  fixture; the unseeded GLOBAL rng family is an ADVISORY (a warning, never a G0
-  fail — the G1 two-run drift gate judges determinism empirically) while a method
-  call on ``self.rng`` stays clean; ``load``/``preload``/``ResourceLoader`` scan
-  CLEAN since guardrails v2 (res://-confined, sandbox-contained reads) and
-  ``ResourceSaver`` (the write vector into the source-project res://) stays HARD;
+  fixture; the global RNG READ family (``randi``/``randf``/``randi_range``/
+  ``randf_range``/``randfn``/bare ``seed``) scans CLEAN since guardrails v2 round 2
+  (the serve host pins the global RNG with ``seed(world_seed)`` before every
+  ``build()``), while ``randomize()`` — which reseeds from the wall clock and
+  defeats that pin — stays a HARD fail; a method call on ``self.rng`` also stays
+  clean; ``load``/``preload``/``ResourceLoader`` scan CLEAN since guardrails v2
+  (res://-confined, sandbox-contained reads) and ``ResourceSaver`` (the write
+  vector into the source-project res://) stays HARD;
 * ``detect_engine`` routes ``.gd`` (and the ``# engine: gdscript`` marker) to the
   ``gdscript`` engine;
 * a banned ``.gd`` game fails G0 through ``verify_game`` WITHOUT ever spawning Godot
@@ -127,6 +130,7 @@ _BANNED = [
     ("gdscript_class", "func build(s): var g = GDScript.new()"),
     ("set_script", "func build(s): node.set_script(x)"),
     ("time", "func build(s): var t = Time.get_ticks_msec()"),
+    ("randomize", "func build(s): randomize()"),
     ("scene_tree", "func build(s): get_tree().quit()"),
 ]
 
@@ -145,53 +149,49 @@ def test_scanner_catches_each_banned_api(rule, src):
 
 
 # ---------------------------------------------------------------------- #
-# 1a. ADVISORY rules — found + surfaced as hints, NEVER a hard violation
-#     (guardrails v2: the G1 two-run drift gate empirically catches RNG
-#     nondeterminism, so the lexical rules only warn).
+# 1a. Global RNG READ family — ALLOWED since guardrails v2 round 2.
+#     The serve host pins the global RNG (seed(world_seed) before every
+#     build(), in both the single-instance and batched/vec paths), so the
+#     global randi/randf/randi_range/randf_range/randfn and bare seed() are
+#     DETERMINISTIC -> they scan CLEAN (no finding at all, not even advisory).
+#     randomize() is the exception (it reseeds from the wall clock and defeats
+#     the host pin) -> it stays a HARD violation (parameterized in _BANNED).
 # ---------------------------------------------------------------------- #
-_ADVISORY = [
-    ("randomize", "func build(s): randomize()"),
-    ("global_rng", "func build(s): var x = randf()"),
-    ("global_seed", "func build(s): seed(5)"),
+_RNG_ALLOWED = [
+    "var x = randi()",
+    "var y = randf()",
+    "var z = randi_range(0, 3)",
+    "var w = randf_range(0.0, 1.0)",
+    "var v = randfn(0.0, 1.0)",
+    "seed(5)",
 ]
 
 
-@pytest.mark.parametrize("rule,src", _ADVISORY, ids=[r for r, _ in _ADVISORY])
-def test_global_rng_family_is_advisory_not_hard(rule, src):
-    full = "extends Node2D\n" + src
-    findings = scan_gd_source(full)
-    hits = [f for f in findings if f["rule"] == rule]
-    assert hits, (rule, findings)                        # still FOUND (a hint)
-    for f in hits:
-        assert f["severity"] == "advisory" and not is_hard(f), f
-        assert "advisory" in str(f) and "banned" not in str(f)
-        assert "world_seed" in f["message"]              # the teachable fix
-    assert scan_violations(full) == []                   # NOT a hard violation
-    assert any(rule in a for a in scan_advisories(full))  # routed to warnings
-
-
-def test_scanner_catches_global_randi_and_randf_range():
-    # The whole unseeded family is still FOUND — as an advisory, not a violation.
-    for bad in ("var x = randi()", "var y = randi_range(0, 3)",
-                "var z = randf_range(0.0, 1.0)"):
-        src = "extends Node2D\nfunc build(s): " + bad
-        assert any(f["rule"] == "global_rng" and not is_hard(f)
-                   for f in scan_gd_source(src)), bad
-        assert scan_violations(src) == [], bad
+@pytest.mark.parametrize("src", _RNG_ALLOWED)
+def test_global_rng_read_family_scans_clean(src):
+    # Host pins the global RNG -> the read family is deterministic and allowed:
+    # no finding, no violation, no advisory.
+    full = "extends Node2D\nfunc build(s): " + src
+    assert scan_gd_source(full) == [], (src, scan_gd_source(full))
+    assert scan_violations(full) == []
+    assert scan_advisories(full) == []
 
 
 def test_scanner_allows_self_rng_methods():
-    # A method call on the seeded self.rng is the SANCTIONED path -> not a finding.
+    # A method call on a self-seeded RandomNumberGenerator is also fine -> not a finding.
     for good in ("var x = self.rng.randf()", "var y = rng.randi_range(0, 3)",
                  "var z = rng.randf_range(-5.0, 5.0)"):
         assert scan_gd_source("extends Node2D\nfunc build(s): " + good) == [], good
 
 
-def test_scanner_flags_rng_randomize_even_on_receiver():
-    # randomize() reseeds from the wall clock -> flagged even as rng.randomize()
-    # (advisory: the two-run drift gate is the hard judge).
-    assert any(f["rule"] == "randomize"
-               for f in scan_gd_source("extends Node2D\nfunc build(s): rng.randomize()"))
+def test_randomize_is_hard_even_on_receiver():
+    # randomize() reseeds from the wall clock, defeating the host's seed(world_seed)
+    # pin -> a HARD violation, flagged on any receiver (global or rng.randomize()).
+    for src in ("func build(s): randomize()", "func build(s): rng.randomize()"):
+        full = "extends Node2D\n" + src
+        hits = [f for f in scan_gd_source(full) if f["rule"] == "randomize"]
+        assert hits and all(is_hard(f) for f in hits), full
+        assert scan_violations(full), full
 
 
 # ---------------------------------------------------------------------- #
@@ -318,9 +318,10 @@ def test_run_g0_gd_scan_violation_short_circuits():
 
 
 def test_run_g0_gd_advisory_findings_do_not_fail():
-    # Guardrails v2: advisory findings (unseeded global RNG) ride along in the
-    # sandbox_scan check for observability but NEVER fail the gate.
-    adv = ["line 4: advisory global_rng (...) — 'randf('"]
+    # The ADVISORY pass-through machinery is retained for future use even though NO
+    # rule is advisory as of guardrails v2 round 2. A synthetic advisory rides along
+    # in the sandbox_scan check for observability but NEVER fails the gate.
+    adv = ["line 4: advisory example_rule (...) — 'foo('"]
     g0 = run_g0_gd(_wellformed_gd_facts(), [], adv)
     assert g0["passed"] is True, g0
     assert g0["checks"]["sandbox_scan"]["pass"] is True

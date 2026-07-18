@@ -48,21 +48,28 @@ a predicate.
 
 ## Determinism + randomness (a hard rule)
 
-Physics is pinned (a fixed step, single thread, jitter-fix off). Draw ALL randomness
-from an rng the game seeds FROM `world_seed`; the global `randi`/`randf`/`randomize`/
-`seed` are unseeded — the scanner flags them as an ADVISORY (a warning, not a reject),
-and G1 gates a two-run drift check per game — determinism is tested, not assumed.
+Physics is pinned (a fixed step, single thread, jitter-fix off). Randomness is
+deterministic: the serve host seeds the global RNG from `world_seed` before every
+`build()` (each reset, both the single-instance and batched/vec paths), so the global
+`randi`/`randf`/`randi_range`/`randf_range`/`randfn` and bare `seed()` draw a fixed
+stream keyed by the seed and replay identically. (A game may also seed its own
+`RandomNumberGenerator` from `world_seed`.) `randomize()` is BANNED — it reseeds the
+global RNG from the wall clock and defeats the host pin. G1 gates a two-run drift
+check per game — determinism is tested, not assumed.
 
 ## Bans (G0 static scanner, `harness/verify/gd_gate.py`)
 
 HARD (a hit fails G0 with a line number): `OS.*`, `FileAccess`, `DirAccess`,
 `ResourceSaver`, `HTTP*`, `TCPServer`, `StreamPeer*`, `PacketPeer*`, `Thread`, `Mutex`,
 `Engine.get_singleton`, `ClassDB`, `Expression`, `GDScript`, `set_script`, `Time.*`
-(wall clock), `get_tree().quit`.
+(wall clock), `randomize()` (reseeds the global RNG from the wall clock, defeating the
+host's `seed(world_seed)` pin), `get_tree().quit`.
 
-ADVISORY (warned, never fails G0): the global `randi`/`randf`/`randomize`/`seed`
-family — seed your own `RandomNumberGenerator` from `world_seed` instead; the G1
-two-run drift gate empirically rejects any nondeterminism they cause.
+ALLOWED (guardrails v2 round 2): the global `randi`/`randf`/`randi_range`/`randf_range`/
+`randfn` family and bare `seed()` — the serve host pins the global RNG with
+`seed(world_seed)` before every `build()`, so they are deterministic (only `randomize()`,
+which reseeds from the wall clock, stays banned). The ADVISORY severity remains in the
+scanner for future use, but no rule currently uses it.
 
 ALLOWED (guardrails v2): `load()`/`preload()`/`ResourceLoader` — reads confined to
 `res://` (the sandboxed project) + an empty `user://`; no network backend, no OS

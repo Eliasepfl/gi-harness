@@ -32,10 +32,12 @@
 # in-container, on a SCRUBBED environment (the Python spawner passes no keys), and
 # ONLY after the Python-side static banned-API scanner (harness/verify/gd_gate.py)
 # has passed. The host hands the game NOTHING but tree membership (its RigidBody2D
-# children join the world's physics space) + build()'s seed; the game seeds its own
-# RandomNumberGenerator. Every escape hatch (OS/FileAccess/net/threads/reflection/
-# wall-clock/unseeded RNG) is a hard G0 scanner fail. This host itself uses NO such
-# API on the game's behalf.
+# children join the world's physics space) + build()'s seed, AND it PINS the global RNG:
+# every reset calls seed(world_seed) before build(), so global randi()/randf() draw a
+# deterministic stream keyed by world_seed (the game may also seed its own
+# RandomNumberGenerator). Every escape hatch (OS/FileAccess/net/threads/reflection/
+# wall-clock Time.*/randomize()) is a hard G0 scanner fail. This host calls seed() (it is
+# NOT scanned); it uses no other banned API on the game's behalf.
 
 extends SceneTree
 
@@ -350,11 +352,16 @@ func _rebuild(world_seed: int) -> String:
 	if inst is Node3D:
 		root.world_3d = World3D.new()
 	root.add_child(inst)
-	# The game is a plain Node implementing the method convention (no base class): it
-	# seeds its OWN RandomNumberGenerator from build()'s seed -- the banned-API scan
-	# forbids the unseeded global randi/randf/randomize, so a self-seeded generator is
-	# the sanctioned path -- and its RigidBody2D children join the world's physics space
-	# by tree membership. The host hands it nothing but that membership + the seed.
+	# The game is a plain Node implementing the method convention (no base class): it may
+	# draw from the global randi()/randf() stream OR seed its own RandomNumberGenerator --
+	# either way determinism holds because THE HOST PINS THE GLOBAL RNG here. seed(world_seed)
+	# immediately before build() reseeds Godot's @GlobalScope generator (the one randi/randf/
+	# randi_range/randf_range/randfn draw from) to a fixed stream keyed by world_seed, re-run
+	# on EVERY reset -- so bare global randi()/randf() in build()/act()/is_success() are now
+	# deterministic and allowed. Only randomize() stays banned: it would reseed that same
+	# generator from the wall clock and defeat this pin. Its RigidBody2D children join the
+	# world's physics space by tree membership; the host hands it nothing but that membership,
+	# the seeded global RNG, and build()'s seed.
 	# RUNTIME ERRORS: GDScript has NO catchable exceptions, so a build() that hits a
 	# runtime fault (null deref, bad call) does NOT raise here -- the engine prints a
 	# `SCRIPT ERROR: ... at: build (gdscript://...:LINE)` block to stderr and the call
@@ -362,6 +369,7 @@ func _rebuild(world_seed: int) -> String:
 	# error frame in-process; the Python spawner mines the tee'd stderr DELTA per op
 	# (harness/verify/gd_exec.parse_runtime_errors + read_stderr_delta) and attaches the
 	# real cause python-side (run_check overrides build.ok, run_batch sets rec.error).
+	seed(world_seed)                        # PIN global RNG: global randi/randf now deterministic
 	inst.build(world_seed)
 	_game = inst
 	# Capture the declared action set + world size, and pre-register every checkpoint
@@ -688,6 +696,10 @@ func _batch_build_game(vp: SubViewport, inst_seed: int) -> Dictionary:
 	if inst is Node3D:
 		vp.world_3d = World3D.new()
 	vp.add_child(inst)
+	# PIN the global RNG per instance so vec rollouts are deterministic too: seed(inst_seed)
+	# reseeds Godot's @GlobalScope generator (randi/randf/...) to this slot's fixed stream
+	# before build(), matching the single-instance path in _rebuild. randomize() stays banned.
+	seed(inst_seed)
 	inst.build(inst_seed)
 	return {"ok": true, "error": "", "game": inst}
 

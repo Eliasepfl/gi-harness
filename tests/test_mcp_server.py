@@ -11,9 +11,10 @@ ENGINE PER TEST (stated so there is zero ambiguity about what certifies what):
     it needs a Godot binary (HARNESS_GODOT_EXE) so it SKIPS offline and runs in-image / PoC-3.
   * ``test_verify_hints_on_banned_api`` also exercises the real gdscript lane offline: the
     harness's own G0 sandbox scanner (rejects OS.*, FileAccess, ResourceSaver, network, ...;
-    guardrails v2 made load/preload ALLOWED and the unseeded randomize/randi family
-    ADVISORY-only) short-circuits BEFORE any Godot spawn, so it needs no binary yet still
-    returns the real typed hint.
+    guardrails v2 made load/preload ALLOWED, and round 2 made the global randi/randf/seed
+    family ALLOWED — the host pins the global RNG — while randomize() stays HARD)
+    short-circuits BEFORE any Godot spawn, so it needs no binary yet still returns the real
+    typed hint.
   * ``test_verify_green_plumbing_legacy_lane_only`` runs the FROZEN LEGACY python lane
     (pymunk) purely to prove the tool's write->funnel->witness->hints WIRING; it is NOT a
     certification path and the payload is asserted to carry ``legacy_lane: true``. pymunk is
@@ -100,8 +101,9 @@ func actions() -> Array:
 """
 
 # GDScript that shells out via OS.* -> tripped by the pure-python banned-API scan
-# at G0 BEFORE any Godot spawn (deterministic, offline typed hint). Guardrails v2:
-# randomize()/randi() are ADVISORY now (warn-only), so the fixture uses a HARD rule.
+# at G0 BEFORE any Godot spawn (deterministic, offline typed hint). Guardrails v2 round 2:
+# the global randi()/randf()/seed() family is ALLOWED now (the host pins the global RNG),
+# so the fixture uses OS.* — an unambiguously HARD rule that short-circuits offline.
 BANNED_GD = COMPLIANT_GD.replace(
     "func build(world_seed: int) -> void:\n\tpass",
     "func build(world_seed: int) -> void:\n\tOS.execute(\"ls\", [])")
