@@ -2,9 +2,16 @@
 
 Always run (no Godot binary needed):
 
-* the BANNED-API scanner catches every forbidden construct (parameterized negative
-  fixtures as inline strings) and passes the clean ``mini_collect.gd`` fixture, and
-  distinguishes a method call on ``self.rng`` from the banned GLOBAL rng;
+* the BANNED-API scanner catches every HARD forbidden construct (parameterized
+  negative fixtures as inline strings) and passes the clean ``mini_collect.gd``
+  fixture; the global RNG READ family (``randi``/``randf``/``randi_range``/
+  ``randf_range``/``randfn``/bare ``seed``) scans CLEAN since guardrails v2 round 2
+  (the serve host pins the global RNG with ``seed(world_seed)`` before every
+  ``build()``), while ``randomize()`` — which reseeds from the wall clock and
+  defeats that pin — stays a HARD fail; a method call on ``self.rng`` also stays
+  clean; ``load``/``preload``/``ResourceLoader`` scan CLEAN since guardrails v2
+  (res://-confined, sandbox-contained reads) and ``ResourceSaver`` (the write
+  vector into the source-project res://) stays HARD;
 * ``detect_engine`` routes ``.gd`` (and the ``# engine: gdscript`` marker) to the
   ``gdscript`` engine;
 * a banned ``.gd`` game fails G0 through ``verify_game`` WITHOUT ever spawning Godot
@@ -25,7 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.verify.gameverify import detect_engine, run_g0_gd, verify_game  # noqa: E402
 from harness.verify.gd_gate import (  # noqa: E402
-    GD_REQUIRED_METHODS, is_failure_constant_false, scan_gd_source, scan_violations,
+    GD_REQUIRED_METHODS, is_failure_constant_false, is_hard, scan_advisories,
+    scan_gd_source, scan_violations,
 )
 from harness.verify.gd_exec import classify_check_output  # noqa: E402
 from harness.verify.godot_exec import scrubbed_env  # noqa: E402
@@ -99,7 +107,7 @@ def test_nonzero_with_no_script_error_diagnostic_stays_fatal():
 
 
 # ====================================================================== #
-# 1. Banned-API scanner
+# 1. Banned-API scanner — the HARD core (a hit fails G0)
 # ====================================================================== #
 _BANNED = [
     ("os", 'func act(a): OS.execute("ls", [])'),
@@ -118,15 +126,11 @@ _BANNED = [
     ("engine_singleton", 'func build(s): var e = Engine.get_singleton("OS")'),
     ("class_db", 'func build(s): ClassDB.instantiate("OS")'),
     ("expression", "func build(s): var e = Expression.new()"),
-    ("resource_loader", 'func build(s): ResourceLoader.load("x")'),
+    ("resource_saver", 'func build(s): ResourceSaver.save(r, "res://x.tres")'),
     ("gdscript_class", "func build(s): var g = GDScript.new()"),
     ("set_script", "func build(s): node.set_script(x)"),
-    ("load", 'func build(s): var r = load("res://x.gd")'),
-    ("preload", 'func build(s): var r = preload("res://x.gd")'),
     ("time", "func build(s): var t = Time.get_ticks_msec()"),
     ("randomize", "func build(s): randomize()"),
-    ("global_rng", "func build(s): var x = randf()"),
-    ("global_seed", "func build(s): seed(5)"),
     ("scene_tree", "func build(s): get_tree().quit()"),
 ]
 
@@ -136,29 +140,83 @@ def test_scanner_catches_each_banned_api(rule, src):
     findings = scan_gd_source("extends Node2D\n" + src)
     rules = {f["rule"] for f in findings}
     assert rule in rules, (rule, rules, src)
-    # every finding carries a 1-based line and a token
+    # every HARD finding carries a 1-based line, a token, and hard severity...
     for f in findings:
         assert f["line"] >= 1 and f["token"]
+        assert is_hard(f), f
+    # ...and lands in the violations payload the G0 gate hard-fails on.
+    assert scan_violations("extends Node2D\n" + src), src
 
 
-def test_scanner_catches_global_randi_and_randf_range():
-    for bad in ("var x = randi()", "var y = randi_range(0, 3)",
-                "var z = randf_range(0.0, 1.0)"):
-        assert any(f["rule"] == "global_rng"
-                   for f in scan_gd_source("extends Node2D\nfunc build(s): " + bad)), bad
+# ---------------------------------------------------------------------- #
+# 1a. Global RNG READ family — ALLOWED since guardrails v2 round 2.
+#     The serve host pins the global RNG (seed(world_seed) before every
+#     build(), in both the single-instance and batched/vec paths), so the
+#     global randi/randf/randi_range/randf_range/randfn and bare seed() are
+#     DETERMINISTIC -> they scan CLEAN (no finding at all, not even advisory).
+#     randomize() is the exception (it reseeds from the wall clock and defeats
+#     the host pin) -> it stays a HARD violation (parameterized in _BANNED).
+# ---------------------------------------------------------------------- #
+_RNG_ALLOWED = [
+    "var x = randi()",
+    "var y = randf()",
+    "var z = randi_range(0, 3)",
+    "var w = randf_range(0.0, 1.0)",
+    "var v = randfn(0.0, 1.0)",
+    "seed(5)",
+]
+
+
+@pytest.mark.parametrize("src", _RNG_ALLOWED)
+def test_global_rng_read_family_scans_clean(src):
+    # Host pins the global RNG -> the read family is deterministic and allowed:
+    # no finding, no violation, no advisory.
+    full = "extends Node2D\nfunc build(s): " + src
+    assert scan_gd_source(full) == [], (src, scan_gd_source(full))
+    assert scan_violations(full) == []
+    assert scan_advisories(full) == []
 
 
 def test_scanner_allows_self_rng_methods():
-    # A method call on the seeded self.rng is the SANCTIONED path -> not a finding.
+    # A method call on a self-seeded RandomNumberGenerator is also fine -> not a finding.
     for good in ("var x = self.rng.randf()", "var y = rng.randi_range(0, 3)",
                  "var z = rng.randf_range(-5.0, 5.0)"):
         assert scan_gd_source("extends Node2D\nfunc build(s): " + good) == [], good
 
 
-def test_scanner_flags_rng_randomize_even_on_receiver():
-    # randomize() reseeds from the wall clock -> banned even as rng.randomize().
-    assert any(f["rule"] == "randomize"
-               for f in scan_gd_source("extends Node2D\nfunc build(s): rng.randomize()"))
+def test_randomize_is_hard_even_on_receiver():
+    # randomize() reseeds from the wall clock, defeating the host's seed(world_seed)
+    # pin -> a HARD violation, flagged on any receiver (global or rng.randomize()).
+    for src in ("func build(s): randomize()", "func build(s): rng.randomize()"):
+        full = "extends Node2D\n" + src
+        hits = [f for f in scan_gd_source(full) if f["rule"] == "randomize"]
+        assert hits and all(is_hard(f) for f in hits), full
+        assert scan_violations(full), full
+
+
+# ---------------------------------------------------------------------- #
+# 1b. ALLOWED since guardrails v2 — load/preload/ResourceLoader scan CLEAN
+#     (res://-confined reads; the sandbox + still-hard FileAccess/network/
+#     GDScript rules contain everything else).
+# ---------------------------------------------------------------------- #
+def test_load_preload_and_resource_loader_scan_clean():
+    for allowed in ('var r = load("res://x.gd")',
+                    'var r = preload("res://chord_util.gd")',
+                    'var r = ResourceLoader.load("res://x.tres")',
+                    "var r = load(path)"):                 # computed arg: still res://-confined
+        src = "extends Node2D\nfunc build(s): " + allowed
+        assert scan_gd_source(src) == [], (allowed, scan_gd_source(src))
+        assert scan_violations(src) == [] and scan_advisories(src) == []
+
+
+def test_resource_saver_stays_hard_when_loader_is_free():
+    # The ONE narrow guard kept from the old Resource(Loader|Saver) rule: the host
+    # runs from a SOURCE project, so res:// is writable — ResourceSaver is the
+    # write vector and stays a hard violation.
+    src = 'extends Node2D\nfunc build(s): ResourceSaver.save(r, "res://serve_game.gd")'
+    assert any(f["rule"] == "resource_saver" and is_hard(f)
+               for f in scan_gd_source(src))
+    assert scan_violations(src)
 
 
 def test_scanner_ignores_banned_token_in_comment_or_string():
@@ -259,6 +317,18 @@ def test_run_g0_gd_scan_violation_short_circuits():
     assert "loads" not in g0["checks"]  # never reached the parse gate
 
 
+def test_run_g0_gd_advisory_findings_do_not_fail():
+    # The ADVISORY pass-through machinery is retained for future use even though NO
+    # rule is advisory as of guardrails v2 round 2. A synthetic advisory rides along
+    # in the sandbox_scan check for observability but NEVER fails the gate.
+    adv = ["line 4: advisory example_rule (...) — 'foo('"]
+    g0 = run_g0_gd(_wellformed_gd_facts(), [], adv)
+    assert g0["passed"] is True, g0
+    assert g0["checks"]["sandbox_scan"]["pass"] is True
+    assert g0["checks"]["sandbox_scan"]["advisories"] == adv
+    assert g0["checks"]["sandbox_scan"]["violations"] == []
+
+
 def test_run_g0_gd_parse_gate_failure():
     facts = _wellformed_gd_facts()
     facts["load"] = {"ok": False, "error": "parse/compile failed (Error 43)"}
@@ -285,12 +355,75 @@ def test_run_g0_gd_catches_two_controlled():
     assert g0["checks"]["controlled"]["pass"] is False
 
 
-def test_run_g0_gd_catches_too_few_actions():
+def test_run_g0_gd_accepts_one_action():
+    # MIN_ACTIONS=1 (2026-07-17): a single-action ("one button") game is well-formed.
     facts = _wellformed_gd_facts()
-    facts["actions"] = {"is_list": True, "length": 1, "all_str": True, "values": ["go"]}
+    facts["actions"] = {"is_list": True, "length": 1, "all_str": True, "values": ["flap"]}
+    g0 = run_g0_gd(facts, [])
+    assert g0["passed"] is True, g0
+    assert g0["checks"]["actions"]["pass"] is True
+
+
+def test_run_g0_gd_catches_zero_actions():
+    facts = _wellformed_gd_facts()
+    facts["actions"] = {"is_list": True, "length": 0, "all_str": True, "values": []}
     g0 = run_g0_gd(facts, [])
     assert g0["passed"] is False
     assert g0["checks"]["actions"]["pass"] is False
+
+
+def test_run_g0_gd_catches_too_many_actions():
+    facts = _wellformed_gd_facts()
+    facts["actions"] = {"is_list": True, "length": 9, "all_str": True,
+                        "values": [f"a{i}" for i in range(9)]}
+    g0 = run_g0_gd(facts, [])
+    assert g0["passed"] is False
+    assert g0["checks"]["actions"]["pass"] is False
+
+
+# ====================================================================== #
+# 4b. Dimension-aware in-bounds (3D games centered on the origin)
+# ====================================================================== #
+# serve_game.gd's _center_in_bounds no longer boxes a 3D body into the 2D
+# [0,w]x[0,h] arena: 3D worlds are built CENTERED ON THE ORIGIN (negative coords),
+# so it now uses a symmetric bound around the origin for >=3-component positions and
+# keeps the 2D rectangle for 2D. That host logic is verified IN-IMAGE (deferred);
+# these tests guard the PYTHON gate side: it trusts the host's in_bounds verdict and
+# imposes no second 2D bound of its own, so the load-bearing boolean fully controls
+# whether an origin-centered 3D game certifies.
+def _gd_facts_3d_origin(in_bounds: bool) -> dict:
+    f = _wellformed_gd_facts()
+    f["entities"] = ["ship", "ring_a", "ring_b"]
+    f["queries"] = {
+        "ship":   {"static": False, "sensor": False, "controlled": True,  "in_bounds": in_bounds},
+        "ring_a": {"static": True,  "sensor": False, "controlled": False, "in_bounds": in_bounds},
+        "ring_b": {"static": True,  "sensor": False, "controlled": False, "in_bounds": in_bounds},
+    }
+    # 3D positions with negative components (an origin-centered layout).
+    f["geometry"] = [
+        {"name": "ship",   "pos": [-40.0, 10.0, -120.0], "controlled": True, "static": False},
+        {"name": "ring_a", "pos": [-200.0, 0.0, 150.0], "static": True},
+        {"name": "ring_b", "pos": [220.0, -30.0, -80.0], "static": True},
+    ]
+    return f
+
+
+def test_run_g0_gd_certifies_3d_origin_game():
+    # Post-fix: the host reports in_bounds=True for origin-centered 3D bodies and G0
+    # certifies -- the Python gate imposes no 2D arena bound of its own.
+    g0 = run_g0_gd(_gd_facts_3d_origin(True), [])
+    assert g0["passed"] is True, g0
+    assert g0["checks"]["in_bounds"]["pass"] is True
+
+
+def test_run_g0_gd_in_bounds_boolean_is_load_bearing():
+    # Under the OLD 2D box the host reported in_bounds=False for those negative-coord
+    # bodies and the DYNAMIC controlled body failed the gate -- which is exactly why
+    # the fix lives host-side (serve_game.gd _center_in_bounds).
+    g0 = run_g0_gd(_gd_facts_3d_origin(False), [])
+    assert g0["passed"] is False
+    assert g0["checks"]["in_bounds"]["pass"] is False
+    assert g0["checks"]["in_bounds"]["offenders"] == ["ship"]
 
 
 # ====================================================================== #

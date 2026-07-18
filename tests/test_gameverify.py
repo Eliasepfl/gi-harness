@@ -24,6 +24,7 @@ from harness.verify import gameverify as gv  # noqa: E402
 from harness.verify.gameverify import (  # noqa: E402
     GUIDED_SEED_BASE, K_STEPS, load_game, run_episode, verify_game,
 )
+from harness.verify.executors import PyExecutor  # noqa: E402
 
 DT = 1.0 / 60.0
 
@@ -67,15 +68,22 @@ class FakeWorld:
     the verifier. Pure integrator (velocity persists, no damping) so a fresh
     world + a fixed action sequence is perfectly reproducible.
 
-    nondeterministic=True injects unseeded global-random jitter per step to
-    simulate a game/engine that leaks unseeded randomness (breaks determinism).
+    nondeterministic=True injects unseeded global-random jitter per STEP to
+    simulate a game/engine that leaks unseeded randomness (breaks determinism on
+    BOTH the noop and the action path).
+
+    act_nondeterministic=True injects unseeded global-random jitter only inside
+    ``impulse`` (which the game calls from ``act``), so the NOOP path stays
+    deterministic while the ACTION path drifts — the own-RNG-in-act residual that
+    the host global-RNG pin does not cover and that the noop-only twin misses.
     """
 
     def __init__(self, seed=0, size=(800, 600), gravity=(0.0, 0.0), *,
-                 nondeterministic=False):
+                 nondeterministic=False, act_nondeterministic=False):
         self.size = size
         self.gravity = list(gravity)
         self.nondeterministic = nondeterministic
+        self.act_nondeterministic = act_nondeterministic
         self._rng = random.Random(seed)
         self._bodies = {}
         self._flags = {}
@@ -128,8 +136,14 @@ class FakeWorld:
     # ---- dynamics ----
     def impulse(self, name, vec):
         b = self._bodies[name]
-        b.vel[0] += float(vec[0]) / b.mass
-        b.vel[1] += float(vec[1]) / b.mass
+        jx = jy = 0.0
+        if self.act_nondeterministic:
+            # UNSEEDED global RNG on the ACT path only (impulse is called from act,
+            # never from a noop tick) -> two identical seeded action rollouts diverge.
+            jx = random.uniform(-0.5, 0.5)
+            jy = random.uniform(-0.5, 0.5)
+        b.vel[0] += (float(vec[0]) + jx) / b.mass
+        b.vel[1] += (float(vec[1]) + jy) / b.mass
 
     def force(self, name, vec):
         b = self._bodies[name]
@@ -708,7 +722,7 @@ def test_sandbox_rejection_fails_g0(tmp_path):
 
 
 def test_determinism_catches_unseeded_randomness(tmp_path):
-    # The game is fine; the (fake) engine leaks unseeded randomness.
+    # The game is fine; the (fake) engine leaks unseeded randomness on every step.
     path = _write(tmp_path, "valid.py", GAME_VALID)
     rep = verify_game(path, sandboxed=False,
                       world_factory=factory(nondeterministic=True))
@@ -716,6 +730,34 @@ def test_determinism_catches_unseeded_randomness(tmp_path):
     assert rep["failure_class"] == "ENV_ERROR"
     assert rep["layers"]["G1_rollout"]["checks"]["determinism"]["pass"] is False
     assert "deterministic" in rep["hint"]
+
+
+def test_determinism_catches_act_path_randomness(tmp_path):
+    # SAFETY: nondeterminism that manifests ONLY under actions (an unseeded own-RNG in
+    # act()) is invisible to the noop-only twin. The NEW action-path twin catches it:
+    # the noop determinism check still PASSES while determinism_action FAILS, so what
+    # would have been a silent bad certificate (a witness that does not replay) is now
+    # a hard G1 fail.
+    path = _write(tmp_path, "valid.py", GAME_VALID)
+    rep = verify_game(path, sandboxed=False,
+                      world_factory=factory(act_nondeterministic=True))
+    g1 = rep["layers"]["G1_rollout"]["checks"]
+    assert g1["determinism"]["pass"] is True          # noop path is deterministic
+    assert g1["determinism_action"]["pass"] is False  # act path caught
+    assert rep["failure_class"] == "ENV_ERROR"
+    assert "under actions" in rep["hint"]
+
+
+def test_action_determinism_does_not_false_reject_a_clean_game(tmp_path):
+    # A legitimately deterministic game (no act-path leak) must PASS the new twin:
+    # two identical seeded action rollouts are byte-identical.
+    path = _write(tmp_path, "valid.py", GAME_VALID)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    g1 = rep["layers"]["G1_rollout"]["checks"]
+    assert g1["determinism"]["pass"] is True
+    assert g1["determinism_action"]["pass"] is True
+    assert g1["determinism_action"]["ticks"] == gv.ACTION_DRIFT_TICKS
+    assert rep["passed"] is True
 
 
 def test_missing_game_file():
@@ -1085,6 +1127,254 @@ def test_run_reachability_passes_open_and_footprint_free_scenes():
     open_box = _walled_geometry_facts()
     open_box["geometry"] = [b for b in open_box["geometry"] if b["name"] != "wall_right"]
     assert _run_reachability(open_box)["passed"] is True
+
+
+# ====================================================================== #
+# One-action games (MIN_ACTIONS=1) x the single-action anti-triviality gate
+# ====================================================================== #
+# MIN_ACTIONS was lowered 2 -> 1 so a legit one-button game (flappy-style timed
+# taps) is well-formed. The anti-degeneracy job is done ORTHOGONALLY by the POLICY
+# gates, which are independent of the action COUNT:
+#   * G1 "agency": the NOOP rollout must not win -> a win-by-IDLE game hard-fails.
+#   * single_action gate: holding any one action must not win -> a win-by-HOLD game
+#     hard-fails to GOAL_ERROR.
+# These tests show a 1-action game passes G0, and that the two policy gates still
+# bite for a 1-action game (trivial) while leaving a game where holding the one
+# action does NOT win (skill/timing required) certified.
+
+# Holding the single action "right" drives the block to the goal -> a TRIVIAL
+# 1-action game (win by holding one input); the single-action gate must reject it.
+GAME_ONE_ACTION_TRIVIAL = '''
+TITLE = "Slide Right"
+PROMPT = "hold right to reach the marker"
+ACTIONS = ["right"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(1000, 10), size=(4000, 20), static=True)
+    world.add("player", shape="box", pos=(100, 60), size=(20, 20))
+    world.control("player")
+
+def act(world, action):
+    if action == "right":
+        world.impulse("player", (60, 0))
+
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    return {"halfway": world.query("player")["pos"][0] > 200}
+'''
+
+# "dash" advances the runner but banks HEAT; heat bleeds off only between dashes.
+# Dashing every tick (the constant-hold policy the single-action probe runs)
+# OVERHEATS and LOSES (is_failure) before reaching the goal, so holding the one
+# action does NOT win -> the single-action gate must leave a cert intact. (The
+# winning policy needs rests, which the G3 solver's noop-free alphabet cannot
+# emit, so this fixture is used ONLY for the gate/probe unit checks, not end-to-end.)
+GAME_ONE_ACTION_SKILL = '''
+TITLE = "Sprint"
+PROMPT = "advance in bursts; sprinting non-stop overheats"
+ACTIONS = ["dash"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(1000, 10), size=(4000, 20), static=True)
+    world.add("runner", shape="box", pos=(100, 60), size=(20, 20))
+    world.control("runner")
+
+def act(world, action):
+    if action == "dash":
+        world.impulse("runner", (40, 0))
+        world.set_flag("heat", world.flag("heat", 0.0) + 2.0)
+
+def on_step(world):
+    h = world.flag("heat", 0.0)
+    if h > 0.0:
+        world.set_flag("heat", max(0.0, h - 0.05))
+
+def failure(world):
+    return world.flag("heat", 0.0) >= 5.0
+
+def success(world):
+    return world.query("runner")["pos"][0] > 300
+
+def checkpoints(world):
+    return {"midway": world.query("runner")["pos"][0] > 200}
+'''
+
+# The player starts with a rightward velocity and coasts to the goal on its own:
+# the NOOP rollout wins, so this 1-action game must fail G1 "agency".
+GAME_ONE_ACTION_IDLE_WIN = '''
+TITLE = "Drift"
+PROMPT = "it wins itself"
+ACTIONS = ["nudge"]
+
+def build(world):
+    world.add("ground", shape="box", pos=(1000, 10), size=(4000, 20), static=True)
+    world.add("player", shape="box", pos=(100, 60), size=(20, 20), velocity=(80, 0))
+    world.control("player")
+
+def act(world, action):
+    if action == "nudge":
+        world.impulse("player", (5, 0))
+
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    return {"halfway": world.query("player")["pos"][0] > 200}
+'''
+
+
+def test_one_action_game_passes_g0(tmp_path):
+    # MIN_ACTIONS=1: a single-action ACTIONS list is well-formed at G0.
+    path = _write(tmp_path, "one.py", GAME_ONE_ACTION_TRIVIAL)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    g0 = rep["layers"]["G0_static"]
+    assert g0["checks"]["actions"]["pass"] is True, g0
+    assert g0["checks"]["actions"]["n"] == 1
+
+
+def test_one_action_hold_to_win_flagged_by_single_action_gate():
+    # A game won by HOLDING the single action is degenerate: the probe finds the win
+    # and the gate flips a certified report to GOAL_ERROR.
+    ex = PyExecutor(world_factory=factory())
+    wins = gv.single_action_probe(ex, GAME_ONE_ACTION_TRIVIAL, ["right"])
+    assert wins and wins[0][0] == "right"
+    report = {"passed": True, "failure_class": None, "hint": "ok",
+              "layers": {"G3_solve": {"passed": True, "checks": {}}}}
+    out = gv._single_action_gate(ex, GAME_ONE_ACTION_TRIVIAL, ["right"], report)
+    assert out["passed"] is False
+    assert out["failure_class"] == "GOAL_ERROR"
+    assert out["layers"]["G3_solve"]["checks"]["single_action"]["pass"] is False
+
+
+def test_one_action_skill_hold_loses_leaves_cert_intact():
+    # Holding the one action OVERHEATS (loses), so no single action wins: the probe is
+    # empty and the gate must leave a certified report untouched. This is the property
+    # that keeps a SKILLFUL 1-action game (timing required) certifiable.
+    ex = PyExecutor(world_factory=factory())
+    wins = gv.single_action_probe(ex, GAME_ONE_ACTION_SKILL, ["dash"])
+    assert wins == []
+    report = {"passed": True, "failure_class": None, "hint": "ok",
+              "layers": {"G3_solve": {"passed": True, "checks": {}}}}
+    out = gv._single_action_gate(ex, GAME_ONE_ACTION_SKILL, ["dash"], report)
+    assert out["passed"] is True
+    assert out["failure_class"] is None
+    assert out["layers"]["G3_solve"]["checks"]["single_action"]["pass"] is True
+
+
+def test_one_action_win_by_idle_fails_agency(tmp_path):
+    # A 1-action game whose NOOP rollout already wins hard-fails G1 agency (win-by-idle
+    # is caught by the policy gate, independent of the action count).
+    path = _write(tmp_path, "idle.py", GAME_ONE_ACTION_IDLE_WIN)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    assert rep["layers"]["G1_rollout"]["checks"]["agency"]["pass"] is False
+    assert rep["failure_class"] == "ENV_ERROR"
+    assert "noop" in rep["hint"]
+
+
+# ====================================================================== #
+# Checkpoint count bounds (CP_MIN=0, CP_MAX=32)
+# ====================================================================== #
+# CP_MIN dropped 1 -> 0: a game with only is_success and NO intermediate milestones
+# (checkpoints() -> {}) is valid. CP_MAX raised 6 -> 32: the old hard cap was
+# artificial. The empty/large cases are exercised end-to-end and at the G2 gate.
+
+# 0 milestones: checkpoints() returns {} -> must still certify (terminal-only game).
+GAME_NO_MILESTONES = '''
+TITLE = "Just Win"
+PROMPT = "reach the marker; no intermediate milestones"
+ACTIONS = ["right", "left"]
+''' + _BODY + '''
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    return {}
+'''
+
+# 8 milestones (was rejected at the old CP_MAX=6): monotone x-thresholds all below
+# the goal, so the winning trajectory latches all eight in declared order.
+GAME_MANY_CHECKPOINTS = '''
+TITLE = "Eight Marks"
+PROMPT = "pass eight marks then the goal"
+ACTIONS = ["right", "left"]
+''' + _BODY + '''
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    x = world.query("player")["pos"][0]
+    return {"m%d" % i: x > (110 + 20 * i) for i in range(8)}
+'''
+
+# 33 milestones: over the new CP_MAX=32 -> the cap must still bite.
+GAME_OVER_CAP_CHECKPOINTS = '''
+TITLE = "Too Many"
+PROMPT = "declares 33 milestones"
+ACTIONS = ["right", "left"]
+''' + _BODY + '''
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    x = world.query("player")["pos"][0]
+    return {"m%d" % i: x > (105 + i) for i in range(33)}
+'''
+
+
+def test_zero_checkpoint_game_certifies(tmp_path, legacy_thresholds):
+    # A game with an EMPTY checkpoints map certifies: G2 accepts n=0, and G3's
+    # dead-milestone check is vacuously satisfied.
+    path = _write(tmp_path, "nocp.py", GAME_NO_MILESTONES)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    assert rep["passed"] is True, rep
+    assert rep["failure_class"] is None
+    cw = rep["layers"]["G2_goal"]["checks"]["checkpoints_wellformed"]
+    assert cw["pass"] is True and cw["n"] == 0
+    assert rep["witness"]["checkpoints"] == {}
+
+
+def test_g2_accepts_empty_checkpoints():
+    layer = gv.run_g2(factory(), load_game(GAME_NO_MILESTONES))
+    assert layer["passed"] is True, layer
+    assert layer["checks"]["checkpoints_wellformed"]["n"] == 0
+
+
+def test_g2_accepts_eight_checkpoints():
+    # Previously (CP_MAX=6) an 8-milestone game failed wellformed; now it passes.
+    layer = gv.run_g2(factory(), load_game(GAME_MANY_CHECKPOINTS))
+    assert layer["passed"] is True, layer
+    cw = layer["checks"]["checkpoints_wellformed"]
+    assert cw["pass"] is True and cw["n"] == 8
+
+
+def test_g2_still_rejects_over_cap_checkpoints():
+    # The relaxed cap is 32; 33 milestones must still be rejected as malformed.
+    layer = gv.run_g2(factory(), load_game(GAME_OVER_CAP_CHECKPOINTS))
+    assert layer["passed"] is False
+    cw = layer["checks"]["checkpoints_wellformed"]
+    assert cw["pass"] is False and cw["n"] == 33
+
+
+def test_g2js_checkpoints_bounds_gd_lane():
+    # The Godot/JS lane shares run_g2_js/_g2js_checkpoints: same 0..32 bounds from
+    # the serve host's check facts (the production path for the gdscript engine).
+    from harness.verify.gameverify import run_g2_js
+
+    def g2(n):
+        return {
+            "success": {"is_bool": True, "value": False, "deterministic": True,
+                        "state_unchanged": True},
+            "failure": None,
+            "checkpoints": {"is_dict": True, "keys": ["m%d" % i for i in range(n)],
+                            "n": n, "non_bool_keys": [], "true_keys": [],
+                            "deterministic": True, "state_unchanged": True},
+        }
+
+    assert run_g2_js(g2(0))["checks"]["checkpoints_wellformed"]["pass"] is True
+    assert run_g2_js(g2(8))["checks"]["checkpoints_wellformed"]["pass"] is True
+    assert run_g2_js(g2(33))["checks"]["checkpoints_wellformed"]["pass"] is False
 
 
 if __name__ == "__main__":

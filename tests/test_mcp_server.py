@@ -10,9 +10,11 @@ ENGINE PER TEST (stated so there is zero ambiguity about what certifies what):
     (engine "gdscript"). ``test_verify_green_gdscript_route`` is the deliverable GREEN proof;
     it needs a Godot binary (HARNESS_GODOT_EXE) so it SKIPS offline and runs in-image / PoC-3.
   * ``test_verify_hints_on_banned_api`` also exercises the real gdscript lane offline: the
-    harness's own G0 sandbox/determinism scanner (rejects OS.*, FileAccess, load/preload,
-    unseeded randomize/randi, ...) short-circuits BEFORE any Godot spawn, so it needs no
-    binary yet still returns the real typed hint.
+    harness's own G0 sandbox scanner (rejects OS.*, FileAccess, ResourceSaver, network, ...;
+    guardrails v2 made load/preload ALLOWED, and round 2 made the global randi/randf/seed
+    family ALLOWED — the host pins the global RNG — while randomize() stays HARD)
+    short-circuits BEFORE any Godot spawn, so it needs no binary yet still returns the real
+    typed hint.
   * ``test_verify_green_plumbing_legacy_lane_only`` runs the FROZEN LEGACY python lane
     (pymunk) purely to prove the tool's write->funnel->witness->hints WIRING; it is NOT a
     certification path and the payload is asserted to carry ``legacy_lane: true``. pymunk is
@@ -98,10 +100,13 @@ func actions() -> Array:
 \treturn ["a"]
 """
 
-# GDScript that reseeds from the wall clock -> tripped by the pure-python banned-API scan
-# at G0 BEFORE any Godot spawn (deterministic, offline typed hint).
-BANNED_GD = COMPLIANT_GD.replace("func build(world_seed: int) -> void:\n\tpass",
-                                 "func build(world_seed: int) -> void:\n\trandomize()")
+# GDScript that shells out via OS.* -> tripped by the pure-python banned-API scan
+# at G0 BEFORE any Godot spawn (deterministic, offline typed hint). Guardrails v2 round 2:
+# the global randi()/randf()/seed() family is ALLOWED now (the host pins the global RNG),
+# so the fixture uses OS.* — an unambiguously HARD rule that short-circuits offline.
+BANNED_GD = COMPLIANT_GD.replace(
+    "func build(world_seed: int) -> void:\n\tpass",
+    "func build(world_seed: int) -> void:\n\tOS.execute(\"ls\", [])")
 
 # A known-good python (pymunk) game: certifies G0-G3 through the real funnel.
 GAME_VALID = """
@@ -195,9 +200,9 @@ def test_extract_bad_path():
 # verify_game
 # --------------------------------------------------------------------------- #
 def test_verify_hints_on_banned_api():
-    """The real gdscript lane's typed HINTS, offline: the harness's own G0 sandbox/
-    determinism scanner (OS.*, FileAccess, load/preload, unseeded randomize/randi, ...)
-    short-circuits G0 BEFORE any Godot spawn and returns a typed, actionable hint."""
+    """The real gdscript lane's typed HINTS, offline: the harness's own G0 sandbox
+    scanner (OS.*, FileAccess, ResourceSaver, network, ...) short-circuits G0 BEFORE
+    any Godot spawn and returns a typed, actionable hint."""
     out = S._do_verify(BANNED_GD, None)
     assert out["verdict"] == "ENV_ERROR"
     assert out["failure_class"] == "ENV_ERROR"

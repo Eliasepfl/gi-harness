@@ -9,8 +9,8 @@ VLM). A four-layer funnel, stopping at the first failing layer:
     G1_rollout  600-step noop rollout: no NaN, no escape, no success under noop
                 (agency), determinism, per-action efficacy (dead-action check)
     G2_goal     success() is a pure bool that is False at t=0 (same for failure);
-                checkpoints() is a pure dict[str, bool] of 1..6 snake_case
-                milestones, all False at t=0 (v2.1)
+                checkpoints() is a pure dict[str, bool] of 0..CP_MAX snake_case
+                milestones, all False at t=0 (v2.1; empty dict allowed)
     G3_solve    seeded random search -> a replayable witness, or UNSOLVED; v2.1
                 checkpoint semantics: the runner latches milestone first-True
                 ticks, dead milestones on the witness -> GOAL_ERROR, latch-order
@@ -47,7 +47,23 @@ GAMEVERIFY_TIMEOUT_S = 480  # sandbox subprocess budget for a full G0-G3 run [en
                             # UNSOLVED search now legitimately runs ~3x longer)
 
 # G0
-MIN_ACTIONS, MAX_ACTIONS = 2, 8         # declared action-set size
+MIN_ACTIONS, MAX_ACTIONS = 1, 8         # declared action-set size
+# MIN_ACTIONS is the declared ACTION-SET SIZE only — a WELL-FORMEDNESS bar, not a
+# non-triviality bar. A one-button game (flappy: timed taps, a single "flap") is a
+# legitimate design, so the floor is 1 (raised from 2 on 2026-07-17, Elias). The
+# anti-degeneracy job is done ORTHOGONALLY, by the POLICY gates, which are
+# independent of the action COUNT and still bite for a 1-action game:
+#   * G1 "agency" (run_g1): the NOOP rollout must NOT reach success -> a game won by
+#     IDLING (the constant-None policy) hard-fails, whatever its action count.
+#   * single_action_probe / _single_action_gate: holding ANY one declared action for
+#     the whole horizon must NOT win -> a game won by HOLDING one input (the
+#     constant-action policy) hard-fails to GOAL_ERROR, whatever its action count.
+# For a 1-action game these two together reject exactly the trivial policies (win by
+# idle / win by holding the one button) while a SKILLFUL 1-action game — success needs
+# TIMING, so neither the all-noop nor the all-hold constant policy wins — passes both
+# and is solved by the G3 search over timed action/noop sequences. So MIN_ACTIONS=1 is
+# safe: it does NOT make the single-action gate reject all 1-action games; the gate
+# rejects a 1-action game iff the single held action alone wins (a true degeneracy).
 MIN_ENTITIES = 2
 PEN_INIT_TOL = 1.5          # px: max tolerated initial dynamic-pair penetration [eng.]
 
@@ -63,10 +79,23 @@ CONTEXT_BURST_TICKS = 8     # ticks of each OTHER action used to build a dynamic
                             # solver (cost stays at the old t=0 pass unless something
                             # is dead at rest) [eng.]
 DETERMINISM_EPS = 1e-6      # px/rad: two identical seeded runs must match within this [eng.]
+ACTION_DRIFT_TICKS = 24     # ticks of a fixed action sequence twinned for the ACT-path
+                            # determinism check — long enough for own-RNG drift to
+                            # accumulate past DETERMINISM_EPS, cheap vs G3 [eng.]
 NAN_EVENT_TYPES = {"nan_detected", "nan", "explosion"}
 
 # G2 (v2.1 checkpoints)
-CP_MIN, CP_MAX = 1, 6       # declared milestone count (CONTRACTS §2)
+CP_MIN, CP_MAX = 0, 32      # declared milestone count (CONTRACTS §2)
+# CP_MIN=0 (raised down from 1, 2026-07-17, Elias): a game with ONLY is_success and no
+# intermediate milestones is valid -- checkpoints() may return {} (an empty dict). This
+# is safe downstream because every checkpoint consumer already guards the no-milestone
+# case: harness/rl/env.py's shaping is `SHAPING_MASS / n_cp` with an explicit
+# `n_cp <= 0 -> 0.0` (a 0-checkpoint game trains on the terminal payoff alone), the obs
+# encoder widths add `n_cp` (0 -> no checkpoint channels), the G3 dead-milestone check
+# is "every DECLARED checkpoint latches" (vacuously true for {}), and the exporter /
+# atlas read reach fractions as "0 when no milestones". CP_MAX was an ARTIFICIAL 6-cap
+# that made games artificial; raised to a generous 32 (not unbounded -- it bounds the
+# obs-vector width and keeps a pathological 10k-entry dict out).
 _SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # G3
@@ -340,7 +369,7 @@ def run_g0(factory, source: str):
     if missing or not_callable:
         return layer, game
 
-    # ACTIONS is a list[str] of size 2..8.
+    # ACTIONS is a list[str] of size MIN_ACTIONS..MAX_ACTIONS (1..8).
     actions = game.actions
     actions_ok = (isinstance(actions, list) and actions
                   and all(isinstance(a, str) for a in actions)
@@ -451,11 +480,31 @@ def run_g1(executor, game_source, actions):
     # Agency: success must never fire with zero actions.
     checks["agency"] = check(noop["result"] != "success", result=noop["result"])
 
-    # --- Determinism: two fresh seeded worlds, identical noop rollout ---
+    # --- Determinism (NOOP path): two fresh seeded worlds, identical noop rollout ---
     r1, r2 = executor.run_batch(game_source, [dict(noop_spec), dict(noop_spec)],
                                 NOOP_TICKS)
     delta = _snapshot_delta(r1["final_snapshot"], r2["final_snapshot"])
     checks["determinism"] = check(delta <= DETERMINISM_EPS, delta=_round_inf(delta))
+
+    # --- Determinism (ACTION path): the noop twin above only exercises the physics
+    # step, so nondeterminism that lives on the ACT path — an unseeded
+    # ``RandomNumberGenerator.new()`` (its OWN instance, which the host's global-RNG
+    # pin does NOT cover), a wall-clock read, or any act()-only leak — sails through
+    # and yields a SILENT bad certificate (a witness that does not replay). Twin a
+    # short FIXED action sequence too: run the same seeded plan twice and require the
+    # final snapshot byte-identical within DETERMINISM_EPS, hard-failing G1 on drift.
+    # It never false-rejects a legit game: a self-seeded RNG or global randi under the
+    # host pin stays byte-identical, so both runs match exactly. Skipped only when the
+    # game declares no actions (nothing to drive; G0 already requires >=1). ---
+    if actions:
+        seq = [actions[i % len(actions)] for i in range(ACTION_DRIFT_TICKS)]
+        act_spec = {"seed": WORLD_SEED, "actions": seq}
+        a1, a2 = executor.run_batch(game_source, [dict(act_spec), dict(act_spec)],
+                                    ACTION_DRIFT_TICKS)
+        adelta = _snapshot_delta(a1["final_snapshot"], a2["final_snapshot"])
+        checks["determinism_action"] = check(adelta <= DETERMINISM_EPS,
+                                             delta=_round_inf(adelta),
+                                             ticks=ACTION_DRIFT_TICKS)
 
     # --- Action efficacy: each declared action must move the world from SOME
     # context (not only t=0). Context-dependent actions — brake on a moving body,
@@ -591,8 +640,8 @@ def _check_predicate(factory, game, fn, label, checks, *, must_be_false_at_t0):
 
 
 def _check_checkpoints(factory, game, checks) -> bool:
-    """v2.1: checkpoints(world) -> dict[str, bool], 1..6 snake_case entries,
-    ALL False at t=0, pure (same 2-call + snapshot protocol as success)."""
+    """v2.1: checkpoints(world) -> dict[str, bool], CP_MIN..CP_MAX (0..32) snake_case
+    entries, ALL False at t=0, pure (same 2-call + snapshot protocol as success)."""
     world = _fresh(factory, game)
     snap_before = _safe_snapshot(world)
     try:
@@ -891,7 +940,8 @@ def _hint_g0(checks: dict) -> str:
         return (f"missing/invalid game symbols: "
                 f"{', '.join(s.get('missing', []) + s.get('not_callable', [])) or 'unknown'}")
     if not checks.get("actions", {}).get("pass", True):
-        return f"ACTIONS must be a list of 2..8 strings (got {checks['actions'].get('n')})"
+        return (f"ACTIONS must be a list of {MIN_ACTIONS}..{MAX_ACTIONS} strings "
+                f"(got {checks['actions'].get('n')})")
     if not checks.get("builds", {}).get("pass", True):
         return f"build(world) failed: {checks['builds'].get('error', 'unknown error')}"
     if not checks.get("controlled", {}).get("pass", True):
@@ -961,6 +1011,12 @@ def _hint_g1(checks: dict) -> str:
     if not checks.get("determinism", {}).get("pass", True):
         return (f"non-deterministic simulation: two identical seeded rollouts diverged "
                 f"(delta={checks['determinism'].get('delta')})")
+    if not checks.get("determinism_action", {}).get("pass", True):
+        return (f"non-deterministic simulation under actions: two identical seeded "
+                f"action rollouts diverged (delta="
+                f"{checks['determinism_action'].get('delta')}) — an unseeded own RNG "
+                f"(RandomNumberGenerator.new()) or wall-clock read on the act() path; "
+                f"seed it from the world seed (or use the pinned global randi)")
     if not checks.get("efficacy", {}).get("pass", True):
         eff = checks["efficacy"]
         n = eff.get("contexts", 1)
@@ -1155,27 +1211,32 @@ def run_g0_js(facts: dict) -> dict:
 # ======================================================================== #
 # The GDScript lane (engine=gdscript) is the NEW static species (GDSCRIPT_LANE.md):
 # generated CODE, not data. Its G0 fuses the three code gates —
-#   (b) the python-side banned-API scan  (harness/verify/gd_gate.scan_gd_source),
+#   (b) the python-side banned-API scan  (harness/verify/gd_gate.scan_gd_source;
+#       HARD findings fail, ADVISORY findings ride along as warnings),
 #   (a) the parse gate                    (facts["load"], serve_game.gd's compile),
 #   (c) the contract probe                (facts["contract"].methods, has_method) —
-# with the SAME structural checks the data lanes use (actions 2..8, one controlled
+# with the SAME structural checks the data lanes use (actions 1..8, one controlled
 # dynamic body, >=2 bodies, in bounds). The check keys mirror run_g0_js so
 # `_hint_g0` renders identical hints across engines.
 
-def run_g0_gd(facts: dict, violations) -> dict:
+def run_g0_gd(facts: dict, violations, advisories=None) -> dict:
     """G0 static layer for a GDScript (GameAPI) game.
 
-    ``violations`` is the python banned-API scan result (list of strings); ``facts``
-    is the serve host's ``check`` payload (parse gate + contract probe + t=0 facts).
-    Stops at the first failing gate, so the code never runs if the scan or parse
-    gate rejects it."""
+    ``violations`` is the python banned-API scan's HARD findings (list of strings);
+    ``advisories`` its non-fatal ADVISORY findings (severity split in
+    ``gd_gate._RULES`` — advisory findings NEVER fail the gate, they ride along in
+    the ``sandbox_scan`` check for observability and are surfaced as report
+    warnings by ``_verify_gdscript``). ``facts`` is the serve host's ``check``
+    payload (parse gate + contract probe + t=0 facts). Stops at the first failing
+    gate, so the code never runs if the scan or parse gate rejects it."""
     from harness.verify.gd_gate import GD_REQUIRED_METHODS
     layer = {"passed": False, "checks": {}}
     checks = layer["checks"]
 
-    # (b) banned-API scan (a hard fail; the code was NOT compiled/run).
+    # (b) banned-API scan (HARD findings fail; the code was NOT compiled/run).
     violations = list(violations or [])
-    checks["sandbox_scan"] = check(not violations, violations=violations)
+    checks["sandbox_scan"] = check(not violations, violations=violations,
+                                   advisories=list(advisories or []))
     if violations:
         return layer
 
@@ -1193,7 +1254,7 @@ def run_g0_gd(facts: dict, violations) -> dict:
     if missing:
         return layer
 
-    # actions() is a list[str] of size 2..8.
+    # actions() is a list[str] of size MIN_ACTIONS..MAX_ACTIONS (1..8).
     actions = facts.get("actions") or {}
     n = actions.get("length")
     actions_ok = (bool(actions.get("is_list")) and isinstance(n, int) and n
@@ -1563,14 +1624,21 @@ def _verify_gdscript(source: str, report: dict) -> dict:
     goal facts (is_success/is_failure/checkpoints share the JS check shape). The code
     is NEVER compiled or run until the static scan passes. Adds ``"engine": "gdscript"``."""
     from harness.verify.gd_exec import GdExecutor
-    from harness.verify.gd_gate import scan_violations
+    from harness.verify.gd_gate import scan_advisories, scan_violations
     report["engine"] = "gdscript"
 
-    # (b) banned-API scan FIRST — a hard fail short-circuits BEFORE any Godot spawn,
-    # so unscanned code is never compiled or executed.
+    # (b) banned-API scan FIRST — a HARD finding short-circuits BEFORE any Godot
+    # spawn, so unscanned code is never compiled or executed. ADVISORY findings never
+    # fail: they surface as report warnings. (As of guardrails v2 round 2 no rule is
+    # advisory — the global RNG family is deterministic now that the host pins it with
+    # seed(world_seed) — but the pass-through is kept for future use.)
     violations = scan_violations(source)
+    advisories = scan_advisories(source)
+    if advisories:
+        report.setdefault("warnings", []).extend(
+            "ADVISORY: " + a for a in advisories)
     if violations:
-        g0 = run_g0_gd({}, violations)
+        g0 = run_g0_gd({}, violations, advisories)
         report["layers"]["G0_static"] = g0
         report["failure_class"] = "ENV_ERROR"
         report["hint"] = _hint_g0(g0["checks"])
@@ -1581,7 +1649,7 @@ def _verify_gdscript(source: str, report: dict) -> dict:
         # G0 (parse gate + contract probe + structural) + G2 facts: ONE check op.
         facts = executor.run_check(source)
 
-        g0 = run_g0_gd(facts, [])
+        g0 = run_g0_gd(facts, [], advisories)
         report["layers"]["G0_static"] = g0
         if not g0["passed"]:
             report["failure_class"] = "ENV_ERROR"
@@ -1709,6 +1777,15 @@ def _finish_g3(report: dict, g3: dict) -> dict:
 # len(actions) episodes) and rejects a certified game if any single action wins. It
 # rides the SAME executor seam as G1/G3, so it is engine-agnostic; the gdscript funnel
 # wires it after G3 so the generation repair loop gets an actionable hint.
+#
+# NON-TRIVIALITY, NOT ACTION COUNT (MIN_ACTIONS=1 reconciliation). This gate is about
+# the POLICY, not the size of the action set: it flags a game iff SOME single held
+# action wins on its own. For a 1-action game (MIN_ACTIONS=1) the one action IS the
+# whole action set, so the gate asks exactly "is the game won by holding the one
+# button?" — YES for a trivial hold-to-win game (correctly rejected), NO for a skillful
+# one where success needs TIMING (holding overshoots / never satisfies the goal), so it
+# passes and G3 certifies it via a timed action/noop plan. Thus lowering MIN_ACTIONS to
+# 1 does NOT make this gate reject all 1-action games — only the degenerate ones.
 
 def single_action_probe(executor, game_source, actions, horizon=SINGLE_ACTION_HORIZON):
     """Probe whether the game is winnable by repeating ONE action. Holds each declared

@@ -133,7 +133,8 @@ _SUBS = {
         "{import_rule}": ("No imports, no dynamic loads, no engine/OS/network/thread "
                           "access: you write ordinary GDScript game logic that reaches "
                           "the world ONLY through the base-class services."),
-        "{rng_forbid}": "use the host's seeded rng, never the global randi/randf",
+        "{rng_forbid}": "draw randomness from world_seed (the host pins the global "
+                        "rng from it), never randomize()",
     },
 }
 

@@ -48,20 +48,34 @@ a predicate.
 
 ## Determinism + randomness (a hard rule)
 
-Physics is pinned (a fixed step, single thread, jitter-fix off). The ONLY randomness is
-an rng the game seeds FROM `world_seed`; the global `randi`/`randf`/`randomize` are
-unseeded and BANNED. G1 gates a two-run drift check per game — determinism is tested,
-not assumed.
+Physics is pinned (a fixed step, single thread, jitter-fix off). Randomness is
+deterministic: the serve host seeds the global RNG from `world_seed` before every
+`build()` (each reset, both the single-instance and batched/vec paths), so the global
+`randi`/`randf`/`randi_range`/`randf_range`/`randfn` and bare `seed()` draw a fixed
+stream keyed by the seed and replay identically. (A game may also seed its own
+`RandomNumberGenerator` from `world_seed`.) `randomize()` is BANNED — it reseeds the
+global RNG from the wall clock and defeats the host pin. G1 gates a two-run drift
+check per game — determinism is tested, not assumed.
 
-## Bans (hard G0 fail — static scanner, `harness/verify/gd_gate.py`)
+## Bans (G0 static scanner, `harness/verify/gd_gate.py`)
 
-`OS.*`, `FileAccess`, `DirAccess`, `HTTP*`, `TCPServer`, `StreamPeer*`, `PacketPeer*`,
-`Thread`, `Mutex`, `Engine.get_singleton`, `ClassDB`, `Expression`, `load()` /
-`preload()`, `Time.*` (wall clock), `randi/randf/randomize` (seed your own
-`RandomNumberGenerator` instead), `get_tree().quit`. The scanner is a HARD fail with
-line numbers. Generated code additionally runs ONLY in-container, in a process whose
-environment is SCRUBBED of every credential. `PhysicsServer3D.set_active(true)` in a 3D
-`build()` is the one allowed PhysicsServer call.
+HARD (a hit fails G0 with a line number): `OS.*`, `FileAccess`, `DirAccess`,
+`ResourceSaver`, `HTTP*`, `TCPServer`, `StreamPeer*`, `PacketPeer*`, `Thread`, `Mutex`,
+`Engine.get_singleton`, `ClassDB`, `Expression`, `GDScript`, `set_script`, `Time.*`
+(wall clock), `randomize()` (reseeds the global RNG from the wall clock, defeating the
+host's `seed(world_seed)` pin), `get_tree().quit`.
+
+ALLOWED (guardrails v2 round 2): the global `randi`/`randf`/`randi_range`/`randf_range`/
+`randfn` family and bare `seed()` — the serve host pins the global RNG with
+`seed(world_seed)` before every `build()`, so they are deterministic (only `randomize()`,
+which reseeds from the wall clock, stays banned). The ADVISORY severity remains in the
+scanner for future use, but no rule currently uses it.
+
+ALLOWED (guardrails v2): `load()`/`preload()`/`ResourceLoader` — reads confined to
+`res://` (the sandboxed project) + an empty `user://`; no network backend, no OS
+paths, deterministic. Generated code additionally runs ONLY in-container, in a process
+whose environment is SCRUBBED of every credential. `PhysicsServer3D.set_active(true)`
+in a 3D `build()` is the one allowed PhysicsServer call.
 
 ## How it is verified
 
