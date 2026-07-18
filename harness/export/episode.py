@@ -250,17 +250,66 @@ def build_steps(state_frames: list, cp_latch: dict, n_cp: int, actions: list,
 # --------------------------------------------------------------------------- #
 def _capture_frames(game_path: str, out_gif: str, actions: list, seed: int,
                     frames_dir: str, *, follow: bool, width: int, height: int,
-                    fps: int, max_frames: int, cam_dist=None) -> dict:
+                    fps: int, max_frames: int, cam_dist=None, views=None) -> dict:
     """Render the witness to PNGs (kept in ``frames_dir``) + a companion GIF, via the
     certified capture lane. ``max_frames`` MUST be ``>= len(actions) + 2`` so the capture
     host keeps stride==1 and each PNG's ordinal equals its decision tick (the alignment the
-    exporter relies on). Returns capture_gif's result dict."""
+    exporter relies on). ``views`` (optional) is capture_gif's multi-view spec list -- one
+    deterministic replay per camera, view 0 primary. Returns capture_gif's result dict."""
     from harness.verify.capture import capture_gif
 
     return capture_gif(
         game_path, out_gif, actions=actions, seed=seed, follow=follow,
         width=width, height=height, fps=fps, max_frames=max_frames,
-        frames_dir=frames_dir, cam_dist=cam_dist)
+        frames_dir=frames_dir, cam_dist=cam_dist, views=views)
+
+
+def _export_view_specs(views, ep_dir: Path, raw_primary: Path):
+    """Normalise the exporter's ``views`` request: assign default ids (``view<k>``), reject
+    duplicates/unsafe ids, and pin each view's RAW frames dir under the episode dir (view 0
+    -> the legacy ``_frames_raw``, extras -> ``_frames_raw_<id>``). Camera keys (follow /
+    cam_dist / elevation / azimuth / fov / view_target) pass through untouched --
+    ``capture_gif`` resolves their inheritance from the top-level knobs. ``None`` -> None
+    (the single-view legacy path, byte-identical package)."""
+    if views is None:
+        return None
+    if not views:
+        raise ValueError("views=[] is ambiguous -- pass None for the single-view default")
+    specs = []
+    for k, v in enumerate(views):
+        v = dict(v or {})
+        vid = str(v.get("id") or f"view{k}")
+        if "/" in vid or "\\" in vid or vid.startswith(".") or not vid:
+            raise ValueError(f"unsafe view id {vid!r} (it names a directory under frames/)")
+        if any(s["id"] == vid for s in specs):
+            raise ValueError(f"duplicate view id {vid!r}")
+        v["id"] = vid
+        v["frames_dir"] = str(raw_primary if k == 0 else ep_dir / f"_frames_raw_{vid}")
+        specs.append(v)
+    return specs
+
+
+def _keep_tick_frames(raw_dir: Path, dest_dir: Path, n_state: int, slug: str,
+                      label: str, capture_result) -> tuple:
+    """Move ONE view's raw ``frame_%05d.png`` sequence (host ordinal == decision tick at
+    stride 1) into ``dest_dir/t%05d.png`` for ticks 1..T, dropping the settle frame
+    (ordinal 0) and any trailing surplus past the state trail's terminal. A DEFICIT
+    (fewer PNGs than state frames -> some tick has no pixel) is a hard error. Deletes
+    ``raw_dir``. Returns ``(n_kept, surplus)``."""
+    pngs = sorted(Path(raw_dir).glob("frame_*.png"))
+    if len(pngs) < n_state:
+        shutil.rmtree(raw_dir, ignore_errors=True)
+        raise ValueError(
+            f"pixel/state tick-count DEFICIT for {slug} ({label}): {len(pngs)} PNG frames "
+            f"< {n_state} state frames (subsampling? capture result={capture_result})")
+    surplus = len(pngs) - n_state          # trailing frames past the reward trail's terminal
+    for png in pngs:
+        ordinal = int(png.stem.split("_")[-1])
+        if ordinal <= 0 or ordinal >= n_state:
+            continue                       # settle frame (0) + surplus tail (>= n_state)
+        shutil.move(str(png), str(Path(dest_dir) / f"t{ordinal:05d}.png"))
+    shutil.rmtree(raw_dir, ignore_errors=True)
+    return len(sorted(Path(dest_dir).glob("t*.png"))), surplus
 
 
 # --------------------------------------------------------------------------- #
@@ -291,7 +340,8 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
                    render_frames: bool = True, follow: bool | None = None,
                    width: int = 960, height: int = 540, fps: int = 20,
                    cam_dist: float | None = None, dimension_hint: str | None = None,
-                   extra_meta: dict | None = None) -> dict:
+                   extra_meta: dict | None = None, views: list | None = None,
+                   capture_fn=None) -> dict:
     """Write ONE episode package from an ALREADY-REPLAYED code-state ``trail`` (the shape
     :func:`_trail_from_rec` returns). Engine/witness-agnostic core shared by the winning-demo
     path (:func:`export_episode`) and the negative-mining paths
@@ -304,7 +354,21 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
     one-episode-per-seed layout); negatives pass a namespaced key (``random-<seed>``,
     ``perturbed-<seed>-<i>``) so many episodes of the same game/seed never collide. Raises
     ``ValueError`` on an empty/degenerate trail or a STATE/PIXEL tick-count mismatch (the
-    alignment contract must hold or the package is not written)."""
+    alignment contract must hold or the package is not written).
+
+    MULTI-VIEW (``views=[{...}, ...]``, opt-in): N camera angles of the SAME deterministic
+    replay (one render pass per view; the capture lane's fingerprint identity machinery is
+    what makes frame j of every view the same tick). View 0 is the PRIMARY and keeps
+    today's layout byte-for-byte (``frames/t%05d.png`` + ``<slug>.gif``); each extra view
+    lands in ``frames/<view_id>/t%05d.png`` (default ids ``view1``, ``view2``, ...) with
+    the SAME settle-drop/surplus-drop/deficit rules and an exact per-view ``n_png == T``
+    check. ``episode.json:capture.views`` records every view's resolved camera params +
+    relative path; ``n_frames`` stays the primary count. ``views=None`` (default) -> the
+    single-view package, byte-identical to before the upgrade.
+
+    ``capture_fn`` injects the frame producer (signature of :func:`_capture_frames`);
+    None -> the real capture lane. It exists so offline tests can exercise the package
+    layout without Godot -- never monkeypatch the module."""
     slug = Path(game_path).resolve().parent.name
     state_frames = trail["frames"]
     if not state_frames:
@@ -335,17 +399,19 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
     n_png = 0
     frame_surplus = 0
     capture_meta = {}
+    capture_views_meta: list = []
     n_actions = len(actions)
     follow_flag = bool(follow) if follow is not None else (dimension == "3D")
     if render_frames:
+        capfn = capture_fn or _capture_frames
         raw_frames_dir = ep_dir / "_frames_raw"
         out_gif = str(ep_dir / f"{slug}.gif")
+        view_specs = _export_view_specs(views, ep_dir, raw_frames_dir)
         # max_frames >= n_actions + 2 keeps the capture host at stride 1 (see _capture_frames).
-        capture_meta = _capture_frames(
+        capture_meta = capfn(
             game_path, out_gif, actions, seed, str(raw_frames_dir),
             follow=follow_flag, width=width, height=height, fps=fps,
-            max_frames=n_actions + 8, cam_dist=cam_dist)
-        pngs = sorted(raw_frames_dir.glob("frame_*.png"))
+            max_frames=n_actions + 8, cam_dist=cam_dist, views=view_specs)
         # The code-STATE trail (with the reward labels) is authoritative for T: it is tick 0..T,
         # so n_state = T + 1 and the pixel channel must supply a frame for every tick 1..T. The
         # capture host emits t=0 (settle) + one PNG per tick, ordinal == tick. For a clean WIN both
@@ -354,24 +420,39 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
         # terminal one tick apart. The replay is byte-faithful up to that divergence (the winning
         # witness matches exactly), so frames 1..T align with the reward trail regardless; we KEEP
         # 1..T and DROP the settle frame + any surplus tail. A DEFICIT (fewer PNGs than the reward
-        # trail -> a tick 1..T has no pixel, e.g. real subsampling) is a hard error.
+        # trail -> a tick 1..T has no pixel, e.g. real subsampling) is a hard error. Every EXTRA
+        # view is a replay of the SAME witness, so the identical rules apply per view.
         n_state = len(state_frames)            # tick 0..T
-        if len(pngs) < n_state:
-            shutil.rmtree(raw_frames_dir, ignore_errors=True)
-            raise ValueError(
-                f"pixel/state tick-count DEFICIT for {slug}: {len(pngs)} PNG frames < "
-                f"{n_state} state frames (subsampling? capture result="
-                f"{capture_meta.get('result')})")
-        frame_surplus = len(pngs) - n_state    # trailing frames past the reward trail's terminal
-        for png in pngs:
-            ordinal = int(png.stem.split("_")[-1])
-            if ordinal <= 0 or ordinal >= n_state:
-                continue                       # settle frame (0) + surplus tail (>= n_state)
-            shutil.move(str(png), str(frames_dir / f"t{ordinal:05d}.png"))
-        shutil.rmtree(raw_frames_dir, ignore_errors=True)
-        # Every tick 1..T must now have exactly one PNG (a subsampled trail leaves a gap ->
-        # n_png < T -> the frame/step check below fires).
-        n_png = len(sorted(frames_dir.glob("t*.png")))
+        n_png, frame_surplus = _keep_tick_frames(
+            raw_frames_dir, frames_dir, n_state, slug, "primary",
+            capture_meta.get("result"))
+        if view_specs is not None:
+            resolved = capture_meta.get("views") or []
+            if len(resolved) != len(view_specs):
+                raise ValueError(
+                    f"multi-view capture for {slug} returned {len(resolved)} view records "
+                    f"for {len(view_specs)} requested views")
+            for k, (spec, rec) in enumerate(zip(view_specs, resolved)):
+                vid = spec["id"]
+                if k == 0:
+                    rel, vn, vsurplus = "frames", n_png, frame_surplus
+                else:
+                    vdir = frames_dir / vid
+                    vdir.mkdir(parents=True, exist_ok=True)
+                    vn, vsurplus = _keep_tick_frames(
+                        Path(spec["frames_dir"]), vdir, n_state, slug, vid,
+                        capture_meta.get("result"))
+                    rel = f"frames/{vid}"
+                    if vn != n_png:
+                        raise ValueError(
+                            f"multi-view frame-count mismatch for {slug}: view {vid!r} "
+                            f"kept {vn} frames vs primary {n_png}")
+                entry = {key: rec.get(key) for key in (
+                    "id", "follow", "cam_dist", "elevation", "azimuth", "fov",
+                    "view_target")}
+                entry.update({"path": rel, "n_frames": vn,
+                              "trailing_frames_dropped": vsurplus})
+                capture_views_meta.append(entry)
 
     # -- steps.jsonl (one line per decision tick t=1..T) -----------------------------
     horizon = rl_env.HORIZON
@@ -430,6 +511,10 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
         },
         "paths": {"steps": "steps.jsonl", "frames": "frames"},
     }
+    if capture_views_meta:
+        # Multi-view provenance: resolved camera params + relative path per view (view 0 =
+        # the primary "frames" dir). Absent for a single-view package (byte-identical).
+        episode["capture"]["views"] = capture_views_meta
     if extra_meta:
         episode.update(extra_meta)
 
@@ -440,7 +525,7 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
             fh.write(json.dumps(s, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     # -- manifest-ready record -------------------------------------------------------
-    return {
+    record = {
         "slug": slug,
         "dim": dimension,
         "trajectory_kind": trajectory_kind,
@@ -459,6 +544,9 @@ def _write_package(game_path: str, out_dir: str, source: str, engine: str,
             "frames": str(frames_dir),
         },
     }
+    if capture_views_meta:
+        record["views"] = capture_views_meta
+    return record
 
 
 def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = None,
@@ -466,7 +554,7 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
                    follow: bool | None = None, width: int = 960, height: int = 540,
                    fps: int = 20, cam_dist: float | None = None,
                    dimension_hint: str | None = None,
-                   render_frames: bool = True) -> dict:
+                   render_frames: bool = True, views: list | None = None) -> dict:
     """Export ONE (game, WINNING-witness) pair to ``<out_dir>/<slug>/<seed>/``.
 
     Resolves the witness (explicit ``--actions`` > trained-policy ``demo_trajectory.json``
@@ -474,6 +562,9 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
     ``witness`` ``trajectory_kind``), replays it ONCE for the code-STATE trail, and hands off
     to :func:`_write_package` (which renders the PIXEL trail unless ``render_frames`` is False,
     recomputes the reward per tick through ``env.step_reward``, and writes the package).
+
+    ``views`` (opt-in) exports N camera angles of the same replay -- see
+    :func:`_write_package`; None keeps today's single-view package byte-identical.
 
     Returns a manifest-ready record; raises ``ValueError`` on an empty witness or a
     STATE/PIXEL tick-count mismatch (the alignment contract must hold or the package is
@@ -503,7 +594,7 @@ def export_episode(game_path: str, out_dir: str, *, actions_arg: str | None = No
         witness_source=wit["witness_source"], witness_path=wit["witness_path"],
         episode_key=str(seed), render_frames=render_frames, follow=follow,
         width=width, height=height, fps=fps, cam_dist=cam_dist,
-        dimension_hint=dimension_hint)
+        dimension_hint=dimension_hint, views=views)
 
 
 DATASET_README = r"""# GI Episode Dataset -- code-defined truth bridged to pixels
@@ -528,6 +619,11 @@ the **pixel frame** rendered by the in-engine capture host at the very same tick
     episode.json              episode meta (objective_text, dimension, trajectory_kind, reward scheme, build)
     steps.jsonl               one line per decision tick t (action, state, reward, done)
     frames/t%05d.png          the rendered pixel frame at tick t (t = 1..ticks) -- ABSENT for a state-only package
+    frames/<view_id>/t%05d.png  EXTRA camera views (opt-in multi-view export). View 0 IS frames/
+                              itself; each extra view is the SAME deterministic replay rendered
+                              from another camera, one PNG per tick, params recorded in
+                              episode.json:capture.views (id, elevation, azimuth, fov, view_target,
+                              follow, path). Absent unless the export requested views.
 ```
 
 `len(steps) == episode.json:ticks` always; `len(frames) == len(steps)` *wherever frames exist*
@@ -704,6 +800,10 @@ def append_manifest(out_dir: str, record: dict) -> None:
             "frames": f"{slug}/{key}/frames",
         },
     }
+    if record.get("views"):
+        # Multi-view episodes carry their per-view camera params + relative paths in the
+        # manifest line too (absent for single-view lines -- byte-identical legacy rows).
+        rel["views"] = record["views"]
     lines = []
     if manifest.exists():
         for line in manifest.read_text(encoding="utf-8").splitlines():

@@ -114,7 +114,8 @@ def export_random_rollouts(game_path: str, out_dir: str, *, n: int, horizon: int
                            seed_base: int = 0, render_frames: bool = False,
                            follow: bool | None = None, width: int = 960,
                            height: int = 540, fps: int = 20,
-                           cam_dist: float | None = None) -> list:
+                           cam_dist: float | None = None,
+                           views: list | None = None) -> list:
     """Export ``n`` seeded random-policy rollouts of the game to
     ``<out>/<slug>/random-<seed>/`` each. The world seeds are ``seed_base .. seed_base+n-1``
     (each seed drives BOTH the world and the random policy, so the rollout is reproducible).
@@ -152,7 +153,7 @@ def export_random_rollouts(game_path: str, out_dir: str, *, n: int, horizon: int
                 game_path, out_dir, source, engine, ep["actions"], s, trail,
                 trajectory_kind="random", witness_source="random", witness_path=None,
                 episode_key=f"random-{s}", render_frames=render_frames, follow=follow,
-                width=width, height=height, fps=fps, cam_dist=cam_dist))
+                width=width, height=height, fps=fps, cam_dist=cam_dist, views=views))
         except ValueError as exc:
             # A degenerate rollout (build-time failure, < 1 decision tick) carries no signal.
             print(f"  [skip] random-{s}: {exc}")
@@ -166,7 +167,8 @@ def export_perturbations(game_path: str, out_dir: str, *, witness_path: str, k: 
                          n_corruptions: int = 2, seed_base: int = 0,
                          render_frames: bool = True, follow: bool | None = None,
                          width: int = 960, height: int = 540, fps: int = 20,
-                         cam_dist: float | None = None) -> list:
+                         cam_dist: float | None = None,
+                         views: list | None = None) -> list:
     """Export ``k`` NEAR-MISS negatives to ``<out>/<slug>/perturbed-<base_seed>-<i>/`` each, by
     taking the winning witness at ``witness_path`` and injecting ``n_corruptions`` seeded action
     corruptions per variant (:func:`perturb_actions`). Every variant replays at the witness's OWN
@@ -222,7 +224,7 @@ def export_perturbations(game_path: str, out_dir: str, *, witness_path: str, k: 
                 trajectory_kind="perturbed", witness_source="perturbed",
                 witness_path=str(witness_path), episode_key=key,
                 render_frames=render_frames, follow=follow, width=width, height=height,
-                fps=fps, cam_dist=cam_dist, extra_meta=extra))
+                fps=fps, cam_dist=cam_dist, views=views, extra_meta=extra))
         except ValueError as exc:
             print(f"  [skip] {key}: {exc}")
     return records
