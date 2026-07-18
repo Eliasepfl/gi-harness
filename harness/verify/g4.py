@@ -58,7 +58,7 @@ import random
 
 # The executor seam + the §2 runner helpers. We only READ gameverify (never edit
 # it): its loader, engine detector and default World factory are stable handles.
-from harness.verify.executors import GodotExecutor, JsExecutor, PyExecutor, VerifyError
+from harness.verify.executors import GodotExecutor, VerifyError
 from harness.verify.gameverify import (
     EFFICACY_EPS, _default_world_factory, detect_engine, load_game,
 )
@@ -380,22 +380,18 @@ def classify(ep, engine, *, avoidance, witness_ticks, controlled, initial_snapsh
 # Replay helpers
 # ======================================================================== #
 def _make_executor(engine, world_factory):
-    if engine == "js":
-        return JsExecutor()
     if engine == "godot":
-        # Declarative-spec games attack through the SAME seam as py/js — the batch
-        # executor is the only physics contact. Without this branch a .spec.json
-        # would fall through to PyExecutor and mis-execute the spec as pymunk code.
+        # Declarative-spec games attack through the batch-executor seam — the only
+        # physics contact — so the whole G4 machinery stays engine-agnostic.
         return GodotExecutor()
     if engine == "gdscript":
         # Generated .gd games drive through the serve host (serve_game.gd) — the
         # SAME run_batch(seed, actions) seam the funnel used, so the whole G4
         # machinery (fuzz families, referee, stale oracle) is engine-agnostic.
-        # Without this branch a .gd would fall to PyExecutor and error out trying
-        # to parse GDScript as pymunk Python ("game attack failed: invalid syntax").
         from harness.verify.gd_exec import GdExecutor
         return GdExecutor()
-    return PyExecutor(world_factory=world_factory or _default_world_factory)
+    raise VerifyError("unsupported_engine",
+                      f"engine {engine!r} is not supported (only godot / gdscript)")
 
 
 def _replay_all(executor, game_source, plans, horizon):

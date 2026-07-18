@@ -28,7 +28,6 @@ from harness.rl import stale_seek as ss  # noqa: E402
 from harness.rl.env import build_obs_vector, PER_BODY, PER_BODY_3D, EGO_BLOCK_3D  # noqa: E402
 from harness.core.statetree import fingerprint, fp_delta  # noqa: E402
 from harness.verify import g4  # noqa: E402
-from harness.verify.executors import PyExecutor  # noqa: E402
 from test_g4 import SOFTLOCK  # noqa: E402  (the py-DSL momentum-pit softlock fixture)
 from test_gameverify import factory  # noqa: E402
 
@@ -489,79 +488,8 @@ def _make_stub_vecenv(script):
     return _StubVecEnv()
 
 
-def test_vec_wrapper_harvests_a_candidate_into_the_sink():
-    script = [(0.0, False, False, False)]
-    script += [(6.0 * k, False, False, False) for k in range(1, 6)]   # travel
-    script += [(30.0, False, False, False) for _ in range(10)]        # freeze -> window
-    venv = _make_stub_vecenv(script)
-    sink: list = []
-    wrapped = ss.make_stale_seek_vec_wrapper(venv, _params(window=4, mobility_min=5.0),
-                                             base_seed=0, candidates=sink)
-    wrapped.reset()
-    for _ in range(len(script)):
-        wrapped.step_async(np.zeros(1, dtype=int))
-        _, rewards, dones, _ = wrapped.step_wait()
-        if dones[0]:
-            break
-    assert len(sink) >= 1
-    assert sink[0]["seed"] == 0 and len(sink[0]["prefix"]) >= 1
-
-
 # ====================================================================== #
-# 5. Escapability probe + CONFIRM over the real oracle (PyExecutor, no Godot).
-# ====================================================================== #
-ACTIONS = ["run", "leap"]
-TRAPPED_PREFIX = ["run", "run", "run", "run"]          # falls into the pit (pos 3) forever
-ESCAPABLE_PREFIX = ["run", "run", "leap"] + ["run"] * 5  # one step from the win (pos 11)
-
-
-def _pyexec():
-    return PyExecutor(world_factory=factory())
-
-
-def test_escapability_probe_drops_a_near_win_but_keeps_the_trap():
-    ex = _pyexec()
-    trap = ss.escapability_probe(ex, SOFTLOCK, ACTIONS, TRAPPED_PREFIX, seed=0, k=6, trials=4)
-    assert trap["escapable"] is False                  # the pit can never win
-    esc = ss.escapability_probe(ex, SOFTLOCK, ACTIONS, ESCAPABLE_PREFIX, seed=0, k=6, trials=6)
-    assert esc["escapable"] is True                    # a random tail wins from pos 11
-
-
-def test_confirm_certifies_a_trapped_candidate_via_the_real_oracle():
-    ex = _pyexec()
-    res = ss.confirm_candidates(ex, SOFTLOCK, ACTIONS,
-                                [{"seed": 0, "prefix": TRAPPED_PREFIX}],
-                                H=30, budget=2500, engine="py")
-    assert res["certified"] == 1
-    f = res["findings"][0]
-    assert f["outcome"] == "softlock" and f["hard"] is True
-    assert f["tier"] == "seeker"
-    assert f["reproducer"]["action_plan"]["sequence"] == TRAPPED_PREFIX
-    assert f["reproducer"]["provenance"]["discovered_by"] == "trained_ppo_seeker"
-
-
-def test_confirm_probes_out_an_escapable_candidate_before_the_oracle():
-    ex = _pyexec()
-    res = ss.confirm_candidates(ex, SOFTLOCK, ACTIONS,
-                                [{"seed": 0, "prefix": ESCAPABLE_PREFIX}],
-                                H=30, budget=2500, engine="py", probe=True)
-    assert res["certified"] == 0 and res["probed_out"] == 1
-    assert res["findings"] == []
-
-
-def test_confirm_dedups_and_ignores_empty_prefixes():
-    ex = _pyexec()
-    res = ss.confirm_candidates(
-        ex, SOFTLOCK, ACTIONS,
-        [{"seed": 0, "prefix": TRAPPED_PREFIX},
-         {"seed": 0, "prefix": list(TRAPPED_PREFIX)},   # duplicate
-         {"seed": 0, "prefix": []}],                    # not a claim
-        H=30, budget=2500, engine="py")
-    assert res["candidates_unique"] == 1 and res["certified"] == 1
-
-
-# ====================================================================== #
-# 6. Ladder GATE — the deep tier fires only on the flag AND cheap-empty.
+# 5. Ladder GATE — the deep tier fires only on the flag AND cheap-empty.
 # ====================================================================== #
 class _SeekerSpy:
     def __init__(self, findings):
@@ -622,19 +550,6 @@ def test_deep_tier_runs_and_reports_findings_when_armed_and_cheap_empty(monkeypa
     assert spy.calls == 1 and block["status"] == "run"
     assert block["certified"] == 1 and block["findings"][0]["outcome"] == "softlock"
     assert block["passed"] is False
-
-
-def test_run_g4_deep_implies_stale_and_wires_seeker_block(monkeypatch):
-    # deep=True must run the cheap stale gate AND expose a seeker block; the seeker
-    # seam is stubbed so no Godot is needed. On this py game the lane guard skips it.
-    spy = _SeekerSpy([])
-    monkeypatch.setattr(g4, "_seeker_discover_and_confirm", spy)
-    out = g4.run_g4(SOFTLOCK, _mini_report(), engine="py", world_factory=factory(),
-                    tiers=(0,), deep=True, fuzz_random=15, fuzz_long=5, noop_heavy=4,
-                    alt_periods=(1, 2), stale_H=20, stale_budget=1500,
-                    stale_cand_budget=800, top_m=4)
-    assert "seeker" in out and out["stale"]["status"] == "run"     # deep implied stale
-    assert out["seeker"]["status"] == "skipped"                    # py lane, not gdscript
 
 
 def _mini_report():

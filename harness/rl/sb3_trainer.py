@@ -2,7 +2,7 @@
 CleanRL-mirror PPO (`harness/rl/ppo.py`) onto stable-baselines3
 (GODOT_RL_AGENTS_CAPABILITIES.md §6.7).
 
-Only the LEARNER changes. This module drives the SAME PlanckEnv seam (through the
+Only the LEARNER changes. This module drives the SAME serve-env seam (through the
 gymnasium adapter `harness/rl/env.wrap_gym`) and exposes the SAME train-and-eval
 surface `certify.g3_prime` consumes — `train(...) -> {agent, curve_*, ...}` plus
 `greedy_episode`/`sample_episode` returning the identical episode-dict shape as
@@ -323,7 +323,7 @@ def _build_onpolicy(method: str, algo_cls, venv, hp: dict, seed: int):
 
 def _build_dqn(algo_cls, venv, hp: dict, seed: int):
     """Construct an OFF-policy DQN model from DQN's OWN small-budget knobs
-    (`DQN_DEFAULTS`). Discrete actions only — the PlanckEnv action space IS
+    (`DQN_DEFAULTS`). Discrete actions only — the serve-env action space IS
     Discrete, so DQN applies. NONE of PPO's rollout hyperparameters are forwarded;
     epsilon-greedy exploration (not an LR anneal) drives exploration. A single Q
     net-arch (no actor/critic split, no ortho_init — DQN's MlpPolicy has neither)."""
@@ -368,7 +368,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           best_model_path: str | None = None, eval_fn=None,
           eval_freq_updates: int = EVAL_FREQ_UPDATES,
           warmstart=None, rnd=None, **overrides) -> dict:
-    """Train an SB3 learner on `make_env` (a 0-arg PlanckEnv factory) for
+    """Train an SB3 learner on `make_env` (a 0-arg serve-env factory) for
     ~`total_steps` env-steps and return the same dict shape as `ppo.train` (agent +
     curves + steps_to_first_success + bookkeeping, plus the resolved `method`).
     `obs_dim`/`n_actions` are accepted for surface parity with the vendored trainer;
@@ -403,7 +403,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
 
     num_envs = hp["num_envs"]
 
-    # One PlanckEnv per vec slot, wrapped as gymnasium.Env then Monitored so each
+    # One serve env per vec slot, wrapped as gymnasium.Env then Monitored so each
     # episode-end info carries r/l PLUS our success + n_latched (info_keywords) —
     # the callback reads those to rebuild the vendored curves.
     def _make_init(slot: int = 0):
@@ -424,7 +424,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
     # process with N in-scene instances over ONE socket (GodotBatchVecEnv), stepped
     # together in the engine tick loop — vs DummyVecEnv, which steps its N slots
     # SEQUENTIALLY (one Godot proc busy at a time, N round-trips per vec-step). The
-    # JS/PlanckEnv lane and num_envs==1 keep DummyVecEnv; HARNESS_VECENV=dummy forces
+    # single-serve-env lane and num_envs==1 keep DummyVecEnv; HARNESS_VECENV=dummy forces
     # the old path everywhere (debug). Farm-level parallelism (1 game/array task) is
     # orthogonal and still live.
     num_shards = int(num_shards)

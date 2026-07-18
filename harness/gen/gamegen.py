@@ -38,7 +38,6 @@ from harness.core import integrity
 from harness.gen import prompts
 from harness.gen import retrieval
 from harness.gen import skill_context
-from harness.gen.prompts_js import SYSTEM_PROMPT_JS
 
 try:  # lazily needed: the template backend must run without the package
     import anthropic
@@ -189,8 +188,8 @@ def _redact(text: str, secret) -> str:
 # The prompt is no longer one giant literal: it is assembled from single-concern
 # SECTION FILES under harness/gen/prompts/ (contract / api_py / api_js / rules /
 # orientation / design_block / bank_menu) by prompts.compose(engine, menu_text).
-# `_SYSTEM_PROMPT` (py, no menu) and prompts_js.SYSTEM_PROMPT_JS (js, no menu)
-# stay as module-level shims so existing callers and tests keep their names; the
+# `_SYSTEM_PROMPT` (py, no menu) stays as a module-level shim so existing callers
+# and tests keep their names; the
 # per-run system prompt (optionally carrying a retrieved Tier-1b parts menu) is
 # composed fresh inside generate_game. The section files are byte-frozen by the
 # run-integrity manifest exactly like base code.
@@ -211,10 +210,10 @@ def _engine_lang(engine):
 
 
 # The godot lane's per-run system prompt (menu-free shim, byte-identical to
-# compose("godot")); parallels _SYSTEM_PROMPT / SYSTEM_PROMPT_JS.
+# compose("godot")); parallels _SYSTEM_PROMPT.
 _SYSTEM_PROMPT_GODOT = prompts.compose("godot")
 # The gdscript lane's per-run system prompt (menu-free shim, byte-identical to
-# compose("gdscript")); parallels the godot/js/py shims.
+# compose("gdscript")); parallels the godot/py shims.
 _SYSTEM_PROMPT_GDSCRIPT = prompts.compose("gdscript")
 
 
@@ -227,8 +226,6 @@ def _system_prompt(engine, menu_text=None):
     """
     if menu_text:
         return prompts.compose(engine, menu_text)
-    if engine == "js":
-        return SYSTEM_PROMPT_JS
     if engine == "godot":
         return _SYSTEM_PROMPT_GODOT
     if engine == "gdscript":

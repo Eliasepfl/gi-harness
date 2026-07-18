@@ -155,9 +155,6 @@ def fetch_facts(game_path, source=None):
         if engine == "gdscript":
             from harness.verify.gd_exec import GdExecutor
             ex = GdExecutor()
-        elif engine == "js":
-            from harness.verify.executors import JsExecutor
-            ex = JsExecutor()
         elif engine == "godot":
             from harness.verify.godot_exec import GodotExecutor
             ex = GodotExecutor()

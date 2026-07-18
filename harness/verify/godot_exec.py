@@ -1,4 +1,4 @@
-"""GodotExecutor — the THIRD engine seam (Godot Physics 2D), twin of JsExecutor.
+"""GodotExecutor — the declarative-spec engine seam (Godot Physics 2D).
 
 The Godot lane's per-game artifact is a declarative JSON game-spec (``godotworld/
 SPEC.md``); a single FROZEN ``godotworld/runner.gd`` interprets it. This executor is
@@ -6,9 +6,9 @@ the Python side of that seam: it batches a whole verification layer's episodes i
 ONE headless Godot process (amortising the ~0.19 s boot — SPIKE_REPORT.md gate (a)),
 writes the job to a temp file (the robust ``--job=<file>`` route from the spike),
 and parses the framed ``__JSONL_BEGIN__ ... __JSONL_END__`` payload back into the
-same episode-dict shape the JS/Py executors return.
+shared episode-dict shape every executor returns.
 
-Surface (identical to ``JsExecutor``)::
+Surface (the shared executor contract)::
 
     run_batch(game_source, episodes, max_ticks, frames_every=0, escape_margin=None)
         -> list[episode_dict]           # result/ticks/checkpoints/final_snapshot/...

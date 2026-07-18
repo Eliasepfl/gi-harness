@@ -89,7 +89,7 @@ def deslug(slug: str) -> str:
 def _latched_count(cp_latch: dict, upto_tick: int) -> int:
     """How many declared checkpoints are latched at (i.e. by the end of) tick ``upto_tick``.
     A checkpoint counts iff its recorded latch tick is an int and ``<= upto_tick`` -- the
-    same latched-set size ``env.PlanckEnv.step`` observes at that tick."""
+    same latched-set size the env's ``step`` observes at that tick."""
     n = 0
     for v in cp_latch.values():
         if isinstance(v, bool):        # guard: a stray True/False is not a latch tick
@@ -181,20 +181,18 @@ def _state_trail(source: str, engine: str, actions: list, seed: int,
     :func:`_trail_from_rec` for the shape).
 
     Engine-agnostic: dispatches to the same executors the verify/replay lanes use
-    (js/godot/gdscript/py) and calls their ``run_batch`` -- pure reuse, no
+    (godot/gdscript) and calls their ``run_batch`` -- pure reuse, no
     reimplementation."""
-    from harness.verify.executors import GodotExecutor, JsExecutor, PyExecutor
+    from harness.verify.executors import GodotExecutor
 
     gd_ex = None
-    if engine == "js":
-        ex = JsExecutor()
-    elif engine == "godot":
+    if engine == "godot":
         ex = GodotExecutor()
     elif engine == "gdscript":
         from harness.verify.gd_exec import GdExecutor
         ex = gd_ex = GdExecutor()
     else:
-        ex = PyExecutor()
+        raise ValueError(f"unsupported engine {engine!r} (only godot / gdscript)")
     try:
         recs = ex.run_batch(source, [{"seed": int(seed), "actions": list(actions)}],
                             int(max_ticks), frames_every=1)
@@ -220,7 +218,7 @@ def build_steps(state_frames: list, cp_latch: dict, n_cp: int, actions: list,
          done, n_latched}
 
     The reward is recomputed through :func:`step_reward_parts` (i.e. env.step_reward), and
-    the terminal result is attached ONLY to the final tick -- exactly as env.PlanckEnv.step
+    the terminal result is attached ONLY to the final tick -- exactly as the env's ``step``
     labels a rollout. Returns ``(steps, episode_return, T)``."""
     T = len(state_frames) - 1                  # decision ticks (frame 0 is the build)
     steps = []

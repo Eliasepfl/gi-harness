@@ -116,20 +116,9 @@ def load_scene_namespace(source: str, *, scan: bool = True) -> dict:
 def _sandbox_worker(scene_path: str, job: str, conn) -> None:
     """Top-level function (picklable for spawn) executed in the subprocess."""
     try:
-        if job == "verify":
-            from harness.legacy.verifier import verify_scene
-            result = verify_scene(scene_path, sandboxed=False)
-        elif job == "gameverify":
+        if job == "gameverify":
             from harness.verify.gameverify import verify_game
             result = verify_game(scene_path, sandboxed=False)
-        elif job == "navigate":
-            try:
-                from harness.legacy.navigator import navigate
-            except ImportError as exc:
-                result = {"error": {"type": "not_implemented",
-                                    "message": f"navigator unavailable: {exc}"}}
-            else:
-                result = navigate(scene_path)
         else:
             result = {"error": {"type": "bad_job", "message": f"unknown job: {job}"}}
     except Exception:  # noqa: BLE001 - forward any error to the parent
@@ -145,8 +134,8 @@ def _sandbox_worker(scene_path: str, job: str, conn) -> None:
 def run_sandboxed(scene_path: str, job: str, timeout_s: float = 20.0) -> dict:
     """Run `job` on `scene_path` in an isolated subprocess.
 
-    job in {"verify", "gameverify", "navigate"}. Timeout -> terminate + error report.
-    Returns the report dict (verify/gameverify job) or {"error": {...}} on trouble.
+    job in {"gameverify"}. Timeout -> terminate + error report.
+    Returns the report dict (gameverify job) or {"error": {...}} on trouble.
     """
     ctx = multiprocessing.get_context("spawn")
     recv_conn, send_conn = ctx.Pipe(duplex=False)

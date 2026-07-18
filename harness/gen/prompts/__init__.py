@@ -29,8 +29,8 @@ prompts, pour mieux les changer separement"):
 
 `compose(engine, menu_text=None)` assembles the final system prompt
 deterministically: the same (engine, menu_text) always yields byte-identical
-output. `gamegen._SYSTEM_PROMPT` and `prompts_js.SYSTEM_PROMPT_JS` are thin
-shims over `compose(...)`. The section .md files are folded into the run-integrity
+output. `gamegen._SYSTEM_PROMPT` is a thin shim over `compose(...)`. The section
+.md files are folded into the run-integrity
 manifest (harness.core.integrity) so a mid-run prompt edit invalidates the run
 exactly like a base-code edit.
 """

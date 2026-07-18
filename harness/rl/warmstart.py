@@ -69,9 +69,8 @@ def replay_prefix(env, prefix, *, seed: int = 0):
     FAST PATH: when the env exposes ``serve_replay`` (GodotServeEnv), the whole prefix is
     replayed in ONE serve round-trip instead of ``len(prefix)`` per-action round-trips —
     profiled 4.3x faster per reset on long prefixes, and byte-identical in end state (same
-    in-engine multi-action ``act``). Fake envs / the JS PlanckEnv (no ``serve_replay``) use
-    the generic per-``step`` loop below, so the unit tests and the vendored lane are
-    unchanged."""
+    in-engine multi-action ``act``). Fake envs without ``serve_replay`` use the generic
+    per-``step`` loop below, so the unit tests and the vendored lane are unchanged."""
     obs, info = env.reset(seed)
     if not prefix:
         return obs, info, False

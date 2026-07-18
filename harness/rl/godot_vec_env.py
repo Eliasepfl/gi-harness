@@ -437,8 +437,8 @@ def _batch_vec_env_cls():
                 result = results[i]
                 terminated = bool(dterm[i])
                 truncated = bool(dtrunc[i])
-                # Realigned reward (single source of truth, byte-for-byte GodotServeEnv/
-                # PlanckEnv): PBRS shaping + per-tick living cost + time-decayed terminal.
+                # Realigned reward (single source of truth, byte-for-byte with
+                # GodotServeEnv): PBRS shaping + per-tick living cost + time-decayed terminal.
                 reward = step_reward(c_before, c_after, len(self._cp_keys or []), result,
                                      int(ticks[i]), self.horizon)
                 rewards[i] = reward

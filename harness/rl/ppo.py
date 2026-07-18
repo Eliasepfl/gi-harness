@@ -135,7 +135,7 @@ class VecEnv:
 def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
           seed: int = 0, device: str = "cpu", log=None, wall_clock_budget_s=None,
           **overrides) -> dict:
-    """Train PPO on `make_env` (a 0-arg PlanckEnv factory) for ~`total_steps`
+    """Train PPO on `make_env` (a 0-arg serve-env factory) for ~`total_steps`
     env-steps. Returns the trained agent + training curves + steps_to_first_success.
 
     Plateau early-stop: stop once no new best mean episodic return appears within
@@ -323,7 +323,7 @@ def train(make_env, obs_dim: int, n_actions: int, *, total_steps: int,
 @torch.no_grad()
 def _rollout(env, agent, seed: int, *, greedy: bool, torch_seed=None) -> dict:
     """Roll out from a fresh `env.reset(seed)`, recording the action STRING sequence
-    so the result replays bit-exactly through JsExecutor.run_batch. `greedy=True`
+    so the result replays bit-exactly through the batch executor. `greedy=True`
     uses argmax (deterministic); `greedy=False` samples the categorical policy
     (seed torch for reproducibility). Either way the recorded (seed, actions) pair
     IS the witness — the batch executor just replays the list."""

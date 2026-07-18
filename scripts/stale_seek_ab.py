@@ -58,7 +58,7 @@ def _detect(specs, episodes, initial):
 
 
 def _certify(src, actions, cands, engine):
-    ex = GdExecutor() if engine == "gdscript" else _py_exec()
+    ex = GdExecutor()
     try:
         res = ss.confirm_candidates(ex, src, actions, [{"seed": 0, "prefix": p} for p in cands],
                                     H=30, budget=3000, engine=engine, top_m=8, probe=False)
@@ -67,12 +67,6 @@ def _certify(src, actions, cands, engine):
         if callable(c):
             c()
     return res["certified"]
-
-
-def _py_exec():
-    from harness.verify.executors import PyExecutor
-    from test_gameverify import factory  # type: ignore
-    return PyExecutor(world_factory=factory())
 
 
 def bench(game_path, budget_steps=4000, horizon=40, n_fuzz=60, engine="gdscript"):
@@ -85,7 +79,7 @@ def bench(game_path, budget_steps=4000, horizon=40, n_fuzz=60, engine="gdscript"
     rng = random.Random(0)
     specs = [{"seed": 0, "actions": [actions[rng.randrange(len(actions))]
                                      for _ in range(horizon)]} for _ in range(n_fuzz)]
-    ex = GdExecutor() if engine == "gdscript" else _py_exec()
+    ex = GdExecutor()
     try:
         eps = ex.run_batch(src, specs, horizon, frames_every=1)
         fuzz_ticks = sum(int(e.get("ticks", 0)) for e in eps)
@@ -99,7 +93,7 @@ def bench(game_path, budget_steps=4000, horizon=40, n_fuzz=60, engine="gdscript"
     # -- 2) GREEDY ANTI-POLICY (spam+alternate coverage + inverted tree search) --
     plans = [[a] * horizon for a in actions]
     plans += [([a, b] * (horizon // 2 + 1))[:horizon] for a in actions for b in actions if a != b]
-    ex = GdExecutor() if engine == "gdscript" else _py_exec()
+    ex = GdExecutor()
     try:
         _, inv_eps, _, gtree = ts._tree_search(ex, src, actions, horizon,
                                                select=ts._select_leaves_inverted, budget=3000)

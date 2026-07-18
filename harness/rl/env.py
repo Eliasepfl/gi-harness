@@ -1,11 +1,13 @@
-"""PlanckEnv — a Gymnasium-style RL environment over a game's "serve" subprocess.
+"""Shared RL obs/reward/space primitives for the Godot serve-mode lane.
 
-One `PlanckEnv` owns ONE long-lived `node nodeworld/runner.js` process in the
-additive interactive "serve" mode: `reset` rebuilds the world, each `step`
-advances exactly ONE decision tick (act + K=6 physics steps + latch + terminal
-checks — identical to `gameverify.run_episode`). Because the semantics match the
-batch `episodes` mode bit-for-bit, a greedy action sequence recorded here replays
-to success through `JsExecutor.run_batch` — the certificate bridge in certify.py.
+This module holds the ENGINE-NEUTRAL building blocks the Godot RL envs
+(`godot_env` / `godot_vec_env` / `godot_shard_env`) and the SB3 trainer reuse:
+the reward function, the flat obs-vector builder, the Gymnasium-compatible space
+duck-types, and the `wrap_gym` adapter. Each `step` advances exactly ONE decision
+tick (act + K=6 physics steps + latch + terminal checks — identical to
+`gameverify.run_episode`), so a greedy action sequence recorded by an env replays
+to success through the matching batch executor — the certificate bridge in
+certify.py.
 
 OBSERVATION (code-state, NOT pixels — the challenge's "code-defined truth"):
 a fixed-layout flat float32 vector, frozen at the first reset. The DIMENSION (2D
@@ -134,9 +136,9 @@ reward (hack-resistant by construction). Episode ends on a terminal ``result`` o
 godot_rl_agents AIController mapping  (GODOT_RL_MERGE.md §2 — pin this)
 ----------------------------------------------------------------------
 The obs/action surface deliberately MIRRORS godot_rl_agents' AIController so the
-Godot lane can replace this Node shell with zero retraining-code changes:
+Godot lane can replace this shell with zero retraining-code changes:
 
-  AIController member / method          | PlanckEnv equivalent
+  AIController member / method          | serve-env equivalent
   --------------------------------------|-------------------------------------
   get_obs() -> {"obs":[float,...]}      | reset()/step() return this flat vector
   get_action_space() ->                 | action_space = Discrete(n)
@@ -158,12 +160,8 @@ not a policy or training-code change (the outer rung, GODOT_RL_MERGE.md §3/Phas
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import random
-import subprocess
-import tempfile
 from dataclasses import dataclass
 
 import numpy as np
@@ -713,181 +711,10 @@ def _build_obs_pure(obs_state, latched, body_order, cp_keys, tick, horizon, dim)
     return vec
 
 
-class PlanckEnv:
-    """Gymnasium-style single env over one game's serve-mode node subprocess.
-
-    API: ``reset(seed=None) -> (obs, info)`` and
-    ``step(action_idx) -> (obs, reward, terminated, truncated, info)``, plus
-    ``observation_space`` / ``action_space`` (available after construction) and
-    ``close()``. One process is spawned per env and reused across episodes.
-    """
-
-    def __init__(self, game_path: str, *, runner_path: str | None = None,
-                 node: str | None = None, horizon: int = HORIZON):
-        self.game_path = game_path
-        self.horizon = int(horizon)
-        with open(game_path, "r", encoding="utf-8") as fh:
-            self._source = fh.read()
-
-        self._node = node or os.environ.get("HARNESS_NODE", "node")
-        if runner_path is None:
-            from harness.verify.executors import default_runner_path
-            runner_path = default_runner_path()
-        self._runner_path = runner_path
-
-        self._stderr = tempfile.TemporaryFile(mode="w+")
-        self._proc = subprocess.Popen(
-            [self._node, self._runner_path],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
-            text=True, encoding="utf-8", bufsize=1,
-            cwd=os.path.dirname(self._runner_path) or None,
-        )
-        # Handshake: send the init line, read the ready line.
-        ready = self._exchange({"mode": "serve", "source": self._source})
-        if not ready.get("ready"):
-            self.close()
-            raise RuntimeError(f"serve init failed for {game_path}: {ready.get('error')}")
-        self.actions: list[str] = list(ready.get("actions") or [])
-        self.title: str = ready.get("title") or os.path.basename(game_path)
-        self.world_size = tuple(ready.get("world_size") or (800, 600))
-
-        # Layout is discovered on the FIRST reset and then frozen.
-        self._body_order: list[str] | None = None
-        self._cp_keys: list[str] | None = None
-        self._dim: int = 2                          # pinned in _freeze_layout (2 or 3)
-        self.action_space = Discrete(len(self.actions))
-        self.observation_space: Box | None = None  # set after first reset
-
-        self._tick = 0
-        self._done = True
-        self._prev_latched: set[str] = set()
-
-        # Priming reset: freezes the body layout / obs space so observation_space
-        # and action_space are available right after construction (gym convention).
-        self.reset(seed=0)
-
-    # -- process I/O ------------------------------------------------------
-    def _exchange(self, op: dict) -> dict:
-        """Send one op line, read exactly one reply line. Raises if node died."""
-        if self._proc.poll() is not None:
-            raise RuntimeError(f"serve process exited (code {self._proc.returncode})"
-                               f"\n{self._read_stderr()}")
-        try:
-            self._proc.stdin.write(json.dumps(op) + "\n")
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError) as exc:
-            raise RuntimeError(f"serve stdin write failed: {exc}\n{self._read_stderr()}")
-        line = self._proc.stdout.readline()
-        if line == "":
-            raise RuntimeError("serve process closed stdout unexpectedly"
-                               f"\n{self._read_stderr()}")
-        return json.loads(line)
-
-    def _read_stderr(self) -> str:
-        try:
-            self._stderr.seek(0)
-            return "STDERR: " + self._stderr.read()[-2000:]
-        except Exception:
-            return ""
-
-    # -- layout / observation --------------------------------------------
-    def _freeze_layout(self, frame: dict) -> None:
-        obs_state = frame.get("obs_state", {})
-        controlled = [n for n, q in obs_state.items() if q.get("controlled")]
-        others = sorted(n for n in obs_state if n not in controlled)
-        # Controlled body first (LLM_RL_SYSTEMS §4.1), then the rest sorted by name.
-        self._body_order = list(controlled) + others
-        self._cp_keys = list((frame.get("latched") or {}).keys())
-        self._dim = detect_dim(obs_state)               # 2D vs true-3D, then PINNED
-        obs_dim = obs_dim_for(len(self._body_order), len(self._cp_keys), self._dim)
-        self.observation_space = Box(-OBS_CLIP, OBS_CLIP, (obs_dim,))
-
-    def _observe(self, frame: dict) -> np.ndarray:
-        return build_obs_vector(
-            frame.get("obs_state", {}), frame.get("latched") or {},
-            self._body_order, self._cp_keys, self.world_size, self._tick,
-            self.horizon, dim=self._dim)
-
-    @staticmethod
-    def _latched_set(frame: dict) -> set[str]:
-        return {k for k, v in (frame.get("latched") or {}).items() if v is not None}
-
-    # -- Gymnasium API ----------------------------------------------------
-    def reset(self, seed: int = 0):
-        frame = self._exchange({"op": "reset", "seed": int(seed)})
-        if self._body_order is None:
-            self._freeze_layout(frame)
-        self._tick = 0
-        self._done = False
-        self._prev_latched = self._latched_set(frame)
-        return self._observe(frame), {"latched": dict(frame.get("latched") or {})}
-
-    def step(self, action_idx: int):
-        if self._done:
-            raise RuntimeError("step() after episode end — call reset() first")
-        action = self.actions[int(action_idx)]
-        frame = self._exchange({"op": "act", "action": action})
-        self._tick = int(frame.get("tick", self._tick + 1))
-        result = frame.get("result")
-
-        latched_now = self._latched_set(frame)
-        c_before = len(self._prev_latched)
-        c_after = len(latched_now)
-        self._prev_latched = latched_now
-
-        terminated = False
-        truncated = False
-        if result == "success":
-            terminated = True
-        elif result in ("failure", "error"):
-            terminated = True
-        elif self._tick >= self.horizon:
-            truncated = True
-        self._done = terminated or truncated
-        # Realigned reward (single source of truth): PBRS checkpoint shaping + the (off-by-
-        # default) living cost + the time-decayed terminal. See step_reward / the docstring.
-        reward = step_reward(c_before, c_after, len(self._cp_keys or []), result,
-                             self._tick, self.horizon)
-
-        info = {
-            "result": result,
-            "tick": self._tick,
-            "latched": dict(frame.get("latched") or {}),
-            "n_latched": len(latched_now),
-            "success": result == "success",
-        }
-        return self._observe(frame), float(reward), terminated, truncated, info
-
-    def close(self) -> None:
-        proc = getattr(self, "_proc", None)
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.stdin.write(json.dumps({"op": "close"}) + "\n")
-                proc.stdin.flush()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                proc.kill()
-        stderr = getattr(self, "_stderr", None)
-        if stderr is not None:
-            try:
-                stderr.close()
-            except Exception:
-                pass
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
 # --- Gymnasium adapter (OPTIONAL dep — the SB3 trainer lane only) -------------
-# `gymnasium` is not needed on the vendored PPO lane (ppo.py drives PlanckEnv's
-# gym-compatible surface directly with the Box/Discrete duck-types above), so it
-# is an optional dependency that arrives only with stable-baselines3
+# `gymnasium` is not needed on the vendored PPO lane (ppo.py drives the serve
+# env's gym-compatible surface directly with the Box/Discrete duck-types above),
+# so it is an optional dependency that arrives only with stable-baselines3
 # (GODOT_RL_AGENTS_CAPABILITIES.md §6.7, the [LF] migration). To keep env.py
 # importable WITHOUT gymnasium, the real gymnasium.Env subclass is built on first
 # use rather than at module import.
@@ -895,7 +722,7 @@ _GYM_ENV_CLS = None
 
 
 def _gym_env_cls():
-    """Lazily define (and cache) the gymnasium.Env adapter subclass over PlanckEnv."""
+    """Lazily define (and cache) the gymnasium.Env adapter subclass over a serve env."""
     global _GYM_ENV_CLS
     if _GYM_ENV_CLS is not None:
         return _GYM_ENV_CLS
@@ -903,12 +730,12 @@ def _gym_env_cls():
     import gymnasium as gym
     from gymnasium import spaces
 
-    class GymPlanckEnv(gym.Env):
-        """A thin gymnasium.Env WRAPPER over one live PlanckEnv (wrap, don't
-        rewrite — PlanckEnv already mirrors the Gym API). Its only jobs are to
-        re-export PlanckEnv's frozen spaces as gymnasium ``spaces`` (sized from
+    class GymEnvAdapter(gym.Env):
+        """A thin gymnasium.Env WRAPPER over one live serve env (wrap, don't
+        rewrite — the serve env already mirrors the Gym API). Its only jobs are to
+        re-export the env's frozen spaces as gymnasium ``spaces`` (sized from
         the env's own ``obs_dim``/``n_actions``) and to thread gymnasium's
-        keyword-only ``reset(*, seed=...)`` contract into PlanckEnv's
+        keyword-only ``reset(*, seed=...)`` contract into the env's
         deterministic per-episode seeding.
 
         The seed is LATCHED: a ``reset(seed=None)`` — the form SB3's VecEnv uses
@@ -920,9 +747,9 @@ def _gym_env_cls():
 
         metadata = {"render_modes": []}
 
-        def __init__(self, planck_env: "PlanckEnv", *, warmstart=None, ws_seed: int = 0):
+        def __init__(self, serve_env, *, warmstart=None, ws_seed: int = 0):
             super().__init__()
-            self._env = planck_env
+            self._env = serve_env
             self._seed = 0                         # latched seed (see class docstring)
             # WITNESS-WARMSTART (Backplay reverse curriculum, OPT-IN — harness.rl.warmstart).
             # When a WarmstartCurriculum is injected, reset() Backplay-replays a witness
@@ -932,7 +759,7 @@ def _gym_env_cls():
             # gets its OWN rng (ws_seed) so slots draw independent prefix lengths.
             self._warmstart = warmstart
             self._ws_rng = random.Random(int(ws_seed)) if warmstart is not None else None
-            obs_dim = int(planck_env.observation_space.shape[0])
+            obs_dim = int(serve_env.observation_space.shape[0])
             self.observation_space = spaces.Box(
                 low=-OBS_CLIP, high=OBS_CLIP, shape=(obs_dim,), dtype=np.float32)
             # CHORD mode (Phase 2): when the wrapped env opts into chords its action space
@@ -940,16 +767,16 @@ def _gym_env_cls():
             # Discrete(n), byte-identical to the pre-chord wrapper. The wrapped env owns the
             # vector->wire mapping in its own step (see GodotServeEnv.step), so this wrapper
             # only re-exports the space and passes the raw action through unchanged.
-            self.chord_mode = bool(getattr(planck_env, "chord_mode", False))
-            self.allow_idle = bool(getattr(planck_env, "allow_idle", False))
-            self.oppose_pairs = getattr(planck_env, "oppose_pairs", [])
+            self.chord_mode = bool(getattr(serve_env, "chord_mode", False))
+            self.allow_idle = bool(getattr(serve_env, "allow_idle", False))
+            self.oppose_pairs = getattr(serve_env, "oppose_pairs", [])
             if self.chord_mode:
-                self.action_space = spaces.MultiBinary(planck_env.action_space.n)
+                self.action_space = spaces.MultiBinary(serve_env.action_space.n)
             else:
-                self.action_space = spaces.Discrete(planck_env.action_space.n)
+                self.action_space = spaces.Discrete(serve_env.action_space.n)
             # Convenience passthroughs the eval rollouts read (action strings, horizon).
-            self.actions = planck_env.actions
-            self.horizon = planck_env.horizon
+            self.actions = serve_env.actions
+            self.horizon = serve_env.horizon
 
         def reset(self, *, seed=None, options=None):
             if seed is not None:
@@ -975,22 +802,14 @@ def _gym_env_cls():
         def close(self):
             self._env.close()
 
-    _GYM_ENV_CLS = GymPlanckEnv
+    _GYM_ENV_CLS = GymEnvAdapter
     return _GYM_ENV_CLS
 
 
-def wrap_gym(planck_env: "PlanckEnv", *, warmstart=None, ws_seed: int = 0):
-    """Wrap a live PlanckEnv in the gymnasium.Env adapter (see ``_gym_env_cls``).
+def wrap_gym(serve_env, *, warmstart=None, ws_seed: int = 0):
+    """Wrap a live serve env in the gymnasium.Env adapter (see ``_gym_env_cls``).
 
     ``warmstart`` (a :class:`harness.rl.warmstart.WarmstartCurriculum`, OPT-IN) makes each
     reset Backplay-replay a witness prefix; ``ws_seed`` seeds this slot's prefix-draw rng.
     The defaults (``None``) keep the wrapper byte-identical to the pre-warmstart adapter."""
-    return _gym_env_cls()(planck_env, warmstart=warmstart, ws_seed=ws_seed)
-
-
-def make_gym_env(game_path: str, **kwargs):
-    """Construct a PlanckEnv for ``game_path`` and return it wrapped as a
-    gymnasium.Env. Factory form so SB3's ``make_vec_env``/``DummyVecEnv`` thunks
-    (`lambda: make_gym_env(path)`) work, while env.py stays importable when
-    gymnasium is absent (the vendored lane never calls this)."""
-    return wrap_gym(PlanckEnv(game_path, **kwargs))
+    return _gym_env_cls()(serve_env, warmstart=warmstart, ws_seed=ws_seed)

@@ -1,6 +1,6 @@
 """GdExecutor — the GDScript (GameAPI) lane's episode executor, over the serve host.
 
-The engine seam for ``engine == "gdscript"``: a drop-in sibling of ``JsExecutor`` /
+The engine seam for ``engine == "gdscript"``: a drop-in sibling of
 ``GodotExecutor`` (``run_check`` + ``run_batch`` + ``batched = True``) that drives a
 generated ``.gd`` game through ``godotworld/serve_game.gd`` instead of interpreting a
 data spec. ONE long-lived headless-Godot serve process backs the whole funnel:

@@ -1,7 +1,7 @@
 """GodotServeEnv — a Gymnasium-style RL environment over a headless Godot
-"serve" subprocess. The Godot-lane sibling of :class:`harness.rl.env.PlanckEnv`.
+"serve" subprocess.
 
-Same obs/action CONTRACT as PlanckEnv (flat per-body float vector + discrete
+It follows the shared RL obs/action CONTRACT (flat per-body float vector + discrete
 actions, seeded reset semantics) — it reuses ``build_obs_vector`` and the reward
 constants verbatim — but the world lives in a headless Godot process. TWO game
 dialects share the identical framed serve protocol (init/reset/act/close), and the
@@ -35,7 +35,7 @@ spam never corrupts the wire). Verbs, determinism-first, no script/eval/``call``
                                    -> {obs_state, checkpoints, done_term, done_trunc}
     close                       -> ack + quit
 
-The runner speaks ``obs_state`` (mirrors PlanckEnv) and ``checkpoints``
+The runner speaks ``obs_state`` (the shared obs contract) and ``checkpoints``
 (name -> latch-tick | null, mirrors ``runner.gd``'s batch field); this env
 re-exports the latch map as ``latched`` in ``step``'s info so the trainer/witness
 code (`ppo`, `sb3_trainer`, `certify`) is engine-agnostic.
@@ -147,7 +147,7 @@ def _recv_frame(sock: socket.socket, deadline: float) -> dict:
 class GodotServeEnv:
     """Gymnasium-style single env over one game's headless-Godot serve subprocess.
 
-    API mirrors :class:`harness.rl.env.PlanckEnv`: ``reset(seed=0) -> (obs, info)``,
+    API follows the shared RL env contract: ``reset(seed=0) -> (obs, info)``,
     ``step(action_idx) -> (obs, reward, terminated, truncated, info)``,
     ``observation_space`` / ``action_space`` (available after construction), and
     ``close()``. One Godot process is spawned per env and reused across episodes.
@@ -565,7 +565,7 @@ class GodotServeEnv:
 
         # term/trunc split comes straight off the wire (INNER dialect); the realigned
         # reward reads `result`/`tick` (single source of truth: PBRS shaping + per-tick living
-        # cost + time-decayed terminal — matching PlanckEnv exactly).
+        # cost + time-decayed terminal — the single shared step_reward).
         terminated = bool(frame.get("done_term"))
         truncated = bool(frame.get("done_trunc"))
         reward = step_reward(c_before, c_after, len(self._cp_keys or []), result,

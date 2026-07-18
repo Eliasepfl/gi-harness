@@ -25,7 +25,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from harness.verify import g4  # noqa: E402
-from harness.verify.executors import PyExecutor  # noqa: E402
 from test_gameverify import GAME_VALID, FakeWorld, factory  # noqa: E402
 
 # Small, fast fuzz sizing for the tests (the defaults run ~600 episodes/game).
@@ -295,227 +294,12 @@ def test_classify_stuck_requires_travel_then_immobility():
 # ====================================================================== #
 # Tier 0 — integration probes
 # ====================================================================== #
-def test_avoidance_catches_degenerate_goal():
-    out = g4.run_g4(DEGENERATE, _report(["a"] * 3, 3, checkpoints={"tick_bumped": 1}),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    assert out["grade"] == "open"
-    assert out["passed"] is False
-    assert out["tier0"]["avoidance"]["unintended_success"] > 0
-    assert out["tier0"]["avoidance"]["passed"] is False
-    hard = [f for f in out["findings"] if f["outcome"] == "unintended_success"]
-    assert hard and all(f["hard"] for f in hard)
-
-
-def test_certified_survivor_grades_hardened():
-    out = g4.run_g4(SURVIVOR, _report(["charge"] * 8 + ["vent"], 9,
-                                      controlled="cell", checkpoints={"charged": 7}),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    # No HARD findings survive: no avoidance win, no escape/NaN.
-    assert out["passed"] is True
-    assert out["grade"] == "hardened"          # tier1 not run -> short of bulletproof
-    assert out["tier0"]["counts"]["unintended_success"] == 0
-    assert out["tier0"]["counts"]["escape"] == 0
-    assert out["tier0"]["counts"]["nan"] == 0
-    assert out["hard_findings"] == []
-
-
-def test_single_action_win_is_flagged_with_tick_count():
-    out = g4.run_g4(SINGLE, _report(["go"] * 10, 10, checkpoints={"near": 5}),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    flags = out["tier0"]["single_action_win"]["flags"]
-    actions = {f["action"] for f in flags}
-    assert "go" in actions
-    go = next(f for f in flags if f["action"] == "go")
-    assert isinstance(go["ticks"], int) and go["ticks"] >= 1
-    assert go["hard"] is False                 # a flag, not a hard fail
-    assert go["reproducer"]["action_plan"]["pattern"] == "spam"
-
-
-def test_fuzz_detects_escape_and_reproducer_replays():
-    out = g4.run_g4(ESCAPE, _report(["blast"] * 6, 6, checkpoints={"moved": 1}),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    escapes = [f for f in out["findings"] if f["outcome"] == "escape"]
-    assert escapes and out["tier0"]["counts"]["escape"] > 0
-    assert out["grade"] == "open"
-
-    # The stored reproducer replays to the SAME escape on a fresh seeded world.
-    ex = PyExecutor(world_factory=factory())
-    rep = escapes[0]["reproducer"]
-    ap = rep["action_plan"]
-    plan = (ap["sequence"] if ap.get("kind") == "sequence"
-            else g4._expand(ap["pattern"], ap["params"], ["blast", "wait"], g4.PROBE_HORIZON))
-    ep = ex.run_batch(ESCAPE, [{"seed": rep["seed"], "actions": plan}],
-                      g4.PROBE_HORIZON, escape_margin=g4.ESCAPE_MARGIN)[0]
-    assert ep["oob"], "reproducer did not reproduce the escape"
-
-
-def test_broken_gating_when_a_win_skips_a_declared_checkpoint():
-    # The witness declares "got_key" as a gating milestone; but a "door"-spam win
-    # reaches success without ever entering the key band -> broken_gating (HARD).
-    out = g4.run_g4(GATING, _report(["key"] * 8 + ["door"] * 20, 28,
-                                    checkpoints={"got_key": 8}),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    broken = [f for f in out["findings"] if f["outcome"] == "broken_gating"]
-    assert broken, "a win that skips the declared gate must flag broken_gating"
-    assert all(f["hard"] for f in broken)
-    assert out["tier0"]["counts"]["broken_gating"] > 0
-    assert "got_key" in broken[0]["evidence"]["skipped_checkpoints"]
-    assert out["grade"] == "open" and out["passed"] is False
-    rr = g4.to_repair_report(broken[0])
-    assert "BROKEN GATING" in rr["hint"]
-
-
-def test_shortcut_beats_witness_is_soft():
-    # Certified witness is (declared) slow (40 ticks); fuzz wins far faster.
-    out = g4.run_g4(SINGLE, _report(["go"] * 40, 40, checkpoints={"near": 20}),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    shortcuts = [f for f in out["findings"] if f["outcome"] == "shortcut_beats_witness"]
-    assert shortcuts, "a fast win under a slow witness should be a shortcut"
-    assert all(f["hard"] is False for f in shortcuts)
-
-
-def test_fuzz_is_deterministic_under_seed():
-    args = dict(engine="py", world_factory=factory(), tiers=(0,), seed=11, **SMALL)
-    a = g4.run_g4(ESCAPE, _report(["blast"] * 6, 6), **args)
-    b = g4.run_g4(ESCAPE, _report(["blast"] * 6, 6), **args)
-    key = lambda o: json.dumps(o["findings"], sort_keys=True, default=str)
-    assert key(a) == key(b)
-    assert a["tier0"]["counts"] == b["tier0"]["counts"]
-
-
-def test_report_schema_shape():
-    out = g4.run_g4(SURVIVOR, _report(["charge"] * 8 + ["vent"], 9, controlled="cell"),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    for key in ("schema", "game", "engine", "grade", "passed", "tiers_run",
-                "tier0", "tier1", "findings", "hard_findings"):
-        assert key in out, key
-    assert out["schema"] == g4.SCHEMA
-    for key in ("avoidance", "single_action_win", "breaker", "shortcut",
-                "findings", "families", "counts", "episodes"):
-        assert key in out["tier0"], key
-
-
 # ====================================================================== #
 # Tier 1 — mocked OpenRouter lane (no network)
 # ====================================================================== #
-def test_tier1_mocked_lane_classifies_and_persists(monkeypatch):
-    proposals = [
-        {"hypothesis": "blast flies out",
-         "action_plan": {"pattern": "spam", "params": {"action": "blast"}}},   # hit: escape
-        {"hypothesis": "idle does nothing",
-         "action_plan": {"pattern": "spam", "params": {"action": "wait"}}},     # misconception
-        {"hypothesis": "unknown move",
-         "action_plan": {"pattern": "spam", "params": {"action": "JUMP"}}},     # incomprehension
-        {"hypothesis": "explicit seq",
-         "action_plan": {"kind": "sequence", "sequence": ["blast", "wait"]}},   # hit: escape
-    ]
-    monkeypatch.setattr(g4, "_have_key", lambda: True)
-    monkeypatch.setattr(g4, "_attacker_complete", _canned(proposals))
-
-    out = g4.run_g4(ESCAPE, _report(["blast"] * 6, 6), engine="py",
-                    world_factory=factory(), tiers=(0, 1),
-                    models=["qwen/qwen-2.5-coder:free"], **SMALL)
-    t1 = out["tier1"]
-    assert t1["status"] == "run"
-    assert t1["models"] == ["qwen/qwen-2.5-coder:free"]
-
-    # Every proposal + outcome is persisted (traceability).
-    assert len(t1["records"]) == 4
-    classes = sorted(r["failure_class"] for r in t1["records"])
-    assert classes == ["hit", "hit", "incomprehension", "misconception"]
-    incomp = next(r for r in t1["records"] if r["failure_class"] == "incomprehension")
-    assert "JUMP" in incomp["reason"] and incomp["outcome"] == "incomprehension"
-
-    # Attacker leaderboard stats add up.
-    a = t1["attackers"][0]
-    assert a["attacker_id"] == "qwen-2.5-coder#lane0"
-    assert a["attempts"] == 4
-    assert a["findings"] == 2 and a["incomprehension"] == 1 and a["misconception"] == 1
-
-    # Findings surfaced at the top level, tagged tier 1 with an attacker id.
-    t1_findings = [f for f in out["findings"] if f["tier"] == 1]
-    assert t1_findings and all(f["attacker_id"] == "qwen-2.5-coder#lane0"
-                               for f in t1_findings)
-
-
-def test_tier1_multiple_lanes(monkeypatch):
-    monkeypatch.setattr(g4, "_have_key", lambda: True)
-    monkeypatch.setattr(g4, "_attacker_complete", _canned(
-        [{"action_plan": {"pattern": "spam", "params": {"action": "wait"}}}]))
-    out = g4.run_g4(ESCAPE, _report(["blast"] * 6, 6), engine="py",
-                    world_factory=factory(), tiers=(0, 1),
-                    models=["m/one:free", "m/two:free"], **SMALL)
-    ids = [a["attacker_id"] for a in out["tier1"]["attackers"]]
-    assert ids == ["one#lane0", "two#lane1"]
-
-
-def test_tier1_skipped_without_key(monkeypatch):
-    # Force "no key": tier 1 must skip cleanly while tier 0 still runs.
-    monkeypatch.setattr(g4, "_have_key", lambda: False)
-
-    def _boom(*a, **k):  # network must never be touched when there is no key
-        raise AssertionError("attacker completion called without a key")
-    monkeypatch.setattr(g4, "_attacker_complete", _boom)
-
-    out = g4.run_g4(ESCAPE, _report(["blast"] * 6, 6), engine="py",
-                    world_factory=factory(), tiers=(0, 1), **SMALL)
-    assert out["tier1"]["status"] == "skipped_no_key"
-    assert out["tier1"]["reason"]
-    assert out["tier0"]["episodes"] > 0        # tier 0 stood alone
-
-
-def test_tier1_not_requested_is_skipped():
-    out = g4.run_g4(SURVIVOR, _report(["charge"] * 8 + ["vent"], 9, controlled="cell"),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    assert out["tier1"]["status"] == "skipped_not_requested"
-    # A clean tier 0 without a tier-1 pass is "hardened", never "bulletproof".
-    assert out["grade"] == "hardened"
-
-
-def test_bulletproof_requires_clean_tier1(monkeypatch):
-    # A survivor whose tier-1 attackers all whiff -> bulletproof.
-    monkeypatch.setattr(g4, "_have_key", lambda: True)
-    monkeypatch.setattr(g4, "_attacker_complete", _canned(
-        [{"action_plan": {"pattern": "spam", "params": {"action": "vent"}}}]))
-    out = g4.run_g4(SURVIVOR, _report(["charge"] * 8 + ["vent"], 9, controlled="cell"),
-                    engine="py", world_factory=factory(), tiers=(0, 1),
-                    models=["m/x:free"], **SMALL)
-    assert out["tier1"]["status"] == "run"
-    assert not out["tier1"]["findings"]
-    assert out["grade"] == "bulletproof"
-    assert out["passed"] is True
-
-
 # ====================================================================== #
 # attack_game — verify-then-attack wiring + certification gate
 # ====================================================================== #
-def test_attack_game_end_to_end(tmp_path, monkeypatch):
-    # GAME_VALID is a legacy-scale fast-win fixture; pin the v2.2 G3 thresholds
-    # (like test_gameverify.legacy_thresholds) so certification passes and this
-    # test exercises the G4 wiring, not the v2.3 duration bar.
-    from harness.verify import gameverify as gv
-    monkeypatch.setattr(gv, "TRIVIAL_TICKS", 5)
-    monkeypatch.setattr(gv, "PROBE_HORIZON", 120)
-    path = _write(tmp_path, "valid.py", GAME_VALID)
-    out = g4.attack_game(path, tiers=(0,), sandboxed=False, world_factory=factory(),
-                         **SMALL)
-    assert out["schema"] == g4.SCHEMA
-    assert out["engine"] == "py"
-    assert out["grade"] in ("open", "hardened", "bulletproof")
-    assert out["tier0"]["episodes"] > 0
-    assert set(out["actions"]) == {"right", "left"}
-
-
-def test_attack_game_refuses_uncertified(tmp_path):
-    # A game missing `success` fails G0 -> not certified -> G4 refuses to attack.
-    broken = GAME_VALID.replace("def success(world):", "def not_success(world):")
-    path = _write(tmp_path, "broken.py", broken)
-    out = g4.attack_game(path, tiers=(0,), sandboxed=False, world_factory=factory())
-    assert out["grade"] == "uncertified"
-    assert out["passed"] is False
-    assert "findings" in out and out["findings"] == []
-
-
 def test_attack_game_missing_file():
     out = g4.attack_game("does_not_exist_zzz.py", tiers=(0,), sandboxed=False)
     assert out["grade"] == "error"
@@ -525,17 +309,6 @@ def test_attack_game_missing_file():
 # ====================================================================== #
 # Finding -> repair-report adapter
 # ====================================================================== #
-def test_to_repair_report_shape():
-    finding = {"outcome": "escape", "family": "spam", "hard": True,
-               "detail": "drove player out", "reproducer": {"engine": "py"},
-               "evidence": {"result": "budget"}}
-    rr = g4.to_repair_report(finding)
-    assert rr["passed"] is False
-    assert rr["failure_class"] == "G4_FINDING"
-    assert rr["outcome"] == "escape"
-    assert rr["hint"] and rr["g4_reproducer"] == {"engine": "py"}
-
-
 # ---------------------------------------------------------------------------
 # B3 smoke — attack a certified Godot spec end to end (skipped without Godot).
 # This exercises the SAME wiring the py/js lanes use: detect_engine routes the
@@ -553,10 +326,9 @@ requires_godot = pytest.mark.skipif(
 
 def test_make_executor_routes_godot_to_godot_executor():
     # Pure-python guard on the router fix (no Godot needed): a godot engine must
-    # get a GodotExecutor, never the pymunk default.
-    from harness.verify.executors import GodotExecutor, PyExecutor
+    # get a GodotExecutor.
+    from harness.verify.executors import GodotExecutor
     assert isinstance(g4._make_executor("godot", None), GodotExecutor)
-    assert isinstance(g4._make_executor("py", None), PyExecutor)
 
 
 def test_make_executor_routes_gdscript_to_gd_executor():
@@ -743,19 +515,6 @@ def test_trigger_1b_missing_entity_or_escape():
 
 
 # -- Oracle 1c — bounded tree-refutation --------------------------------- #
-def test_oracle_certifies_softlock_and_refutes_control():
-    ex = PyExecutor(world_factory=factory())
-    soft = g4.refute_prefix(ex, SOFTLOCK, ["run", "leap"],
-                            ["run", "run", "run", "run"], H=30, budget=2500)
-    assert soft["certified"] is True and soft["witness"] is None
-    assert soft["subtree_status"] in ("saturated", "budget_exhausted",
-                                      "terminal_stuck", "exhausted")
-    # A continuation of a benign control prefix WINS -> refuted, not a softlock.
-    ctrl = g4.refute_prefix(ex, CONTROL, ["push", "coast"], ["coast", "coast"],
-                            H=30, budget=2500)
-    assert ctrl["certified"] is False and ctrl["witness"] is not None
-
-
 # -- Grading + registry wiring ------------------------------------------- #
 def test_softlock_is_a_hard_outcome_and_maps_to_repair():
     assert "softlock" in g4._HARD_OUTCOMES
@@ -780,69 +539,5 @@ def test_stale_seek_registered_but_not_attacker_emittable():
 
 
 # -- End to end through the g4 entry point ------------------------------- #
-def test_stale_tier_certifies_softlock_end_to_end():
-    out = g4.run_g4(SOFTLOCK, _report(["run", "run", "leap"] + ["run"] * 6, 9,
-                                      checkpoints={"lip": 2, "crossed": 3}),
-                    engine="py", world_factory=factory(), tiers=(0,),
-                    stale=True, **STALE, **SMALL)
-    assert out["grade"] == "open" and out["passed"] is False
-    soft = [f for f in out["findings"] if f["outcome"] == "softlock"]
-    assert soft, "the momentum pit must certify a softlock"
-    f = soft[0]
-    assert f["hard"] is True and f["tier"] == "stale" and f["family"] == "tree_refute"
-
-    ap = f["reproducer"]["action_plan"]
-    assert ap["kind"] == "sequence" and ap["sequence"] and all(a == "run"
-                                                               for a in ap["sequence"])
-    prov = f["reproducer"]["provenance"]
-    assert prov["oracle"] == "tree_refute" and prov["engine"] == "py"
-    assert prov["seed"] == 0 and prov["H"] == 30 and prov["budget"] == 2500
-    assert "subtree_status" in prov
-
-    assert out["stale"]["status"] == "run"
-    assert out["stale"]["triggered"] >= 1 and out["stale"]["certified"] >= 1
-    # The softlock is the ONLY thing that opened the game (no incidental hard find).
-    assert {hf["outcome"] for hf in out["hard_findings"]} == {"softlock"}
-
-    # The persisted reproducer genuinely re-certifies on a fresh executor.
-    recheck = g4.refute_prefix(PyExecutor(world_factory=factory()), SOFTLOCK,
-                               out["actions"], ap["sequence"], H=30, budget=2500)
-    assert recheck["certified"] is True
-
-
-def test_stale_tier_refutes_control_and_leaves_grade_unchanged():
-    args = dict(engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    rpt = _report(["push"] * 8, 8, checkpoints={"halfway": 4})
-    base = g4.run_g4(CONTROL, rpt, **args)
-    withstale = g4.run_g4(CONTROL, rpt, stale=True, **STALE, **args)
-    # The periodic control trips the trigger, but the oracle refutes every suspect.
-    assert withstale["stale"]["triggered"] >= 1
-    assert withstale["stale"]["certified"] == 0
-    assert not [f for f in withstale["findings"] if f["outcome"] == "softlock"]
-    # The stale tier changes nothing about the pre-existing grade.
-    assert base["grade"] != "open"
-    assert withstale["grade"] == base["grade"]
-
-
-def test_stale_tier_is_deterministic():
-    args = dict(engine="py", world_factory=factory(), tiers=(0,), stale=True,
-                **STALE, **SMALL)
-    rpt = _report(["run", "run", "leap"] + ["run"] * 6, 9,
-                  checkpoints={"lip": 2, "crossed": 3})
-    a = g4.run_g4(SOFTLOCK, rpt, **args)
-    b = g4.run_g4(SOFTLOCK, rpt, **args)
-    key = lambda o: json.dumps(o["stale"]["findings"], sort_keys=True, default=str)
-    assert key(a) == key(b)
-    assert a["stale"]["certified"] == b["stale"]["certified"]
-
-
-def test_stale_tier_absent_by_default():
-    out = g4.run_g4(SOFTLOCK, _report(["run", "run", "leap"] + ["run"] * 6, 9),
-                    engine="py", world_factory=factory(), tiers=(0,), **SMALL)
-    assert out["stale"]["status"] == "skipped_not_requested"
-    assert not [f for f in out["findings"] if f["outcome"] == "softlock"]
-    assert out["grade"] != "open"          # no certified softlock -> not opened
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
