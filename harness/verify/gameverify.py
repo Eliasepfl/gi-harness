@@ -9,8 +9,8 @@ VLM). A four-layer funnel, stopping at the first failing layer:
     G1_rollout  600-step noop rollout: no NaN, no escape, no success under noop
                 (agency), determinism, per-action efficacy (dead-action check)
     G2_goal     success() is a pure bool that is False at t=0 (same for failure);
-                checkpoints() is a pure dict[str, bool] of 1..6 snake_case
-                milestones, all False at t=0 (v2.1)
+                checkpoints() is a pure dict[str, bool] of 0..CP_MAX snake_case
+                milestones, all False at t=0 (v2.1; empty dict allowed)
     G3_solve    seeded random search -> a replayable witness, or UNSOLVED; v2.1
                 checkpoint semantics: the runner latches milestone first-True
                 ticks, dead milestones on the witness -> GOAL_ERROR, latch-order
@@ -82,7 +82,17 @@ DETERMINISM_EPS = 1e-6      # px/rad: two identical seeded runs must match withi
 NAN_EVENT_TYPES = {"nan_detected", "nan", "explosion"}
 
 # G2 (v2.1 checkpoints)
-CP_MIN, CP_MAX = 1, 6       # declared milestone count (CONTRACTS §2)
+CP_MIN, CP_MAX = 0, 32      # declared milestone count (CONTRACTS §2)
+# CP_MIN=0 (raised down from 1, 2026-07-17, Elias): a game with ONLY is_success and no
+# intermediate milestones is valid -- checkpoints() may return {} (an empty dict). This
+# is safe downstream because every checkpoint consumer already guards the no-milestone
+# case: harness/rl/env.py's shaping is `SHAPING_MASS / n_cp` with an explicit
+# `n_cp <= 0 -> 0.0` (a 0-checkpoint game trains on the terminal payoff alone), the obs
+# encoder widths add `n_cp` (0 -> no checkpoint channels), the G3 dead-milestone check
+# is "every DECLARED checkpoint latches" (vacuously true for {}), and the exporter /
+# atlas read reach fractions as "0 when no milestones". CP_MAX was an ARTIFICIAL 6-cap
+# that made games artificial; raised to a generous 32 (not unbounded -- it bounds the
+# obs-vector width and keeps a pathological 10k-entry dict out).
 _SNAKE_CASE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # G3
@@ -607,8 +617,8 @@ def _check_predicate(factory, game, fn, label, checks, *, must_be_false_at_t0):
 
 
 def _check_checkpoints(factory, game, checks) -> bool:
-    """v2.1: checkpoints(world) -> dict[str, bool], 1..6 snake_case entries,
-    ALL False at t=0, pure (same 2-call + snapshot protocol as success)."""
+    """v2.1: checkpoints(world) -> dict[str, bool], CP_MIN..CP_MAX (0..32) snake_case
+    entries, ALL False at t=0, pure (same 2-call + snapshot protocol as success)."""
     world = _fresh(factory, game)
     snap_before = _safe_snapshot(world)
     try:

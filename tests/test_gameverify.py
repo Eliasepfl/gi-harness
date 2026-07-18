@@ -1232,5 +1232,109 @@ def test_one_action_win_by_idle_fails_agency(tmp_path):
     assert "noop" in rep["hint"]
 
 
+# ====================================================================== #
+# Checkpoint count bounds (CP_MIN=0, CP_MAX=32)
+# ====================================================================== #
+# CP_MIN dropped 1 -> 0: a game with only is_success and NO intermediate milestones
+# (checkpoints() -> {}) is valid. CP_MAX raised 6 -> 32: the old hard cap was
+# artificial. The empty/large cases are exercised end-to-end and at the G2 gate.
+
+# 0 milestones: checkpoints() returns {} -> must still certify (terminal-only game).
+GAME_NO_MILESTONES = '''
+TITLE = "Just Win"
+PROMPT = "reach the marker; no intermediate milestones"
+ACTIONS = ["right", "left"]
+''' + _BODY + '''
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    return {}
+'''
+
+# 8 milestones (was rejected at the old CP_MAX=6): monotone x-thresholds all below
+# the goal, so the winning trajectory latches all eight in declared order.
+GAME_MANY_CHECKPOINTS = '''
+TITLE = "Eight Marks"
+PROMPT = "pass eight marks then the goal"
+ACTIONS = ["right", "left"]
+''' + _BODY + '''
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    x = world.query("player")["pos"][0]
+    return {"m%d" % i: x > (110 + 20 * i) for i in range(8)}
+'''
+
+# 33 milestones: over the new CP_MAX=32 -> the cap must still bite.
+GAME_OVER_CAP_CHECKPOINTS = '''
+TITLE = "Too Many"
+PROMPT = "declares 33 milestones"
+ACTIONS = ["right", "left"]
+''' + _BODY + '''
+def success(world):
+    return world.query("player")["pos"][0] > 300
+
+def checkpoints(world):
+    x = world.query("player")["pos"][0]
+    return {"m%d" % i: x > (105 + i) for i in range(33)}
+'''
+
+
+def test_zero_checkpoint_game_certifies(tmp_path, legacy_thresholds):
+    # A game with an EMPTY checkpoints map certifies: G2 accepts n=0, and G3's
+    # dead-milestone check is vacuously satisfied.
+    path = _write(tmp_path, "nocp.py", GAME_NO_MILESTONES)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    assert rep["passed"] is True, rep
+    assert rep["failure_class"] is None
+    cw = rep["layers"]["G2_goal"]["checks"]["checkpoints_wellformed"]
+    assert cw["pass"] is True and cw["n"] == 0
+    assert rep["witness"]["checkpoints"] == {}
+
+
+def test_g2_accepts_empty_checkpoints():
+    layer = gv.run_g2(factory(), load_game(GAME_NO_MILESTONES))
+    assert layer["passed"] is True, layer
+    assert layer["checks"]["checkpoints_wellformed"]["n"] == 0
+
+
+def test_g2_accepts_eight_checkpoints():
+    # Previously (CP_MAX=6) an 8-milestone game failed wellformed; now it passes.
+    layer = gv.run_g2(factory(), load_game(GAME_MANY_CHECKPOINTS))
+    assert layer["passed"] is True, layer
+    cw = layer["checks"]["checkpoints_wellformed"]
+    assert cw["pass"] is True and cw["n"] == 8
+
+
+def test_g2_still_rejects_over_cap_checkpoints():
+    # The relaxed cap is 32; 33 milestones must still be rejected as malformed.
+    layer = gv.run_g2(factory(), load_game(GAME_OVER_CAP_CHECKPOINTS))
+    assert layer["passed"] is False
+    cw = layer["checks"]["checkpoints_wellformed"]
+    assert cw["pass"] is False and cw["n"] == 33
+
+
+def test_g2js_checkpoints_bounds_gd_lane():
+    # The Godot/JS lane shares run_g2_js/_g2js_checkpoints: same 0..32 bounds from
+    # the serve host's check facts (the production path for the gdscript engine).
+    from harness.verify.gameverify import run_g2_js
+
+    def g2(n):
+        return {
+            "success": {"is_bool": True, "value": False, "deterministic": True,
+                        "state_unchanged": True},
+            "failure": None,
+            "checkpoints": {"is_dict": True, "keys": ["m%d" % i for i in range(n)],
+                            "n": n, "non_bool_keys": [], "true_keys": [],
+                            "deterministic": True, "state_unchanged": True},
+        }
+
+    assert run_g2_js(g2(0))["checks"]["checkpoints_wellformed"]["pass"] is True
+    assert run_g2_js(g2(8))["checks"]["checkpoints_wellformed"]["pass"] is True
+    assert run_g2_js(g2(33))["checks"]["checkpoints_wellformed"]["pass"] is False
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
