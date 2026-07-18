@@ -68,15 +68,22 @@ class FakeWorld:
     the verifier. Pure integrator (velocity persists, no damping) so a fresh
     world + a fixed action sequence is perfectly reproducible.
 
-    nondeterministic=True injects unseeded global-random jitter per step to
-    simulate a game/engine that leaks unseeded randomness (breaks determinism).
+    nondeterministic=True injects unseeded global-random jitter per STEP to
+    simulate a game/engine that leaks unseeded randomness (breaks determinism on
+    BOTH the noop and the action path).
+
+    act_nondeterministic=True injects unseeded global-random jitter only inside
+    ``impulse`` (which the game calls from ``act``), so the NOOP path stays
+    deterministic while the ACTION path drifts — the own-RNG-in-act residual that
+    the host global-RNG pin does not cover and that the noop-only twin misses.
     """
 
     def __init__(self, seed=0, size=(800, 600), gravity=(0.0, 0.0), *,
-                 nondeterministic=False):
+                 nondeterministic=False, act_nondeterministic=False):
         self.size = size
         self.gravity = list(gravity)
         self.nondeterministic = nondeterministic
+        self.act_nondeterministic = act_nondeterministic
         self._rng = random.Random(seed)
         self._bodies = {}
         self._flags = {}
@@ -129,8 +136,14 @@ class FakeWorld:
     # ---- dynamics ----
     def impulse(self, name, vec):
         b = self._bodies[name]
-        b.vel[0] += float(vec[0]) / b.mass
-        b.vel[1] += float(vec[1]) / b.mass
+        jx = jy = 0.0
+        if self.act_nondeterministic:
+            # UNSEEDED global RNG on the ACT path only (impulse is called from act,
+            # never from a noop tick) -> two identical seeded action rollouts diverge.
+            jx = random.uniform(-0.5, 0.5)
+            jy = random.uniform(-0.5, 0.5)
+        b.vel[0] += (float(vec[0]) + jx) / b.mass
+        b.vel[1] += (float(vec[1]) + jy) / b.mass
 
     def force(self, name, vec):
         b = self._bodies[name]
@@ -709,7 +722,7 @@ def test_sandbox_rejection_fails_g0(tmp_path):
 
 
 def test_determinism_catches_unseeded_randomness(tmp_path):
-    # The game is fine; the (fake) engine leaks unseeded randomness.
+    # The game is fine; the (fake) engine leaks unseeded randomness on every step.
     path = _write(tmp_path, "valid.py", GAME_VALID)
     rep = verify_game(path, sandboxed=False,
                       world_factory=factory(nondeterministic=True))
@@ -717,6 +730,34 @@ def test_determinism_catches_unseeded_randomness(tmp_path):
     assert rep["failure_class"] == "ENV_ERROR"
     assert rep["layers"]["G1_rollout"]["checks"]["determinism"]["pass"] is False
     assert "deterministic" in rep["hint"]
+
+
+def test_determinism_catches_act_path_randomness(tmp_path):
+    # SAFETY: nondeterminism that manifests ONLY under actions (an unseeded own-RNG in
+    # act()) is invisible to the noop-only twin. The NEW action-path twin catches it:
+    # the noop determinism check still PASSES while determinism_action FAILS, so what
+    # would have been a silent bad certificate (a witness that does not replay) is now
+    # a hard G1 fail.
+    path = _write(tmp_path, "valid.py", GAME_VALID)
+    rep = verify_game(path, sandboxed=False,
+                      world_factory=factory(act_nondeterministic=True))
+    g1 = rep["layers"]["G1_rollout"]["checks"]
+    assert g1["determinism"]["pass"] is True          # noop path is deterministic
+    assert g1["determinism_action"]["pass"] is False  # act path caught
+    assert rep["failure_class"] == "ENV_ERROR"
+    assert "under actions" in rep["hint"]
+
+
+def test_action_determinism_does_not_false_reject_a_clean_game(tmp_path):
+    # A legitimately deterministic game (no act-path leak) must PASS the new twin:
+    # two identical seeded action rollouts are byte-identical.
+    path = _write(tmp_path, "valid.py", GAME_VALID)
+    rep = verify_game(path, sandboxed=False, world_factory=factory())
+    g1 = rep["layers"]["G1_rollout"]["checks"]
+    assert g1["determinism"]["pass"] is True
+    assert g1["determinism_action"]["pass"] is True
+    assert g1["determinism_action"]["ticks"] == gv.ACTION_DRIFT_TICKS
+    assert rep["passed"] is True
 
 
 def test_missing_game_file():

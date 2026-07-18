@@ -79,6 +79,9 @@ CONTEXT_BURST_TICKS = 8     # ticks of each OTHER action used to build a dynamic
                             # solver (cost stays at the old t=0 pass unless something
                             # is dead at rest) [eng.]
 DETERMINISM_EPS = 1e-6      # px/rad: two identical seeded runs must match within this [eng.]
+ACTION_DRIFT_TICKS = 24     # ticks of a fixed action sequence twinned for the ACT-path
+                            # determinism check — long enough for own-RNG drift to
+                            # accumulate past DETERMINISM_EPS, cheap vs G3 [eng.]
 NAN_EVENT_TYPES = {"nan_detected", "nan", "explosion"}
 
 # G2 (v2.1 checkpoints)
@@ -477,11 +480,31 @@ def run_g1(executor, game_source, actions):
     # Agency: success must never fire with zero actions.
     checks["agency"] = check(noop["result"] != "success", result=noop["result"])
 
-    # --- Determinism: two fresh seeded worlds, identical noop rollout ---
+    # --- Determinism (NOOP path): two fresh seeded worlds, identical noop rollout ---
     r1, r2 = executor.run_batch(game_source, [dict(noop_spec), dict(noop_spec)],
                                 NOOP_TICKS)
     delta = _snapshot_delta(r1["final_snapshot"], r2["final_snapshot"])
     checks["determinism"] = check(delta <= DETERMINISM_EPS, delta=_round_inf(delta))
+
+    # --- Determinism (ACTION path): the noop twin above only exercises the physics
+    # step, so nondeterminism that lives on the ACT path — an unseeded
+    # ``RandomNumberGenerator.new()`` (its OWN instance, which the host's global-RNG
+    # pin does NOT cover), a wall-clock read, or any act()-only leak — sails through
+    # and yields a SILENT bad certificate (a witness that does not replay). Twin a
+    # short FIXED action sequence too: run the same seeded plan twice and require the
+    # final snapshot byte-identical within DETERMINISM_EPS, hard-failing G1 on drift.
+    # It never false-rejects a legit game: a self-seeded RNG or global randi under the
+    # host pin stays byte-identical, so both runs match exactly. Skipped only when the
+    # game declares no actions (nothing to drive; G0 already requires >=1). ---
+    if actions:
+        seq = [actions[i % len(actions)] for i in range(ACTION_DRIFT_TICKS)]
+        act_spec = {"seed": WORLD_SEED, "actions": seq}
+        a1, a2 = executor.run_batch(game_source, [dict(act_spec), dict(act_spec)],
+                                    ACTION_DRIFT_TICKS)
+        adelta = _snapshot_delta(a1["final_snapshot"], a2["final_snapshot"])
+        checks["determinism_action"] = check(adelta <= DETERMINISM_EPS,
+                                             delta=_round_inf(adelta),
+                                             ticks=ACTION_DRIFT_TICKS)
 
     # --- Action efficacy: each declared action must move the world from SOME
     # context (not only t=0). Context-dependent actions — brake on a moving body,
@@ -988,6 +1011,12 @@ def _hint_g1(checks: dict) -> str:
     if not checks.get("determinism", {}).get("pass", True):
         return (f"non-deterministic simulation: two identical seeded rollouts diverged "
                 f"(delta={checks['determinism'].get('delta')})")
+    if not checks.get("determinism_action", {}).get("pass", True):
+        return (f"non-deterministic simulation under actions: two identical seeded "
+                f"action rollouts diverged (delta="
+                f"{checks['determinism_action'].get('delta')}) — an unseeded own RNG "
+                f"(RandomNumberGenerator.new()) or wall-clock read on the act() path; "
+                f"seed it from the world seed (or use the pinned global randi)")
     if not checks.get("efficacy", {}).get("pass", True):
         eff = checks["efficacy"]
         n = eff.get("contexts", 1)
