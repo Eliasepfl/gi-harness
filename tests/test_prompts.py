@@ -4,6 +4,14 @@ The spec-lane prompt library was purged (Elias, 2026-07-15); its tests died with
 What survives is the gdscript engine section: compose('gdscript') assembles the
 duck-typed METHOD-CONVENTION prompt (a plain Node implementing build/act/state/...,
 NO base class -- godotworld/GAME_API.md), examples-free.
+
+2026-07-18 (Elias): api_gdscript.md was shrunk TO THE BONE — every design-coaching
+section (dimension, controlled body, stakes, MATERIAL REALITY, visuals, Godot-4
+runtime ghosts, the banned-API table, the common-gate-failure cheat sheet) was
+DELETED. Only the hard INTERFACE (the seven method signatures + the state() shape
+the funnel reads) and the DETERMINISM rule remain; everything else the model now
+learns from verify_game's typed hints via the feedback loop. Tests for the deleted
+sections were removed with them.
 """
 from __future__ import annotations
 
@@ -24,49 +32,40 @@ def _gdscript_blocks(sp):
 
 def test_all_sections_present_in_composed_gdscript():
     sp = P.compose("gdscript")
-    # api_gdscript.md — the self-contained code contract + tables.
-    assert "ONE GDScript file" in sp                # emit a .gd node, real code
-    assert "NO BASE CLASS" in sp                    # a PLAIN node, nothing to resolve
-    assert "DESIGN BEFORE YOU CODE" in sp           # design-before-code scaffold
-    assert "DIVERSITY IS THE JOB" in sp             # the diversity mandate
-    # MATERIAL REALITY — the spatial-milestone non-vacuity rule (STAKES's twin): a goal in
-    # space is a thing, not a coordinate. Two stable pins harden the wording (a reword is a
-    # coupled prompt+test edit + a fresh integrity snapshot, never a mid-run tweak).
-    assert "MATERIAL REALITY" in sp
-    assert "never off a bare coordinate" in sp
+    # api_gdscript.md — the shrunk interface + determinism contract.
+    assert "extends" in sp and "Node3D" in sp       # extend a plain node type
+    assert "custom base class" in sp                # no custom base class (the host needs a Node, not RefCounted)
     # The seven method SIGNATURES the has_method contract probe checks (taught by name,
-    # not as a filled skeleton — reference, not a worked example).
+    # the ONLY interface guidance that survives — the funnel hard-depends on them).
     for sig in ("func build(world_seed: int) -> void", "func act(action: String) -> void",
                 "func state() -> Dictionary", "func checkpoints() -> Dictionary",
                 "func is_success() -> bool", "func is_failure() -> bool",
                 "func actions() -> Array"):
         assert sig in sp, sig
-    # The rng is self-seeded (a determinism RULE, not an anchoring node/value).
-    assert "RandomNumberGenerator" in sp
-    # The state() snapshot keys the funnel reads.
+    # The state() snapshot keys the funnel reads (structural interface, not coaching).
     for key in ('"controlled"', '"static"', '"bodies"'):
         assert key in sp, key
-    # design_block_gdscript.md — DESIGN output format.
+    # design_block_gdscript.md — DESIGN output format (unchanged by the shrink).
     assert "DESIGN" in sp and "Milestones:" in sp and "Parts used:" in sp
     assert "# Output format" in sp
 
 
-def test_gdscript_material_reality_binds_only_spatial_milestones():
-    # The rule binds a WHERE-milestone to a real shaped node, but explicitly EXEMPTS a
-    # milestone that is not about a place (a time/motion condition) — so the generator is not
-    # pushed to drop tick/velocity milestones to dodge the check. And it names the advisory
-    # signal ("flips in empty space") so the wording matches the verifier's ANCHORING hint.
-    flat = " ".join(P.compose("gdscript").lower().split())
-    assert "milestones not defined by a place need no anchor" in flat   # the exemption
-    assert "flips in empty space" in flat                               # the advisory signal
+def test_gdscript_prompt_carries_no_determinism_lecture():
+    # 2026-07-18 (Elias): the whole Determinism section was DELETED. Determinism is now
+    # ENFORCED, not requested — the host pins the global RNG (seed(world_seed) each reset)
+    # and the strengthened G1 gate twins a real-action rollout, so any nondeterminism fails
+    # certification regardless of what the prompt says. The prompt must NOT re-grow a
+    # determinism lecture (verify, don't instruct).
+    sp = P.compose("gdscript")
+    assert "byte-for-byte" not in sp
+    assert "RandomNumberGenerator" not in sp
+    assert "# Determinism" not in sp
 
 
 def test_composed_gdscript_is_reference_not_a_worked_game():
-    # Elias's discipline: the guide carries SIGNATURES + slot descriptions, never a
-    # filled skeleton or a copyable game — a worked example anchors the small model
-    # (and a filled skeleton hardcodes a dimension/shape it must not).
+    # Elias's discipline: the guide carries SIGNATURES only, never a filled skeleton or a
+    # copyable game — a worked example anchors the small model.
     sp = P.compose("gdscript")
-    assert "there is deliberately no skeleton" in sp
     # NO fenced gdscript block is a complete, playable game body.
     for b in _gdscript_blocks(sp):
         builds = b.count("RigidBody") + b.count("StaticBody") + b.count("add_child(")
@@ -77,82 +76,19 @@ def test_composed_gdscript_is_reference_not_a_worked_game():
     assert "_puck" not in sp and "_pads" not in sp
 
 
-def test_gdscript_grants_2d_and_3d_dimension_freedom():
-    # Elias: BOTH 2D and 3D are first-class; the fiction chooses, neither is the default.
-    sp = P.compose("gdscript")
-    assert "Node2D" in sp and "Node3D" in sp             # both dimension families named
-    assert "PhysicsServer3D.set_active(true)" in sp      # the one 3D quirk, taught
-    # The controlled body's shape/type is a design choice, never a forced circle.
-    assert "default to a circle" in sp
-    flat = " ".join(sp.lower().split())
-    assert "whatever the game is about" in flat
-
-
-def test_gdscript_banned_list_states_determinism_and_sandbox_reasons():
-    sp = P.compose("gdscript")
-    assert "BANNED" in sp
-    # The banned families, each named so the G0 scanner's finding is teachable.
-    for banned in ("OS.", "FileAccess", "HTTPRequest", "StreamPeerTCP", "Thread",
-                   "WorkerThreadPool", "Time.", "randi()", "randf()", "preload(",
-                   "set_script", "Expression", "get_tree()"):
-        assert banned in sp, banned
-    # The WHY is the two hard rules, not style.
-    flat = " ".join(sp.lower().split())
-    assert "sandbox escape" in flat
-    assert "nondeterministic" in flat or "nondeterminism" in flat
-    # The sanctioned randomness path: seed your own generator, not the global rng.
-    assert "seed it from world_seed" in flat or "seed your own" in flat
-
-
-def test_gdscript_names_godot4_runtime_and_bans_godot3_ghosts():
-    # 2026-07-17 parser-friction lever: the free model half-remembers Godot 3 and invents
-    # symbols the strict parser rejects. ONE runtime hard-rule line (anti-hallucination,
-    # NOT a design menu) names the runtime as Godot 4.x and the real API surface, and calls
-    # out the Godot-3 ghosts the A/B traces caught. Sits in the BANNED/determinism-adjacent
-    # runtime area, BEFORE the "Common gate failures" section.
-    sp = P.compose("gdscript")
-    flat = " ".join(sp.lower().split())
-    assert "runtime is godot 4" in flat                 # the runtime is named
-    # The REAL Godot-4 API names the model must reach for.
-    for real in ("apply_central_force", "apply_torque_impulse", "overlaps_body",
-                 "limit_length", "CharacterBody2/3D"):
-        assert real in sp, real
-    # The Godot-3 GHOSTS, each named as non-existent so the model unlearns it.
-    for ghost in ("add_central_force", "apply_angular_impulse", "has_overlapping_body",
-                  "Vector2.limited", "KinematicBody", "FixedJoint3D", "PolygonShape2D",
-                  "MODE_"):
-        assert ghost in sp, ghost
-    # It is a RUNTIME rule, not steering about the game: it lands before the gate-failure
-    # reminders and after the BANNED table (the determinism/sandbox runtime area).
-    assert sp.index("BANNED") < sp.index("RUNTIME IS GODOT 4")
-    assert sp.index("RUNTIME IS GODOT 4") < sp.index("Common gate failures")
-
-
-def test_gdscript_gravity_is_the_games_own_choice():
-    # View guidance: gravity/view is the GAME's to set - and the contract offers NO menu.
-    # (2026-07-16 de-bias: enumerating "side elevation or topdown" was itself a two-item
-    # menu steering the frame choice; steering belongs to the user prompt, not the harness.)
-    sp = P.compose("gdscript")
-    flat = " ".join(sp.lower().split())
-    assert "yours to set" in flat                       # gravity/orientation is the game's
-    assert "topdown" not in flat                        # no closed frame menu
-    assert "side elevation" not in flat
-    # No fiction menu either: the controlled body must not be pre-cast into example kinds.
-    assert "a ship, a car" not in flat
-
-
 def test_gdscript_prompt_carries_no_anchoring_residue():
-    # Elias's anti-anchoring principle: the surface carries signatures + hard rules only,
-    # NOT hardcoded values, a world extent, prescribed (2D-only) node types, or a skeleton.
+    # Elias's anti-anchoring principle: the surface carries signatures + the determinism
+    # rule only, NOT hardcoded values, a world extent, prescribed (2D-only) node types.
     sp = P.compose("gdscript")
-    # No world-size field (pure spec-lane residue) and no hardcoded arena extent.
-    for residue in ("world_size", "[800", "800, 600", "WORLD_SIZE"):
+    # No hardcoded arena extent and no spec-lane WORLD_SIZE constant. NB the lowercase
+    # `world_size` key IS legitimately documented now (the host reads it from state() to
+    # enlarge the default 800x600 arena — a contract option, not anchoring residue).
+    for residue in ("[800", "800, 600", "WORLD_SIZE"):
         assert residue not in sp, residue
     # No prescribed 2D-only node types (the game picks bodies for its dimension).
     for node2d in ("RigidBody2D", "StaticBody2D", "Area2D", "CollisionShape2D"):
         assert node2d not in sp, node2d
-    # No filled skeleton / worked game.
-    assert "there is deliberately no skeleton" in sp
+    # No filled skeleton / worked game in any fenced block.
     for b in _gdscript_blocks(sp):
         assert "func " not in b, "a code skeleton leaked in"
 
@@ -193,19 +129,6 @@ def test_composed_gdscript_has_no_spec_or_pyjs_idioms_or_placeholders():
     for token in ("{lang}", "{fence}", "{artifact}", "{substrate}", "{false}",
                   "{import_rule}", "{rng_forbid}", "{dict_word}"):
         assert token not in sp, token
-
-
-def test_gdscript_common_failures_are_taught():
-    sp = P.compose("gdscript")
-    # The per-gate failure reminders (hard rules), no hardcoded physics numbers.
-    assert "Common gate failures" in sp
-    for row in ("G0 parse error", "G0 banned API", "G0 contract probe",
-                "G1 containment escape", "G1 dead action", "G1 single-action win",
-                "G2 predicate already true at t=0", "G3 goal never true"):
-        assert row in sp, row
-    # The tunnelling principle is folded into the containment fix (a rule, not a value).
-    flat = " ".join(sp.lower().split())
-    assert "clamp the controlled body" in flat
 
 
 def test_gdscript_integrity_freezes_its_prompt_sections():
