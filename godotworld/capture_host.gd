@@ -347,7 +347,7 @@ func _grab(tick_no: int) -> void:
 	if _no_frames:
 		return
 	if _stage != null and is_instance_valid(_stage):
-		_stage.sync()
+		_stage.sync(_state_positions())
 	RenderingServer.force_draw(false)
 	var tex := root.get_texture()
 	if tex == null:
@@ -401,6 +401,29 @@ func _load_assets_dict(path: String) -> Dictionary:
 	if typeof(parsed) != TYPE_DICTIONARY:
 		return {}
 	return parsed
+
+
+func _state_positions() -> Dictionary:
+	# Per-tick canonical body poses from the game's own state() -- the SAME pure query that
+	# _fingerprint (303) and _sane (364) already make each tick, so this adds NO physics step
+	# and NO game-tree mutation: zero-contact holds and the state() trail is byte-unchanged.
+	# Keyed by state() body NAME so the dresser can drive a proxy that has NO live node (a
+	# synthesized shapeless body) straight from the trail. Render-only; the same tick as the PNG.
+	var out := {}
+	var st = _game.state()
+	if typeof(st) != TYPE_DICTIONARY:
+		return out
+	var bodies = st.get("bodies", [])
+	if typeof(bodies) != TYPE_ARRAY:
+		return out
+	for b in bodies:
+		if typeof(b) != TYPE_DICTIONARY:
+			continue
+		out[str(b.get("name", ""))] = {
+			"pos": b.get("pos", []),
+			"angle": b.get("angle", 0.0),
+		}
+	return out
 
 
 func _write_dump_state() -> void:

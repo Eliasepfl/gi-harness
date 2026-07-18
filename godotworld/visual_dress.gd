@@ -172,6 +172,18 @@ var _tgt_min := Vector3(INF, INF, INF)    # union AABB of the resolved view-targ
 var _tgt_max := Vector3(-INF, -INF, -INF)
 var _tgt_resolved := 0
 var _tgt_missing: Array = []
+# ---- dresser-follows-state (per-tick trail -> proxy transforms) ------------- #
+# Every proxy is stamped with the state() body NAME it belongs to (t=0 pos-nearest match, the
+# same match asset routing uses -- see _resolve_state_names). The capture host hands sync() a
+# per-tick {name: {pos, angle}} map read from the game's own state(); a proxy is then driven
+# straight from its trail entry. SYNTHESIZED proxies (a shapeless hand-sim body with no node to
+# ride) are ALWAYS trail-driven -- the whole point. Shape-backed proxies node-ride by default
+# (byte-identical) unless UNIFIED state-follow is opted in.
+var _state_name_by_body: Dictionary = {}  # body instance-id -> state() name (trail key)
+var _state_follow_all := false            # unified: drive shape-backed proxies from the trail too
+var _controlled_state_name := ""          # the controlled body's state() name (follow-cam trail key)
+var _controlled_synth := false            # the controlled body is shapeless (a synthesized proxy)
+var _controlled_synth_pos0 := Vector3.ZERO # its t=0 state() position (follow-cam base at setup)
 
 
 # =========================================================================== #
@@ -188,6 +200,7 @@ func dress(game_root: Node, opts := {}) -> void:
 	_build_assets_norm(opts.get("assets", {}))
 	_read_cam_opts(opts)
 	_read_dress_mode(opts)
+	_read_state_follow(opts)
 
 	# 1. Discover every collision shape in the game tree (READ-ONLY walk), taking the visnode
 	#    census on the way: what did this game already author for itself?
@@ -198,6 +211,15 @@ func dress(game_root: Node, opts := {}) -> void:
 	# 2. Identify the controlled body by matching state()'s controlled entry to a body.
 	var ctrl_pos = _controlled_pos_from_state(game_root)
 	_assign_roles(shapes, ctrl_pos)
+
+	# 2a. Match every body to its state() NAME (t=0 pos-nearest, node-name fallback), for BOTH
+	#     2D and 3D. This is the key the per-tick state() trail is looked up by each frame; the
+	#     matcher is the same one asset routing uses, so trail keys and asset routing agree.
+	var state_bodies := _state_bodies(game_root)
+	_resolve_state_names(shapes, state_bodies)
+	if _controlled_body != null and is_instance_valid(_controlled_body):
+		_controlled_state_name = String(_state_name_by_body.get(
+			_controlled_body.get_instance_id(), ""))
 
 	# 2b. Resolve each body's bank asset (3D only), matching nodes to state() names by t=0 pos.
 	if _is_3d:
@@ -214,40 +236,174 @@ func dress(game_root: Node, opts := {}) -> void:
 		_build_2d(shapes)
 		_precompute_mirror_2d()
 
+	# 3b. SYNTHESIS: a state() body that matched NO collision shape (a shapeless hand-sim body)
+	#     has no node to ride, so it never animated -- the frozen-GIF bug. Build it a render-only
+	#     primitive proxy driven purely by the per-tick trail. Nothing here touches the game tree;
+	#     the proxy lives in our sibling stage exactly like every shape-backed one.
+	_synthesize_bodies(state_bodies)
+
+	# 3c. Cache each shape-backed pair's t=0 rel transform, so UNIFIED state-follow (opt-in) can
+	#     drive it from the trail while keeping its shape offset + asset fit-scale.
+	_precompute_trail(state_bodies)
+
 	# 4. Camera framing (fit-to-scene overview, or follow the controlled body).
 	_setup_camera()
 	# Prime proxy transforms so the very first captured frame is already aligned.
 	sync()
 
 
-func sync() -> void:
+func sync(positions := {}) -> void:
 	# Mirror each body's current pose onto its visual proxy. READ-ONLY on the game tree -- the
 	# whole zero-contact contract. Called once per captured frame by the host; never steps physics.
 	#
-	# 2D mirrors from the body's STORED .position/.rotation (via _mirror_xform_2d) rather than
-	# reading the shape's .global_transform: a .global_transform read mid-physics forces a
-	# transform-notification flush that perturbs a float-sensitive replay (a debris-threading game
-	# docks at tick 275 but the flush diverged it into a crash at ~130). state()'s own reads are
-	# .position/.rotation for exactly this reason. 3D keeps the direct .global_transform read (its
-	# asset mounts carry a fit-scale the compose path would drop; the 3D follow-cam is unchanged).
+	# positions (optional; capture_host._grab passes it): {state_name: {pos, angle}} for THIS
+	# tick, read from the game's own state(). Empty ({}) == the exact legacy node-ride path, so
+	# demo_player.gd (which calls sync() with no arg) stays byte-identical. Per pair:
+	#   * a SYNTHESIZED proxy (src == null; a shapeless hand-sim body) has NO node to ride and is
+	#     ALWAYS driven from its trail entry -- the dresser-follows-state fix.
+	#   * a shape-backed proxy node-rides as before (byte-identical) UNLESS unified state-follow
+	#     is opted in (_state_follow_all), when it too is driven from the trail via its cached
+	#     t=0 rel transform (preserving shape offset + asset fit-scale).
+	#
+	# 2D node-ride mirrors from the body's STORED .position/.rotation (via _mirror_xform_2d)
+	# rather than reading the shape's .global_transform: a .global_transform read mid-physics
+	# forces a transform-notification flush that perturbs a float-sensitive replay. 3D node-ride
+	# keeps the direct .global_transform read (its asset mounts carry a fit-scale the compose
+	# path would drop). Trail-driving reads NEITHER -- it composes from the state() values.
+	var have_pos: bool = not positions.is_empty()
 	for p in _pairs:
 		var proxy = p["proxy"]
 		if not is_instance_valid(proxy):
 			continue
+		var src = p["src"]
+		var shapeless: bool = (src == null or not is_instance_valid(src))
+		var sname := String(p.get("state_name", ""))
+		if have_pos and sname != "" and positions.has(sname) \
+				and (shapeless or _state_follow_all):
+			_apply_trail(p, positions[sname])
+			continue
+		if shapeless:
+			continue                        # no node and no trail entry -> leave at its last pose
 		if _is_3d:
-			var src = p["src"]
-			if is_instance_valid(src):
-				proxy.global_transform = src.global_transform
+			proxy.global_transform = src.global_transform
 		else:
 			proxy.global_transform = _mirror_xform_2d(p)
-	if _follow and _camera != null and is_instance_valid(_camera) \
-			and _controlled_body != null and is_instance_valid(_controlled_body):
-		# The chase camera trails the controlled body at a FIXED WORLD offset (its orientation
-		# was baked at setup). Read-only on the game tree, so the zero-contact contract holds.
-		if _is_3d:
-			_camera.global_position = _follow_pose()
-		else:
+	_sync_follow_cam(positions)
+
+
+func _sync_follow_cam(positions) -> void:
+	# The chase camera trails the controlled body at a FIXED WORLD offset (its orientation was
+	# baked at setup). Read-only on the game tree, so the zero-contact contract holds. For a
+	# SHAPELESS controlled body (no node) the base position comes from the per-tick trail.
+	if not _follow or _camera == null or not is_instance_valid(_camera):
+		return
+	var have_node: bool = _controlled_body != null and is_instance_valid(_controlled_body)
+	if not have_node and not _controlled_synth:
+		return
+	if _is_3d:
+		var base := _controlled_base_pos()
+		if not have_node and _controlled_state_name != "" \
+				and typeof(positions) == TYPE_DICTIONARY and positions.has(_controlled_state_name):
+			base = _entry_pos3(positions[_controlled_state_name].get("pos", []))
+		_camera.global_position = _follow_pose_from(base)
+	else:
+		if have_node:
 			_camera.global_position = (_controlled_body as Node2D).position
+		elif _controlled_state_name != "" and typeof(positions) == TYPE_DICTIONARY \
+				and positions.has(_controlled_state_name):
+			_camera.global_position = _entry_pos2(positions[_controlled_state_name].get("pos", []))
+		else:
+			_camera.global_position = Vector2(_controlled_synth_pos0.x, _controlled_synth_pos0.y)
+
+
+func _apply_trail(p: Dictionary, entry) -> void:
+	# Drive one proxy from its per-tick state() trail entry {pos, angle}. A cached rel transform
+	# (shape-backed, unified mode) preserves the shape offset + asset fit-scale; a synthesized
+	# proxy has no rel (it IS the body) and takes the state pose directly.
+	var proxy = p["proxy"]
+	if _is_3d:
+		var pose := _trail_pose_3d(entry)
+		if p.has("rel3d"):
+			(proxy as Node3D).global_transform = pose * (p["rel3d"] as Transform3D)
+		else:
+			(proxy as Node3D).global_transform = pose
+	else:
+		var pose2 := _trail_pose_2d(entry)
+		if p.has("rel2d"):
+			(proxy as Node2D).global_transform = pose2 * (p["rel2d"] as Transform2D)
+		else:
+			(proxy as Node2D).global_transform = pose2
+
+
+# ---- trail pose math (PURE: read no member state -> unit-testable in isolation) ---- #
+func trail_pose_3d(pos, angle) -> Transform3D:
+	# (state() pos, state() angle) -> the body's world pose. `angle` is a scalar yaw OR an
+	# [x,y,z] Euler vector (serve_game._angle_json). PURE.
+	return Transform3D(_basis_from_angle(angle), _entry_pos3(pos))
+
+
+func trail_pose_2d(pos, angle) -> Transform2D:
+	# (state() pos, state() scalar angle) -> the body's 2D world pose. PURE.
+	return Transform2D(_rot2_from_angle(angle), _entry_pos2(pos))
+
+
+func _trail_pose_3d(entry) -> Transform3D:
+	return trail_pose_3d(entry.get("pos", []), entry.get("angle", 0.0))
+
+
+func _trail_pose_2d(entry) -> Transform2D:
+	return trail_pose_2d(entry.get("pos", []), entry.get("angle", 0.0))
+
+
+func _entry_pos3(p) -> Vector3:
+	# Accept a state() pos as an [x,y(,z)] Array (the wire form) OR a Vector2/Vector3.
+	if typeof(p) == TYPE_VECTOR3:
+		return p
+	if typeof(p) == TYPE_VECTOR2:
+		return Vector3((p as Vector2).x, (p as Vector2).y, 0.0)
+	if typeof(p) == TYPE_ARRAY:
+		var a: Array = p
+		var x := float(a[0]) if a.size() >= 1 else 0.0
+		var y := float(a[1]) if a.size() >= 2 else 0.0
+		var z := float(a[2]) if a.size() >= 3 else 0.0
+		return Vector3(x, y, z)
+	return Vector3.ZERO
+
+
+func _entry_pos2(p) -> Vector2:
+	var v := _entry_pos3(p)
+	return Vector2(v.x, v.y)
+
+
+func _basis_from_angle(a) -> Basis:
+	# A 3-vector angle is the natural [x,y,z] Euler basis; a scalar (or 1-vector) angle is a
+	# yaw about the world +Y (the only rotation state() reports for a top-down/planar body).
+	if typeof(a) == TYPE_ARRAY:
+		var arr: Array = a
+		if arr.size() >= 3:
+			return Basis.from_euler(Vector3(float(arr[0]), float(arr[1]), float(arr[2])))
+		if arr.size() >= 1:
+			return Basis(Vector3(0.0, 1.0, 0.0), float(arr[0]))
+		return Basis()
+	return Basis(Vector3(0.0, 1.0, 0.0), float(a))
+
+
+func _rot2_from_angle(a) -> float:
+	if typeof(a) == TYPE_ARRAY:
+		var arr: Array = a
+		return float(arr[0]) if arr.size() >= 1 else 0.0
+	return float(a)
+
+
+func _read_state_follow(opts: Dictionary) -> void:
+	# SAFE default (unset): only synthesized (shapeless) proxies are trail-driven, so the
+	# certified real-body demos stay PIXEL-identical (their sync path is unchanged). "all"/
+	# "unified" (opt or HARNESS_DRESS_STATE_FOLLOW env) opts EVERY matched proxy into the trail
+	# -- a conscious byte-identity choice, off until validated on the 2-run determinism grid.
+	var m := str(opts.get("state_follow", ""))
+	if m == "":
+		m = OS.get_environment("HARNESS_DRESS_STATE_FOLLOW")
+	_state_follow_all = (m == "all" or m == "unified")
 
 
 func _precompute_mirror_2d() -> void:
@@ -531,6 +687,15 @@ func _body_pos3(body: Node) -> Vector3:
 	return Vector3.ZERO
 
 
+func _pair_dict(src, proxy, body) -> Dictionary:
+	# One {src, proxy, state_name} pair. state_name is the body's matched state() name (the
+	# trail key); "" for an unmatched body (the proxy then node-rides only).
+	var sname := ""
+	if body != null and is_instance_valid(body):
+		sname = String(_state_name_by_body.get(body.get_instance_id(), ""))
+	return {"src": src, "proxy": proxy, "state_name": sname}
+
+
 # =========================================================================== #
 # 2D build
 # =========================================================================== #
@@ -551,7 +716,7 @@ func _build_2d(shapes: Array) -> void:
 		if proxy == null:
 			continue
 		_stage2d.add_child(proxy)
-		_pairs.append({"src": rec["shape"], "proxy": proxy})
+		_pairs.append(_pair_dict(rec["shape"], proxy, rec["body"]))
 		if rec["role"] == "controlled" and ctrl_shape == null:
 			ctrl_shape = rec["shape"]
 
@@ -589,7 +754,7 @@ func _build_2d(shapes: Array) -> void:
 		halo.color = Color(COL_CONTROLLED.r, COL_CONTROLLED.g, COL_CONTROLLED.b, 0.22)
 		halo.z_index = Z_DYNAMIC + 3
 		_stage2d.add_child(halo)
-		_pairs.append({"src": ctrl_shape, "proxy": halo})
+		_pairs.append(_pair_dict(ctrl_shape, halo, _controlled_body))
 
 
 func _make_2d_proxy(rec: Dictionary):
@@ -769,7 +934,7 @@ func _build_3d(shapes: Array) -> void:
 		if proxy == null:
 			continue
 		_stage3d.add_child(proxy)
-		_pairs.append({"src": rec["shape"], "proxy": proxy})
+		_pairs.append(_pair_dict(rec["shape"], proxy, rec["body"]))
 		if rec["role"] == "controlled" and _controlled_proxy == null:
 			_controlled_proxy = proxy
 
@@ -962,7 +1127,10 @@ func _state_bodies(game_root: Node) -> Array:
 			v.x = float(pos[0]); v.y = float(pos[1])
 			if pos.size() >= 3:
 				v.z = float(pos[2])
-		out.append({"name": String(b.get("name", "")), "pos": v})
+		out.append({"name": String(b.get("name", "")), "pos": v,
+			"angle": b.get("angle", 0.0),
+			"controlled": bool(b.get("controlled", false)),
+			"static": bool(b.get("static", false))})
 	return out
 
 
@@ -988,6 +1156,167 @@ func _asset_id_for_rec(rec: Dictionary) -> String:
 	if body == null or not is_instance_valid(body):
 		return ""
 	return String(_asset_by_body.get(body.get_instance_id(), ""))
+
+
+# =========================================================================== #
+# Dresser-follows-state: name matching, shapeless-body synthesis, rel caching
+# =========================================================================== #
+func _resolve_state_names(shapes: Array, state_bodies: Array) -> void:
+	# Stamp every shape-owning body with the state() NAME nearest its t=0 position (the same
+	# match asset routing uses), so each pair can be keyed into the per-tick trail. Runs for
+	# BOTH 2D and 3D (asset routing is 3D-only, but the trail is not).
+	_state_name_by_body.clear()
+	if state_bodies.is_empty():
+		return
+	var seen := {}
+	for rec in shapes:
+		var body = rec["body"]
+		if body == null or not is_instance_valid(body):
+			continue
+		var bid: int = body.get_instance_id()
+		if seen.has(bid):
+			continue
+		seen[bid] = true
+		_state_name_by_body[bid] = _state_name_for_body(body, state_bodies)
+
+
+func _state_name_for_body(body: Node, state_bodies: Array) -> String:
+	# The state() body NAME nearest this body's t=0 position (within ASSET_POS_TOL), with a
+	# normalised node-name fallback. Mirrors _asset_for_body's match. "" when nothing matches.
+	var bpos := _body_pos3(body)
+	var best_name := ""
+	var best_d := INF
+	for sb in state_bodies:
+		var d: float = (sb["pos"] as Vector3).distance_to(bpos)
+		if d < best_d:
+			best_d = d
+			best_name = String(sb["name"])
+	if best_name != "" and best_d <= ASSET_POS_TOL:
+		return best_name
+	var want := _norm_name(String(body.name))
+	for sb in state_bodies:
+		if _norm_name(String(sb["name"])) == want:
+			return String(sb["name"])
+	return ""
+
+
+func _synthesize_bodies(state_bodies: Array) -> void:
+	# For every state() body that matched NO shape (a shapeless hand-sim body), build a render-
+	# only primitive proxy (src == null) keyed by the body's own state() name and driven purely
+	# by the trail. A 0-shape game thus finally animates. Zero-contact: the proxy is a child of
+	# our sibling stage, never of the game.
+	if state_bodies.is_empty():
+		return
+	var matched := {}
+	for v in _state_name_by_body.values():
+		if String(v) != "":
+			matched[_norm_name(String(v))] = true
+	var ext := _synth_half_extent()
+	for sb in state_bodies:
+		var nm := String(sb["name"])
+		if nm == "" or matched.has(_norm_name(nm)):
+			continue
+		var role := _role_for_state(sb)
+		var proxy = _make_synth_proxy(role, ext)
+		if proxy == null:
+			continue
+		var pos: Vector3 = sb["pos"]
+		if _is_3d:
+			if _stage3d == null:
+				return
+			_stage3d.add_child(proxy)
+			(proxy as Node3D).global_transform = _trail_pose_3d(sb)
+		else:
+			if _stage2d == null:
+				return
+			_stage2d.add_child(proxy)
+			(proxy as Node2D).global_transform = _trail_pose_2d(sb)
+		_pairs.append({"src": null, "proxy": proxy, "state_name": nm, "synth": true})
+		_expand_bounds_synth(pos, ext)
+		# A shapeless CONTROLLED body becomes the follow target when no shaped one was found.
+		if bool(sb.get("controlled", false)) \
+				and (_controlled_body == null or not is_instance_valid(_controlled_body)):
+			_controlled_state_name = nm
+			_controlled_synth = true
+			_controlled_synth_pos0 = pos
+			_controlled_ext = ext
+			_controlled_ext_set = true
+
+
+func _role_for_state(sb) -> String:
+	if bool(sb.get("controlled", false)):
+		return "controlled"
+	if bool(sb.get("static", false)):
+		return "static"
+	return "dynamic"
+
+
+func _synth_half_extent() -> Vector3:
+	# state() carries NO geometry, so a synthesized body's size is a scene-span heuristic,
+	# floored to an absolute so it reads in a huge OR a degenerate (single-body) scene.
+	var s := 10.0
+	if _bounds_valid():
+		var span := _max - _min
+		if is_finite(span.length()):
+			s = maxf(span.length() * 0.02, 6.0)
+	if _is_3d:
+		return Vector3(s, s, s)
+	return Vector3(s, s, 0.0)
+
+
+func _make_synth_proxy(role: String, ext: Vector3):
+	# A role-coloured primitive standing in for a shapeless body: a box in 3D, a box polygon
+	# in 2D (same look as the shape-backed rect proxy).
+	if _is_3d:
+		var bm := BoxMesh.new()
+		bm.size = ext * 2.0
+		var mi := MeshInstance3D.new()
+		mi.mesh = bm
+		mi.mesh.surface_set_material(0, _mesh_material(role))
+		return mi
+	var hs := Vector2(ext.x, ext.y)
+	return _poly2d(PackedVector2Array([
+		Vector2(-hs.x, -hs.y), Vector2(hs.x, -hs.y),
+		Vector2(hs.x, hs.y), Vector2(-hs.x, hs.y)]), _role_fill(role), role)
+
+
+func _expand_bounds_synth(pos: Vector3, ext: Vector3) -> void:
+	for sx in [-1.0, 1.0]:
+		for sy in [-1.0, 1.0]:
+			for sz in [-1.0, 1.0]:
+				var wp := pos + Vector3(ext.x * sx, ext.y * sy, ext.z * sz)
+				_min.x = minf(_min.x, wp.x); _min.y = minf(_min.y, wp.y); _min.z = minf(_min.z, wp.z)
+				_max.x = maxf(_max.x, wp.x); _max.y = maxf(_max.y, wp.y); _max.z = maxf(_max.z, wp.z)
+
+
+func _precompute_trail(state_bodies: Array) -> void:
+	# Cache, per shape-backed pair, the RIGID t=0 rel transform proxy_global0 relative to the
+	# body's t=0 state() pose, so UNIFIED state-follow can reconstruct proxy_global(t) =
+	# state_pose(t) * rel -- preserving any shape offset + asset fit-scale. Synthesized proxies
+	# need no rel (they ARE the body). The t=0 global_transform reads here are pre-stepping
+	# (safe; same discipline as _precompute_mirror_2d). Only used when _state_follow_all, so
+	# the SAFE default does zero extra work on the shape-backed proxies.
+	if not _state_follow_all or state_bodies.is_empty():
+		return
+	var pose0 := {}
+	for sb in state_bodies:
+		pose0[String(sb["name"])] = sb
+	for p in _pairs:
+		if bool(p.get("synth", false)):
+			continue
+		var sname := String(p.get("state_name", ""))
+		if sname == "" or not pose0.has(sname):
+			continue
+		var src = p["src"]
+		if src == null or not is_instance_valid(src):
+			continue
+		var sb = pose0[sname]
+		if _is_3d and src is Node3D:
+			var sp0 := _trail_pose_3d(sb)
+			p["rel3d"] = sp0.affine_inverse() * (src as Node3D).global_transform
+		elif (not _is_3d) and src is Node2D:
+			var sp2 := _trail_pose_2d(sb)
+			p["rel2d"] = sp2.affine_inverse() * _mirror_xform_2d(p)
 
 
 # =========================================================================== #
@@ -1131,6 +1460,8 @@ func _setup_camera_2d() -> void:
 		z = clamp(z * 3.0, 0.35, 1.4)
 		if _controlled_body != null and is_instance_valid(_controlled_body):
 			cam.global_position = _controlled_body.global_position
+		elif _controlled_synth:
+			cam.global_position = Vector2(_controlled_synth_pos0.x, _controlled_synth_pos0.y)
 	else:
 		z = min(z, 1.4)
 	_base_zoom = z
@@ -1147,7 +1478,8 @@ func _setup_camera_3d() -> void:
 	# (godot_rl-examples arena look, but never losing a fly-through craft off-frame).
 	# Explicit cam params take the parametric (godot-ai) path instead of the overview;
 	# in follow mode they re-aim the chase rig inside _setup_follow_cam_3d.
-	if _follow and _controlled_body != null and is_instance_valid(_controlled_body):
+	if _follow and ((_controlled_body != null and is_instance_valid(_controlled_body)) \
+			or _controlled_synth):
 		_setup_follow_cam_3d()
 	elif _cam_explicit:
 		_setup_param_cam_3d()
@@ -1269,7 +1601,7 @@ func _setup_follow_cam_3d() -> void:
 	# cam_dist keeps its existing meaning. view_target is ignored in follow mode (the rig
 	# follows the controlled body by definition).
 	var fwd := _traj_fwd
-	if not _has_fwd:
+	if not _has_fwd and _controlled_body != null and is_instance_valid(_controlled_body):
 		var bf: Vector3 = -_controlled_body.global_transform.basis.z
 		if Vector3(bf.x, 0.0, bf.z).length() > 1.0e-3:
 			fwd = bf
@@ -1381,10 +1713,22 @@ func _clamp_box() -> Array:
 	return [_min, _max]
 
 
+func _controlled_base_pos() -> Vector3:
+	# The controlled body's world position: its node when it has one, else its shapeless t=0
+	# state() position (sync() re-bases it from the per-tick trail).
+	if _controlled_body != null and is_instance_valid(_controlled_body):
+		return _controlled_body.global_position
+	return _controlled_synth_pos0
+
+
+func _follow_pose_from(base: Vector3) -> Vector3:
+	var box := _clamp_box()
+	return clamp_follow_pos(base + _follow_offset, box[0], box[1])
+
+
 func _follow_pose() -> Vector3:
 	# The chase camera's world position for the controlled body's current pose, clamped.
-	var box := _clamp_box()
-	return clamp_follow_pos(_controlled_body.global_position + _follow_offset, box[0], box[1])
+	return _follow_pose_from(_controlled_base_pos())
 
 
 func _thin_axis_dir(span: Vector3) -> Vector3:
