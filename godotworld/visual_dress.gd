@@ -55,7 +55,10 @@
 # API:
 #   var stage := load("res://visual_dress.gd").new()
 #   parent.add_child(stage)                 # a SIBLING of the game, never a child of it
-#   stage.dress(game_root, {follow=false, assets={...}, manifest_path="...", dress_mode="auto"})
+#   stage.dress(game_root, {follow=false, assets={...}, manifest_path="...", dress_mode="auto",
+#       cam_elevation=25.0, cam_azimuth=30.0, cam_fov=50.0, view_target="puck,goal"})
+#   # the four cam_* opts are OPTIONAL (godot-ai editor_screenshot semantics, 3D only);
+#   # any one set = an explicit caller override of the default/authored framing
 #   ... each rendered frame ...
 #   stage.sync()                            # mirror transforms (read-only on the game)
 
@@ -75,6 +78,23 @@ const CIRCLE_SEGMENTS := 24
 const ASSET_POS_TOL := 30.0         # t=0 body<->state position match tolerance (asset routing)
 const ELEV_3D := 38.0               # 3D overview elevation above the play plane (deg; not top-down)
 
+# ---- parametric camera (godot-ai editor_screenshot port; 3D only) ---------- #
+# Placement math ported from godot-ai's screenshot framing so a capture-lane view and a
+# godot-ai editor screenshot of the same box agree:
+#   godot-ai/plugin/addons/godot_ai/handlers/editor_handler.gd::_frame_transform_for_aabb
+#     distance = radius / tan(fov/2) * padding, floored at radius*2+1 (tiny-AABB standoff);
+#     cam_pos = center + distance * (cos(el)sin(az), sin(el), cos(el)cos(az)) (Y-up);
+#     up-hint = FORWARD above ~overhead elevation (fixes look_at degeneracy);
+#   ::_get_visual_aabb -- the per-target AABB (ours comes from collision shapes instead).
+# Semantics: elevation 0=level/90=overhead, azimuth 0=front/90=right, fov deg,
+# view_target = comma-separated state() body NAMES. Active ONLY when the caller passed a
+# param explicitly (_cam_explicit) -- the default framing stays byte-identical.
+const PARAM_ELEV_DEG := 25.0        # godot-ai custom-path default elevation
+const PARAM_AZIM_DEG := 30.0        # godot-ai custom-path default azimuth
+const PARAM_FOV_DEG := 50.0         # fov fallback = our overview fov
+const PARAM_PADDING := 1.8          # godot-ai framing padding
+const PARAM_OVERHEAD_DEG := 85.0    # above this elevation, FORWARD up-hint (look_at fix)
+
 # ---- 3D follow-cam rig ----------------------------------------------------- #
 # A chase cam trailing the controlled body along its TRAVEL direction, modelled on the
 # godot_rl HovercraftRacing car.tscn rig (Camera3D at y=0.94 up, z=-3.37 back, pitch 12.6deg):
@@ -83,7 +103,8 @@ const ELEV_3D := 38.0               # 3D overview elevation above the play plane
 # gluing the camera to itself (the "on ne la voit pas trop" bug). The offset points BEHIND
 # the travel direction -- the old rig sat on local +Z and faced backwards, hiding the path
 # ahead entirely on a +Z-moving craft.
-const FOLLOW_CAM_DIST := 3.0        # default chase multiplier (body-lengths back); --cam-dist overrides
+const FOLLOW_CAM_DIST := 3.0        # default chase multiplier (body-lengths back); the cam_dist
+                                    # opt / HARNESS_CAM_DIST env (from capture.py) overrides
 const FOLLOW_MIN_BACK := 8.0        # absolute floor on the back distance (tiny-body guard)
 const FOLLOW_MIN_UP := 3.0          # absolute floor on the rise
 const FOLLOW_UP_FRAC := 0.30        # rise as a fraction of the back distance (keeps the pitch sane)
@@ -138,6 +159,19 @@ var _traj_max := Vector3.ZERO
 var _has_fwd := false
 var _traj_fwd := Vector3(0.0, 0.0, 1.0)   # controlled body's travel direction (fallback: +Z)
 var _follow_offset := Vector3.ZERO        # world-space body->camera chase offset
+# parametric camera (explicit caller override; godot-ai semantics) -- render-only
+var _cam_elev_set := false
+var _cam_elev := PARAM_ELEV_DEG
+var _cam_azim_set := false
+var _cam_azim := PARAM_AZIM_DEG
+var _cam_fov_set := false
+var _cam_fov := PARAM_FOV_DEG
+var _view_target := ""                    # comma-separated state() body names to frame on
+var _cam_explicit := false                # any of the four set -> the parametric path
+var _tgt_min := Vector3(INF, INF, INF)    # union AABB of the resolved view-target bodies
+var _tgt_max := Vector3(-INF, -INF, -INF)
+var _tgt_resolved := 0
+var _tgt_missing: Array = []
 
 
 # =========================================================================== #
@@ -168,6 +202,10 @@ func dress(game_root: Node, opts := {}) -> void:
 	# 2b. Resolve each body's bank asset (3D only), matching nodes to state() names by t=0 pos.
 	if _is_3d:
 		_resolve_assets(game_root, shapes)
+		# 2c. Resolve explicit view-target names (parametric-camera framing box; same
+		#     t=0 state-name/pos match as asset routing). Misses show up in census().
+		if _view_target != "":
+			_resolve_view_targets(game_root, shapes)
 
 	# 3. Build the overlay proxies + framing under a fresh stage subtree (a sibling).
 	if _is_3d:
@@ -354,10 +392,20 @@ func _read_dress_mode(opts: Dictionary) -> void:
 
 func census() -> Dictionary:
 	# Exposed for the host's logging + the dress tests: what the game brought of its own, and
-	# therefore what we did NOT stamp over it.
-	return {"mode": _dress_mode, "authored_bodies": _authored_bodies.size(),
+	# therefore what we did NOT stamp over it. Parametric-camera keys appear ONLY when the
+	# caller passed explicit params, so the default census line stays byte-identical.
+	var c := {"mode": _dress_mode, "authored_bodies": _authored_bodies.size(),
 		"root_visual": _authored_root_visual, "camera": _authored_camera,
 		"light": _authored_light, "env": _authored_env}
+	if _cam_explicit:
+		c["cam_explicit"] = true
+		if not _is_3d:
+			# godot-ai's viewport_2d rule: 2D ignores parametric camera args entirely.
+			c["cam_params_ignored_2d"] = true
+	if _view_target != "":
+		c["view_targets_resolved"] = _tgt_resolved
+		c["view_targets_missing"] = _tgt_missing
+	return c
 
 
 # ---- census -> decisions (the ONLY places the census changes behaviour) ---- #
@@ -942,6 +990,90 @@ func _asset_id_for_rec(rec: Dictionary) -> String:
 	return String(_asset_by_body.get(body.get_instance_id(), ""))
 
 
+# =========================================================================== #
+# View-target resolution (parametric camera) -- read-only, 3D only
+# =========================================================================== #
+func _resolve_view_targets(game_root: Node, shapes: Array) -> void:
+	# Map each requested state() body NAME to its node by the SAME t=0 name/pos match
+	# asset routing uses (state names are our stable identifier -- never scene paths),
+	# then union the matched bodies' collision AABBs into the parametric framing box.
+	# Misses land in census()["view_targets_missing"] (godot-ai's view_target_not_found
+	# analogue); when nothing resolves the camera falls back to the overview box.
+	var state_bodies := _state_bodies(game_root)
+	for raw_name in _view_target.split(",", false):
+		var name := String(raw_name).strip_edges()
+		if name == "":
+			continue
+		var body = _body_for_state_name(name, state_bodies, shapes)
+		if body == null:
+			_tgt_missing.append(name)
+			continue
+		_tgt_resolved += 1
+		for rec in shapes:
+			if rec["body"] == body:
+				_expand_target_bounds(rec)
+
+
+func _body_for_state_name(name: String, state_bodies: Array, shapes: Array):
+	# state() name -> body node: (1) find the state entry whose normalised name matches;
+	# (2) the collision body nearest its t=0 pos (within ASSET_POS_TOL) -- the inverse of
+	# _asset_for_body's match; (3) fallback: a body whose NODE name normalises equal.
+	# null on a miss.
+	var want := _norm_name(name)
+	var bodies := _unique_bodies(shapes)
+	for sb in state_bodies:
+		if _norm_name(String(sb["name"])) != want:
+			continue
+		var spos: Vector3 = sb["pos"]
+		var best = null
+		var best_d := INF
+		for body in bodies:
+			var d: float = _body_pos3(body).distance_to(spos)
+			if d < best_d:
+				best_d = d
+				best = body
+		if best != null and best_d <= ASSET_POS_TOL:
+			return best
+		break
+	for body in bodies:
+		if _norm_name(String(body.name)) == want:
+			return body
+	return null
+
+
+func _unique_bodies(shapes: Array) -> Array:
+	var seen := {}
+	var out := []
+	for rec in shapes:
+		var body = rec["body"]
+		if body == null or not is_instance_valid(body):
+			continue
+		var bid: int = body.get_instance_id()
+		if seen.has(bid):
+			continue
+		seen[bid] = true
+		out.append(body)
+	return out
+
+
+func _expand_target_bounds(rec: Dictionary) -> void:
+	# Union one shape's world-space corners into the view-target box (t=0 read, safe --
+	# same corner math as _expand_bounds_3d, different accumulator).
+	var shape_node = rec["shape"]
+	var xf: Transform3D = shape_node.global_transform
+	var ext := _shape_half_extent_3d(rec["shape"].shape)
+	for sx in [-1.0, 1.0]:
+		for sy in [-1.0, 1.0]:
+			for sz in [-1.0, 1.0]:
+				var wp: Vector3 = xf * Vector3(ext.x * sx, ext.y * sy, ext.z * sz)
+				_tgt_min.x = minf(_tgt_min.x, wp.x)
+				_tgt_min.y = minf(_tgt_min.y, wp.y)
+				_tgt_min.z = minf(_tgt_min.z, wp.z)
+				_tgt_max.x = maxf(_tgt_max.x, wp.x)
+				_tgt_max.y = maxf(_tgt_max.y, wp.y)
+				_tgt_max.z = maxf(_tgt_max.z, wp.z)
+
+
 func _load_asset(asset_id: String, target_size: Vector3, anchor: String):
 	# Render-only bank model via AssetLoader (physics provably stripped). Returns null on any
 	# failure -> the caller falls back to the primitive proxy, so the demo always renders.
@@ -961,8 +1093,16 @@ func _setup_camera() -> void:
 	# theirs (it is already the viewport's current camera -- there is nothing to make current).
 	# This is the make_current() theft that used to discard the framing 7 of the 22 certified
 	# games authored for themselves. _camera stays null -> sync()'s follow block is inert.
+	#
+	# ONE exception (the parametric upgrade): an EXPLICIT cam param (elevation/azimuth/fov/
+	# view_target) is the caller CONSCIOUSLY overriding authorship -- godot-ai screenshot
+	# semantics -- so a 3D game gets the parametric camera even over an authored one. The
+	# override camera still lives in OUR sibling stage (zero-contact; the authored camera is
+	# never touched, ours simply becomes current). 2D always ignores the params (godot-ai
+	# rejects camera args for viewport_2d), so 2D authored precedence is unchanged.
 	if not _should_own_camera():
-		return
+		if not (_is_3d and _cam_explicit):
+			return
 	if _is_3d:
 		_setup_camera_3d()
 	else:
@@ -1005,8 +1145,12 @@ func _setup_camera_3d() -> void:
 	# --follow = a chase cam trailing the controlled body along its travel direction; default
 	# is an elevated, TILTED overview framed on the whole scene UNION the witness trajectory
 	# (godot_rl-examples arena look, but never losing a fly-through craft off-frame).
+	# Explicit cam params take the parametric (godot-ai) path instead of the overview;
+	# in follow mode they re-aim the chase rig inside _setup_follow_cam_3d.
 	if _follow and _controlled_body != null and is_instance_valid(_controlled_body):
 		_setup_follow_cam_3d()
+	elif _cam_explicit:
+		_setup_param_cam_3d()
 	else:
 		_setup_overview_cam_3d()
 
@@ -1059,27 +1203,99 @@ func _setup_overview_cam_3d() -> void:
 	_camera = cam
 
 
+func _param_box() -> Array:
+	# The parametric camera's framing box: the resolved view-target bodies' union AABB when
+	# any target resolved, else the whole-scene overview box (t=0 UNION trajectory).
+	if _tgt_resolved > 0 and _tgt_min.x <= _tgt_max.x and is_finite(_tgt_min.x):
+		return [_tgt_min, _tgt_max]
+	return _overview_box()
+
+
+func _setup_param_cam_3d() -> void:
+	# EXPLICIT parametric framing: the godot-ai editor_screenshot camera, ported (source
+	# citation at the PARAM_* constants block). Runs ONLY when the caller explicitly set a
+	# cam param; lives in _stage3d like every dresser camera (zero-contact, render-only).
+	var box := _param_box()
+	var bmin: Vector3 = box[0]
+	var bmax: Vector3 = box[1]
+	var center := (bmin + bmax) * 0.5
+	var radius: float = maxf((bmax - bmin).length() * 0.5, 1.0e-3)
+	var elev: float = _cam_elev if _cam_elev_set else PARAM_ELEV_DEG
+	var azim: float = _cam_azim if _cam_azim_set else PARAM_AZIM_DEG
+	var fov: float = _cam_fov if _cam_fov_set else PARAM_FOV_DEG
+	var cam := Camera3D.new()
+	cam.name = "DemoParamCam3D"
+	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
+	cam.fov = fov
+	var d := param_cam_distance(radius, fov)
+	cam.near = 0.5
+	cam.far = d * 4.0 + 2000.0
+	_stage3d.add_child(cam)              # in-tree BEFORE look_at (needs a global transform)
+	cam.global_position = center + param_cam_dir(elev, azim) * d
+	cam.look_at(center, param_up_hint(elev))
+	cam.make_current()
+	_camera = cam
+
+
+# ---- parametric-cam math (PURE: reads no member state -> unit-testable in isolation) ---- #
+func param_cam_dir(elev_deg: float, azim_deg: float) -> Vector3:
+	# godot-ai's spherical placement (editor_handler.gd::_frame_transform_for_aabb):
+	# Y-up; azimuth 0 = +Z (front), 90 = +X (right); elevation 0 = level, 90 = overhead.
+	var el := deg_to_rad(elev_deg)
+	var az := deg_to_rad(azim_deg)
+	return Vector3(cos(el) * sin(az), sin(el), cos(el) * cos(az))
+
+
+func param_cam_distance(radius: float, fov_deg: float) -> float:
+	# distance = radius / tan(fov/2) * padding, floored at radius*2+1 -- godot-ai's
+	# tiny-AABB standoff guard (a near-point target must not glue the camera to it).
+	var d := radius / tan(deg_to_rad(fov_deg) * 0.5) * PARAM_PADDING
+	return maxf(d, radius * 2.0 + 1.0)
+
+
+func param_up_hint(elev_deg: float) -> Vector3:
+	# Near-overhead, UP is (nearly) collinear with the view direction and look_at
+	# degenerates -> use FORWARD instead (godot-ai's overhead fix).
+	return Vector3.FORWARD if elev_deg > PARAM_OVERHEAD_DEG else Vector3.UP
+
+
 func _setup_follow_cam_3d() -> void:
 	# A chase camera trailing the controlled body along its TRAVEL direction (from the
 	# pre-scanned witness trajectory; falls back to the body's facing). Its world offset +
 	# orientation are baked here from the AABB-scaled rig; sync() re-poses the position each
 	# frame (read-only -> the zero-contact contract holds, as when it was proxy-parented).
+	# Explicit cam params (godot-ai semantics) re-aim the rig: elevation/azimuth replace the
+	# baked behind-travel offset direction, fov replaces FOLLOW_FOV -- ONLY when set;
+	# cam_dist keeps its existing meaning. view_target is ignored in follow mode (the rig
+	# follows the controlled body by definition).
 	var fwd := _traj_fwd
 	if not _has_fwd:
 		var bf: Vector3 = -_controlled_body.global_transform.basis.z
 		if Vector3(bf.x, 0.0, bf.z).length() > 1.0e-3:
 			fwd = bf
-	_follow_offset = follow_offset(_controlled_ext, _cam_dist, fwd)
+	var angled := _cam_elev_set or _cam_azim_set
+	if angled:
+		_follow_offset = follow_param_offset(_controlled_ext, _cam_dist, fwd,
+			(_cam_elev if _cam_elev_set else null), (_cam_azim if _cam_azim_set else null))
+	else:
+		_follow_offset = follow_offset(_controlled_ext, _cam_dist, fwd)
 	var cam := Camera3D.new()
 	cam.name = "DemoFollowCam3D"
 	cam.projection = Camera3D.PROJECTION_PERSPECTIVE
-	cam.fov = FOLLOW_FOV
+	cam.fov = _cam_fov if _cam_fov_set else FOLLOW_FOV
 	cam.near = 0.5
 	var span_len: float = (_overview_box()[1] - _overview_box()[0]).length()
 	cam.far = maxf(span_len * 2.0 + _follow_offset.length() * 2.0, 2000.0)
 	_stage3d.add_child(cam)              # in-tree BEFORE global_transform (needs a scenario)
+	var look_dir := follow_look_dir(fwd)
+	var up_hint := Vector3.UP
+	if angled:
+		# Re-aimed rig: look from the new offset back AT the body (its pose stays centred).
+		look_dir = (-_follow_offset).normalized()
+		if _cam_elev_set and _cam_elev > PARAM_OVERHEAD_DEG:
+			up_hint = Vector3.FORWARD
 	cam.global_transform = Transform3D(
-		Basis.looking_at(follow_look_dir(fwd), Vector3.UP), _follow_pose())
+		Basis.looking_at(look_dir, up_hint), _follow_pose())
 	cam.make_current()
 	_camera = cam
 
@@ -1111,6 +1327,24 @@ func follow_offset(ext: Vector3, cam_dist: float, fwd: Vector3) -> Vector3:
 	var back := follow_back_dist(ext, cam_dist)
 	var up := follow_up_dist(ext, back)
 	return -f * back + Vector3(0.0, up, 0.0)
+
+
+func follow_param_offset(ext: Vector3, cam_dist: float, fwd: Vector3,
+		elev_deg, azim_deg) -> Vector3:
+	# The chase offset re-aimed by explicit godot-ai angles: azimuth (0=front/+Z, 90=
+	# right/+X) replaces the behind-travel horizontal direction; elevation replaces the
+	# rig-height rise (rise = back * tan(elev), so the camera really sits at that
+	# elevation). A null component keeps the legacy rig behaviour for that part; the
+	# elevation is clamped to +-80 deg so the offset never degenerates vertical. PURE.
+	var back := follow_back_dist(ext, cam_dist)
+	var h := -_horiz_fwd(fwd)
+	if azim_deg != null:
+		var az := deg_to_rad(float(azim_deg))
+		h = Vector3(sin(az), 0.0, cos(az))
+	var up := follow_up_dist(ext, back)
+	if elev_deg != null:
+		up = back * tan(deg_to_rad(clampf(float(elev_deg), -80.0, 80.0)))
+	return h * back + Vector3(0.0, up, 0.0)
 
 
 func follow_look_dir(fwd: Vector3) -> Vector3:
@@ -1243,11 +1477,37 @@ func _read_cam_opts(opts: Dictionary) -> void:
 	if fwd != null:
 		_traj_fwd = fwd
 		_has_fwd = true
+	# Parametric camera (godot-ai editor_screenshot semantics): opts from the capture
+	# host's --cam-* argv (opts WIN, like every knob here), env fallbacks for sbatch-lane
+	# parity with HARNESS_CAM_DIST. Absent -> unset: the legacy framing stays
+	# byte-identical and authored-camera precedence is unchanged.
+	var elev = opts.get("cam_elevation", _env_float_or_null("HARNESS_CAM_ELEV"))
+	if elev != null:
+		_cam_elev = float(elev)
+		_cam_elev_set = true
+	var azim = opts.get("cam_azimuth", _env_float_or_null("HARNESS_CAM_AZIM"))
+	if azim != null:
+		_cam_azim = float(azim)
+		_cam_azim_set = true
+	var pfov = opts.get("cam_fov", _env_float_or_null("HARNESS_CAM_FOV"))
+	if pfov != null:
+		_cam_fov = float(pfov)
+		_cam_fov_set = true
+	var tgt := String(opts.get("view_target", OS.get_environment("HARNESS_CAM_TARGET")))
+	_view_target = tgt.strip_edges()
+	_cam_explicit = _cam_elev_set or _cam_azim_set or _cam_fov_set or _view_target != ""
 
 
 func _env_float(name: String, dflt: float) -> float:
 	var s := OS.get_environment(name)
 	return s.to_float() if s != "" else dflt
+
+
+func _env_float_or_null(name: String):
+	# Like _env_float but with NO default: null when the var is unset, so an absent knob
+	# reads as "not explicitly set" (the parametric path stays off).
+	var s := OS.get_environment(name)
+	return s.to_float() if s != "" else null
 
 
 func _env_vec3(name: String):

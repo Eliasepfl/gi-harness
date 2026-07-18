@@ -77,6 +77,86 @@ def test_assemble_gif_downscales_wide_frames(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Parametric camera + multi-view plumbing (Godot-free). The host/dresser side
+# (capture_host.gd / visual_dress.gd) is exercised by the cluster Validate lane.
+# --------------------------------------------------------------------------- #
+def test_cam_user_args_default_appends_nothing():
+    # The byte-identity contract: no explicit cam param -> NOTHING added to the argv
+    # (same append-nothing-when-default pattern as speedup_user_args).
+    assert capture._cam_user_args() == []
+    assert capture._cam_user_args(None, None, None, None) == []
+    assert capture._cam_user_args(cam_view_target="") == []
+
+
+def test_cam_user_args_renders_all_four():
+    args = capture._cam_user_args(25.0, 30.5, 45.0, "puck,goal_left")
+    assert args == ["--cam-elevation=25.0", "--cam-azimuth=30.5",
+                    "--cam-fov=45.0", "--cam-target=puck,goal_left"]
+
+
+def test_view_user_args_default_is_byte_identical_to_legacy():
+    # With every new knob unset, the host user-args are EXACTLY the pre-parametric list.
+    got = capture._view_user_args(
+        "/g/game.gd", "/tmp/w.json", "/tmp/frames", width=960, height=540,
+        max_frames=300, speedup=1, follow=False, assets_file="", manifest="")
+    want = ["--capture",
+            "--game-file=%s" % os.path.abspath("/g/game.gd"),
+            "--actions-file=/tmp/w.json",
+            "--out=/tmp/frames",
+            "--width=960", "--height=540", "--max-frames=300"]
+    assert got == want
+
+
+def test_view_user_args_ordering_follow_cam_assets():
+    # New cam args slot between --follow and the asset args; both neighbours unchanged.
+    got = capture._view_user_args(
+        "/g/game.gd", "/w.json", "/f", width=640, height=360, max_frames=100,
+        speedup=1, follow=True, assets_file="/a.json", manifest="/m.json",
+        cam_elevation=60.0, cam_view_target="puck")
+    assert got[-5:] == ["--follow", "--cam-elevation=60.0", "--cam-target=puck",
+                        "--assets-file=/a.json",
+                        "--assets-manifest=%s" % os.path.abspath("/m.json")]
+
+
+def _rv(views, **over):
+    kw = dict(follow=False, cam_dist=None, cam_elevation=None, cam_azimuth=None,
+              cam_fov=None, cam_view_target=None)
+    kw.update(over)
+    return capture._resolve_views(views, **kw)
+
+
+def test_resolve_views_none_is_single_view_legacy():
+    assert _rv(None) is None
+
+
+def test_resolve_views_inherits_toplevel_and_overrides_per_view():
+    vs = _rv([{}, {"id": "top", "elevation": 90.0, "fov": 45.0}],
+             follow=True, cam_dist=2.5, cam_azimuth=10.0, cam_view_target="puck")
+    v0, v1 = vs
+    assert v0 == {"id": "view0", "follow": True, "cam_dist": 2.5, "elevation": None,
+                  "azimuth": 10.0, "fov": None, "view_target": "puck"}
+    assert v1["id"] == "top" and v1["elevation"] == 90.0 and v1["fov"] == 45.0
+    assert v1["azimuth"] == 10.0 and v1["follow"] is True     # inherited
+    assert v1["view_target"] == "puck"                        # inherited
+
+
+def test_resolve_views_rejects_empty_list_and_duplicate_ids():
+    with pytest.raises(capture.CaptureError):
+        _rv([])
+    with pytest.raises(capture.CaptureError):
+        _rv([{"id": "a"}, {"id": "a"}])
+
+
+def test_capture_gif_default_signature_has_new_knobs_off():
+    # The public surface: every new kwarg defaults to None (byte-identical behaviour).
+    import inspect
+    sig = inspect.signature(capture.capture_gif)
+    for name in ("cam_elevation", "cam_azimuth", "cam_fov", "cam_view_target", "views"):
+        assert name in sig.parameters
+        assert sig.parameters[name].default is None
+
+
+# --------------------------------------------------------------------------- #
 # Bank-asset routing call-site (Godot-free plumbing; 3D games only get dressed)
 # --------------------------------------------------------------------------- #
 def test_use_llm_off_when_harness_offline(monkeypatch):

@@ -23,7 +23,12 @@
 #         --path godotworld -s res://capture_host.gd -- \
 #         --capture --game-file=<abs.gd> --actions-file=<abs.json> \
 #         --out=<dir> [--follow] [--width=960] [--height=540] [--speedup=K] \
-#         [--every=1] [--max-frames=400]
+#         [--every=1] [--max-frames=400] \
+#         [--cam-elevation=DEG] [--cam-azimuth=DEG] [--cam-fov=DEG] [--cam-target=NAMES]
+#
+# The four --cam-* args are the PARAMETRIC CAMERA (render-only; godot-ai editor_screenshot
+# semantics, consumed by visual_dress.gd). All optional; absent -> legacy framing,
+# byte-identical. 3D only -- a 2D game ignores them (godot-ai's viewport_2d rule).
 #
 # SECURITY: like serve_game.gd this compiles + runs UNTRUSTED game code, so it runs ONLY
 # in-container on a SCRUBBED env, and only on games that already PASSED the G0 scanner
@@ -65,6 +70,13 @@ var _fp_lines: PackedStringArray = PackedStringArray()
 var _assets_file := ""       # route_assets cache JSON ({body_name: asset_id|null}); 3D dressing
 var _assets_manifest := ""   # abs/res:// assets/manifest.json for AssetLoader
 var _dump_state := ""        # write t=0 state body list to this path + quit (routing pre-pass)
+# Parametric camera (render-only; semantics ported from godot-ai's editor_screenshot --
+# see visual_dress.gd's parametric path). Kept as the raw argv strings: "" = unset, so
+# the dresser's opts-win-over-env fallback (_read_cam_opts) still sees "absent".
+var _cam_elev := ""          # --cam-elevation= (deg; 0=level, 90=overhead)
+var _cam_azim := ""          # --cam-azimuth=   (deg; 0=front, 90=right)
+var _cam_fov := ""           # --cam-fov=       (deg)
+var _cam_target := ""        # --cam-target=    (comma-separated state() body names)
 
 
 func _initialize() -> void:
@@ -94,6 +106,11 @@ func _run() -> void:
 	_assets_file = _str_arg("--assets-file=", "")
 	_assets_manifest = _str_arg("--assets-manifest=", "")
 	_dump_state = _str_arg("--dump-state=", "")   # routing pre-pass: emit t=0 bodies + quit
+	# Parametric camera args (all optional; absent -> the dresser's legacy framing).
+	_cam_elev = _str_arg("--cam-elevation=", "")
+	_cam_azim = _str_arg("--cam-azimuth=", "")
+	_cam_fov = _str_arg("--cam-fov=", "")
+	_cam_target = _str_arg("--cam-target=", "")
 
 	# The routing pre-pass and the render pass both need a game; --out is only required when
 	# actually writing frames.
@@ -196,7 +213,7 @@ func _run() -> void:
 		var dress_script = load("res://visual_dress.gd")
 		_stage = dress_script.new()
 		root.add_child(_stage)
-		_stage.dress(_game, {
+		var opts := {
 			"follow": _follow,
 			"view_w": float(_width),
 			"view_h": float(_height),
@@ -204,7 +221,18 @@ func _run() -> void:
 			"manifest_path": _assets_manifest,
 			# "" -> the dresser's own default (auto / HARNESS_DRESS_MODE).
 			"dress_mode": _dress_mode,
-		})
+		}
+		# Parametric camera opts: forwarded ONLY when set, so _read_cam_opts' opts-win-
+		# over-env fallback still applies and an unset knob stays byte-identical to today.
+		if _cam_elev != "":
+			opts["cam_elevation"] = _cam_elev.to_float()
+		if _cam_azim != "":
+			opts["cam_azimuth"] = _cam_azim.to_float()
+		if _cam_fov != "":
+			opts["cam_fov"] = _cam_fov.to_float()
+		if _cam_target != "":
+			opts["view_target"] = _cam_target
+		_stage.dress(_game, opts)
 		# What the game authored for itself, and therefore what we did NOT stamp over it. A
 		# flattened demo is diagnosable from the capture log alone.
 		print("capture_host: dress census ", _stage.census())
@@ -408,6 +436,19 @@ func _write_meta() -> void:
 		"follow": _follow,
 		"speedup": _speedup,
 	}
+	# Parametric-camera provenance: only when explicitly set, so the default meta.json
+	# stays byte-identical to the pre-parametric lane.
+	if _cam_elev != "" or _cam_azim != "" or _cam_fov != "" or _cam_target != "":
+		var camera := {}
+		if _cam_elev != "":
+			camera["elevation"] = _cam_elev.to_float()
+		if _cam_azim != "":
+			camera["azimuth"] = _cam_azim.to_float()
+		if _cam_fov != "":
+			camera["fov"] = _cam_fov.to_float()
+		if _cam_target != "":
+			camera["view_target"] = _cam_target
+		meta["camera"] = camera
 	var f := FileAccess.open("%s/meta.json" % _out_dir, FileAccess.WRITE)
 	if f != null:
 		f.store_string(JSON.stringify(meta))

@@ -310,6 +310,95 @@ def _capture_argv(exe: str, project: str, user_args: list[str], width: int,
     return argv
 
 
+def _cam_user_args(cam_elevation=None, cam_azimuth=None, cam_fov=None,
+                   cam_view_target=None) -> list[str]:
+    """Parametric-camera argv for the capture host (render-only; consumed by
+    visual_dress.gd). Semantics ported from godot-ai's ``editor_screenshot`` tool
+    (godot-ai plugin editor_handler.gd): elevation 0=level/90=overhead, azimuth
+    0=front/90=right, fov in degrees (20-30=zoom, 60-75=context), view_target =
+    comma-separated state() body NAMES to frame on. PURE, and append-NOTHING when
+    every knob is unset (the same pattern as speedup_user_args) -- the default
+    invocation stays byte-identical to the pre-parametric lane."""
+    args: list[str] = []
+    if cam_elevation is not None:
+        args.append("--cam-elevation=%r" % float(cam_elevation))
+    if cam_azimuth is not None:
+        args.append("--cam-azimuth=%r" % float(cam_azimuth))
+    if cam_fov is not None:
+        args.append("--cam-fov=%r" % float(cam_fov))
+    if cam_view_target:
+        args.append("--cam-target=%s" % str(cam_view_target))
+    return args
+
+
+def _view_user_args(game_path: str, actions_file: str, frames_out: str, *, width: int,
+                    height: int, max_frames: int, speedup: int, follow: bool,
+                    assets_file: str, manifest: str, cam_elevation=None,
+                    cam_azimuth=None, cam_fov=None, cam_view_target=None) -> list[str]:
+    """The capture host's user-arg list for ONE rendered view. PURE (no IO beyond
+    path normalisation) so the default-byte-identity contract is unit-testable: with
+    every ``cam_*`` at None the list is exactly the legacy single-view one."""
+    from harness.verify.godot_exec import speedup_user_args
+
+    user_args = [
+        "--capture",
+        "--game-file=%s" % os.path.abspath(game_path),
+        "--actions-file=%s" % actions_file,
+        "--out=%s" % frames_out,
+        "--width=%d" % int(width),
+        "--height=%d" % int(height),
+        "--max-frames=%d" % int(max_frames),
+        *speedup_user_args(speedup),
+    ]
+    if follow:
+        user_args.append("--follow")
+    user_args += _cam_user_args(cam_elevation, cam_azimuth, cam_fov, cam_view_target)
+    if assets_file:
+        user_args.append("--assets-file=%s" % assets_file)
+        user_args.append("--assets-manifest=%s" % os.path.abspath(manifest))
+    return user_args
+
+
+def _resolve_views(views, *, follow, cam_dist, cam_elevation, cam_azimuth, cam_fov,
+                   cam_view_target):
+    """Normalise a ``views=[...]`` request into fully-resolved per-view camera specs.
+
+    ``None`` -> ``None`` (the single-view legacy path, byte-identical to before the
+    multi-view upgrade). Otherwise each entry is a dict whose camera keys (``follow``,
+    ``cam_dist``, ``elevation``, ``azimuth``, ``fov``, ``view_target``) OVERRIDE the
+    top-level kwargs of the same meaning; unset keys inherit them (which themselves
+    default to None = today's framing). Optional per-view ``frames_dir``/``out_gif``
+    name where that view's artifacts land; ``id`` defaults to ``view<k>``. PURE."""
+    if views is None:
+        return None
+    if not views:
+        raise CaptureError("views=[] is ambiguous -- pass None for the single-view default")
+    out = []
+    for k, v in enumerate(views):
+        if v is None:
+            v = {}
+        if not isinstance(v, dict):
+            raise CaptureError(f"views[{k}] must be a dict, got {type(v).__name__}")
+        rv = {
+            "id": str(v.get("id") or f"view{k}"),
+            "follow": bool(v.get("follow", follow)),
+            "cam_dist": v.get("cam_dist", cam_dist),
+            "elevation": v.get("elevation", cam_elevation),
+            "azimuth": v.get("azimuth", cam_azimuth),
+            "fov": v.get("fov", cam_fov),
+            "view_target": v.get("view_target", cam_view_target),
+        }
+        if v.get("frames_dir"):
+            rv["frames_dir"] = str(v["frames_dir"])
+        if v.get("out_gif"):
+            rv["out_gif"] = str(v["out_gif"])
+        out.append(rv)
+    ids = [r["id"] for r in out]
+    if len(set(ids)) != len(ids):
+        raise CaptureError(f"duplicate view ids: {ids}")
+    return out
+
+
 def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
                 follow: bool = False, width: int = DEFAULT_WIDTH,
                 height: int = DEFAULT_HEIGHT, fps: int = DEFAULT_FPS,
@@ -318,7 +407,10 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
                 exe: str | None = None, project: str | None = None,
                 dress_assets: bool = True, game_context: str | None = None,
                 assets_manifest: str | None = None, cam_dist: float | None = None,
-                trajectory_overview: bool = True) -> dict:
+                trajectory_overview: bool = True,
+                cam_elevation: float | None = None, cam_azimuth: float | None = None,
+                cam_fov: float | None = None, cam_view_target: str | None = None,
+                views: list | None = None) -> dict:
     """Render a certified ``.gd`` game's witness replay to a GIF. ``actions`` is the
     winning plan (from a fresh verify). Returns ``{result, ticks, n_frames, out_path,
     frames_dir?}``. Raises ``CaptureError`` on an infra failure.
@@ -326,9 +418,28 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     When ``dress_assets`` (default), route the game's bodies to render-only bank assets once
     (``asset_bank.route_assets``, cached to ``<game>.assets.json``) and feed the mapping to
     the capture host; only 3D games' proxies are actually dressed (2D games stay flat). Asset
-    dressing is purely cosmetic -- the certified physics/state trail is unaffected."""
+    dressing is purely cosmetic -- the certified physics/state trail is unaffected.
+
+    PARAMETRIC CAMERA (3D; render-only; semantics ported from godot-ai's editor_screenshot):
+    ``cam_elevation`` (deg; 0=level, 90=overhead), ``cam_azimuth`` (deg; 0=front, 90=right),
+    ``cam_fov`` (deg), ``cam_view_target`` (comma-separated state() body NAMES to frame on).
+    All default None -> nothing is appended to the host argv and framing is byte-identical
+    to before. 2D games ignore all four (mirroring godot-ai's viewport_2d rule). Setting any
+    of the four EXPLICITLY overrides an authored in-game camera (a conscious caller choice);
+    when none is set an authored camera is honoured as before.
+
+    MULTI-VIEW (``views=[{...}, ...]``): render the SAME witness N times, one deterministic
+    replay per camera spec (the fingerprint identity machinery proves every replay's state
+    trail is byte-identical, so view k's frame ordinal j is pixel-for-pixel the same tick as
+    view 0's). Each view dict may set ``id``/``follow``/``cam_dist``/``elevation``/
+    ``azimuth``/``fov``/``view_target`` (unset keys inherit the top-level kwargs) plus
+    ``frames_dir``/``out_gif`` for where its artifacts land. View 0 is the PRIMARY: it uses
+    the top-level ``out_gif``/``frames_dir`` defaults, and the returned dict's top-level
+    keys describe it. Extra views without ``out_gif`` render frames only (no GIF). The
+    trajectory pre-scan and asset routing run ONCE and are shared by every view. With
+    ``views=None`` (default) behaviour is byte-identical to the single-view lane."""
     from harness.verify.godot_exec import (
-        default_godot_project, find_godot_exe, speedup_from_env, speedup_user_args,
+        default_godot_project, find_godot_exe, speedup_from_env,
     )
 
     exe = exe or find_godot_exe()
@@ -356,9 +467,9 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     # Trajectory-aware framing (3D): pre-scan the witness once headless so the render overlay
     # can frame the whole flight path, not the t=0 static box, and trail the craft along it.
     # Returns None for a 2D game (2D framing then stays byte-identical) or on any failure.
+    # Hoisted ABOVE the (possibly multi-view) render loop: one scan serves every view.
     scan = _scan_trajectory(exe, project, game_path, actions, seed) \
         if trajectory_overview else None
-    cam_env = _cam_env(cam_dist, scan)
 
     # Replay at the SAME game-tick speedup certification ran at (HARNESS_GODOT_SPEEDUP), so
     # the capture host's paired physics-rate/time-scale scaling matches the serve host that
@@ -367,55 +478,104 @@ def capture_gif(game_path: str, out_gif: str, *, actions, seed: int = 0,
     # exact env that certified the game (and defends against any future non-tick-identical
     # game). N==1 appends nothing, so the default invocation stays byte-identical to before.
     speedup = speedup_from_env()
-    user_args = [
-        "--capture",
-        "--game-file=%s" % os.path.abspath(game_path),
-        "--actions-file=%s" % actions_file,
-        "--out=%s" % frames_out,
-        "--width=%d" % int(width),
-        "--height=%d" % int(height),
-        "--max-frames=%d" % int(max_frames),
-        *speedup_user_args(speedup),
-    ]
-    if follow:
-        user_args.append("--follow")
-    if assets_file:
-        user_args.append("--assets-file=%s" % assets_file)
-        user_args.append("--assets-manifest=%s" % os.path.abspath(manifest))
 
-    argv = _capture_argv(exe, project, user_args, int(width), int(height))
+    resolved = _resolve_views(
+        views, follow=follow, cam_dist=cam_dist, cam_elevation=cam_elevation,
+        cam_azimuth=cam_azimuth, cam_fov=cam_fov, cam_view_target=cam_view_target)
 
-    try:
-        with _Xvfb(int(width), int(height)):
-            env = _child_env()
-            env.update(cam_env)          # render-only camera framing hints (see _cam_env)
-            log = tempfile.TemporaryFile(mode="w+b")
-            try:
-                proc = subprocess.run(argv, stdout=log, stderr=log,
-                                      stdin=subprocess.DEVNULL, env=env,
-                                      timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                raise CaptureError("capture host timed out (%.0fs)" % timeout_s)
-            rc = proc.returncode
-
-        meta = _read_meta(frames_out)
-        pngs = sorted(Path(frames_out).glob("frame_*.png"))
+    def _render_one(v: dict, v_frames_out: str, v_gif: str | None) -> dict:
+        """Run the capture host ONCE for one camera spec; frames into ``v_frames_out``,
+        optional GIF to ``v_gif``. Same argv/env discipline as the legacy single view."""
+        user_args = _view_user_args(
+            game_path, actions_file, v_frames_out, width=int(width), height=int(height),
+            max_frames=int(max_frames), speedup=speedup, follow=bool(v["follow"]),
+            assets_file=assets_file, manifest=manifest, cam_elevation=v["elevation"],
+            cam_azimuth=v["azimuth"], cam_fov=v["fov"], cam_view_target=v["view_target"])
+        argv = _capture_argv(exe, project, user_args, int(width), int(height))
+        env = _child_env()
+        env.update(_cam_env(v["cam_dist"], scan))   # render-only framing hints (see _cam_env)
+        log = tempfile.TemporaryFile(mode="w+b")
+        try:
+            proc = subprocess.run(argv, stdout=log, stderr=log,
+                                  stdin=subprocess.DEVNULL, env=env,
+                                  timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            raise CaptureError("capture host timed out (%.0fs)" % timeout_s)
+        rc = proc.returncode
+        meta = _read_meta(v_frames_out)
+        pngs = sorted(Path(v_frames_out).glob("frame_*.png"))
         if not pngs:
             log.seek(0)
             tail = log.read().decode("utf-8", "replace")[-1500:]
             raise CaptureError(
                 "capture produced no frames (rc=%s). Godot log tail:\n%s" % (rc, tail))
+        info = {"result": meta.get("result", "unknown"), "ticks": meta.get("ticks"),
+                "n_pngs": len(pngs)}
+        if v_gif:
+            gif_info = _assemble_gif(pngs, v_gif, fps=fps, downscale_to=downscale_to)
+            info["n_frames"] = gif_info["n_frames"]
+            info["out_path"] = str(v_gif)
+        return info
 
-        gif_info = _assemble_gif(pngs, out_gif, fps=fps, downscale_to=downscale_to)
-        result = {
-            "result": meta.get("result", "unknown"),
-            "ticks": meta.get("ticks"),
-            "n_frames": gif_info["n_frames"],
-            "out_path": str(out_gif),
-        }
-        if frames_dir:
-            result["frames_dir"] = str(frames_out)
-        return result
+    try:
+        with _Xvfb(int(width), int(height)):
+            if resolved is None:
+                # -- single view: the legacy lane, byte-identical argv/env/artifacts ------
+                prim = {"follow": bool(follow), "cam_dist": cam_dist,
+                        "elevation": cam_elevation, "azimuth": cam_azimuth,
+                        "fov": cam_fov, "view_target": cam_view_target}
+                info = _render_one(prim, frames_out, str(out_gif))
+                result = {
+                    "result": info["result"],
+                    "ticks": info["ticks"],
+                    "n_frames": info["n_frames"],
+                    "out_path": str(out_gif),
+                }
+                if frames_dir:
+                    result["frames_dir"] = str(frames_out)
+                return result
+
+            # -- multi-view: N deterministic replays of the SAME witness ------------------
+            view_records = []
+            prim_info: dict = {}
+            for k, v in enumerate(resolved):
+                v_frames = v.get("frames_dir") or \
+                    (frames_out if k == 0 else os.path.join(work, "frames_%s" % v["id"]))
+                v_gif = v.get("out_gif") or (str(out_gif) if k == 0 else None)
+                Path(v_frames).mkdir(parents=True, exist_ok=True)
+                info = _render_one(v, v_frames, v_gif)
+                if k == 0:
+                    prim_info = info
+                rec = {"id": v["id"], "follow": v["follow"], "cam_dist": v["cam_dist"],
+                       "elevation": v["elevation"], "azimuth": v["azimuth"],
+                       "fov": v["fov"], "view_target": v["view_target"],
+                       "result": info["result"], "ticks": info["ticks"],
+                       "n_pngs": info["n_pngs"], "frames_dir": str(v_frames)}
+                if info.get("out_path"):
+                    rec["out_path"] = info["out_path"]
+                view_records.append(rec)
+                # Determinism tripwire: every replay of the same witness must land the same
+                # outcome at the same tick (the cameras are render-only). A divergence means
+                # the tick lock broke -- fail loudly, never ship misaligned views.
+                r0 = view_records[0]
+                if (rec["result"], rec["ticks"], rec["n_pngs"]) != \
+                        (r0["result"], r0["ticks"], r0["n_pngs"]):
+                    raise CaptureError(
+                        "multi-view replay divergence: view %r got %r, view %r got %r"
+                        % (rec["id"], (rec["result"], rec["ticks"], rec["n_pngs"]),
+                           r0["id"], (r0["result"], r0["ticks"], r0["n_pngs"])))
+
+            # Top-level keys mirror the single-view result and describe the PRIMARY view.
+            result = {
+                "result": prim_info["result"],
+                "ticks": prim_info["ticks"],
+                "n_frames": prim_info.get("n_frames", prim_info["n_pngs"]),
+                "out_path": prim_info.get("out_path", str(out_gif)),
+                "views": view_records,
+            }
+            if frames_dir:
+                result["frames_dir"] = str(frames_out)
+            return result
     finally:
         if not frames_dir:
             shutil.rmtree(work, ignore_errors=True)

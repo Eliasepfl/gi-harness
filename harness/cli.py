@@ -521,7 +521,11 @@ def cmd_game_capture(args) -> int:
                           follow=args.follow, width=args.width, height=args.height,
                           fps=args.fps, max_frames=getattr(args, "max_frames", 300),
                           frames_dir=getattr(args, "frames_dir", None),
-                          cam_dist=getattr(args, "cam_dist", None))
+                          cam_dist=getattr(args, "cam_dist", None),
+                          cam_elevation=getattr(args, "cam_elevation", None),
+                          cam_azimuth=getattr(args, "cam_azimuth", None),
+                          cam_fov=getattr(args, "cam_fov", None),
+                          cam_view_target=getattr(args, "cam_target", None))
     except CaptureError as exc:
         return _call_error("game capture", exc, args.json)
     except Exception as exc:  # noqa: BLE001
@@ -544,6 +548,35 @@ def cmd_game_capture(args) -> int:
         if res.get("frames_dir"):
             print(f"  pngs  : {res.get('frames_dir')}")
     return 0 if res.get("result") in ("success", "failure", "exhausted") else 1
+
+
+def _parse_view_spec(spec: str) -> dict:
+    """Parse one ``--view`` spec into a capture-view dict: ``key=value`` pairs separated
+    by ``;`` (so ``view_target`` keeps its comma-separated body names), e.g.
+    ``id=top;elevation=90;fov=45;view_target=puck,goal_left``. Keys: id, follow
+    (true/false), cam_dist, elevation, azimuth, fov, view_target. ``''``/``default`` =
+    the inherit-everything view (today's camera). Raises ``ValueError`` on a bad spec."""
+    out: dict = {}
+    spec = (spec or "").strip()
+    if spec in ("", "default"):
+        return out
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"--view: expected key=value, got {part!r} (in {spec!r})")
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k in ("elevation", "azimuth", "fov", "cam_dist"):
+            out[k] = float(v)
+        elif k == "follow":
+            out[k] = v.lower() in ("1", "true", "yes")
+        elif k in ("id", "view_target"):
+            out[k] = v
+        else:
+            raise ValueError(f"--view: unknown key {k!r} (in {spec!r})")
+    return out
 
 
 def cmd_game_export(args) -> int:
@@ -572,6 +605,13 @@ def cmd_game_export(args) -> int:
     follow = (True if args.follow else None)
     n_random = int(getattr(args, "random_rollouts", 0) or 0)
     perturb = getattr(args, "perturb", None)
+    views = None
+    view_args = getattr(args, "view", None)
+    if view_args:
+        try:
+            views = [_parse_view_spec(s) for s in view_args]
+        except ValueError as exc:
+            return _call_error("game export (--view)", exc, args.json)
     records: list = []
     try:
         # 1) the winning witness (a clean win) -- unless suppressed
@@ -581,7 +621,7 @@ def cmd_game_export(args) -> int:
                 witness_mode=getattr(args, "witness", "auto"), seed_default=args.seed,
                 follow=follow, width=args.width, height=args.height,
                 fps=args.fps, cam_dist=getattr(args, "cam_dist", None),
-                render_frames=not args.no_frames))
+                render_frames=not args.no_frames, views=views))
         # 2) random-policy rollouts (NEGATIVES) -- state-only unless --random-frames
         if n_random > 0:
             records += export_random_rollouts(
@@ -590,7 +630,7 @@ def cmd_game_export(args) -> int:
                 render_frames=(bool(getattr(args, "random_frames", False))
                                and not args.no_frames),
                 follow=follow, width=args.width, height=args.height, fps=args.fps,
-                cam_dist=getattr(args, "cam_dist", None))
+                cam_dist=getattr(args, "cam_dist", None), views=views)
         # 3) perturbed near-misses (NEGATIVES) -- rendered unless --no-perturb-frames
         if perturb:
             wit_path, k = perturb[0], int(perturb[1])
@@ -601,7 +641,7 @@ def cmd_game_export(args) -> int:
                 render_frames=(not bool(getattr(args, "no_perturb_frames", False))
                                and not args.no_frames),
                 follow=follow, width=args.width, height=args.height, fps=args.fps,
-                cam_dist=getattr(args, "cam_dist", None))
+                cam_dist=getattr(args, "cam_dist", None), views=views)
     except ValueError as exc:
         return _call_error("game export", exc, args.json)
     except Exception as exc:  # noqa: BLE001
@@ -1299,6 +1339,20 @@ def build_parser() -> argparse.ArgumentParser:
     gc.add_argument("--cam-dist", type=float, default=None,
                     help="3D chase-cam distance multiplier (body-lengths back; default ~3.0, "
                          "floored by an absolute minimum). Only affects --follow.")
+    gc.add_argument("--cam-elevation", type=float, default=None,
+                    help="3D parametric camera elevation in degrees (0=level, 90=overhead; "
+                         "godot-ai editor_screenshot semantics). Setting ANY --cam-elevation/"
+                         "--cam-azimuth/--cam-fov/--cam-target consciously overrides an "
+                         "authored in-game camera; all unset = legacy framing, byte-identical. "
+                         "2D games ignore these.")
+    gc.add_argument("--cam-azimuth", type=float, default=None,
+                    help="3D parametric camera azimuth in degrees (0=front, 90=right)")
+    gc.add_argument("--cam-fov", type=float, default=None,
+                    help="3D parametric camera fov in degrees (20-30=zoom, 60-75=context)")
+    gc.add_argument("--cam-target", default=None,
+                    help="comma-separated state() body NAMES to frame the parametric "
+                         "camera on (3D; misses fall back to the whole-scene box and are "
+                         "reported in the dress census)")
     gc.add_argument("--actions", default=None,
                     help="witness JSON ({seed,actions}) to replay; overrides the default "
                          "pick-up of a trained-policy demo_trajectory.json")
@@ -1339,6 +1393,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "2D games use the fit-to-scene overview)")
     ge.add_argument("--cam-dist", type=float, default=None,
                     help="3D chase-cam distance multiplier (only with --follow)")
+    ge.add_argument("--view", action="append", default=None, metavar="SPEC",
+                    help="MULTI-VIEW export (repeatable; opt-in). SPEC = ';'-separated "
+                         "key=value pairs -- keys: id, follow, cam_dist, elevation, "
+                         "azimuth, fov, view_target (view_target keeps its commas). "
+                         "'default' (or '') = inherit today's camera. Example: "
+                         "--view default --view 'id=top;elevation=90;fov=45'. View 0 "
+                         "keeps frames/t*.png; extras land in frames/<id>/t*.png with "
+                         "params recorded in episode.json:capture.views")
     ge.add_argument("--width", type=int, default=960)
     ge.add_argument("--height", type=int, default=540)
     ge.add_argument("--fps", type=int, default=20, help="companion GIF playback fps")
