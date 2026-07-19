@@ -55,15 +55,26 @@ plane; 3D games get camera, light, and optional low-poly assets from the bank
 (`episode.json` + `steps.jsonl` + one PNG frame per tick, T states aligned to T frames): the
 same play as code-truth and as pixels, the signal a reward or world model can learn from.
 
+## Setup
+
+```bash
+git clone https://github.com/Eliasepfl/gi-harness gi && cd gi
+conda create -n godot-rl python=3.11 -y && conda activate godot-rl
+pip install -r requirements.txt
+# put your model key in env.py (gitignored, never commit):
+#   OPENROUTER_API_KEY = "sk-or-..."
+```
+
 ## Install the live-editor stack
 
 Every step below comes straight from each project's own documentation, linked. Nothing here
 is custom or unofficial to download.
 
 - **Godot 4.7** (MIT): the engine. Download the editor binary: https://godotengine.org/download
-- **godot-ai** (MIT): the MCP plugin that gives an agent tools inside the live editor.
-  https://github.com/hi-godot/godot-ai
+- **godot-ai** (MIT): the MCP plugin that gives an agent tools inside the live editor. Needs
+  the `uv` package manager (per its README). https://github.com/hi-godot/godot-ai
   ```bash
+  # prerequisite: the uv package manager, then:
   git clone https://github.com/hi-godot/godot-ai
   cp -r godot-ai/plugin/addons/godot_ai your-project/addons/
   # Project > Project Settings > Plugins > enable "Godot AI"  (serves MCP at 127.0.0.1:8000/mcp)
@@ -99,7 +110,7 @@ scripts/export_library.sh out/dataset --limit 20
 
 The whole verifier is also exposed as MCP tools any agent can call:
 ```json
-{ "mcpServers": { "gi-harness": { "command": "python",
+{ "mcpServers": { "harness": { "command": "python",
   "args": ["-m", "harness.mcp_server", "--transport", "stdio"] } } }
 ```
 
