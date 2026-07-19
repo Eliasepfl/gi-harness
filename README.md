@@ -94,7 +94,18 @@ is custom or unofficial to download.
   pip install godot-rl
   ```
 
-## Quickstart (offline harness, ORCD cluster)
+## Quickstart (local, any machine)
+
+No cluster needed. After Setup above, point the harness at a Godot 4.7 binary and go:
+
+```bash
+export HARNESS_GODOT_EXE=/path/to/Godot_v4.7-stable   # the editor binary from godotengine.org
+python -m harness game new "hop across moving platforms" --engine gdscript --backend openrouter --json
+# -> prints the generated .gd path + the certification report and replayable witness
+python -m harness game harden <generated>.gd --backend openrouter --json   # the feedback loop
+```
+
+## Quickstart (ORCD cluster, how we ran it at scale)
 
 ```bash
 module load apptainer/1.4.2   # gi-certifier.sif is the canonical certifier
