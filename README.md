@@ -1,10 +1,12 @@
-# gi-harness — text to a playable, code-certified game
+# gi-harness: text to a playable, code-certified game
 
 Turn a natural-language prompt (*"drive a cart one full lap around an oval track"*) into a
 **GDScript game** on Godot 4.7 headless, certified by a **100% programmatic** verifier that
 reads engine state directly (positions, velocities, checkpoints) and never looks at a
 rendered pixel or asks a VLM. Generation, verification, adversarial attack, RL learnability
 probing, and a personalized repair loop all close end to end in code.
+
+**Repo:** https://github.com/Eliasepfl/gi-harness
 
 **Showcase / write-up:** https://claude.ai/code/artifact/8b09f8a6-480f-402b-8472-778433e4e9c2
 
@@ -30,7 +32,7 @@ LLM-routed per prompt.
 | **G2** | Goal well-formed, not pre-satisfied, milestones latchable? | t=0 facts + guided episodes |
 | **G3** | Actually solvable? | Go-Explore tree solver, reduced to a replayable witness `{seed, actions}` |
 | **G4** | Robust? (escapes, single-action wins, shortcut-vs-gating, softlocks) | adversarial fuzz ladder to `open / hardened / bulletproof` |
-| **G3′** | Learnable by an RL agent? | SB3 PPO/A2C/DQN, in-scene batched vec env, plateau-patience early stop |
+| **G3'** | Learnable by an RL agent? | SB3 PPO/A2C/DQN, in-scene batched vec env, plateau-patience early stop |
 
 A game is "certified" when G0 to G3 pass and the witness replays bit-identically through the
 serve host (`godotworld/serve_game.gd`, length-prefixed JSON over TCP, env-scrubbed).
@@ -58,23 +60,27 @@ same play as code-truth and as pixels, the signal a reward or world model can le
 Every step below comes straight from each project's own documentation, linked. Nothing here
 is custom or unofficial to download.
 
-- **Godot 4.7** (MIT) — the engine. Download the editor binary: https://godotengine.org/download
-- **godot-ai** (MIT) — the MCP plugin that gives an agent tools inside the live editor.
+- **Godot 4.7** (MIT): the engine. Download the editor binary: https://godotengine.org/download
+- **godot-ai** (MIT): the MCP plugin that gives an agent tools inside the live editor.
   https://github.com/hi-godot/godot-ai
   ```bash
   git clone https://github.com/hi-godot/godot-ai
   cp -r godot-ai/plugin/addons/godot_ai your-project/addons/
   # Project > Project Settings > Plugins > enable "Godot AI"  (serves MCP at 127.0.0.1:8000/mcp)
   ```
-- **Hermes agent** (MIT) — the agent that drives the editor, point it at any model.
+- **Hermes agent** (MIT): the agent that drives the editor, point it at any model.
   https://github.com/nousresearch/hermes-agent
   ```bash
   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash && hermes setup
   ```
-- **gd-agentic-skills** (LGPLv3) — GDScript craft knowledge the agent reads at runtime.
+- **gd-agentic-skills** (LGPLv3): GDScript craft knowledge the agent reads at runtime.
   Complements godot-ai, does not clash with it. https://github.com/thedivergentai/gd-agentic-skills
   ```bash
   npx skills add thedivergentai/gd-agentic-skills/skills/godot-master -g -a <agent> -y
+  ```
+- **godot-rl-agents** (MIT): the RL bridge behind the G3' learnability probe.
+  ```bash
+  pip install godot-rl
   ```
 
 ## Quickstart (offline harness, ORCD cluster)
@@ -84,9 +90,9 @@ module load apptainer/1.4.2   # gi-certifier.sif is the canonical certifier
 apptainer exec -B /orcd gi-certifier.sif bash -lc '
   cd ~/gi &&
   python -m harness game new "hop across moving platforms" --engine gdscript --backend openrouter --json &&
-  python -m harness game harden scenes/games/<slug>/<slug>.gd --backend openrouter --json'
+  python -m harness game harden <generated>.gd --backend openrouter --json'   # game new --json prints the .gd path
 # capture a demo (needs host Xvfb, see scripts/capture_demo.sh)
-scripts/capture_demo.sh scenes/games/<slug>/<slug>.gd demo.gif
+scripts/capture_demo.sh <generated>.gd demo.gif
 # export the dataset (state + pixels, aligned)
 scripts/export_library.sh out/dataset --limit 20
 ```
@@ -107,13 +113,11 @@ for a free model like `tencent/hy3:free` in `env.py`. Run one game per Slurm job
 |---|---|
 | `harness/gen/` | gamegen (multi-turn repair loop), skill routing, feedback compiler + harden driver |
 | `harness/verify/` | gameverify funnel, gd/godot executors, G4, reachability, capture |
-| `harness/rl/` | serve env, batched vec env, SB3 trainer, g3′ certify |
+| `harness/rl/` | serve env, batched vec env, SB3 trainer, g3' certify |
 | `harness/mcp_server.py` | the funnel as four MCP tools (extract, verify, capture, atlas) |
 | `godotworld/` | serve host, capture host, visual dresser, asset loader, demo player |
 | `assets/` | curated low-poly bank (manifest committed) |
 | `tests/` | the harness's own test suite |
-| `scenes/games/` | generated games (artifacts, not tracked) |
 
-`CONTRACTS.md` holds the normative interfaces (and is hashed by the run-integrity tripwire).
-The `pymunk` / `Planck.js` lanes under `harness/legacy/` and `nodeworld/` are the frozen
-regression floor, not the default path.
+Budget caps live in code as defaults in `harness/designer/budgets.py`. GDScript on Godot is
+the only lane.
