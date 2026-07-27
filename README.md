@@ -8,7 +8,7 @@ probing, and a personalized repair loop all close end to end in code.
 
 **Repo:** https://github.com/Eliasepfl/gi-harness
 
-**Showcase / write-up:** https://eliasepfl.github.io/gi-harness/blog/game-harness/
+**Showcase / write-up:** https://eliasepfl.github.io/blog/game-harness/
 
 ## What a game is
 
