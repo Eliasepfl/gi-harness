@@ -61,8 +61,9 @@ same play as code-truth and as pixels, the signal a reward or world model can le
 git clone https://github.com/Eliasepfl/gi-harness gi && cd gi
 conda create -n godot-rl python=3.11 -y && conda activate godot-rl
 pip install -r requirements.txt
-# put your model key in env.py (gitignored, never commit):
+# put your model key AND model in env.py (gitignored, never commit) - both are required:
 #   OPENROUTER_API_KEY = "sk-or-..."
+#   OPENROUTER_MODEL = "z-ai/glm-5.2"     # or any OpenRouter model, e.g. "tencent/hy3:free"
 ```
 
 ## Install the live-editor stack
